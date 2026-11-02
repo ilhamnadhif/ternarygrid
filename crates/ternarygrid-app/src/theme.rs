@@ -160,7 +160,7 @@ pub fn visuals(theme: Theme) -> Visuals {
     v.window_stroke = Stroke::new(1.0, p.border);
     v.extreme_bg_color = p.surface;
     v.text_edit_bg_color = Some(p.surface);
-    v.faint_bg_color = if dark { hex(0x1b1c21) } else { hex(0xf7f7f9) };
+    v.faint_bg_color = if dark { hex(0x272930) } else { hex(0xf7f7f9) };
     v.code_bg_color = p.subtle;
     v.hyperlink_color = p.accent_text;
     v.warn_fg_color = p.warn;

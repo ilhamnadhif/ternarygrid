@@ -71,26 +71,28 @@ pub const LIGHT: Palette = Palette {
 };
 
 pub const DARK: Palette = Palette {
-    canvas: rgb(0x17191e),
-    chrome: rgb(0x121317),
-    surface: rgb(0x1f2026),
-    hover: rgb(0x26272e),
-    subtle: rgb(0x2c2d35),
-    header: rgb(0x25262d),
-    border: rgb(0x2b2c33),
-    border_strong: rgb(0x3d3f48),
-    text: rgb(0xe8e8ec),
-    text_muted: rgb(0x9e9fa8),
-    text_faint: rgb(0x76777f),
+    // A soft, mid-dark grey (not near-black): panels a step lighter than the
+    // chrome, the grid and the editor a step lighter again.
+    canvas: rgb(0x24262d),
+    chrome: rgb(0x1e2026),
+    surface: rgb(0x292b33),
+    hover: rgb(0x30323b),
+    subtle: rgb(0x363843),
+    header: rgb(0x2d2f37),
+    border: rgb(0x363843),
+    border_strong: rgb(0x4a4d59),
+    text: rgb(0xe8e9ed),
+    text_muted: rgb(0xa6a8b3),
+    text_faint: rgb(0x8d8f9b),
     accent: rgb(0x11806d),
     accent_hover: rgb(0x0d7363),
     on_accent: Color32::WHITE,
-    accent_soft: rgb(0x12302b),
-    accent_text: rgb(0x4cc9b0),
-    ok: rgb(0x3fb950),
-    warn: rgb(0xe3ae5a),
-    err: rgb(0xf87171),
-    info: rgb(0x6ea0ff),
+    accent_soft: rgb(0x1e3e39),
+    accent_text: rgb(0x5fd1ba),
+    ok: rgb(0x4cc764),
+    warn: rgb(0xe8b45e),
+    err: rgb(0xf88a84),
+    info: rgb(0x7aa7ff),
 };
 
 impl Palette {
