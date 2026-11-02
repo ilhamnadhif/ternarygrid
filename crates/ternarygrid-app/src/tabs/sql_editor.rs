@@ -1703,87 +1703,101 @@ impl SqlEditorTab {
         if let Some(p) = self.params.as_mut() {
             let mut run = false;
             let mut close = false;
-            let modal = egui::Modal::new(egui::Id::new(("params", self.editor.id()))).show(ui.ctx(), |ui| {
-                ui.heading(tr("Parameters"));
-                ui.label(tr("Values are inserted as SQL text: quote strings, e.g. 'abc'."));
-                egui::Grid::new("params_grid").num_columns(2).show(ui, |ui| {
+            let mut enter = false;
+            let (modal, ()) = ternarygrid_ui::parts::Dialog::new(tr("Parameters")).icon(icon::BRACKETS_CURLY).width(480.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("params", self.editor.id())),
+                |ui| {
+                    ui.label(RichText::new(tr("Values are inserted as SQL text: quote strings, e.g. 'abc'.")).color(ternarygrid_ui::pal(ui).text_muted));
                     for (i, n) in p.names.iter().enumerate() {
-                        ui.label(n);
-                        let r = ui.add(egui::TextEdit::singleline(&mut p.values[i]).desired_width(260.0));
-                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        ternarygrid_ui::parts::form_row(ui, n, 120.0, |ui| {
+                            let r = ui.add(egui::TextEdit::singleline(&mut p.values[i]).desired_width(280.0).font(egui::TextStyle::Monospace));
+                            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                enter = true;
+                            }
+                            if i == 0 && !p.focused {
+                                r.request_focus();
+                                p.focused = true;
+                            }
+                        });
+                    }
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if kit::primary_icon(ui, icon::PLAY, tr("Execute")).clicked() {
                             run = true;
                         }
-                        if i == 0 && !p.focused {
-                            r.request_focus();
-                            p.focused = true;
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            close = true;
                         }
-                        ui.end_row();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Execute")).strong()).clicked() {
-                        run = true;
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        close = true;
-                    }
-                });
-            });
+                    });
+                },
+            );
+            run |= enter;
             if run {
                 let p = self.params.take().expect("present");
                 for (n, v) in p.names.iter().zip(p.values) {
                     self.variables.insert(n.clone(), v);
                 }
                 self.run(cx, p.request);
-            } else if close || modal.should_close() {
+            } else if close || modal.close {
                 self.params = None;
             }
         }
         if let Some(c) = &self.confirm {
             let mut run = false;
             let mut close = false;
-            let modal = egui::Modal::new(egui::Id::new(("confirm_exec", self.editor.id()))).show(ui.ctx(), |ui| {
-                ui.set_width(520.0);
-                crate::widgets::icon_heading(ui, icon::WARNING, tr("Confirm execution"));
-                for r in &c.reasons {
-                    ui.label(r);
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Execute")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        run = true;
+            let (modal, ()) = ternarygrid_ui::parts::Dialog::new(tr("Confirm execution")).icon(icon::WARNING).width(540.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("confirm_exec", self.editor.id())),
+                |ui| {
+                    for r in &c.reasons {
+                        ui.add(egui::Label::new(r).wrap());
                     }
-                    if ui.button(tr("Cancel")).clicked() {
-                        close = true;
-                    }
-                });
-            });
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::PLAY), tr("Execute"), false).clicked() {
+                            run = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            close = true;
+                        }
+                    });
+                },
+            );
             if run {
                 let mut req = self.confirm.take().expect("present").request;
                 req.confirmed = true;
                 self.run(cx, req);
-            } else if close || modal.should_close() {
+            } else if close || modal.close {
                 self.confirm = None;
             }
         }
         if self.close_prompt {
             let mut close = false;
             let mut decided: Option<bool> = None;
-            let modal = egui::Modal::new(egui::Id::new(("close_editor", self.editor.id()))).show(ui.ctx(), |ui| {
-                ui.heading(tr("Unsaved changes"));
-                ui.label(trf("Save changes to \"{}\"?", &[&self.title]));
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Save")).strong()).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button(tr("Don't save")).clicked() {
+            let title = self.title.clone();
+            let (modal, ()) = ternarygrid_ui::parts::Dialog::new(tr("Unsaved changes")).icon(icon::WARNING).width(480.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("close_editor", self.editor.id())),
+                |ui| {
+                    ui.add(egui::Label::new(trf("Save changes to \"{}\"?", &[&title])).wrap());
+                },
+                |ui| {
+                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Don't save"), false).clicked() {
                         decided = Some(false);
                     }
-                    if ui.button(tr("Cancel")).clicked() {
-                        close = true;
-                    }
-                });
-            });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if kit::primary_icon(ui, icon::FLOPPY_DISK, tr("Save")).clicked() {
+                            decided = Some(true);
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            close = true;
+                        }
+                    });
+                },
+            );
             match decided {
                 // Save: the script (when it changed) and the result edits; the tab closes once they are saved.
                 Some(true) => {
@@ -1821,25 +1835,31 @@ impl SqlEditorTab {
                         cx.push(AppCommand::CloseTab(id));
                     }
                 }
-                None if close || modal.should_close() => self.close_prompt = false,
+                None if close || modal.close => self.close_prompt = false,
                 None => {}
             }
         }
         if self.close_tx_prompt {
             let mut decided: Option<bool> = None;
-            let modal = egui::Modal::new(egui::Id::new(("close_editor_tx", self.editor.id()))).show(ui.ctx(), |ui| {
-                ui.heading(tr("Uncommitted transaction"));
-                ui.label(trf("\"{}\" has uncommitted changes; closing it rolls them back.", &[&self.title]));
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Roll back and close")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        decided = Some(false);
-                    }
-                });
-            });
-            if decided.is_none() && modal.should_close() {
+            let title = self.title.clone();
+            let (modal, ()) = ternarygrid_ui::parts::Dialog::new(tr("Uncommitted transaction")).icon(icon::WARNING).width(500.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("close_editor_tx", self.editor.id())),
+                |ui| {
+                    ui.add(egui::Label::new(trf("\"{}\" has uncommitted changes; closing it rolls them back.", &[&title])).wrap());
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, None, tr("Roll back and close"), false).clicked() {
+                            decided = Some(true);
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            decided = Some(false);
+                        }
+                    });
+                },
+            );
+            if decided.is_none() && modal.close {
                 decided = Some(false);
             }
             if let Some(close) = decided {

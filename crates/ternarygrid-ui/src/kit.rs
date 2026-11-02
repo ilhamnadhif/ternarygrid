@@ -26,6 +26,8 @@ pub enum Kind {
     Ghost,
     /// Outlined, red text: destructive actions.
     Danger,
+    /// Filled red, white text: the confirming button of a destructive dialog.
+    DangerFilled,
 }
 
 /// A button with an optional leading icon. `small` makes it 24 px high instead of 28 (the
@@ -42,13 +44,13 @@ pub fn button_full(ui: &mut Ui, kind: Kind, icon: Option<&str>, text: &str, smal
     let pad = if small { 8.0 } else { 12.0 };
     let enabled = ui.is_enabled();
     let text_color = match kind {
-        Kind::Primary => p.on_accent,
+        Kind::Primary | Kind::DangerFilled => p.on_accent,
         Kind::Danger => p.err,
         _ if on => p.accent_text,
         Kind::Secondary | Kind::Ghost => p.text,
     };
     let galley = (!text.is_empty()).then(|| ui.painter().layout_no_wrap(text.to_string(), style::medium(ui.ctx(), size), Color32::PLACEHOLDER));
-    let icon_color = if matches!(kind, Kind::Primary | Kind::Danger) || galley.is_none() || on { text_color } else { p.text_muted };
+    let icon_color = if matches!(kind, Kind::Primary | Kind::Danger | Kind::DangerFilled) || galley.is_none() || on { text_color } else { p.text_muted };
     let icon_galley = icon.map(|i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size + 2.0), Color32::PLACEHOLDER));
     let gap = if galley.is_some() && icon_galley.is_some() { 6.0 } else { 0.0 };
     let content_w = galley.as_ref().map_or(0.0, |g| g.size().x) + icon_galley.as_ref().map_or(0.0, |g| g.size().x) + gap;
@@ -60,6 +62,10 @@ pub fn button_full(ui: &mut Ui, kind: Kind, icon: Option<&str>, text: &str, smal
         let pressed = enabled && resp.is_pointer_button_down_on();
         let (fill, stroke) = match kind {
             Kind::Primary => (if hovered { p.accent_hover } else { p.accent }, Stroke::NONE),
+            Kind::DangerFilled => {
+                let red = if ui.visuals().dark_mode { Color32::from_rgb(0xc4, 0x35, 0x2b) } else { p.err };
+                (if hovered { style::soft(red, 0.85) } else { red }, Stroke::NONE)
+            }
             Kind::Secondary | Kind::Danger => (
                 if on {
                     p.accent_soft

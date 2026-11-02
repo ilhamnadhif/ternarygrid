@@ -1740,17 +1740,23 @@ impl eframe::App for TernaryGridApp {
             && let Some(ai) = self.ai_panel.as_mut()
         {
             let max = (ui.available_width() - 640.0).clamp(320.0, 720.0);
-            egui::Panel::right("ternarygrid_ai").resizable(true).default_size(440.0).size_range(320.0..=max).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} {}", icon::SPARKLE, tr("AI assistant"))).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close = egui::Button::new(ternarygrid_icons::ic(icon::X)).frame_when_inactive(false);
-                        if ui.add(close).on_hover_text(tr("Hide the AI assistant")).clicked() {
-                            self.ai_open = false;
-                        }
+            let pal = ternarygrid_ui::pal(ui);
+            let frame = egui::Frame::new().fill(pal.canvas);
+            egui::Panel::right("ternarygrid_ai").resizable(true).default_size(440.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
+                // Header: the sparkle, the name and ×, over a hairline.
+                egui::Frame::new().inner_margin(egui::Margin { left: 14, right: 8, top: 6, bottom: 6 }).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(28.0);
+                        ui.label(RichText::new(icon::SPARKLE).font(ternarygrid_ui::style::icon_font(16.0)).color(pal.accent_text));
+                        ui.label(RichText::new(tr("AI assistant")).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.5)).color(pal.text));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ternarygrid_ui::kit::icon_button_ex(ui, icon::X, tr("Hide the AI assistant"), false, 26.0).clicked() {
+                                self.ai_open = false;
+                            }
+                        });
                     });
                 });
-                ui.separator();
+                ternarygrid_ui::parts::hline(ui);
                 crate::tabs::TabView::ui(ai, ui, &mut cx);
             });
         }
