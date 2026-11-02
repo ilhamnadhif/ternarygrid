@@ -168,7 +168,12 @@ impl Shots {
             .build_eframe(move |cc| {
                 ternarygrid_app::theme::setup_fonts(&cc.egui_ctx);
                 backend.set_context(cc.egui_ctx.clone());
-                TernaryGridApp::new(backend, conns, services, settings)
+                let mut app = TernaryGridApp::new(backend, conns, services, settings);
+                // As on macOS (the mockups): the menus in the system's menu bar, the window
+                // buttons at the left of the top bar (painted by `shot`).
+                app.native_menu_bar = true;
+                app.titlebar_inset = ternarygrid_app::app::MAC_TITLEBAR_INSET;
+                app
             });
         ternarygrid_app::theme::apply_settings(&h.ctx, &h.state().settings);
         let theme = if theme == Theme::Dark { "dark" } else { "light" };
@@ -202,7 +207,8 @@ impl Shots {
         let prims = self.h.ctx.tessellate(out.shapes.clone(), PPP);
         let size = self.h.ctx.content_rect().size() * PPP;
         let bg = self.h.ctx.global_style().visuals.panel_fill;
-        let img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        let mut img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        traffic_lights(&mut img, PPP);
         let path = self.dir.join(format!("{name}-{}.png", self.theme));
         img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
@@ -255,6 +261,25 @@ impl Shots {
             tab.view.as_any_mut().downcast_mut::<TableDesignerTab>().is_some_and(|d| d.is_ready())
         });
         self.frames(3);
+    }
+}
+
+/// The macOS window buttons, as the system paints them over the top bar's left end.
+fn traffic_lights(img: &mut image::RgbaImage, ppp: f32) {
+    for (i, c) in [[0xff, 0x5f, 0x57], [0xfe, 0xbc, 0x2e], [0x28, 0xc8, 0x40]].iter().enumerate() {
+        let (cx, cy, r) = ((16.0 + 6.0 + 20.0 * i as f32) * ppp, 22.0 * ppp, 6.0 * ppp);
+        for y in (cy - r - 2.0) as u32..=(cy + r + 2.0) as u32 {
+            for x in (cx - r - 2.0) as u32..=(cx + r + 2.0) as u32 {
+                let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                let a = (r + 0.5 - d).clamp(0.0, 1.0);
+                if a > 0.0 {
+                    let px = img.get_pixel_mut(x, y);
+                    for k in 0..3 {
+                        px[k] = (c[k] as f32 * a + px[k] as f32 * (1.0 - a)).round() as u8;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -405,6 +430,7 @@ fn ui_snapshots_designer() {
                 &["name", "orders", "revenue"],
                 &[["Eko Lestari", "10", "18,483.74"], ["Fajar Lestari", "6", "19,438.54"], ["Kartika Kurniawan", "11", "17,327.29"]],
             ));
+            s.ai().set_answered_by("claude-opus-5-5", 2104, 318);
             // The step opens on its result.
             s.frames(8);
             s.park_pointer();
@@ -422,6 +448,7 @@ fn ui_snapshots_designer() {
             s.frames(2);
             s.ai().set_input(QuickAction::FixError, "select name, statuss from \"order\"", "no such column: statuss");
             s.ai().push_exchange(QuickAction::FixError, "Fix error: column o.statuss does not exist", "The column is called status (one s). Here is the statement with the name fixed:\n\n```sql\nselect c.name, c.city, count(distinct o.id) as orders\nfrom customer c join \"order\" o on o.customer_id = c.id\nwhere o.status <> 'cancelled'\ngroup by c.id;\n```");
+            s.ai().set_answered_by("claude-opus-5-5", 1862, 141);
             s.frames(4);
             s.park_pointer();
             s.shot("ai_fix");
