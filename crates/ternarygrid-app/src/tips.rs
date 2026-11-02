@@ -55,10 +55,12 @@ impl TipWindow {
             None,
             |ui| {
                 let p = style::pal(ui);
-                ui.add(egui::Label::new(RichText::new(tip).size(14.5).color(p.text)).wrap());
+                crate::dialogs::label_lh(ui, RichText::new(tip).color(p.text), egui::FontId::proportional(14.5), 1.55, false);
             },
             Some(&mut |ui: &mut egui::Ui| {
-                ternarygrid_ui::kit::checkbox(ui, show_on_start, tr("Show tips on start"));
+                crate::dialogs::row_lead(ui, &mut |ui| {
+                    ternarygrid_ui::kit::checkbox(ui, show_on_start, tr("Show tips on start"));
+                });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if kit::button_ex(ui, Kind::Ghost, None, tr("Close"), false).clicked() {
                         close.set(true);
@@ -73,6 +75,7 @@ impl TipWindow {
                 });
             }),
         );
+        crate::dialogs::dim_behind(ctx, resp.layer);
         match step.get() {
             1 => self.index = (self.index + 1) % n,
             -1 => self.index = (self.index + n - 1) % n,

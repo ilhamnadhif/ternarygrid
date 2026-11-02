@@ -1,6 +1,6 @@
 //! Import connections from DBeaver, `~/.pgpass` or a connection URL (FR-C8).
 
-use super::{Column, LABEL_W, W, add_field, cancel_button, hint, muted, rest, right, table, text_field};
+use super::{Column, W, add_field, cancel_button, hint, muted, rest, right, table, text_field};
 use crate::cx::AppContext;
 use egui::{Id, RichText, Ui};
 use egui_phosphor::regular as icon;
@@ -59,6 +59,15 @@ impl Default for ImportDialog {
 }
 
 impl ImportDialog {
+    /// Starts on the DBeaver workspace at `path` (tests, screenshots).
+    #[doc(hidden)]
+    pub fn with_workspace(path: PathBuf) -> Self {
+        let mut d = Self::default();
+        d.workspaces.insert(0, path.clone());
+        d.workspace = Some(path);
+        d
+    }
+
     fn load(&mut self) {
         self.error = None;
         let res: DbResult<ImportResult> = match self.source {
@@ -126,8 +135,8 @@ impl ImportDialog {
         let cancel = Cell::new(false);
         let selected = self.selected.iter().filter(|s| **s).count();
         let has_result = self.result.as_ref().is_some_and(|r| !r.connections.is_empty());
-        let label = trf("Import {} connection(s)", &[&selected]);
-        let (resp, _) = Dialog::new(tr("Import connections")).icon(icon::DOWNLOAD_SIMPLE).width(760.0).show_window(
+        let label = if selected == 1 { tr("Import 1 connection").to_string() } else { trf("Import {} connections", &[&selected]) };
+        let (resp, _) = Dialog::new(tr("Import connections")).icon(icon::DOWNLOAD_SIMPLE).width(760.0).body_padding(egui::Margin::symmetric(20, 16)).show_window(
             ctx,
             Id::new("ternarygrid_import_connections"),
             &mut open,
@@ -144,6 +153,7 @@ impl ImportDialog {
                 });
             }),
         );
+        super::dim_behind(ctx, resp.layer);
         let done = import.get() && self.apply(cx);
         open && !done && !cancel.get() && !crate::widgets::escape_closes(ctx, resp.layer)
     }
@@ -166,12 +176,16 @@ impl ImportDialog {
                 Source::Dbeaver => {
                     muted(ui, tr("Workspace folder (contains General/.dbeaver/data-sources.json)"));
                     ui.horizontal(|ui| {
-                        let current = self.workspace.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| tr("(none found)").to_string());
-                        let w = rest(ui, find_w + browse_w + 16.0) - 12.0;
-                        egui::ComboBox::from_id_salt("dbeaver_ws").icon(kit::combo_caret).selected_text(current).width(w).show_ui(ui, |ui| {
-                            for w in &self.workspaces {
-                                ui.selectable_value(&mut self.workspace, Some(w.clone()), w.display().to_string());
-                            }
+                        let current = self.workspace.as_deref().map(home_relative).unwrap_or_else(|| tr("(none found)").to_string());
+                        let w = rest(ui, find_w + browse_w + 16.0).min(420.0);
+                        // At most `w` wide: a long path is cut, the dialog does not grow.
+                        ui.allocate_ui_with_layout(egui::vec2(w, ternarygrid_ui::style::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let combo = egui::ComboBox::from_id_salt("dbeaver_ws").icon(kit::combo_caret).selected_text(current).width(w).truncate();
+                            combo.show_ui(ui, |ui| {
+                                for w in &self.workspaces {
+                                    ui.selectable_value(&mut self.workspace, Some(w.clone()), home_relative(w));
+                                }
+                            });
                         });
                         if kit::secondary(ui, Some(icon::FOLDER_OPEN), tr("Browse…")).clicked()
                             && let Some(p) = rfd::FileDialog::new().pick_folder()
@@ -187,7 +201,7 @@ impl ImportDialog {
                     muted(ui, tr("File"));
                     ui.horizontal(|ui| {
                         let w = rest(ui, find_w + browse_w + 16.0);
-                        add_field(ui, text_field(&mut self.pgpass_path, w).font(egui::TextStyle::Monospace));
+                        add_field(ui, text_field(&mut self.pgpass_path, w).font(egui::FontId::monospace(12.5)));
                         if kit::secondary(ui, Some(icon::FOLDER_OPEN), tr("Browse…")).clicked()
                             && let Some(p) = rfd::FileDialog::new().pick_file()
                         {
@@ -198,12 +212,12 @@ impl ImportDialog {
                     ternarygrid_ui::kit::checkbox(ui, &mut self.pgpass_store_passwords, tr("Copy the passwords into the secure store (otherwise the connections read .pgpass)"));
                 }
                 Source::Url => {
-                    parts::form_row(ui, tr("URL"), 80.0, |ui| {
+                    super::form_row_w(ui, tr("URL"), 80.0, |ui| {
                         let w = rest(ui, find_w + 8.0);
-                        add_field(ui, text_field(&mut self.url, w).font(egui::TextStyle::Monospace).hint_text(hint(ui, "postgres://user@host:5432/db")));
+                        add_field(ui, text_field(&mut self.url, w).font(egui::FontId::monospace(12.5)).hint_text(super::mono_hint(ui, "postgres://user@host:5432/db")));
                         find |= kit::primary_icon(ui, icon::MAGNIFYING_GLASS, tr("Find connections")).clicked();
                     });
-                    parts::form_row(ui, tr("Name"), 80.0, |ui| add_field(ui, text_field(&mut self.url_name, 260.0)));
+                    super::form_row_w(ui, tr("Name"), 80.0, |ui| add_field(ui, text_field(&mut self.url_name, 260.0)));
                     ui.label(
                         RichText::new(tr("Supported: postgres://, mysql://, mariadb://, sqlserver://, oracle://, clickhouse://, cassandra://, sqlite:, jdbc:…"))
                             .size(12.0)
@@ -225,7 +239,9 @@ impl ImportDialog {
             return;
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new(trf("{} connection(s) found", &[&r.connections.len()])).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+            let n = r.connections.len();
+            let found = if n == 1 { tr("1 connection found").to_string() } else { trf("{} connections found", &[&n]) };
+            ui.label(RichText::new(found).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
             if kit::ghost(ui, None, tr("Select all")).clicked() {
                 self.selected.iter_mut().for_each(|s| *s = true);
             }
@@ -234,7 +250,7 @@ impl ImportDialog {
             }
         });
         let cols = [
-            Column::new("", W::Px(34.0)),
+            Column::new("", W::Px(32.0)),
             Column::new(tr("Connection"), W::Fr(1.3)),
             Column::new(tr("Host"), W::Fr(1.6)),
             Column::new(tr("Folder"), W::Fr(1.0)),
@@ -242,13 +258,12 @@ impl ImportDialog {
         ];
         let max_h = (ui.ctx().content_rect().height() - 560.0).max(120.0);
         let selected = &mut self.selected;
-        table(ui, "import_conns", &cols, r.connections.len(), 31.0, max_h, |ui, row, col| {
+        table(ui, "import_conns", &cols, r.connections.len(), 30.0, max_h, |ui, row, col| {
             let Some(row) = row else {
                 // The header's box selects all or none.
                 if col == 0 {
                     let mut all = !selected.is_empty() && selected.iter().all(|s| *s);
-                    let partly = !all && selected.iter().any(|s| *s);
-                    if ui.add(egui::Checkbox::without_text(&mut all).indeterminate(partly)).on_hover_text(tr("Select all")).changed() {
+                    if ternarygrid_ui::kit::checkbox(ui, &mut all, "").on_hover_text(tr("Select all")).changed() {
                         selected.iter_mut().for_each(|s| *s = all);
                     }
                 }
@@ -258,7 +273,7 @@ impl ImportDialog {
             match col {
                 0 => {
                     if let Some(s) = selected.get_mut(row) {
-                        ui.add(egui::Checkbox::without_text(s));
+                        ternarygrid_ui::kit::checkbox(ui, s, "");
                     }
                 }
                 1 => {
@@ -282,21 +297,30 @@ impl ImportDialog {
                 }
             }
         });
-        if !r.warnings.is_empty() && super::disclosure(ui, Id::new("import_notes"), &trf("{} note(s)", &[&r.warnings.len()]), false) {
+        let notes = if r.warnings.len() == 1 { tr("1 note").to_string() } else { trf("{} notes", &[&r.warnings.len()]) };
+        if !r.warnings.is_empty() && super::disclosure(ui, Id::new("import_notes"), &notes, false) {
             for w in &r.warnings {
                 muted(ui, w);
             }
         }
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
-            parts::form_row(ui, tr("Existing connections"), LABEL_W, |ui| {
+            super::form_row(ui, tr("Existing connections"), |ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
                 ternarygrid_ui::kit::radio_value(ui, &mut self.policy, DuplicatePolicy::Skip, tr("Skip"));
                 ternarygrid_ui::kit::radio_value(ui, &mut self.policy, DuplicatePolicy::Replace, tr("Replace"));
                 ternarygrid_ui::kit::radio_value(ui, &mut self.policy, DuplicatePolicy::KeepBoth, tr("Keep both"));
             });
-            parts::form_row(ui, tr("Put into folder"), LABEL_W, |ui| add_field(ui, text_field(&mut self.folder_prefix, 260.0).hint_text(hint(ui, tr("(top level)")))));
-            parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.keep_shell_commands, tr("Keep shell commands that run on connect / disconnect")));
+            super::form_row(ui, tr("Put into folder"), |ui| add_field(ui, text_field(&mut self.folder_prefix, 260.0).hint_text(hint(ui, tr("(top level)")))));
+            super::form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.keep_shell_commands, tr("Keep shell commands that run on connect / disconnect")));
         });
+    }
+}
+
+/// `path` with the home folder written `~`.
+fn home_relative(path: &std::path::Path) -> String {
+    match std::env::var_os("HOME").map(PathBuf::from).and_then(|h| path.strip_prefix(h).ok().map(|r| r.display().to_string())) {
+        Some(rest) => format!("~/{rest}"),
+        None => path.display().to_string(),
     }
 }

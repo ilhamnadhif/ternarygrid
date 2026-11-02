@@ -3,7 +3,7 @@
 //! short-lived session in auto-commit mode (PostgreSQL moves a database to
 //! another tablespace outside of a transaction) and a navigator refresh.
 
-use super::{LABEL_W, add_field, number_field, opt_field, text_field};
+use super::{add_field, number_field, opt_field, text_field};
 use crate::backend::Job;
 use crate::command::AppCommand;
 use crate::cx::AppContext;
@@ -118,7 +118,7 @@ impl AlterDatabaseDialog {
         let (save_clicked, editor, cancel) = (Cell::new(false), Cell::new(false), Cell::new(false));
         let title = trf("Database {}", &[&name]);
         let subtitle = trf("On {}", &[&conn_name]);
-        let (resp, _) = Dialog::new(&title).icon(icon::DATABASE).subtitle(&subtitle).width(600.0).show_modal(
+        let (resp, _) = Dialog::new(&title).icon(icon::DATABASE).subtitle(&subtitle).width(600.0).body_padding(super::BODY).show_modal(
             ctx,
             egui::Id::new(("alter_database", &self.conn)),
             |ui| {
@@ -131,7 +131,7 @@ impl AlterDatabaseDialog {
                     None => {}
                 }
                 if postgres && (renamed || moved) {
-                    parts::form_row(ui, "", LABEL_W, |ui| {
+                    super::form_row(ui, "", |ui| {
                         ternarygrid_ui::kit::checkbox(ui, &mut self.disconnect_others, tr("Disconnect the other sessions on this database first"))
                             .on_hover_text(tr("PostgreSQL renames or moves a database only while nobody is connected to it."))
                     });
@@ -146,7 +146,7 @@ impl AlterDatabaseDialog {
                     if statements.is_empty() {
                         super::muted(ui, tr("No changes."));
                     } else {
-                        super::sql_preview(ui, ("alter_db_sql", &self.conn), Some(dialect.clone()), script.trim_end(), 140.0);
+                        super::sql_preview(ui, ("alter_db_sql", &self.conn), Some(dialect.clone()), script.trim_end(), 140.0, false);
                     }
                 }
                 if read_only {
@@ -157,7 +157,7 @@ impl AlterDatabaseDialog {
                 }
             },
             |ui| {
-                if ui.add_enabled_ui(!statements.is_empty(), |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), false)).inner.clicked() {
+                if ui.add_enabled_ui(!statements.is_empty(), |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::FILE_CODE), tr("Open in SQL editor"), false)).inner.clicked() {
                     editor.set(true);
                 }
                 super::right(ui, |ui| {
@@ -188,7 +188,7 @@ impl AlterDatabaseDialog {
     fn form(&mut self, ui: &mut egui::Ui, original: &DatabaseProps, kind: DbKind, edits: ternarygrid_core::DatabaseEdits, save: &mut bool) {
         let p = ternarygrid_ui::pal(ui);
         let value = |ui: &mut egui::Ui, v: &str| ui.label(RichText::new(v).color(p.text_muted));
-        parts::form_row(ui, tr("Name"), LABEL_W, |ui| {
+        super::form_row(ui, tr("Name"), |ui| {
             if edits.name {
                 let r = add_field(ui, text_field(&mut self.edited.name, f32::INFINITY));
                 if std::mem::take(&mut self.focus_name) {
@@ -205,7 +205,7 @@ impl AlterDatabaseDialog {
             if !editable && !shown {
                 return;
             }
-            parts::form_row(ui, label, LABEL_W, |ui| {
+            super::form_row(ui, label, |ui| {
                 if editable {
                     opt_field(ui, v, "", f32::INFINITY, false);
                 } else {
@@ -222,7 +222,7 @@ impl AlterDatabaseDialog {
         if edits.connection_limit
             && let Some(n) = self.edited.connection_limit.as_mut()
         {
-            parts::form_row(ui, tr("Connection limit"), LABEL_W, |ui| {
+            super::form_row(ui, tr("Connection limit"), |ui| {
                 number_field(ui, "alter_db_conn_limit", n, -1..=i64::from(i32::MAX), 90.0);
                 ui.label(RichText::new(tr("-1: no limit")).size(12.0).color(p.text_faint));
             });
@@ -230,21 +230,22 @@ impl AlterDatabaseDialog {
         if edits.allow_connections
             && let Some(b) = self.edited.allow_connections.as_mut()
         {
-            parts::form_row(ui, tr("Connections"), LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, b, tr("Allow connections")));
+            super::form_row(ui, tr("Connections"), |ui| ternarygrid_ui::kit::checkbox(ui, b, tr("Allow connections")));
         }
         if edits.is_template
             && let Some(b) = self.edited.is_template.as_mut()
         {
-            parts::form_row(ui, tr("Template"), LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, b, tr("Others can be created from it (CREATE DATABASE … TEMPLATE)")));
+            super::form_row(ui, tr("Template"), |ui| ternarygrid_ui::kit::checkbox(ui, b, tr("Others can be created from it (CREATE DATABASE … TEMPLATE)")));
         }
         if edits.comment || original.comment.is_some() {
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(egui::vec2(LABEL_W, ternarygrid_ui::style::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.set_min_width(LABEL_W);
-                    ui.label(RichText::new(tr("Comment")).color(p.text_muted));
-                });
+            super::form_row(ui, tr("Comment"), |ui| {
                 let mut text = self.edited.comment.clone().unwrap_or_default();
-                let edit = egui::TextEdit::multiline(&mut text).margin(egui::Margin::symmetric(10, 6)).desired_rows(2).desired_width(f32::INFINITY);
+                let edit = egui::TextEdit::multiline(&mut text)
+                    .margin(egui::Margin::symmetric(13, 6))
+                    .min_size(egui::vec2(0.0, 50.0))
+                    .vertical_align(egui::Align::Center)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY);
                 let r = ui.add_enabled_ui(edits.comment, |ui| add_field(ui, edit)).inner;
                 if r.changed() {
                     self.edited.comment = Some(text).filter(|t| !t.trim().is_empty());
@@ -252,7 +253,7 @@ impl AlterDatabaseDialog {
             });
         }
         if let Some(b) = original.size_bytes {
-            parts::form_row(ui, tr("Size"), LABEL_W, |ui| value(ui, &crate::nav::long_size(b)));
+            super::form_row(ui, tr("Size"), |ui| value(ui, &crate::nav::long_size(b)));
         }
     }
 

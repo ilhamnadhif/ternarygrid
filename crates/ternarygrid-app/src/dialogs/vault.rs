@@ -1,6 +1,6 @@
 //! Master password dialog of the encrypted secret vault (FR-C4).
 
-use super::{LABEL_W, add_field, text_field};
+use super::{add_field, text_field};
 use crate::backend::Job;
 use crate::cx::AppContext;
 use egui::{Id, RichText};
@@ -63,13 +63,18 @@ impl VaultDialog {
         let skip = Cell::new(false);
         let title = if create { tr("Create the password vault") } else { tr("Unlock saved passwords") };
         let error = self.error.clone();
-        let (resp, _) = Dialog::new(title).icon(icon::LOCK_KEY).width(if create { 460.0 } else { 440.0 }).show_modal(
+        let (resp, _) = Dialog::new(title).icon(icon::LOCK).width(if create { 460.0 } else { 440.0 }).body_padding(super::BODY).show_modal(
             ctx,
             Id::new("vault_unlock"),
             |ui| {
-                super::form_spacing(ui, 12.0);
-                ui.add(egui::Label::new(RichText::new(tr("Saved passwords are kept in a file encrypted with your master password.")).color(style::pal(ui).text_muted)).wrap());
-                let r = parts::form_row(ui, tr("Master password"), LABEL_W, |ui| {
+                super::form_spacing(ui, if create { 12.0 } else { 14.0 });
+                let text = RichText::new(tr("Saved passwords are kept in a file encrypted with your master password.")).color(style::pal(ui).text_muted);
+                if create {
+                    ui.add(egui::Label::new(text).wrap());
+                } else {
+                    super::label_lh(ui, text, egui::FontId::proportional(13.0), 1.45, false);
+                }
+                let r = super::form_row(ui, tr("Master password"), |ui| {
                     ui.add_enabled_ui(!busy, |ui| add_field(ui, text_field(&mut self.password, f32::INFINITY).password(true))).inner
                 });
                 if !busy && self.password.is_empty() {
@@ -79,7 +84,7 @@ impl VaultDialog {
                     submit.set(true);
                 }
                 if create {
-                    let r = parts::form_row(ui, tr("Repeat password"), LABEL_W, |ui| {
+                    let r = super::form_row(ui, tr("Repeat password"), |ui| {
                         ui.add_enabled_ui(!busy, |ui| add_field(ui, text_field(&mut self.confirm, f32::INFINITY).password(true))).inner
                     });
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -100,7 +105,7 @@ impl VaultDialog {
                 }
                 super::right(ui, |ui| {
                     let label = if create { tr("Create") } else { tr("Unlock") };
-                    if kit::primary_icon(ui, icon::LOCK_KEY, label).clicked() {
+                    if kit::primary_icon(ui, icon::LOCK, label).clicked() {
                         submit.set(true);
                     }
                 });

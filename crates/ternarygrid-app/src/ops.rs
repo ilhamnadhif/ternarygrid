@@ -174,7 +174,8 @@ impl Operations {
         }
     }
 
-    /// Operations panel content: the number running, then one row per operation.
+    /// Operations panel content: the number running, then one row per operation (the
+    /// running ones first).
     pub fn ui(&mut self, ui: &mut Ui) {
         self.collect();
         let p = style::pal(ui);
@@ -187,7 +188,7 @@ impl Operations {
             return;
         }
         let mut clear = false;
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(26.0);
                 ui.label(RichText::new(trf("{} running", &[&self.running()])).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
@@ -199,10 +200,11 @@ impl Operations {
             });
         });
         parts::hline(ui);
+        let order: Vec<usize> = (0..self.list.len()).filter(|i| self.list[*i].is_running()).chain((0..self.list.len()).filter(|i| !self.list[*i].is_running())).collect();
         egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            let n = self.list.len();
-            for (i, op) in self.list.iter().rev().enumerate() {
+            for i in order {
+                let op = &self.list[i];
                 let running = matches!(op.state, OpState::Running);
                 let (glyph, color, txt) = match &op.state {
                     OpState::Running => (icon::CLOCK_COUNTER_CLOCKWISE, p.accent_text, String::new()),
@@ -214,18 +216,21 @@ impl Operations {
                     ui.set_width(ui.available_width());
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
-                        ui.label(RichText::new(glyph).font(style::icon_font(16.0)).color(color));
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(16.0, 17.0), egui::Sense::hover());
+                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, style::icon_font(16.0), color);
                         let cancel_w = if running { 34.0 } else { 0.0 };
                         let w = (ui.available_width() - cancel_w).max(80.0);
                         ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                             ui.set_width(w);
                             ui.spacing_mut().item_spacing.y = 5.0;
+                            // Rows as tall as their text (the title, the progress line).
+                            ui.spacing_mut().interact_size.y = 0.0;
                             let elapsed = op.finished.unwrap_or_else(Instant::now).duration_since(op.started);
                             ui.horizontal(|ui| {
                                 let time = format!("{:.1}s", elapsed.as_secs_f32());
                                 let time_w = ui.painter().layout_no_wrap(time.clone(), egui::FontId::proportional(11.5), p.text_faint).size().x;
                                 let title_w = (ui.available_width() - time_w - 8.0).max(40.0);
-                                ui.allocate_ui_with_layout(egui::vec2(title_w, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.allocate_ui_with_layout(egui::vec2(title_w, 0.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                     ui.set_min_width(title_w);
                                     ui.add(egui::Label::new(RichText::new(&op.title).font(style::semibold(ui.ctx(), 13.0)).color(p.text)).truncate());
                                 });
@@ -236,27 +241,26 @@ impl Operations {
                                 let done = op.progress.done.load(Ordering::Relaxed);
                                 let total = op.progress.total.load(Ordering::Relaxed);
                                 let msg = op.progress.message.lock().clone();
+                                let mut detail = if total > 0 {
+                                    format!("{} / {}", group(done), group(total))
+                                } else if done > 0 {
+                                    group(done)
+                                } else {
+                                    String::new()
+                                };
+                                if !msg.is_empty() {
+                                    if !detail.is_empty() {
+                                        detail.push_str(" · ");
+                                    }
+                                    detail.push_str(&msg);
+                                }
+                                // The bar takes what the detail leaves (empty while the total is unknown).
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 8.0;
-                                    let mut detail = if total > 0 {
-                                        format!("{} / {}", group(done), group(total))
-                                    } else if done > 0 {
-                                        group(done)
-                                    } else {
-                                        String::new()
-                                    };
-                                    if !msg.is_empty() {
-                                        if !detail.is_empty() {
-                                            detail.push_str(" · ");
-                                        }
-                                        detail.push_str(&msg);
-                                    }
-                                    if total > 0 {
-                                        let bar_w = (ui.available_width() * 0.5).max(60.0);
-                                        parts::progress(ui, (done as f32 / total as f32).clamp(0.0, 1.0), bar_w);
-                                    } else {
-                                        ui.add(egui::Spinner::new().size(12.0).color(p.accent_text));
-                                    }
+                                    let g = ui.painter().layout_no_wrap(detail.clone(), egui::FontId::proportional(11.5), p.text_faint);
+                                    let bar_w = (ui.available_width() - g.size().x - 8.0).max(60.0);
+                                    let frac = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                                    parts::progress(ui, frac, bar_w);
                                     if !detail.is_empty() {
                                         ui.add(egui::Label::new(RichText::new(detail).size(11.5).color(p.text_faint)).truncate());
                                     }
@@ -270,10 +274,9 @@ impl Operations {
                         }
                     });
                 });
-                if i + 1 < n {
-                    let r = row.response.rect;
-                    ui.painter().hline(r.x_range(), r.bottom() - 0.5, egui::Stroke::new(1.0, line));
-                }
+                let r = row.response.rect;
+                ui.painter().hline(r.x_range(), r.bottom() + 0.5, egui::Stroke::new(1.0, line));
+                ui.add_space(1.0);
             }
         });
         if clear {

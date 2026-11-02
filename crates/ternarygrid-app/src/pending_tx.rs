@@ -103,8 +103,12 @@ impl PendingTxDialog {
         let action: Cell<Option<(Option<usize>, bool)>> = Cell::new(None);
         let busy = self.busy();
         let statements: usize = items.iter().map(|p| p.statements).sum();
-        let summary = trf("{} statement(s) in {} transaction(s)", &[&statements, &items.len()]);
-        let (resp, _) = Dialog::new(tr("Pending transactions")).icon(icon::PAUSE).width(760.0).show_window(
+        let summary = match (statements, items.len()) {
+            (1, 1) => tr("1 statement in 1 transaction").to_string(),
+            (s, 1) => trf("{} statements in 1 transaction", &[&s]),
+            (s, n) => trf("{} statements in {} transactions", &[&s, &n]),
+        };
+        let (resp, _) = Dialog::new(tr("Pending transactions")).icon(icon::PAUSE).width(760.0).body_padding(egui::Margin::symmetric(20, 16)).show_window(
             ctx,
             egui::Id::new("pending_transactions"),
             &mut open,
@@ -123,7 +127,7 @@ impl PendingTxDialog {
                     Column::new("", W::Px(200.0)),
                 ];
                 let max_h = (ui.ctx().content_rect().height() - 300.0).max(120.0);
-                table(ui, "pending_tx", &cols, items.len(), 41.0, max_h, |ui, row, col| {
+                table(ui, "pending_tx", &cols, items.len(), 40.0, max_h, |ui, row, col| {
                     let Some(i) = row else { return };
                     let tx = &items[i];
                     match col {
@@ -182,6 +186,7 @@ impl PendingTxDialog {
         if !self.jobs.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+        dialogs::dim_behind(ctx, resp.layer);
         self.open = open && !crate::widgets::escape_closes(ctx, resp.layer);
     }
 }

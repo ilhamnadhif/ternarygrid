@@ -3,7 +3,7 @@
 //! mode (PostgreSQL refuses `CREATE DATABASE` inside a transaction) and a
 //! navigator refresh.
 
-use super::{LABEL_W, add_field, opt_field, text_field};
+use super::{add_field, opt_field, text_field};
 use crate::backend::Job;
 use crate::command::AppCommand;
 use crate::cx::AppContext;
@@ -12,7 +12,7 @@ use std::cell::Cell;
 use ternarygrid_core::driver::TransactionMode;
 use ternarygrid_core::{DbKind, DbResult, NewDatabase, tr, trf};
 use ternarygrid_ui::kit::{self, Kind};
-use ternarygrid_ui::parts::{self, Dialog};
+use ternarygrid_ui::parts::Dialog;
 
 pub struct CreateDatabaseDialog {
     conn: String,
@@ -89,12 +89,12 @@ impl CreateDatabaseDialog {
         let title = if schema { tr("New schema") } else { tr("New database") };
         let subtitle = trf("On {}", &[&conn_name]);
         let error = self.error.clone();
-        let (resp, _) = Dialog::new(title).icon(icon::DATABASE).subtitle(&subtitle).width(560.0).show_modal(
+        let (resp, _) = Dialog::new(title).icon(icon::DATABASE).subtitle(&subtitle).width(560.0).body_padding(super::BODY).show_modal(
             ctx,
             egui::Id::new(("create_database", &self.conn)),
             |ui| {
                 super::form_spacing(ui, 12.0);
-                let r = parts::form_row(ui, tr("Name"), LABEL_W, |ui| add_field(ui, text_field(&mut self.db.name, f32::INFINITY)));
+                let r = super::form_row(ui, tr("Name"), |ui| add_field(ui, text_field(&mut self.db.name, f32::INFINITY)));
                 if std::mem::take(&mut self.focus) {
                     r.request_focus();
                 }
@@ -102,7 +102,7 @@ impl CreateDatabaseDialog {
                     enter.set(true);
                 }
                 let field = |ui: &mut egui::Ui, label: &str, v: &mut Option<String>, hint: &str| {
-                    parts::form_row(ui, label, LABEL_W, |ui| opt_field(ui, v, hint, f32::INFINITY, false));
+                    super::form_row(ui, label, |ui| opt_field(ui, v, hint, f32::INFINITY, false));
                 };
                 match (schema, kind) {
                     (true, DbKind::Postgres | DbKind::CockroachDb | DbKind::SqlServer) => field(ui, tr("Owner"), &mut self.db.owner, tr("(current user)")),
@@ -119,7 +119,7 @@ impl CreateDatabaseDialog {
                     _ => {}
                 }
                 if offer_show_all {
-                    parts::form_row(ui, "", LABEL_W, |ui| {
+                    super::form_row(ui, "", |ui| {
                         ternarygrid_ui::kit::checkbox(ui, &mut self.show_all, tr("Show all databases in the navigator"))
                             .on_hover_text(tr("The navigator lists only the connection's database; the new one appears when all databases are shown."))
                     });
@@ -127,7 +127,7 @@ impl CreateDatabaseDialog {
                 match &sql {
                     // A bounded preview: a view that fills the available space
                     // would make the dialog grow every frame (and move its buttons).
-                    Some(s) => super::sql_preview(ui, ("create_db_sql", &self.conn), Some(dialect.clone()), &format!("{s};"), 120.0),
+                    Some(s) => super::sql_preview(ui, ("create_db_sql", &self.conn), Some(dialect.clone()), &format!("{s};"), 120.0, false),
                     None if self.db.name.trim().is_empty() => {
                         super::muted(ui, tr("Enter a name."));
                     }
@@ -143,7 +143,7 @@ impl CreateDatabaseDialog {
                 }
             },
             |ui| {
-                if ui.add_enabled_ui(sql.is_some(), |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), false)).inner.clicked() {
+                if ui.add_enabled_ui(sql.is_some(), |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::FILE_CODE), tr("Open in SQL editor"), false)).inner.clicked() {
                     editor.set(true);
                 }
                 super::right(ui, |ui| {
