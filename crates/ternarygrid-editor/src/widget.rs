@@ -32,6 +32,8 @@ const MARK_W: f32 = 12.0;
 const FOLD_W: f32 = 12.0;
 /// Bracket matching scan limit (bytes in each direction).
 const BRACKET_SCAN: usize = 64 * 1024;
+/// Larger documents report only the cursor line as their accessibility value.
+const A11Y_FULL_VALUE_BYTES: usize = 100_000;
 
 /// An action offered by the context menu (and accepted by
 /// [`EditorState::apply_action`]).
@@ -289,8 +291,13 @@ impl<'a> SqlEditor<'a> {
         // Metrics.
         let font_id = FontId::new(options.font_size.max(4.0), options.font_family.clone());
         let ppp = ctx.pixels_per_point();
-        let (font_h, char_w) =
-            ctx.fonts_mut(|f| (f.row_height(&font_id), f.glyph_width(&font_id, '0')));
+        let (font_h, char_w, tab_w) = ctx.fonts_mut(|f| {
+            (
+                f.row_height(&font_id),
+                f.glyph_width(&font_id, '0'),
+                f.glyph_width(&font_id, '\t'),
+            )
+        });
         let char_w = if char_w > 0.0 {
             char_w
         } else {
@@ -327,6 +334,8 @@ impl<'a> SqlEditor<'a> {
             char_width: char_w,
             wrap_width: wrap,
             pixels_per_point: ppp,
+            tab_size: options.tab_size.max(1),
+            tab_width: tab_w,
         };
         // Keep the first visible line in place when row geometry changes
         // (re-wrapping after a resize, font change, background refinement of
@@ -561,21 +570,21 @@ impl<'a> SqlEditor<'a> {
             let text = st.text.as_str();
             let cursor_line = st.index.line_range(st.index.line_of_offset(st.sel.cursor));
             let value = || {
-                if text.len() <= 100_000 {
+                if text.len() <= A11Y_FULL_VALUE_BYTES {
                     text
                 } else {
                     &text[cursor_line.clone()]
                 }
             };
             response.widget_info(|| egui::WidgetInfo::text_edit(enabled, value(), value(), ""));
+            ctx.accesskit_node_builder(st.id, |b| {
+                b.set_role(egui::accesskit::Role::MultilineTextInput);
+                b.set_value(value());
+                if options.read_only {
+                    b.set_read_only();
+                }
+            });
         }
-        ctx.accesskit_node_builder(st.id, |b| {
-            b.set_role(egui::accesskit::Role::MultilineTextInput);
-            b.set_value(st.text.clone());
-            if options.read_only {
-                b.set_read_only();
-            }
-        });
 
         // Events.
         let focused = ctx.memory(|m| m.has_focus(st.id));
@@ -735,7 +744,7 @@ fn pointer(
                 && cursor_line > a
                 && cursor_line <= b
             {
-                st.sel = crate::text::Selection::caret(st.index.line_start(a));
+                st.set_selection(crate::text::Selection::caret(st.index.line_start(a)));
             }
             st.sync_folds(lang);
             ui.ctx().request_repaint();
@@ -849,8 +858,9 @@ fn pointer(
 }
 
 /// Expose the visible lines as AccessKit text runs (with the caret /
-/// selection) when a screen reader is active. The whole document is the
-/// value of the text node; runs cover what is on screen, matching what a
+/// selection) when a screen reader is active. The document (only the cursor
+/// line for large documents) is the value of the text node; runs cover what
+/// is on screen, matching what a
 /// virtualized view can describe without laying out every line.
 fn accessibility(ui: &Ui, st: &mut EditorState, frame: &Frame, lines: Range<usize>, focused: bool) {
     let ctx = ui.ctx().clone();

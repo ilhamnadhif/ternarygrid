@@ -91,7 +91,9 @@ impl Folds {
             .filter_map(|l| {
                 if l < first {
                     // Edits inside a collapsed region open it.
-                    let end = regions.iter().find(|r| r.0 == l).map(|r| r.1).unwrap_or(l);
+                    let end = regions
+                        .binary_search_by_key(&l, |r| r.0)
+                        .map_or(l, |i| regions[i].1);
                     (end < first).then_some(l)
                 } else if l >= first + old {
                     Some((l as isize + delta) as usize)
@@ -140,15 +142,18 @@ impl Folds {
 
     /// Expand every collapsed region that hides `line`.
     pub fn reveal(&mut self, line: usize) -> bool {
-        let before = self.collapsed.len();
-        let regions = &self.regions;
-        self.collapsed.retain(|&s| {
-            regions
-                .iter()
-                .find(|r| r.0 == s)
-                .is_none_or(|r| !(s < line && line <= r.1))
-        });
-        self.collapsed.len() != before
+        // Runs every frame: only regions starting above `line` can hide it,
+        // and each is looked up by binary search.
+        let hiding: Vec<usize> = self
+            .collapsed
+            .range(..line)
+            .copied()
+            .filter(|&s| self.region_at(s).is_some_and(|(_, end)| line <= end))
+            .collect();
+        for s in &hiding {
+            self.collapsed.remove(s);
+        }
+        !hiding.is_empty()
     }
 
     /// The innermost region containing `line`.
@@ -189,5 +194,40 @@ mod tests {
         assert!(f.toggle(7) && f.collapsed.contains(&7));
         assert!(!f.toggle(8));
         assert_eq!(f.region_containing(9), Some((7, 11)));
+    }
+
+    #[test]
+    fn reveal_and_splice_scale_after_fold_all() {
+        // "Fold all" on a big script: every region collapsed. `reveal` runs
+        // every frame; a linear region lookup per fold made it quadratic.
+        let n = 60_000;
+        let mut f = Folds {
+            regions: (0..n).map(|i| (3 * i, 3 * i + 1)).collect(),
+            ..Default::default()
+        };
+        f.collapsed = f.regions.iter().map(|r| r.0).collect();
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(!f.reveal(3 * n - 1), "a visible line between regions");
+        }
+        assert!(
+            f.reveal(3 * (n - 1) + 1),
+            "the last line of the last region"
+        );
+        assert_eq!(f.collapsed.len(), n - 1);
+        assert!(!f.collapsed.contains(&(3 * (n - 1))));
+        // An edit near the end: every fold above it is checked.
+        f.on_splice(3 * n - 2, 1, 2);
+        assert_eq!(f.collapsed.len(), n - 1);
+        // An edit inside the first region opens it.
+        f.regions = (0..n).map(|i| (3 * i, 3 * i + 1)).collect();
+        f.on_splice(1, 1, 1);
+        assert!(!f.collapsed.contains(&0));
+        assert!(f.collapsed.contains(&3));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed.as_secs_f64() < 2.0,
+            "fold bookkeeping took {elapsed:?}"
+        );
     }
 }

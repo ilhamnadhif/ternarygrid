@@ -35,8 +35,78 @@ struct PreparedItem {
 
 #[derive(Debug, Clone)]
 struct PreparedLayer {
-    key: (usize, usize),
+    key: (usize, u64),
     items: Vec<PreparedItem>,
+}
+
+/// Cache key of a layer: the item count and a fingerprint of everything
+/// [`prepare`] reads (rows and x/y coordinates). The address of the item
+/// vector is not used: a rebuilt vector can reuse the old allocation and a
+/// vector edited in place keeps it, both would serve stale triangulations.
+fn layer_key(layer: &SpatialLayer) -> (usize, u64) {
+    let mut f = Fingerprint(0xcbf2_9ce4_8422_2325);
+    for it in &layer.items {
+        f.add(it.row as u64);
+        f.geom(&it.geometry.geom);
+    }
+    (layer.items.len(), f.0)
+}
+
+/// Fast non-cryptographic hash (FxHash style mixing).
+struct Fingerprint(u64);
+
+impl Fingerprint {
+    fn add(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn coords(&mut self, cs: &[Coord]) {
+        self.add(cs.len() as u64);
+        for c in cs {
+            self.add(c.x.to_bits());
+            self.add(c.y.to_bits());
+        }
+    }
+
+    fn rings(&mut self, rings: &[Vec<Coord>]) {
+        self.add(rings.len() as u64);
+        rings.iter().for_each(|r| self.coords(r));
+    }
+
+    fn geom(&mut self, g: &Geom) {
+        match g {
+            Geom::Point(c) => {
+                self.add(1);
+                self.coords(c.as_slice());
+            }
+            Geom::LineString(cs) => {
+                self.add(2);
+                self.coords(cs);
+            }
+            Geom::Polygon(rings) => {
+                self.add(3);
+                self.rings(rings);
+            }
+            Geom::MultiPoint(cs) => {
+                self.add(4);
+                self.coords(cs);
+            }
+            Geom::MultiLineString(ls) => {
+                self.add(5);
+                self.rings(ls);
+            }
+            Geom::MultiPolygon(ps) => {
+                self.add(6);
+                self.add(ps.len() as u64);
+                ps.iter().for_each(|p| self.rings(p));
+            }
+            Geom::GeometryCollection(gs) => {
+                self.add(7);
+                self.add(gs.len() as u64);
+                gs.iter().for_each(|g| self.geom(g));
+            }
+        }
+    }
 }
 
 fn xy(cs: &[Coord]) -> Vec<[f64; 2]> {
@@ -90,8 +160,28 @@ fn prepare(layer: &SpatialLayer) -> PreparedLayer {
         })
         .collect();
     PreparedLayer {
-        key: (layer.items.as_ptr() as usize, layer.items.len()),
+        key: layer_key(layer),
         items,
+    }
+}
+
+/// Keeps the prepared cache in sync with the layers (re-prepares a layer
+/// only when its content changed).
+fn sync_cache(cache: &mut Vec<PreparedLayer>, layers: &[SpatialLayer]) {
+    cache.truncate(layers.len());
+    for (i, l) in layers.iter().enumerate() {
+        let key = layer_key(l);
+        match cache.get(i) {
+            Some(c) if c.key == key => {}
+            _ => {
+                let p = prepare(l);
+                if i < cache.len() {
+                    cache[i] = p;
+                } else {
+                    cache.push(p);
+                }
+            }
+        }
     }
 }
 
@@ -182,21 +272,7 @@ pub fn show_spatial(
 ) -> SpatialResponse {
     let id = ui.id().with("ternarygrid_spatial");
     // keep the prepared cache in sync with the layers
-    state.cache.truncate(layers.len());
-    for (i, l) in layers.iter().enumerate() {
-        let key = (l.items.as_ptr() as usize, l.items.len());
-        match state.cache.get(i) {
-            Some(c) if c.key == key => {}
-            _ => {
-                let p = prepare(l);
-                if i < state.cache.len() {
-                    state.cache[i] = p;
-                } else {
-                    state.cache.push(p);
-                }
-            }
-        }
-    }
+    sync_cache(&mut state.cache, layers);
     let srid = layers.iter().find_map(|l| l.srid());
     let geographic = srid == Some(4326) || srid == Some(4258) || srid == Some(4269);
     if state.show_toolbar {
@@ -705,6 +781,34 @@ mod tests {
         // screen transform roundtrip
         let w = xf.to_world(xf.to_screen([12.5, -3.25]));
         assert!((w[0] - 12.5).abs() < 1e-3 && (w[1] + 3.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cache_follows_the_layer_content() {
+        let mut layers = vec![layer(&["POLYGON((0 0,10 0,10 10,0 10,0 0))"])];
+        let mut cache = Vec::new();
+        sync_cache(&mut cache, &layers);
+        let first = cache[0].items[0].polygons[0].clone();
+        assert_eq!(first.rings[0].len(), 5);
+        // unchanged content: the prepared layer is reused
+        let prepared = cache[0].items.as_ptr();
+        sync_cache(&mut cache, &layers);
+        assert_eq!(cache[0].items.as_ptr(), prepared);
+        // edited in place: same vector address and length as before
+        let ptr = layers[0].items.as_ptr();
+        layers[0].items[0].geometry = parse_wkt("POLYGON((0 0,20 0,0 20,0 0))").unwrap();
+        assert_eq!(layers[0].items.as_ptr(), ptr);
+        sync_cache(&mut cache, &layers);
+        let tri = cache[0].items[0].polygons[0].tri.as_ref().unwrap();
+        assert_eq!(tri.triangles.len(), 1);
+        assert!((tri.area() - 200.0).abs() < 1e-9);
+        // a different row with the same geometry is also a change
+        layers[0].items[0].row = 7;
+        sync_cache(&mut cache, &layers);
+        assert_eq!(cache[0].items[0].row, 7);
+        // removing layers truncates the cache
+        sync_cache(&mut cache, &[]);
+        assert!(cache.is_empty());
     }
 
     #[test]

@@ -175,8 +175,10 @@ impl EditorTheme {
         }
     }
 
-    /// Palette matching `visuals` (dark or light), using its text-edit
-    /// background and selection colors so the editor blends into the app.
+    /// Palette matching `visuals` (dark or light), using its
+    /// `extreme_bg_color` as background (not `text_edit_bg_color`, which apps
+    /// may set to a distinct input-field color) and its selection color so
+    /// the editor blends into the app.
     pub fn from_visuals(visuals: &Visuals) -> Self {
         let mut theme = if visuals.dark_mode {
             Self::dark()
@@ -237,9 +239,13 @@ mod tests {
         let light = EditorTheme::light();
         let dark = EditorTheme::dark();
         assert_ne!(light.layout_key(), dark.layout_key());
-        let v = Visuals::dark();
+        let mut v = Visuals::dark();
+        // A distinct text-edit fill (as the app sets) must not leak into the editor.
+        v.text_edit_bg_color = Some(Color32::from_rgb(1, 2, 3));
         let t = EditorTheme::from_visuals(&v);
-        assert_eq!(t.background, v.text_edit_bg_color());
+        assert_eq!(t.background, v.extreme_bg_color);
+        assert_eq!(t.gutter_background, v.extreme_bg_color);
+        assert_eq!(t.selection, v.selection.bg_fill);
         assert_eq!(t.keyword, dark.keyword);
         let t = EditorTheme::from_visuals(&Visuals::light());
         assert_eq!(t.keyword, light.keyword);

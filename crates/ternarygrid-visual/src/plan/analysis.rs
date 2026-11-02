@@ -253,12 +253,24 @@ fn property_number(node: &PlanNode, key: &str) -> Option<f64> {
         .and_then(|v| v.parse().ok())
 }
 
-/// True for full table scans of the supported databases.
+/// True for full table scans of the supported databases: PostgreSQL
+/// `Seq Scan`, MySQL `ALL` / `Table scan on t`, SQLite `SCAN t`, Oracle
+/// `TABLE ACCESS FULL` (also `STORAGE FULL` / `INMEMORY FULL`, materialized
+/// views), SQL Server `Table Scan` and `Clustered Index Scan` (the clustered
+/// index is the table). Full scans of a secondary index (Oracle `INDEX FAST
+/// FULL SCAN`, SQL Server `Index Scan`) are not table scans.
 pub fn is_full_scan(node: &PlanNode) -> bool {
     let t = node.node_type.to_ascii_lowercase();
+    let words: Vec<&str> = t.split_whitespace().collect();
+    let oracle_full = matches!(
+        words.as_slice(),
+        ["table" | "mat_view", "access", rest @ ..] if rest.contains(&"full")
+    );
     t.contains("seq scan")
         || t.contains("table scan")
-        || t.contains("full scan")
+        || oracle_full
+        || t.starts_with("clustered index scan")
+        || (t.contains("full scan") && !t.contains("index"))
         || t == "all"
         || (t.starts_with("scan")
             && !t.contains("index")
@@ -564,5 +576,61 @@ pub(crate) mod tests {
         assert!(is_full_scan(&PlanNode::new("SCAN orders")));
         assert!(!is_full_scan(&PlanNode::new("SCAN orders USING INDEX idx")));
         assert!(!is_full_scan(&PlanNode::new("Index Only Scan")));
+    }
+
+    #[test]
+    fn full_scan_names_of_all_drivers() {
+        for name in [
+            "Seq Scan",
+            "Parallel Seq Scan",
+            "ALL",
+            "Table scan on orders",
+            "SCAN orders",
+            // Oracle: operation + options
+            "TABLE ACCESS FULL",
+            "TABLE ACCESS STORAGE FULL",
+            "TABLE ACCESS INMEMORY FULL",
+            "MAT_VIEW ACCESS FULL",
+            // SQL Server PhysicalOp
+            "Table Scan",
+            "Clustered Index Scan",
+        ] {
+            assert!(is_full_scan(&PlanNode::new(name)), "{name}");
+        }
+        for name in [
+            "TABLE ACCESS BY INDEX ROWID",
+            "TABLE ACCESS BY INDEX ROWID BATCHED",
+            "INDEX FAST FULL SCAN",
+            "INDEX FULL SCAN",
+            "INDEX RANGE SCAN",
+            "Index Scan",
+            "Index Seek",
+            "Clustered Index Seek",
+            "Index Only Scan",
+            "SCAN orders USING COVERING INDEX idx",
+        ] {
+            assert!(!is_full_scan(&PlanNode::new(name)), "{name}");
+        }
+        // an Oracle full scan of a large table is reported
+        let mut scan = PlanNode::new("TABLE ACCESS FULL");
+        scan.relation = Some("HR.EMPLOYEES".into());
+        scan.plan_rows = Some(50_000.0);
+        scan.total_cost = Some(120.0);
+        let mut root = PlanNode::new("SELECT STATEMENT");
+        root.total_cost = Some(120.0);
+        root.children.push(scan);
+        let plan = QueryPlan {
+            roots: vec![root],
+            ..Default::default()
+        };
+        let s = plan_summary(&plan);
+        assert!(
+            s.warnings
+                .iter()
+                .any(|w| w.kind == PlanWarningKind::SeqScanOnLargeTable
+                    && w.message.contains("HR.EMPLOYEES")),
+            "{:?}",
+            s.warnings
+        );
     }
 }

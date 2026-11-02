@@ -323,7 +323,7 @@ fn show_plot(ui: &mut Ui, data: &ChartData, config: &ChartConfig, state: &mut Ch
 
 /// Width of one x slot: 1 for categories/rows, the smallest gap between x
 /// values otherwise.
-fn bar_slot(data: &ChartData) -> f64 {
+pub(crate) fn bar_slot(data: &ChartData) -> f64 {
     match data.x_kind {
         XKind::Categorical | XKind::Index => 1.0,
         _ => {

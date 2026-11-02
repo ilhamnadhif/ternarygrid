@@ -12,20 +12,27 @@ pub(crate) fn compact(v: f64, decimals: usize) -> String {
             "-∞".into()
         };
     }
+    const UNITS: [(f64, &str); 5] = [(1.0, ""), (1e3, "K"), (1e6, "M"), (1e9, "B"), (1e12, "T")];
     let a = v.abs();
-    let (scaled, suffix) = if a >= 1e12 {
-        (v / 1e12, "T")
-    } else if a >= 1e9 {
-        (v / 1e9, "B")
-    } else if a >= 1e6 {
-        (v / 1e6, "M")
-    } else if a >= 1e3 {
-        (v / 1e3, "K")
-    } else {
-        return trim_decimals(v, decimals);
-    };
-    let digits = if scaled.abs() >= 100.0 { 0 } else { 1 };
-    format!("{}{suffix}", trim_decimals(scaled, digits))
+    let mut unit = UNITS.iter().rposition(|(s, _)| a >= *s).unwrap_or(0);
+    loop {
+        let (scale, suffix) = UNITS[unit];
+        let scaled = v / scale;
+        let digits = if unit == 0 {
+            decimals
+        } else if scaled.abs() >= 100.0 {
+            0
+        } else {
+            1
+        };
+        let text = trim_decimals(scaled, digits);
+        // rounding can reach the next unit: 999_950 -> "1M", not "1000K"
+        if unit + 1 < UNITS.len() && text.parse::<f64>().is_ok_and(|r| r.abs() >= 1000.0) {
+            unit += 1;
+            continue;
+        }
+        return format!("{text}{suffix}");
+    }
 }
 
 /// Fixed decimals with trailing zeros (and a trailing dot) removed.
@@ -156,6 +163,15 @@ mod tests {
         assert_eq!(compact(4_200_000.0, 2), "4.2M");
         assert_eq!(compact(-150_000.0, 0), "-150K");
         assert_eq!(compact(f64::NAN, 0), "NaN");
+        // rounding up to 1000 rolls over to the next unit
+        assert_eq!(compact(999_950.0, 2), "1M");
+        assert_eq!(compact(-999_950.0, 2), "-1M");
+        assert_eq!(compact(999_499.0, 2), "999K");
+        assert_eq!(compact(999_960_000.0, 2), "1B");
+        assert_eq!(compact(999.9996, 2), "1K");
+        assert_eq!(compact(999.6, 0), "1K");
+        assert_eq!(compact(999.4, 0), "999");
+        assert_eq!(compact(2e15, 0), "2000T");
     }
 
     #[test]

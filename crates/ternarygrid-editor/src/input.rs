@@ -299,8 +299,13 @@ fn handle_ime(
                 }
                 start = crate::text::prev_char_boundary(&st.text, start);
             }
+            // Like the deletion before the cursor, stay on the cursor's line.
+            let end_line = st.index.line_end(st.index.line_of_offset(r.end));
             let mut end = r.end;
             for _ in 0..*after_chars {
+                if end >= end_line {
+                    break;
+                }
                 end = crate::text::next_char_boundary(&st.text, end);
             }
             let before = st.sel;

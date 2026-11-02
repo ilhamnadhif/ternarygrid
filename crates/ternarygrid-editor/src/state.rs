@@ -373,6 +373,9 @@ impl EditorState {
         self.completion.close();
         self.hover_cache = None;
         self.link_cache = None;
+        // `layout.reset` cleared the hidden lines: forget the old document's
+        // folds too (they are recomputed for the new text).
+        self.folds = crate::fold::Folds::default();
         self.sel = Selection::caret(0);
         self.h_pos = None;
         self.restore_scroll = Some(Vec2::ZERO);
@@ -720,7 +723,7 @@ impl EditorState {
                 self.folds.toggle(start);
                 if self.folds.collapsed.contains(&start) && line != start {
                     // Keep the cursor visible: on the fold's first line.
-                    self.sel = Selection::caret(self.index.line_start(start));
+                    self.set_selection(Selection::caret(self.index.line_start(start)));
                 }
                 true
             }
@@ -789,13 +792,26 @@ impl EditorState {
     /// `O(text)` memmove per edit. Returns the undo records in application
     /// order and whether they form a batch (see `UndoStack::record_batch`).
     pub(crate) fn apply_batch(&mut self, edits: &[Edit]) -> (Vec<EditRecord>, bool) {
-        let clean: Vec<Edit> = edits
+        let mut clean: Vec<Edit> = edits
             .iter()
             .map(|e| Edit::new(clamp_range(&self.text, e.range.clone()), e.text.clone()))
             .collect();
-        let sorted = clean.windows(2).all(|w| w[0].range.end <= w[1].range.start);
+        if !clean.windows(2).all(|w| w[0].range.end <= w[1].range.start) {
+            // Callers should pass sorted, non-overlapping edits. Otherwise
+            // sort them (stable: insertions at one offset keep their order)
+            // and clip overlaps so that every edit applies to text no
+            // earlier edit touched; applying them back to front with
+            // original coordinates would corrupt the text.
+            clean.sort_by_key(|e| e.range.start);
+            let mut end = 0;
+            for e in &mut clean {
+                let start = e.range.start.max(end);
+                e.range = start..e.range.end.max(start);
+                end = e.range.end;
+            }
+        }
         let (Some(first_edit), Some(last_edit), true) =
-            (clean.first(), clean.last(), sorted && clean.len() > 2)
+            (clean.first(), clean.last(), clean.len() > 2)
         else {
             let records = clean
                 .iter()
@@ -1144,6 +1160,106 @@ mod tests {
         check::<crate::EditorTheme>();
         check::<Diagnostic>();
         check::<crate::BasicSqlLanguage>();
+    }
+
+    #[test]
+    fn unsorted_or_overlapping_batches_apply_like_sorted_ones() {
+        let c = ctx();
+        let base = "0123456789abcdef";
+        // Two edits (one by one) and four (one pass), given out of order.
+        for edits in [
+            vec![Edit::new(10..12, "X"), Edit::new(0..2, "Y")],
+            vec![
+                Edit::new(10..12, "X"),
+                Edit::new(0..2, "Y"),
+                Edit::new(14..14, "Z"),
+                Edit::new(5..6, ""),
+            ],
+        ] {
+            let mut sorted = edits.clone();
+            sorted.sort_by_key(|e| e.range.start);
+            let expected = EditPlan {
+                edits: sorted,
+                selection: Selection::caret(0),
+            }
+            .apply_to(base);
+            let mut s = EditorState::new(1, base.into());
+            s.apply_plan(
+                EditPlan {
+                    edits,
+                    selection: Selection::caret(0),
+                },
+                EditKind::Other,
+            );
+            assert_eq!(s.text(), expected);
+            assert_eq!(s.index.line_count(), 1);
+            assert!(s.undo(&c));
+            assert_eq!(s.text(), base);
+            assert!(s.redo(&c));
+            assert_eq!(s.text(), expected);
+        }
+        // Overlaps are clipped to what no earlier edit replaced.
+        let mut s = EditorState::new(1, base.into());
+        s.apply_plan(
+            EditPlan {
+                edits: vec![Edit::new(4..8, "B"), Edit::new(2..6, "A")],
+                selection: Selection::caret(0),
+            },
+            EditKind::Other,
+        );
+        assert_eq!(s.text(), "01AB89abcdef");
+        assert!(s.undo(&c));
+        assert_eq!(s.text(), base);
+    }
+
+    #[test]
+    fn fold_toggle_moves_the_cursor_like_any_selection_change() {
+        let lang = crate::BasicSqlLanguage::new();
+        let mut s = EditorState::new(1, "select a,\n  b\nfrom t;\n".into());
+        s.sync_folds(&lang);
+        assert_eq!(s.fold_regions(), vec![(0, 2)]);
+        let inside = s.index.line_start(1) + 2;
+        s.sel = Selection::caret(inside);
+        s.auto_pairs.push(AutoPair {
+            open: inside - 1,
+            close: inside,
+            open_char: '(',
+            close_char: ')',
+        });
+        s.now = 5.0;
+        assert!(s.toggle_fold_at_cursor());
+        assert_eq!(s.cursor(), 0, "the cursor moves to the fold's first line");
+        assert_eq!(s.blink_epoch, 5.0, "the cursor blink restarts");
+        assert!(
+            s.auto_pairs.is_empty(),
+            "the cursor left the auto-closed pair"
+        );
+    }
+
+    #[test]
+    fn reset_text_forgets_folds() {
+        let c = ctx();
+        let lang = crate::BasicSqlLanguage::new();
+        let text = "select a,\n  b\nfrom t;\nselect 1;\n";
+        let mut s = EditorState::new(1, text.into());
+        s.sync_folds(&lang);
+        s.fold_all();
+        s.sync_folds(&lang);
+        assert!(s.is_line_hidden(1) && s.is_line_hidden(2));
+        // Reloading the same text: no fold may stay collapsed while its
+        // lines are visible again.
+        s.reset_text(&c, text.into());
+        s.sync_folds(&lang);
+        assert!(s.folded_lines().is_empty());
+        assert!((0..s.line_count()).all(|l| !s.is_line_hidden(l)));
+        // A new document does not inherit collapsed folds either.
+        s.fold_all();
+        s.sync_folds(&lang);
+        assert!(s.is_line_hidden(1));
+        s.reset_text(&c, "select x,\n  y\nfrom u;\n".into());
+        s.sync_folds(&lang);
+        assert!(s.folded_lines().is_empty());
+        assert!(!s.is_line_hidden(1));
     }
 
     #[test]

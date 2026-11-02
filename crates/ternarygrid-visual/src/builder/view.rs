@@ -864,7 +864,7 @@ fn tabs(ui: &mut Ui, model: &mut QueryModel, state: &mut QbViewState) {
             QbTab::Conditions => {
                 conditions_grid(ui, "ternarygrid_qb_where", &mut model.conditions, &refs);
             }
-            QbTab::Grouping => grouping(ui, model, &refs),
+            QbTab::Grouping => grouping(ui, model, &refs, state.dialect.as_ref()),
             QbTab::Order => order_grid(ui, model, &refs),
         });
 }
@@ -985,7 +985,18 @@ fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &
     }
 }
 
-fn grouping(ui: &mut Ui, model: &mut QueryModel, refs: &[String]) {
+/// The "Effective GROUP BY" hint, rendered with the builder's dialect so it
+/// matches the generated SQL.
+fn effective_group_by_hint(model: &QueryModel, dialect: &dyn Dialect) -> Option<String> {
+    let effective = model.effective_group_by(dialect);
+    if effective.is_empty() {
+        None
+    } else {
+        Some(trf("Effective GROUP BY: {}", &[&effective.join(", ")]))
+    }
+}
+
+fn grouping(ui: &mut Ui, model: &mut QueryModel, refs: &[String], dialect: &dyn Dialect) {
     ui.weak(tr("Columns without an aggregate are grouped automatically when the select list contains aggregates."));
     let mut action = None;
     egui::Grid::new("ternarygrid_qb_group")
@@ -1011,12 +1022,8 @@ fn grouping(ui: &mut Ui, model: &mut QueryModel, refs: &[String]) {
             .group_by
             .push(refs.first().cloned().unwrap_or_default());
     }
-    let effective = {
-        let d = GenericDialect::new();
-        model.effective_group_by(&d)
-    };
-    if !effective.is_empty() {
-        ui.weak(trf("Effective GROUP BY: {}", &[&effective.join(", ")]));
+    if let Some(hint) = effective_group_by_hint(model, dialect) {
+        ui.weak(hint);
     }
     ui.separator();
     ui.strong(tr("Having"));
@@ -1070,6 +1077,31 @@ mod tests {
         let y = t.column_y(column).expect("column");
         let view = ViewTransform::new(state.zoom, state.pan);
         view.to_screen(state.last_canvas.min, pos2(t.rect().center().x, y))
+    }
+
+    #[test]
+    fn effective_group_by_hint_uses_the_dialect() {
+        use crate::builder::sql::tests::dialect;
+        use ternarygrid_core::DbKind;
+        let mut model = QueryModel::default();
+        model.add_table(&customers());
+        model.add_table(&orders());
+        assert_eq!(
+            effective_group_by_hint(&model, &dialect(DbKind::MySql)),
+            None
+        );
+        model.group_by.push("o.order".into()); // reserved word -> quoted
+        let hint = effective_group_by_hint(&model, &dialect(DbKind::MySql)).unwrap();
+        assert!(hint.ends_with("o.`order`"), "{hint}");
+        let sql = model.to_sql(&dialect(DbKind::MySql));
+        assert!(sql.contains("GROUP BY o.`order`"), "{sql}");
+        // the grouping tab renders with a MySQL state
+        let mut state = QbViewState::new(Arc::new(dialect(DbKind::MySql)));
+        state.tab = QbTab::Grouping;
+        let mut h = Harness::new(1000.0, 700.0);
+        h.idle(2, &mut |ui: &mut Ui| {
+            show_query_builder(ui, &mut model, &mut state);
+        });
     }
 
     #[test]

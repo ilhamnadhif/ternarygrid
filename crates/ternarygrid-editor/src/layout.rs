@@ -96,6 +96,11 @@ pub struct LayoutParams {
     pub wrap_width: Option<f32>,
     /// Display scale.
     pub pixels_per_point: f32,
+    /// Columns between tab stops (the editor's `tab_size`).
+    pub tab_size: usize,
+    /// Advance egui gives a `\t` glyph of the font (its own fixed tab width);
+    /// laid-out tabs are widened or narrowed from it to the next tab stop.
+    pub tab_width: f32,
 }
 
 impl LayoutParams {
@@ -111,6 +116,8 @@ impl LayoutParams {
             && self.char_width == other.char_width
             && self.wrap_width == other.wrap_width
             && self.pixels_per_point == other.pixels_per_point
+            && self.tab_size == other.tab_size
+            && self.tab_width == other.tab_width
     }
 }
 
@@ -155,20 +162,68 @@ fn is_wide(c: char) -> bool {
         | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x1F300..=0x1FAFF | 0x20000..=0x3FFFD)
 }
 
-fn estimate_width(line: &str, char_width: f32) -> f32 {
-    let cols: usize = line
-        .chars()
-        .map(|c| {
-            if c == '\t' {
-                4
-            } else if is_wide(c) {
-                2
-            } else {
-                1
-            }
-        })
-        .sum();
+/// Display column after `c` when it starts at `col` (tabs advance to the
+/// next multiple of `tab_size`, wide chars take two columns).
+fn advance_col(col: usize, c: char, tab_size: usize) -> usize {
+    if c == '\t' {
+        let tab_size = tab_size.max(1);
+        (col / tab_size + 1) * tab_size
+    } else if is_wide(c) {
+        col + 2
+    } else {
+        col + 1
+    }
+}
+
+fn estimate_width(line: &str, char_width: f32, tab_size: usize) -> f32 {
+    let cols = line.chars().fold(0, |col, c| advance_col(col, c, tab_size));
     cols as f32 * char_width
+}
+
+/// Appends line text to a [`LayoutJob`] so that every tab ends at the next
+/// tab stop: egui gives `\t` a fixed advance (`tab_width`), so the text
+/// after a tab starts a section whose leading space corrects the difference.
+struct TabStops {
+    tab_size: usize,
+    char_width: f32,
+    tab_width: f32,
+    col: usize,
+    /// Correction still to apply after the last tab.
+    pending: f32,
+}
+
+impl TabStops {
+    fn append(&mut self, job: &mut LayoutJob, s: &str, format: &TextFormat) {
+        let mut start = 0;
+        for (i, c) in s.char_indices() {
+            let next = advance_col(self.col, c, self.tab_size);
+            if c == '\t' {
+                let end = i + c.len_utf8();
+                job.append(
+                    &s[start..end],
+                    std::mem::take(&mut self.pending),
+                    format.clone(),
+                );
+                self.pending = (next - self.col) as f32 * self.char_width - self.tab_width;
+                start = end;
+            }
+            self.col = next;
+        }
+        if start < s.len() {
+            job.append(
+                &s[start..],
+                std::mem::take(&mut self.pending),
+                format.clone(),
+            );
+        }
+    }
+
+    /// Apply a correction left by a trailing tab (keeps the row width right).
+    fn finish(&mut self, job: &mut LayoutJob, format: &TextFormat) {
+        if self.pending != 0.0 {
+            job.append("", std::mem::take(&mut self.pending), format.clone());
+        }
+    }
 }
 
 /// Normalize raw highlighter output: clamp to the text, sort, drop overlaps
@@ -250,6 +305,7 @@ impl DocLayout {
         let w = estimate_width(
             display_prefix(&text[index.line_range(line)]).0,
             p.char_width,
+            p.tab_size,
         );
         let wrap = p.effective_wrap();
         let rows = ((w / wrap).ceil() as u32).max(1);
@@ -638,6 +694,21 @@ impl DocLayout {
         };
         job.text.reserve(line_text.len());
         let plain = self.format(TokenStyle::Plain);
+        let mut tabs = self
+            .params
+            .as_ref()
+            .filter(|_| line_text.contains('\t'))
+            .map(|p| TabStops {
+                tab_size: p.tab_size,
+                char_width: p.char_width,
+                tab_width: p.tab_width,
+                col: 0,
+                pending: 0.0,
+            });
+        let mut append = |job: &mut LayoutJob, s: &str, format: TextFormat| match tabs.as_mut() {
+            Some(t) => t.append(job, s, &format),
+            None => job.append(s, 0.0, format),
+        };
         let mut pos = 0usize;
         for sp in spans {
             let (s, e) = (sp.start as usize, (sp.end as usize).min(line_text.len()));
@@ -646,13 +717,16 @@ impl DocLayout {
                 continue;
             }
             if s > pos {
-                job.append(&line_text[pos..s], 0.0, plain.clone());
+                append(&mut job, &line_text[pos..s], plain.clone());
             }
-            job.append(&line_text[s..e], 0.0, self.format(sp.style));
+            append(&mut job, &line_text[s..e], self.format(sp.style));
             pos = e;
         }
         if pos < line_text.len() || job.sections.is_empty() {
-            job.append(&line_text[pos..], 0.0, plain);
+            append(&mut job, &line_text[pos..], plain.clone());
+        }
+        if let Some(t) = tabs.as_mut() {
+            t.finish(&mut job, &plain);
         }
         job
     }
@@ -1005,14 +1079,21 @@ mod tests {
 
     fn params(ctx: &Context, wrap: Option<f32>) -> LayoutParams {
         let font_id = FontId::monospace(13.0);
-        let (row_height, char_width) =
-            ctx.fonts_mut(|f| (f.row_height(&font_id), f.glyph_width(&font_id, '0')));
+        let (row_height, char_width, tab_width) = ctx.fonts_mut(|f| {
+            (
+                f.row_height(&font_id),
+                f.glyph_width(&font_id, '0'),
+                f.glyph_width(&font_id, '\t'),
+            )
+        });
         LayoutParams {
             font_id,
             row_height: (row_height + 3.0).round(),
             char_width,
             wrap_width: wrap,
             pixels_per_point: 1.0,
+            tab_size: 4,
+            tab_width,
         }
     }
 
@@ -1226,6 +1307,50 @@ mod tests {
         let (line, col, _) = layout.hit(&ctx, &text, &index, Vec2::new(0.0, top + rh * 1.5));
         assert_eq!(line, 1);
         assert!(col > 0);
+    }
+
+    #[test]
+    fn tabs_end_at_tab_stops_of_the_tab_size() {
+        // Leading tab, tab after text, trailing tab, tab after a full stop.
+        let text = "\tx\nab\tc\nab\t\nabcd\te";
+        let ctx = ctx();
+        let index = LineIndex::new(text);
+        for tab_size in [2usize, 3, 4, 8] {
+            let mut layout = DocLayout::new();
+            layout.reset(text, &index);
+            let mut p = params(&ctx, None);
+            p.tab_size = tab_size;
+            let cw = p.char_width;
+            layout.set_params(&ctx, text, &index, p, &EditorTheme::dark());
+            let mut x = |line, col| {
+                layout
+                    .caret_rect(&ctx, text, &index, line, col, false)
+                    .min
+                    .x
+            };
+            let stop = |col: usize| (col / tab_size + 1) * tab_size;
+            for (line, col, cols) in [
+                (0, 1, tab_size),
+                (0, 2, tab_size + 1),
+                (1, 3, stop(2)),
+                (1, 4, stop(2) + 1),
+                (2, 3, stop(2)),
+                (3, 5, stop(4)),
+            ] {
+                let got = x(line, col);
+                assert!(
+                    (got - cols as f32 * cw).abs() <= 1.0,
+                    "tab size {tab_size}, line {line} col {col}: x {got}, expected {} columns",
+                    cols
+                );
+            }
+            // The width estimate agrees with the laid out line.
+            for line in 0..index.line_count() {
+                let w = layout.galley(&ctx, text, &index, line).rect.width();
+                let est = estimate_width(&text[index.line_range(line)], cw, tab_size);
+                assert!((w - est).abs() <= 1.0, "line {line}: {w} vs {est}");
+            }
+        }
     }
 
     #[test]

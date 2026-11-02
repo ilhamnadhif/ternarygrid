@@ -252,7 +252,9 @@ pub struct QbCondition {
     pub operator: String,
     /// Right side as SQL text (literal, list, column reference ...).
     pub value: String,
-    /// Combination with the previous condition (ignored for the first).
+    /// Combination with the conditions before it (ignored for the first).
+    /// The list is evaluated left to right: `a OR b AND c` is
+    /// `(a OR b) AND c`.
     pub connector: Connector,
 }
 
@@ -467,6 +469,35 @@ impl QueryModel {
                 ));
             }
         }
+        // Instances of the same table already on the canvas: a child already
+        // joined through a foreign key to one of them keeps that join and is
+        // not joined to the new instance as well (that would only force both
+        // instances onto the same row). Unjoined children, e.g. the original
+        // of a self referencing table, are joined to the new instance.
+        let instances: Vec<&str> = self
+            .tables
+            .iter()
+            .filter(|t| t.matches(def.schema.as_deref(), &def.name))
+            .map(|t| t.alias.as_str())
+            .collect();
+        incoming.retain(|(child_alias, cols, ref_cols)| {
+            !instances.iter().any(|inst| {
+                cols.iter().zip(ref_cols).all(|(c, rc)| {
+                    self.joins.iter().any(|j| {
+                        same_join(
+                            j,
+                            &QbJoin {
+                                left_alias: child_alias.clone(),
+                                left_column: c.clone(),
+                                right_alias: (*inst).to_string(),
+                                right_column: rc.clone(),
+                                kind: JoinKind::Inner,
+                            },
+                        )
+                    })
+                })
+            })
+        });
         for (child_alias, cols, ref_cols) in incoming {
             for (c, rc) in cols.iter().zip(&ref_cols) {
                 joins.push(QbJoin {
@@ -714,9 +745,29 @@ pub(crate) mod tests {
         assert_eq!(m.joins[0].right_alias, "c");
         assert_eq!(m.add_table(&order_items()), "oi");
         assert_eq!(m.joins.len(), 2);
-        // second instance of a table gets a numbered alias
+        // second instance of a table gets a numbered alias, and the child
+        // already joined to the first instance is not joined to it again
         assert_eq!(m.add_table(&customers()), "c2");
         assert!(m.tables[1].pos.x > m.tables[0].pos.x);
+        assert_eq!(m.joins.len(), 2, "{:?}", m.joins);
+        assert!(
+            !m.joins
+                .iter()
+                .any(|j| j.left_alias == "c2" || j.right_alias == "c2"),
+            "{:?}",
+            m.joins
+        );
+        // a second instance of a child joins its own foreign key
+        assert_eq!(m.add_table(&orders()), "o2");
+        assert_eq!(m.joins.len(), 3);
+        assert_eq!(
+            (
+                m.joins[2].left_alias.as_str(),
+                m.joins[2].left_column.as_str(),
+                m.joins[2].right_alias.as_str()
+            ),
+            ("o2", "customer_id", "c")
+        );
 
         // child added first, parent second: join from the stored FK
         let mut m = QueryModel::default();
@@ -729,6 +780,45 @@ pub(crate) mod tests {
                 m.joins[0].right_alias.as_str()
             ),
             ("o", "c")
+        );
+    }
+
+    #[test]
+    fn self_reference_joins_the_second_instance_once() {
+        let mut emp = TableDef::new(None, "employees");
+        emp.columns = vec![
+            ColumnDef::new("id", "int"),
+            ColumnDef::new("manager_id", "int"),
+        ];
+        emp.foreign_keys.push(ForeignKeyDef {
+            name: None,
+            columns: vec!["manager_id".into()],
+            ref_table: "employees".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        });
+        let mut m = QueryModel::default();
+        assert_eq!(m.add_table(&emp), "e");
+        assert!(m.joins.is_empty(), "self reference needs a second instance");
+        // e.manager_id = e2.id
+        assert_eq!(m.add_table(&emp), "e2");
+        assert_eq!(m.joins.len(), 1);
+        assert_eq!(
+            (
+                m.joins[0].left_alias.as_str(),
+                m.joins[0].right_alias.as_str()
+            ),
+            ("e", "e2")
+        );
+        // a third instance continues the chain from e2 only
+        assert_eq!(m.add_table(&emp), "e3");
+        assert_eq!(m.joins.len(), 2, "{:?}", m.joins);
+        assert_eq!(
+            (
+                m.joins[1].left_alias.as_str(),
+                m.joins[1].right_alias.as_str()
+            ),
+            ("e2", "e3")
         );
     }
 

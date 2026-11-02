@@ -7,7 +7,9 @@
 //! 3. longest-path layering, sources pulled next to their children;
 //! 4. width-bounded layer splitting so wide layers (hub tables with many
 //!    children) wrap instead of producing extreme aspect ratios;
-//! 5. dummy nodes for edges spanning several layers;
+//! 5. neighbour lists; edges spanning several layers connect their end
+//!    nodes directly (no dummy nodes: relations attach to the box sides
+//!    without bend points, so dummies would only widen wrapped layers);
 //! 6. crossing reduction with alternating barycenter sweeps plus adjacent
 //!    transpositions, keeping the best ordering found;
 //! 7. coordinate assignment honoring real box sizes: within a layer boxes are

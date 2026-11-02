@@ -405,6 +405,13 @@ impl ErModel {
     /// tables referenced by (or referencing) the given ones are added as
     /// placeholder boxes showing only the key columns known from the foreign
     /// keys; otherwise relations to tables outside `tables` are dropped.
+    ///
+    /// A foreign key may target the primary key or a unique key, which the
+    /// definitions do not tell apart: referenced placeholder columns are
+    /// shown as primary key only when every foreign key to the placeholder
+    /// references the same columns; when they reference different column
+    /// sets (so at most one of them is the primary key) single columns are
+    /// marked unique instead.
     pub fn from_tables(tables: &[TableDef], include_referenced: bool) -> ErModel {
         let mut model = ErModel::default();
         let mut seen = BTreeSet::new();
@@ -418,6 +425,8 @@ impl ErModel {
         }
         if include_referenced {
             let mut placeholders: BTreeMap<String, ErTable> = BTreeMap::new();
+            // distinct (sorted) referenced column sets per placeholder
+            let mut referenced: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
             for (def, idx) in &defs {
                 let child_schema = model.tables.get(*idx).and_then(|t| t.schema.clone());
                 for fk in &def.foreign_keys {
@@ -426,14 +435,15 @@ impl ErModel {
                     if seen.contains(&key) {
                         continue;
                     }
+                    let mut set = fk.ref_columns.clone();
+                    set.sort();
+                    referenced.entry(key.clone()).or_default().insert(set);
                     let entry = placeholders.entry(key).or_insert_with(|| {
                         ErTable::new(schema.as_deref(), fk.ref_table.clone(), ErTableKind::Table)
                     });
                     for c in &fk.ref_columns {
                         if entry.column(c).is_none() {
-                            entry
-                                .columns
-                                .push(ErColumn::new(c.clone(), "").primary_key());
+                            entry.columns.push(ErColumn::new(c.clone(), ""));
                         }
                     }
                 }
@@ -454,6 +464,23 @@ impl ErModel {
                             entry
                                 .columns
                                 .push(ErColumn::new(c.clone(), "").foreign_key());
+                        }
+                    }
+                }
+            }
+            for (key, sets) in &referenced {
+                let Some(entry) = placeholders.get_mut(key) else {
+                    continue;
+                };
+                let single = sets.len() == 1;
+                for set in sets {
+                    for col in entry.columns.iter_mut().filter(|c| set.contains(&c.name)) {
+                        if single {
+                            col.pk = true;
+                            col.nullable = false;
+                            col.unique |= set.len() == 1;
+                        } else if set.len() == 1 {
+                            col.unique = true;
                         }
                     }
                 }
@@ -784,6 +811,41 @@ mod tests {
                 .unwrap()
                 .fk
         );
+    }
+
+    #[test]
+    fn placeholder_keys_from_different_referenced_columns() {
+        // two foreign keys to the same table: one to its primary key, one to
+        // a unique key; only one of them can be the primary key
+        let mut audit = TableDef::new(Some("app".into()), "audit");
+        audit.columns.push(ColumnDef::new("user_id", "integer"));
+        audit.columns.push(ColumnDef::new("user_email", "text"));
+        audit.foreign_keys.push(ForeignKeyDef {
+            columns: vec!["user_id".into()],
+            ref_table: "users".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        });
+        audit.foreign_keys.push(ForeignKeyDef {
+            columns: vec!["user_email".into()],
+            ref_table: "users".into(),
+            ref_columns: vec!["email".into()],
+            ..Default::default()
+        });
+        let m = ErModel::from_tables(&[audit], true);
+        let users = m.table("app.users").unwrap();
+        assert_eq!(users.columns.len(), 2);
+        assert!(users.pk_columns().is_empty(), "{:?}", users.columns);
+        assert!(users.columns.iter().all(|c| c.unique));
+        assert_eq!(m.relations.len(), 2);
+
+        // several foreign keys agreeing on the referenced columns: key
+        let mut o2 = orders();
+        o2.name = "invoices".into();
+        let m = ErModel::from_tables(&[orders(), o2], true);
+        let users = m.table("app.users").unwrap();
+        assert_eq!(users.pk_columns(), vec!["id".to_string()]);
+        assert!(!users.columns[0].nullable && users.columns[0].unique);
     }
 
     fn users_def_with_incoming() -> TableDef {
