@@ -636,6 +636,8 @@ impl ResultPanel {
     pub fn set_query(&mut self, where_clause: Option<String>, order_by: Option<String>) {
         self.view.toolbar.filter_text = where_clause.clone().unwrap_or_default();
         self.view.toolbar.order_text = order_by.clone().unwrap_or_default();
+        // The header's arrows show the ORDER BY (when it names the result's columns).
+        self.view.grid.sort = ternarygrid_grid::toolbar::parse_order_by(&self.view.toolbar.order_text, &self.model.column_names()).unwrap_or_default();
         self.where_clause = where_clause;
         self.order_by = order_by;
     }
@@ -1067,32 +1069,42 @@ impl ResultPanel {
             let config = ternarygrid_visual::chart::ChartConfig::suggest(self.model.columns());
             ChartView { data: ternarygrid_visual::chart::ChartData::default(), config, state: Default::default(), generation: u64::MAX }
         });
-        ternarygrid_ui::parts::toolbar(ui, |ui| {
-            use ternarygrid_ui::kit;
-            if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TABLE), tr("Back to grid"), true, false).clicked() {
-                self.mode = Mode::Grid;
-            }
-            if kit::button_full(ui, kit::Kind::Ghost, Some(icon::EXPORT), tr("Export chart…"), true, false).clicked()
-                && let Some(path) = rfd::FileDialog::new().set_file_name("chart.png").add_filter("PNG", &["png"]).add_filter("SVG", &["svg"]).save_file()
-            {
-                let size = egui::vec2(1200.0, 700.0);
-                let res = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
-                    std::fs::write(&path, ternarygrid_visual::chart::export_chart_svg(&cv.data, &cv.config, size)).map_err(|e| e.to_string())
-                } else {
-                    ternarygrid_visual::chart::export_chart_png(&cv.data, &cv.config, size, 2.0)
-                        .map_err(|e| e.to_string())
-                        .and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string()))
-                };
-                if let Err(e) = res {
-                    self.status = Some((e, true));
-                }
-            }
-        });
         let mut rebuild = cv.generation != generation;
         let pal = ternarygrid_ui::pal(ui);
-        egui::Panel::left("chart_cfg").resizable(true).default_size(250.0).frame(egui::Frame::new().fill(pal.surface).inner_margin(egui::Margin::same(14))).show(ui, |ui| {
-            rebuild |= ternarygrid_visual::chart::chart_config_ui(ui, self.model.columns(), &mut cv.config);
-        });
+        // The settings at the left (Back to grid and Export at their top), the chart beside them.
+        let (mut back, mut export) = (false, false);
+        let side = egui::Panel::left("chart_cfg")
+            .resizable(true)
+            .default_size(250.0)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(pal.surface).inner_margin(egui::Margin::same(14)))
+            .show(ui, |ui| {
+                use ternarygrid_ui::kit;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    back = kit::button_full(ui, kit::Kind::Ghost, Some(icon::TABLE), tr("Back to grid"), true, false).clicked();
+                    export = kit::button_full(ui, kit::Kind::Ghost, Some(icon::EXPORT), tr("Export chart…"), true, false).clicked();
+                });
+                ui.add_space(4.0);
+                rebuild |= ternarygrid_visual::chart::chart_config_ui(ui, self.model.columns(), &mut cv.config);
+            });
+        ui.painter().vline(side.response.rect.right() - 0.5, side.response.rect.y_range(), egui::Stroke::new(1.0, pal.border));
+        if back {
+            self.mode = Mode::Grid;
+        }
+        if export && let Some(path) = rfd::FileDialog::new().set_file_name("chart.png").add_filter("PNG", &["png"]).add_filter("SVG", &["svg"]).save_file() {
+            let size = egui::vec2(1200.0, 700.0);
+            let res = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
+                std::fs::write(&path, ternarygrid_visual::chart::export_chart_svg(&cv.data, &cv.config, size)).map_err(|e| e.to_string())
+            } else {
+                ternarygrid_visual::chart::export_chart_png(&cv.data, &cv.config, size, 2.0)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string()))
+            };
+            if let Err(e) = res {
+                self.status = Some((e, true));
+            }
+        }
         if rebuild {
             let rows = rows_of(&self.model, 100_000);
             cv.data = ternarygrid_visual::chart::ChartData::build(self.model.columns(), &rows, &cv.config);
@@ -1177,6 +1189,9 @@ impl ResultPanel {
             }
         }
         if let Some(sql) = self.save_preview.clone() {
+            // Coloured as in the SQL editor (the connection's dialect).
+            let tokens =
+                cx.conns.live(&self.conn).map(|l| ternarygrid_editor::EditorLanguage::highlight(&crate::sqllang::SqlLanguage::new(l.dialect.clone()), &sql)).unwrap_or_default();
             let mut close = false;
             let mut save = false;
             use ternarygrid_ui::{kit, parts};
@@ -1190,12 +1205,7 @@ impl ResultPanel {
                 egui::Id::new(("save_preview", &self.conn, &self.title)),
                 |ui| {
                     ui.label(RichText::new(tr("These statements will run in one transaction:")).color(ternarygrid_ui::pal(ui).text_muted));
-                    parts::code_frame()(ui).show(ui, |ui| {
-                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                            let mut t = sql.as_str();
-                            ui.add(egui::TextEdit::multiline(&mut t).code_editor().frame(egui::Frame::NONE).desired_width(f32::INFINITY));
-                        });
-                    });
+                    crate::widgets::code_block(ui, ("save_preview_sql", &self.conn), &sql, &tokens, 320.0);
                     if crate::theme::connection_marker(ty.color).is_some() {
                         let note = trf("{} is a {} connection: these changes reach the live database.", &[&conn_name, &ty.name]);
                         parts::callout(ui, parts::Tone::Warning, None, &note, |_| {});

@@ -177,38 +177,47 @@ fn panel_name(p: PanelKind) -> &'static str {
     crate::toolbar::PANELS.iter().find(|(k, ..)| *k == p).map_or("", |(.., name)| tr(name))
 }
 
-/// A panel tab: its icon, its name (`named`), and × to close it. Returns (select, close).
-fn panel_tab(ui: &mut Ui, p: PanelKind, selected: bool, named: bool) -> (bool, bool) {
-    use egui::{Button, CornerRadius, Label, Margin, RichText, Sense};
-    let v = ui.visuals().clone();
+/// A panel tab: 26 high, its icon, and for the shown one its name and × (it closes the
+/// panel). Returns (select, close).
+fn panel_tab(ui: &mut Ui, p: PanelKind, selected: bool) -> (bool, bool) {
+    use egui::{Align2, FontId, Sense, vec2};
     let pal = ternarygrid_ui::pal(ui);
-    let fill = if selected { pal.subtle } else { egui::Color32::TRANSPARENT };
-    // The icon and the name select the tab; the frame itself takes no clicks:
-    // sensed after the ×, it would cover it and swallow its clicks.
-    let inner = Frame::new().fill(fill).corner_radius(CornerRadius::same(4)).inner_margin(Margin::symmetric(6, 3)).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let icon = ui.add(Label::new(RichText::new(panel_icon(p)).color(if selected { pal.accent_text } else { pal.text_muted })).sense(Sense::click()));
-        let mut clicked = icon.clicked();
-        if !named {
-            icon.on_hover_text(panel_name(p));
-        }
-        if named {
-            let text = RichText::new(panel_name(p)).color(if selected { v.strong_text_color() } else { v.text_color() });
-            clicked |= ui.add(Label::new(text).extend().sense(Sense::click())).clicked();
-        }
-        let close = named
-            && ui.add(Button::new(RichText::new(egui_phosphor::regular::X).size(11.0).color(v.weak_text_color())).frame(false).small()).on_hover_text(tr("Close panel")).clicked();
-        (clicked, close)
+    let name = panel_name(p);
+    let galley = selected.then(|| ui.painter().layout_no_wrap(name.to_string(), FontId::proportional(12.5), egui::Color32::PLACEHOLDER));
+    // 8 | icon 13 | 6 name 6 × 18 | 8 (named), 8 | icon | 8 (icon only).
+    let width = match &galley {
+        Some(g) => 8.0 + 13.0 + 6.0 + g.size().x + 6.0 + 18.0 + 4.0,
+        None => 8.0 + 13.0 + 8.0,
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, name));
+    let resp = if selected { resp } else { resp.on_hover_text(name) };
+    let close_rect = egui::Rect::from_center_size(egui::pos2(rect.right() - 4.0 - 9.0, rect.center().y), vec2(18.0, 18.0));
+    let close = selected.then(|| {
+        let c = ui.interact(close_rect, resp.id.with("close"), Sense::click()).on_hover_text(tr("Close panel"));
+        c.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("Close panel")));
+        c
     });
-    let (select, close) = inner.inner;
-    (select && !close, close)
-}
-
-/// Width of a tab with its name.
-fn panel_tab_width(ui: &Ui, p: PanelKind) -> f32 {
-    let font = egui::TextStyle::Body.resolve(ui.style());
-    let text = ui.painter().layout_no_wrap(panel_name(p).to_string(), font, egui::Color32::WHITE).size().x;
-    text + 52.0
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, pal.subtle);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, pal.hover);
+    }
+    let icon_color = if selected { pal.accent_text } else { pal.text_muted };
+    painter.text(egui::pos2(rect.left() + 8.0 + 6.5, rect.center().y), Align2::CENTER_CENTER, panel_icon(p), ternarygrid_ui::style::icon_font(13.0), icon_color);
+    if let Some(g) = galley {
+        painter.galley(egui::pos2(rect.left() + 8.0 + 13.0 + 6.0, rect.center().y - g.size().y / 2.0), g, pal.text);
+    }
+    let mut closed = false;
+    if let Some(c) = &close {
+        if c.hovered() {
+            painter.rect_filled(close_rect, 4, pal.hover);
+        }
+        painter.text(close_rect.center(), Align2::CENTER_CENTER, egui_phosphor::regular::X, ternarygrid_ui::style::icon_font(10.0), pal.text_muted);
+        closed = c.clicked();
+    }
+    (resp.clicked() && !closed, closed)
 }
 
 impl<'a> ResultViewer<'a> {
@@ -244,17 +253,21 @@ impl<'a> ResultViewer<'a> {
         let id = ui.make_persistent_id(id_salt);
         let mut actions: Vec<GridAction> = Vec::new();
         let mut grid_response = None;
-        let canvas = ternarygrid_ui::pal(ui).canvas;
-        let filter_frame = Frame::new().inner_margin(egui::Margin { left: 8, right: 6, top: 6, bottom: 6 }).fill(canvas);
-        let footer_frame = Frame::new().inner_margin(egui::Margin { left: 6, right: 6, top: 3, bottom: 3 }).fill(canvas);
-        Panel::top(id.with("filter_bar")).frame(filter_frame).show(ui, |ui| {
+        let pal = ternarygrid_ui::pal(ui);
+        // The filter bar: 46 high, 16 / 12 at the sides, a line under it; the footer 42 high, a line over it.
+        let filter_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 12, top: 8, bottom: 8 }).fill(pal.canvas);
+        let footer_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 10, top: 6, bottom: 6 }).fill(pal.canvas);
+        let line = egui::Stroke::new(1.0, pal.border);
+        let bar = Panel::top(id.with("filter_bar")).frame(filter_frame).show_separator_line(false).show(ui, |ui| {
             actions.extend(FilterBar::new(model, &mut state.grid, &mut state.toolbar).dialect(options.dialect.clone()).show(ui));
         });
+        ui.painter().hline(bar.response.rect.x_range(), bar.response.rect.bottom() - 0.5, line);
         // "Filter by value" in server mode adds to the WHERE the filter box shows.
         state.grid.set_server_filter(&state.toolbar.filter_text);
-        Panel::bottom(id.with("toolbar")).frame(footer_frame).show(ui, |ui| {
-            actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).show(ui));
+        let footer = Panel::bottom(id.with("toolbar")).frame(footer_frame).show_separator_line(false).show(ui, |ui| {
+            actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).fetch_size(options.fetch_more_threshold).show(ui));
         });
+        ui.painter().hline(footer.response.rect.x_range(), footer.response.rect.top() + 0.5, line);
         // Errors in a pop-up: a refused edit or a failed save each time, a failed fetch once.
         if let Some((message, true)) = state.toolbar.notice.clone() {
             state.toolbar.notice = None;
@@ -273,33 +286,33 @@ impl<'a> ResultViewer<'a> {
             if state.active_panel.is_none_or(|p| !state.toolbar.is_panel_open(p)) {
                 state.active_panel = state.toolbar.open_panels.last().copied();
             }
-            Panel::right(id.with("side"))
+            let side = Panel::right(id.with("side"))
                 .resizable(true)
-                .default_size(state.side_width.unwrap_or(340.0))
+                .default_size(state.side_width.unwrap_or(360.0))
                 .size_range(220.0..=900.0)
+                .show_separator_line(false)
                 .frame(Frame::new().fill(ui.visuals().panel_fill))
                 .show(ui, |ui| {
                     state.side_width = Some(ui.available_width());
-                    // Tabs of the open panels (× closes one), and Hide for the whole area. When
-                    // they do not all fit with their names, the others show their icon only.
+                    // Tabs of the open panels (the shown one named, with × to close it), and
+                    // Hide for the whole area.
                     if state.active_panel.is_none_or(|p| !state.toolbar.is_panel_open(p)) {
                         state.active_panel = state.toolbar.open_panels.last().copied();
                     }
-                    Frame::new().inner_margin(egui::Margin { left: 4, right: 2, top: 4, bottom: 3 }).show(ui, |ui| {
+                    let spacing = ui.spacing().item_spacing.y;
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let strip = Frame::new().inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
                             let tabs_width = (ui.available_width() - 26.0).max(40.0);
-                            let full: f32 = state.toolbar.open_panels.iter().map(|p| panel_tab_width(ui, *p)).sum();
-                            let compact = full > tabs_width;
-                            ui.allocate_ui_with_layout(egui::vec2(tabs_width, 0.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.allocate_ui_with_layout(egui::vec2(tabs_width, 26.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 2.0;
-                                        for p in state.toolbar.open_panels.clone() {
-                                            let selected = state.active_panel == Some(p);
-                                            // Only the shown panel names itself; the others are icons (their name in a tooltip).
-                                            let _ = compact;
-                                            let (select, close) = panel_tab(ui, p, selected, selected);
+                                        // In a fixed order (Value, Metadata, Grouping, Calc, References).
+                                        let open: Vec<PanelKind> = crate::toolbar::PANELS.iter().map(|(k, ..)| *k).filter(|k| state.toolbar.is_panel_open(*k)).collect();
+                                        for p in open {
+                                            let (select, close) = panel_tab(ui, p, state.active_panel == Some(p));
                                             if close {
                                                 state.toolbar.set_panel_open(p, false);
                                             } else if select {
@@ -310,18 +323,19 @@ impl<'a> ResultViewer<'a> {
                                 });
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let hide = egui::Button::new(egui::RichText::new(egui_phosphor::regular::CARET_DOUBLE_RIGHT).size(13.0)).frame(false);
-                                if ui.add(hide).on_hover_text(tr("Hide panels")).clicked() {
+                                if ternarygrid_ui::kit::icon_button_ex(ui, egui_phosphor::regular::CARET_RIGHT, tr("Hide panels"), false, 24.0).clicked() {
                                     state.toolbar.panels_hidden = true;
                                 }
                             });
                         });
                     });
+                    ui.painter().hline(strip.response.rect.x_range(), strip.response.rect.bottom() + 0.5, egui::Stroke::new(1.0, pal.border));
+                    ui.add_space(1.0);
+                    ui.spacing_mut().item_spacing.y = spacing;
                     if state.active_panel.is_none_or(|p| !state.toolbar.is_panel_open(p)) {
                         state.active_panel = state.toolbar.open_panels.last().copied();
                     }
-                    ui.separator();
-                    let content = Frame::new().inner_margin(egui::Margin { left: 6, right: 6, top: 2, bottom: 6 });
+                    let content = Frame::new().inner_margin(egui::Margin::same(14));
                     content.show(ui, |ui| {
                         ui.set_min_size(ui.available_size());
                         match state.active_panel {
@@ -343,6 +357,8 @@ impl<'a> ResultViewer<'a> {
                         }
                     });
                 });
+            // The line left of the panels.
+            ui.painter().vline(side.response.rect.left() + 0.5, side.response.rect.y_range(), egui::Stroke::new(1.0, pal.border));
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             if let Some(e) = model.fetch.error.clone().filter(|e| state.toolbar.dismissed_fetch_error.as_ref() != Some(e))

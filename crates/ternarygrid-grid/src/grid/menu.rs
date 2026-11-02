@@ -12,12 +12,50 @@ use egui_phosphor::regular as icon;
 use ternarygrid_core::dialect::GenericDialect;
 use ternarygrid_core::{Dialect, Value, tr, trf};
 
-fn item(ui: &mut Ui, icon: &str, text: &str, shortcut: Option<KeyboardShortcut>) -> Response {
-    let mut b = Button::new(format!("{icon}  {text}"));
+/// A menu entry's text: its icon in the muted colour (the same room left blank without
+/// one, so the texts line up), then the text (`color`: the item's own, e.g. red).
+pub(crate) fn entry(ui: &Ui, icon: Option<&str>, text: &str, color: Option<egui::Color32>) -> egui::text::LayoutJob {
+    let p = ternarygrid_ui::pal(ui);
+    let size = ternarygrid_ui::style::body_size(ui.ctx());
+    let mut job = egui::text::LayoutJob::default();
+    let icon_font = ternarygrid_ui::style::icon_font(size + 1.0);
+    let lead = match icon {
+        Some(i) => {
+            job.append(i, 0.0, egui::TextFormat::simple(icon_font, color.unwrap_or(p.text_muted)));
+            10.0
+        }
+        // The icon's room left blank (not a glyph: the item's name stays its text).
+        None => {
+            let square = egui_phosphor::regular::SQUARE.chars().next().unwrap_or(' ');
+            ui.fonts_mut(|f| f.glyph_width(&icon_font, square)) + 10.0
+        }
+    };
+    job.append(text, lead, egui::TextFormat::simple(egui::FontId::proportional(size), color.unwrap_or(egui::Color32::PLACEHOLDER)));
+    job
+}
+
+fn item(ui: &mut Ui, icon: Option<&str>, text: &str, shortcut: Option<KeyboardShortcut>) -> Response {
+    let mut b = Button::new(entry(ui, icon, text, None));
     if let Some(s) = shortcut {
         b = b.shortcut_text(ui.ctx().format_shortcut(&s));
     }
     ui.add(b)
+}
+
+/// A caption over a group of menu items ("Cell value", "Custom").
+fn caption(ui: &mut Ui, text: &str) {
+    let p = ternarygrid_ui::pal(ui);
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.label(RichText::new(text).font(ternarygrid_ui::style::semibold(ui.ctx(), 11.0)).color(p.text_faint));
+    });
+}
+
+/// A submenu entry (see [`entry`]).
+fn submenu(ui: &mut Ui, icon: Option<&str>, text: &str, add: &mut dyn FnMut(&mut Ui)) {
+    let title = entry(ui, icon, text, None);
+    ui.menu_button(title, |ui| add(ui));
 }
 
 fn short_value(v: &Value) -> String {
@@ -55,11 +93,11 @@ impl GridFrame<'_> {
             };
             self.column_items(ui, col);
             ui.separator();
-            if item(ui, icon::COPY, tr("Copy column name"), None).clicked() {
+            if item(ui, Some(icon::COPY), tr("Copy column name"), None).clicked() {
                 self.ctx.copy_text(self.model.column_name(col).to_string());
                 ui.close();
             }
-            if item(ui, icon::COPY, tr("Copy column values"), None).clicked() {
+            if item(ui, Some(icon::COPY), tr("Copy column values"), None).clicked() {
                 if let Some(pos) = self.pos_of(col) {
                     self.state.rt.selection.select_columns(pos, pos, false);
                     self.copy_selection(&CopyOptions::plain());
@@ -94,12 +132,16 @@ impl GridFrame<'_> {
     fn column_popup_items(&mut self, ui: &mut Ui, col: usize) {
         let name = self.model.column_name(col).to_string();
         let current = self.state.sort.iter().find(|k| k.column == col).copied();
-        let check = |on: bool| if on { icon::CHECK } else { "" };
-        // --- ordering
+        let accent = ternarygrid_ui::pal(ui).accent_text;
+        // --- ordering: the one in effect has a check mark
         for desc in [false, true] {
             let on = current.is_some_and(|k| k.descending == desc);
-            let (arrow, label) = if desc { (icon::ARROW_DOWN, trf("Order by {} DESC", &[&name])) } else { (icon::ARROW_UP, trf("Order by {} ASC", &[&name])) };
-            if ui.add(Button::new(format!("{arrow}  {label}")).right_text(check(on))).clicked() {
+            let label = if desc { format!("↓  {}", trf("Order by {} DESC", &[&name])) } else { format!("↑  {}", trf("Order by {} ASC", &[&name])) };
+            let mut text = entry(ui, on.then_some(icon::CHECK), &label, None);
+            if on && let Some(s) = text.sections.first_mut() {
+                s.format.color = accent;
+            }
+            if ui.add(Button::new(text)).clicked() {
                 let key = if desc { SortKey::desc(col) } else { SortKey::asc(col) };
                 // A column already in the ordering keeps its place.
                 let keys = if current.is_some() { self.state.sort.iter().map(|k| if k.column == col { key } else { *k }).collect() } else { vec![key] };
@@ -107,13 +149,13 @@ impl GridFrame<'_> {
                 ui.close();
             }
         }
-        if ui.add_enabled(current.is_some(), Button::new(format!("{}  {}", icon::ARROWS_DOWN_UP, trf("Disable order by {}", &[&name])))).clicked() {
+        if ui.add_enabled(current.is_some(), Button::new(entry(ui, None, &trf("Disable order by {}", &[&name]), None))).clicked() {
             let keys = self.state.sort.iter().copied().filter(|k| k.column != col).collect();
             apply_sort(self.model, self.state, self.options, keys, &self.ctx, &mut self.actions);
             ui.close();
         }
         if !self.state.sort.is_empty() && current.is_none() {
-            ui.menu_button(format!("{}  {}", icon::LIST_PLUS, tr("Add to the ordering")), |ui| {
+            submenu(ui, Some(icon::LIST_PLUS), tr("Add to the ordering"), &mut |ui| {
                 for (desc, label) in [(false, "ASC"), (true, "DESC")] {
                     if ui.button(format!("{name} {label}")).clicked() {
                         let mut keys = self.state.sort.clone();
@@ -133,12 +175,12 @@ impl GridFrame<'_> {
             && let Some(value) = self.menu_value(row, col)
         {
             ui.separator();
-            ui.label(RichText::new(tr("Cell value")).weak().small());
+            caption(ui, tr("Cell value"));
             let v = short_value(&value);
             let ops: &[FilterOp] = if value.is_null() { &[FilterOp::Eq, FilterOp::NotEq] } else { &[FilterOp::Eq, FilterOp::NotEq, FilterOp::Gt, FilterOp::Lt] };
             for &op in ops {
                 let label = if value.is_null() { format!("{name} {}", if op == FilterOp::Eq { "IS NULL" } else { "IS NOT NULL" }) } else { format!("{name} {} '{v}'", op.sql()) };
-                if ui.button(label).clicked() {
+                if ui.add(Button::new(entry(ui, None, &label, None))).clicked() {
                     apply_value_filter(self.model, self.state, self.options, (col, op, &value), &self.ctx, &mut self.actions);
                     ui.close();
                 }
@@ -146,16 +188,16 @@ impl GridFrame<'_> {
         }
         if filterable {
             ui.separator();
-            ui.label(RichText::new(tr("Custom")).weak().small());
+            caption(ui, tr("Custom"));
             let column = if server { super::server_column(self.model, self.options, col) } else { name.clone() };
             for op in [FilterOp::Eq, FilterOp::NotEq, FilterOp::Gt, FilterOp::Lt] {
-                if ui.button(format!("{name} {} …", op.sql())).on_hover_text(tr("Type the value in the filter box")).clicked() {
+                if ui.add(Button::new(entry(ui, None, &format!("{name} {} …", op.sql()), None))).on_hover_text(tr("Type the value in the filter box")).clicked() {
                     self.actions.push(GridAction::EditFilter(format!("{column} {} ", op.sql())));
                     ui.close();
                 }
             }
             for op in [FilterOp::IsNull, FilterOp::IsNotNull] {
-                if ui.button(format!("{name} {}", op.sql())).clicked() {
+                if ui.add(Button::new(entry(ui, None, &format!("{name} {}", op.sql()), None))).clicked() {
                     apply_value_filter(self.model, self.state, self.options, (col, op, &Value::Null), &self.ctx, &mut self.actions);
                     ui.close();
                 }
@@ -164,16 +206,16 @@ impl GridFrame<'_> {
         // --- default filter, reset
         ui.separator();
         if crate::model::source_table(self.model.columns()).is_ok() {
-            if item(ui, icon::PUSH_PIN, tr("Save as default filter"), None).on_hover_text(tr("Applied whenever this table's data is opened")).clicked() {
+            if item(ui, Some(icon::PUSH_PIN), tr("Save as default filter"), None).on_hover_text(tr("Applied whenever this table's data is opened")).clicked() {
                 self.actions.push(GridAction::SaveDefaultFilter);
                 ui.close();
             }
-            if item(ui, icon::PUSH_PIN_SLASH, tr("Reset default filter"), None).clicked() {
+            if item(ui, None, tr("Reset default filter"), None).clicked() {
                 self.actions.push(GridAction::DefaultFilter { where_clause: None, order_by: None });
                 ui.close();
             }
         }
-        if item(ui, icon::FUNNEL_X, tr("Remove all filters and orderings"), None).clicked() {
+        if item(ui, Some(icon::X), tr("Remove all filters and orderings"), None).clicked() {
             self.state.sort.clear();
             match self.state.mode {
                 super::DataMode::Client => self.model.clear_view(),
@@ -182,7 +224,7 @@ impl GridFrame<'_> {
             self.actions.push(GridAction::ClearFilterText);
             ui.close();
         }
-        if item(ui, icon::FUNNEL, tr("Edit filter…"), None).clicked() {
+        if item(ui, Some(icon::FUNNEL), tr("Edit filter…"), None).clicked() {
             self.actions.push(GridAction::EditFilter(String::new()));
             ui.close();
         }
@@ -193,15 +235,15 @@ impl GridFrame<'_> {
         let editable = self.model.is_editable() && self.options.allow_editing;
         let cmd = Modifiers::COMMAND;
         // --- clipboard (a detached menu has its own Copy)
-        if !self.detached && item(ui, icon::COPY, tr("Copy"), Some(KeyboardShortcut::new(cmd, Key::C))).clicked() {
+        if !self.detached && item(ui, Some(icon::COPY), tr("Copy"), Some(KeyboardShortcut::new(cmd, Key::C))).clicked() {
             self.copy_selection(&CopyOptions::plain());
             ui.close();
         }
-        if item(ui, icon::CLIPBOARD, tr("Advanced copy…"), Some(KeyboardShortcut::new(cmd | Modifiers::SHIFT, Key::C))).clicked() {
+        if item(ui, None, tr("Advanced copy…"), Some(KeyboardShortcut::new(cmd | Modifiers::SHIFT, Key::C))).clicked() {
             self.state.rt.copy_dialog = true;
             ui.close();
         }
-        ui.menu_button(format!("{}  {}", icon::COPY_SIMPLE, tr("Copy as")), |ui| {
+        submenu(ui, None, tr("Copy as"), &mut |ui| {
             for f in CopyFormat::ALL {
                 if ui.button(f.label()).clicked() {
                     let opts = CopyOptions { format: f, include_header: true, ..self.state.copy_options.clone() };
@@ -210,7 +252,7 @@ impl GridFrame<'_> {
                 }
             }
         });
-        if editable && item(ui, icon::CLIPBOARD, tr("Paste"), Some(KeyboardShortcut::new(cmd, Key::V))).clicked() {
+        if editable && item(ui, None, tr("Paste"), Some(KeyboardShortcut::new(cmd, Key::V))).clicked() {
             self.actions.push(GridAction::PasteRequested);
             ui.close();
         }
@@ -219,59 +261,47 @@ impl GridFrame<'_> {
         if let Some((row, col)) = active {
             let cell_ok = editable && self.model.can_edit_cell(row, col).is_ok();
             ui.add_enabled_ui(cell_ok, |ui| {
-                if item(ui, icon::PENCIL_SIMPLE, tr("Edit cell"), Some(KeyboardShortcut::new(Modifiers::NONE, Key::Enter))).clicked() {
+                if item(ui, Some(icon::PENCIL_SIMPLE), tr("Edit cell"), Some(KeyboardShortcut::new(Modifiers::NONE, Key::Enter))).clicked() {
                     self.start_edit(row, col, None);
                     ui.close();
                 }
-                if item(ui, icon::PROHIBIT, tr("Set NULL"), Some(KeyboardShortcut::new(Modifiers::SHIFT, Key::Delete))).clicked() {
+                if item(ui, None, tr("Set NULL"), Some(KeyboardShortcut::new(Modifiers::SHIFT, Key::Delete))).clicked() {
                     self.set_selected_null();
                     ui.close();
                 }
-                if item(ui, icon::ARROW_COUNTER_CLOCKWISE, tr("Set DEFAULT"), None).clicked() {
+                if item(ui, None, tr("Set DEFAULT"), None).clicked() {
                     self.set_selected_default();
                     ui.close();
                 }
             });
         }
         ui.add_enabled_ui(editable, |ui| {
-            if item(ui, icon::ROWS_PLUS_BOTTOM, tr("Add row"), Some(KeyboardShortcut::new(Modifiers::NONE, Key::Insert))).clicked() {
+            if item(ui, Some(icon::PLUS), tr("Add row"), Some(KeyboardShortcut::new(Modifiers::NONE, Key::Insert))).clicked() {
                 self.add_row_after_active();
                 ui.close();
             }
-            if item(ui, icon::ROWS_PLUS_TOP, tr("Add row before"), Some(KeyboardShortcut::new(Modifiers::SHIFT, Key::Insert))).clicked() {
-                self.add_row_before_active();
-                ui.close();
-            }
-            if item(ui, icon::COPY_SIMPLE, tr("Duplicate row(s)"), Some(KeyboardShortcut::new(cmd, Key::D))).clicked() {
+            if item(ui, Some(icon::COPY), tr("Duplicate row(s)"), Some(KeyboardShortcut::new(cmd, Key::D))).clicked() {
                 self.duplicate_selected();
                 ui.close();
             }
-            if active.is_some() {
-                if item(ui, icon::ARROW_FAT_LINE_DOWN, tr("Copy from row above"), Some(KeyboardShortcut::new(cmd | Modifiers::ALT, Key::ArrowUp))).clicked() {
-                    self.copy_from_adjacent(true);
-                    ui.close();
-                }
-                if item(ui, icon::ARROW_FAT_LINE_UP, tr("Copy from row below"), Some(KeyboardShortcut::new(cmd | Modifiers::ALT, Key::ArrowDown))).clicked() {
-                    self.copy_from_adjacent(false);
-                    ui.close();
-                }
-                if item(ui, icon::FINGERPRINT, tr("Generate UUID"), None).clicked() {
-                    self.generate_uuid();
-                    ui.close();
-                }
+            if active.is_some() && item(ui, None, tr("Generate UUID"), None).clicked() {
+                self.generate_uuid();
+                ui.close();
             }
-            if item(ui, icon::TRASH, tr("Delete row(s)"), Some(KeyboardShortcut::new(Modifiers::NONE, Key::Delete))).clicked() {
+            let delete = Button::new(entry(ui, Some(icon::TRASH), tr("Delete row(s)"), Some(ternarygrid_ui::pal(ui).err)))
+                .shortcut_text(ui.ctx().format_shortcut(&KeyboardShortcut::new(Modifiers::NONE, Key::Delete)));
+            if ui.add(delete).clicked() {
                 self.delete_selected();
                 ui.close();
             }
         });
-        if self.model.can_undo() && item(ui, icon::ARROW_U_UP_LEFT, tr("Undo"), Some(KeyboardShortcut::new(cmd, Key::Z))).clicked() {
+        if self.model.can_undo() && item(ui, Some(icon::ARROW_U_UP_LEFT), tr("Undo"), Some(KeyboardShortcut::new(cmd, Key::Z))).clicked() {
             self.model.undo();
             ui.close();
         }
         if !editable && let Some(reason) = self.model.read_only_reason().cloned() {
             ui.add_enabled(false, Button::new(format!("{}  {}", icon::LOCK_SIMPLE, reason.short_label()))).on_disabled_hover_text(reason.message());
-            if reason == ReadOnlyReason::NoKey && item(ui, icon::KEY, tr("Define virtual key…"), None).clicked() {
+            if reason == ReadOnlyReason::NoKey && item(ui, Some(icon::KEY), tr("Define virtual key…"), None).clicked() {
                 let table = crate::model::source_table(self.model.columns()).ok();
                 self.actions.push(GridAction::DefineVirtualKey { table });
                 ui.close();
@@ -286,7 +316,7 @@ impl GridFrame<'_> {
             let name = self.model.column_name(col).to_string();
             let virtual_server = self.model.is_virtual_column(col) && self.state.mode == super::DataMode::Server;
             ui.add_enabled_ui(!virtual_server && known.is_some(), |ui| {
-                ui.menu_button(format!("{}  {}", icon::FUNNEL, tr("Filter by value")), |ui| {
+                submenu(ui, Some(icon::FUNNEL), tr("Filter by value"), &mut |ui| {
                     let v = short_value(&value);
                     for op in FilterOp::ALL {
                         if value.is_null() && !op.is_unary() && op != FilterOp::Eq && op != FilterOp::NotEq {
@@ -308,7 +338,7 @@ impl GridFrame<'_> {
                 });
             });
             ui.add_enabled_ui(known.is_some(), |ui| {
-                ui.menu_button(format!("{}  {}", icon::PAINT_BUCKET, tr("Highlight rows with this value")), |ui| {
+                submenu(ui, None, tr("Highlight rows with this value"), &mut |ui| {
                     let text = (!value.is_null()).then(|| value.to_text().into_owned());
                     for (label, rgb) in super::state::HIGHLIGHT_COLORS {
                         let swatch = egui::RichText::new("■").color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
@@ -329,7 +359,7 @@ impl GridFrame<'_> {
                 });
             });
             let has_filter = self.model.requested_view_spec().filter.is_some();
-            if has_filter && item(ui, icon::FUNNEL_X, tr("Clear client filter"), None).clicked() {
+            if has_filter && item(ui, Some(icon::FUNNEL_X), tr("Clear client filter"), None).clicked() {
                 crate::grid::apply_client_filter(self.model, None, &self.ctx);
                 ui.close();
             }
@@ -338,16 +368,16 @@ impl GridFrame<'_> {
             // --- navigation / values
             if let Some(i) = self.model.foreign_key_for_column(col) {
                 let target = self.model.foreign_keys()[i].ref_table.display_path();
-                if item(ui, icon::ARROW_SQUARE_OUT, &trf("Navigate to {}", &[&target]), None).on_hover_text(tr("Cmd+click a link cell to navigate")).clicked() {
+                if item(ui, Some(icon::ARROW_SQUARE_OUT), &trf("Navigate to {}", &[&target]), None).on_hover_text(tr("Cmd+click a link cell to navigate")).clicked() {
                     self.navigate_fk(row, col);
                     ui.close();
                 }
             }
-            if item(ui, icon::EYE, tr("View value"), Some(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter))).clicked() {
+            if item(ui, Some(icon::EYE), tr("View value"), Some(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter))).clicked() {
                 self.actions.push(GridAction::OpenValuePanel { row, col });
                 ui.close();
             }
-            ui.menu_button(format!("{}  {}", icon::FILE_SQL, tr("Generate SQL")), |ui| {
+            submenu(ui, Some(icon::FILE_SQL), tr("Generate SQL"), &mut |ui| {
                 for (kind, label) in [(SqlKind::Select, "SELECT"), (SqlKind::Insert, "INSERT"), (SqlKind::Update, "UPDATE"), (SqlKind::Delete, "DELETE")] {
                     if ui.button(label).clicked() {
                         self.generate_sql(kind);
@@ -356,61 +386,24 @@ impl GridFrame<'_> {
                 }
             });
         }
-        ui.menu_button(format!("{}  {}", icon::FUNCTION, tr("Virtual columns")), |ui| {
-            if ui.button(tr("Add virtual column…")).clicked() {
-                self.state.rt.virtual_dialog = Some(VirtualColumnDialog::default());
-                ui.close();
-            }
-            if let Some((_, col)) = active
-                && self.model.is_virtual_column(col)
-            {
-                let idx = col - self.model.base_column_count();
-                if ui.button(tr("Edit virtual column…")).clicked() {
-                    let v = &self.model.virtual_columns()[idx];
-                    self.state.rt.virtual_dialog =
-                        Some(VirtualColumnDialog { name: v.name.clone(), expression: v.expression.source().to_string(), error: None, editing: Some(idx) });
-                    ui.close();
-                }
-                if ui.button(tr("Remove virtual column")).clicked() {
-                    self.model.remove_virtual_column(idx);
-                    // The columns after it move: widths, order and sort follow them.
-                    self.state.sync_columns(self.model);
-                    ui.close();
-                }
-            }
-        });
-        // Zoom and widths are the grid's own.
-        if !self.detached {
-            ui.menu_button(format!("{}  {}", icon::MAGNIFYING_GLASS_PLUS, tr("Zoom")), |ui| {
-                if ui.button(tr("Zoom in")).clicked() {
-                    self.state.zoom_by(Some(0.1));
-                }
-                if ui.button(tr("Zoom out")).clicked() {
-                    self.state.zoom_by(Some(-0.1));
-                }
-                if ui.button(tr("Reset zoom")).clicked() {
-                    self.state.zoom_by(None);
-                    ui.close();
-                }
-            });
-        }
         ui.separator();
-        if item(ui, icon::EXPORT, tr("Export selection…"), None).clicked() {
+        if item(ui, Some(icon::EXPORT), tr("Export selection…"), None).clicked() {
             let rows = self.state.rt.selection.rows(self.geo.nrows, usize::MAX);
             let columns = self.state.selected_columns();
             let all = self.state.rt.selection.is_all();
             self.actions.push(GridAction::Export { rows: (!all).then_some(rows), columns });
             ui.close();
         }
-        if item(ui, icon::ARROWS_CLOCKWISE, tr("Refresh"), Some(KeyboardShortcut::new(cmd, Key::R))).clicked() {
+        if item(ui, Some(icon::ARROWS_CLOCKWISE), tr("Refresh"), Some(KeyboardShortcut::new(cmd, Key::R))).clicked() {
             self.actions.push(GridAction::Refresh);
             ui.close();
         }
     }
 
-    /// Column related items (ordering, visibility, size, format).
+    /// Column related items: ordering, hiding, statistics, the columns (visibility, sizes,
+    /// layout, virtual columns, zoom) and the format.
     fn column_items(&mut self, ui: &mut Ui, col: usize) {
-        ui.menu_button(format!("{}  {}", icon::SORT_ASCENDING, tr("Order by")), |ui| {
+        submenu(ui, Some(icon::SORT_ASCENDING), tr("Order by"), &mut |ui| {
             let name = self.model.column_name(col).to_string();
             if ui.button(format!("{name} ASC")).clicked() {
                 apply_sort(self.model, self.state, self.options, vec![SortKey::asc(col)], &self.ctx, &mut self.actions);
@@ -434,22 +427,91 @@ impl GridFrame<'_> {
                 }
             }
         });
-        if item(ui, icon::EYE_SLASH, tr("Hide column"), None).clicked() {
+        if item(ui, Some(icon::EYE_SLASH), tr("Hide column"), None).clicked() {
             self.state.set_column_visible(col, false);
             ui.close();
         }
         // The header's tooltip summarises the fetched rows; this asks the server.
         if !self.model.is_virtual_column(col)
-            && item(ui, icon::CHART_BAR, tr("Statistics of the whole column"), None)
+            && item(ui, Some(icon::CHART_BAR), tr("Statistics of the whole column"), None)
                 .on_hover_text(tr("Rows, NULLs, distinct values, the smallest and the largest, over all rows of the query"))
                 .clicked()
         {
             self.actions.push(GridAction::ColumnStatistics { column: col });
             ui.close();
         }
-        ui.menu_button(format!("{}  {}", icon::COLUMNS, tr("Columns")), |ui| {
+        let active = self.active();
+        submenu(ui, Some(icon::COLUMNS), tr("Columns"), &mut |ui| {
             if ui.button(tr("Show all")).clicked() {
                 self.state.show_all_columns();
+            }
+            if !self.detached {
+                if item(ui, Some(icon::ARROWS_OUT_LINE_HORIZONTAL), tr("Auto-size column"), None).clicked() {
+                    let ctx = self.ctx.clone();
+                    let painter = egui::Painter::new(ctx, ui.layer_id(), ui.clip_rect());
+                    self.autosize_with(&painter, col);
+                    ui.close();
+                }
+                let cmd_alt = Modifiers::COMMAND | Modifiers::ALT;
+                if item(ui, Some(icon::ARROW_LEFT), tr("Move column left"), Some(KeyboardShortcut::new(cmd_alt, Key::ArrowLeft))).clicked() {
+                    self.move_active_column(-1);
+                    ui.close();
+                }
+                if item(ui, Some(icon::ARROW_RIGHT), tr("Move column right"), Some(KeyboardShortcut::new(cmd_alt, Key::ArrowRight))).clicked() {
+                    self.move_active_column(1);
+                    ui.close();
+                }
+                if item(ui, Some(icon::ARROWS_OUT_LINE_HORIZONTAL), tr("Fit columns to values"), None).clicked() {
+                    let ctx = self.ctx.clone();
+                    let painter = egui::Painter::new(ctx, ui.layer_id(), ui.clip_rect());
+                    self.fit_columns_to_values(&painter);
+                    ui.close();
+                }
+                if item(ui, Some(icon::ARROWS_HORIZONTAL), tr("Fit columns to screen"), None).clicked() {
+                    self.fit_columns_to_screen();
+                    ui.close();
+                }
+                if item(ui, Some(icon::EYE_SLASH), tr("Hide columns without data"), None).clicked() {
+                    self.hide_empty_columns();
+                    ui.close();
+                }
+            }
+            ui.separator();
+            // Virtual columns: computed on the client from the row's values.
+            if item(ui, Some(icon::FUNCTION), tr("Add virtual column…"), None).clicked() {
+                self.state.rt.virtual_dialog = Some(VirtualColumnDialog::default());
+                ui.close();
+            }
+            if let Some((_, c)) = active
+                && self.model.is_virtual_column(c)
+            {
+                let idx = c - self.model.base_column_count();
+                if ui.button(tr("Edit virtual column…")).clicked() {
+                    let v = &self.model.virtual_columns()[idx];
+                    self.state.rt.virtual_dialog =
+                        Some(VirtualColumnDialog { name: v.name.clone(), expression: v.expression.source().to_string(), error: None, editing: Some(idx) });
+                    ui.close();
+                }
+                if ui.button(tr("Remove virtual column")).clicked() {
+                    self.model.remove_virtual_column(idx);
+                    // The columns after it move: widths, order and sort follow them.
+                    self.state.sync_columns(self.model);
+                    ui.close();
+                }
+            }
+            // Zoom is the grid's own.
+            if !self.detached {
+                ui.separator();
+                if item(ui, Some(icon::MAGNIFYING_GLASS_PLUS), tr("Zoom in"), None).clicked() {
+                    self.state.zoom_by(Some(0.1));
+                }
+                if item(ui, Some(icon::MAGNIFYING_GLASS_MINUS), tr("Zoom out"), None).clicked() {
+                    self.state.zoom_by(Some(-0.1));
+                }
+                if item(ui, None, tr("Reset zoom"), None).clicked() {
+                    self.state.zoom_by(None);
+                    ui.close();
+                }
             }
             ui.separator();
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
@@ -462,47 +524,11 @@ impl GridFrame<'_> {
                 }
             });
         });
-        if !self.detached && item(ui, icon::ARROWS_OUT_LINE_HORIZONTAL, tr("Auto-size column"), None).clicked() {
-            let ctx = self.ctx.clone();
-            let painter = egui::Painter::new(ctx, ui.layer_id(), ui.clip_rect());
-            self.autosize_with(&painter, col);
-            ui.close();
-        }
-        if self.detached {
-            self.format_menu(ui, col);
-            return;
-        }
-        ui.menu_button(format!("{}  {}", icon::COLUMNS_PLUS_RIGHT, tr("Column layout")), |ui| {
-            let cmd_alt = Modifiers::COMMAND | Modifiers::ALT;
-            if item(ui, icon::ARROW_LEFT, tr("Move column left"), Some(KeyboardShortcut::new(cmd_alt, Key::ArrowLeft))).clicked() {
-                self.move_active_column(-1);
-                ui.close();
-            }
-            if item(ui, icon::ARROW_RIGHT, tr("Move column right"), Some(KeyboardShortcut::new(cmd_alt, Key::ArrowRight))).clicked() {
-                self.move_active_column(1);
-                ui.close();
-            }
-            ui.separator();
-            if item(ui, icon::ARROWS_OUT_LINE_HORIZONTAL, tr("Fit columns to values"), None).clicked() {
-                let ctx = self.ctx.clone();
-                let painter = egui::Painter::new(ctx, ui.layer_id(), ui.clip_rect());
-                self.fit_columns_to_values(&painter);
-                ui.close();
-            }
-            if item(ui, icon::ARROWS_HORIZONTAL, tr("Fit columns to screen"), None).clicked() {
-                self.fit_columns_to_screen();
-                ui.close();
-            }
-            if item(ui, icon::EYE_SLASH, tr("Hide columns without data"), None).clicked() {
-                self.hide_empty_columns();
-                ui.close();
-            }
-        });
         self.format_menu(ui, col);
     }
 
     fn format_menu(&mut self, ui: &mut Ui, col: usize) {
-        ui.menu_button(format!("{}  {}", icon::TEXT_AA, tr("Format")), |ui| {
+        submenu(ui, None, tr("Format"), &mut |ui| {
             let mut f = self.state.column_format(col).cloned().unwrap_or_default();
             let mut changed = false;
             if self.model.column_kind(col).is_numeric() || self.model.is_virtual_column(col) {

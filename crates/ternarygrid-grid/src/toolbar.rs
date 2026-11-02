@@ -171,11 +171,6 @@ fn status_parts(model: &ResultModel) -> (String, String) {
         s.push_str(" · ");
         s.push_str(&duration_text(e));
     }
-    // When the rows were read: are they still current?
-    if let Some(at) = model.fetch.fetched_at {
-        s.push_str(" · ");
-        s.push_str(&fetched_at_text(at, chrono::Local::now()));
-    }
     (rows, s)
 }
 
@@ -231,12 +226,9 @@ impl<'a> FilterBar<'a> {
         let mut actions = Vec::new();
         let mut apply = false;
         let mut clear = false;
+        let mut clear_sort = false;
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            // The two fields share what the buttons leave: Apply, clear and ⋯.
-            let gap = ui.spacing().item_spacing.x;
-            let apply_w = kit::button_width(ui, Some(icon::PLAY), tr("Apply"), false);
-            let flexible = (ui.available_width() - apply_w - 2.0 * 28.0 - 4.0 * gap).max(200.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
             // The keyword says where the filter runs: the database (WHERE) or the fetched rows.
             let (prefix, prefix_tip, hint) = match kind {
                 _ if !server => (
@@ -249,9 +241,15 @@ impl<'a> FilterBar<'a> {
                     ("WHERE", tr("WHERE condition sent to the database: the query runs again over all rows of the table. Switch in ⋯."), tr("e.g. status = 'open' and price > 100"))
                 }
             };
+            // The sort chip, Apply and ⋯ keep their widths; the WHERE field takes the rest.
+            let gap = ui.spacing().item_spacing.x;
+            let sort = sort_summary(model, grid, state);
+            let chip_w = sort_chip_width(ui, sort.as_ref());
+            let apply_w = kit::button_width(ui, Some(icon::PLAY), tr("Apply"), false);
+            let flexible = (ui.available_width() - chip_w - apply_w - 30.0 - 3.0 * gap).max(160.0);
             const WHERE_WORDS: [&str; 10] = ["AND", "OR", "NOT", "IS NULL", "IS NOT NULL", "LIKE", "ILIKE", "IN", "BETWEEN", "NULL"];
             let label = if server { tr("Filter rows in the database") } else { tr("Filter the fetched rows") };
-            let field = Field { salt: "filter_where", prefix, label, prefix_tip, hint, width: flexible * 0.62, keywords: &WHERE_WORDS, history: &state.filter_history };
+            let field = Field { salt: "filter_where", prefix, label, prefix_tip, hint, width: flexible, keywords: &WHERE_WORDS, history: &state.filter_history };
             let filter_resp = prefixed_field(ui, field, &mut state.filter_text, &columns, &quote, &mut state.rt.where_suggest, &mut apply);
             if filter_resp.changed() {
                 state.rt.filter_error = None;
@@ -269,31 +267,42 @@ impl<'a> FilterBar<'a> {
             if !server {
                 filter_resp.clone().on_hover_text(crate::expr::help_text());
             }
-            let field = Field {
-                salt: "filter_order",
-                prefix: "ORDER BY",
-                label: tr("Order rows by"),
-                prefix_tip: if server { tr("ORDER BY sent to the database") } else { tr("Sorts the fetched rows") },
-                hint: tr("e.g. created_at DESC, name"),
-                width: flexible * 0.38,
-                // The client sort knows no NULLS FIRST / LAST (NULLs sort first).
-                keywords: if server { &["ASC", "DESC", "NULLS FIRST", "NULLS LAST"] } else { &["ASC", "DESC"] },
-                history: &state.order_history,
-            };
-            let order_resp = prefixed_field(ui, field, &mut state.order_text, &columns, &quote, &mut state.rt.order_suggest, &mut apply);
-            if order_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                apply = true;
-            }
+            // ORDER BY as a chip ("Sort ↓ created_at ×"): a click edits the ORDER BY text, × drops it.
+            let (chip, remove) = sort_chip(ui, sort.as_ref(), chip_w);
+            clear_sort = remove;
+            let order_popup = ui.id().with("order_by_popup");
+            Popup::menu(&chip).id(order_popup).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.set_min_width(380.0);
+                ui.label(kit::section_title(ui, tr("Order rows by")));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let field = Field {
+                        salt: "filter_order",
+                        prefix: "ORDER BY",
+                        label: tr("Order rows by"),
+                        prefix_tip: if server { tr("ORDER BY sent to the database") } else { tr("Sorts the fetched rows") },
+                        hint: tr("e.g. created_at DESC, name"),
+                        width: 300.0,
+                        // The client sort knows no NULLS FIRST / LAST (NULLs sort first).
+                        keywords: if server { &["ASC", "DESC", "NULLS FIRST", "NULLS LAST"] } else { &["ASC", "DESC"] },
+                        history: &state.order_history,
+                    };
+                    let order_resp = prefixed_field(ui, field, &mut state.order_text, &columns, &quote, &mut state.rt.order_suggest, &mut apply);
+                    if order_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        apply = true;
+                    }
+                    if kit::button_ex(ui, kit::Kind::Primary, None, tr("Apply"), false).clicked() {
+                        apply = true;
+                    }
+                });
+                if apply {
+                    ui.close();
+                }
+            });
             if kit::button_ex(ui, kit::Kind::Primary, Some(icon::PLAY), tr("Apply"), false).on_hover_text(tr("Apply filter and order (Enter)")).clicked() {
                 apply = true;
             }
-            let filtered = !state.filter_text.trim().is_empty() || !state.order_text.trim().is_empty() || !grid.sort.is_empty() || model.has_client_view();
-            ui.add_enabled_ui(filtered, |ui| {
-                if kit::icon_button(ui, icon::X, tr("Clear filter and order")).clicked() {
-                    clear = true;
-                }
-            });
-            let menu = kit::icon_button(ui, icon::DOTS_THREE, tr("Filter options"));
+            let menu = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("Filter options"), false, 30.0);
             Popup::menu(&menu).id(ui.id().with("filter_options")).show(|ui| {
                 ui.set_min_width(280.0);
                 ui.label(kit::section_title(ui, tr("Filter and sort")));
@@ -311,6 +320,16 @@ impl<'a> FilterBar<'a> {
                 if ternarygrid_ui::kit::radio(ui, !server, tr("Client: over the fetched rows")).on_hover_text(client_hint).clicked() {
                     grid.mode = DataMode::Client;
                 }
+                ui.separator();
+                if ui.button(kit::with_icon(icon::ARROWS_DOWN_UP, tr("Edit ORDER BY…"))).clicked() {
+                    ui.close();
+                    Popup::open_id(ui.ctx(), order_popup);
+                }
+                let filtered = !state.filter_text.trim().is_empty() || !state.order_text.trim().is_empty() || !grid.sort.is_empty() || model.has_client_view();
+                if ui.add_enabled(filtered, Button::new(kit::with_icon(icon::X, tr("Clear filter and order")))).clicked() {
+                    clear = true;
+                    ui.close();
+                }
                 if crate::model::source_table(model.columns()).is_ok() {
                     ui.separator();
                     let some = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
@@ -326,6 +345,11 @@ impl<'a> FilterBar<'a> {
                 }
             });
         });
+        if clear_sort {
+            state.order_text.clear();
+            grid.sort.clear();
+            apply = true;
+        }
         if let Some(e) = &state.rt.filter_error {
             ui.label(RichText::new(e).color(p.err));
         }
@@ -345,7 +369,8 @@ impl<'a> FilterBar<'a> {
             match grid.mode {
                 DataMode::Server => {
                     actions.push(GridAction::ServerQueryChanged { where_clause: Some(state.filter_text.trim().to_string()), order_by: Some(state.order_text.trim().to_string()) });
-                    grid.sort.clear();
+                    // The header's arrows show the ORDER BY when it names columns (none for expressions).
+                    grid.sort = parse_order_by(&state.order_text, &model.column_names()).unwrap_or_default();
                 }
                 DataMode::Client => {
                     let names = model.column_names();
@@ -388,6 +413,117 @@ struct Field<'a> {
     history: &'a [String],
 }
 
+/// Height of the filter bar's fields, chip and buttons.
+const FIELD_H: f32 = 30.0;
+
+/// What the sort chip shows: the first ORDER BY column, its direction, how many follow.
+struct SortSummary {
+    name: String,
+    descending: bool,
+    more: usize,
+}
+
+/// The ordering in effect: the ORDER BY text, else the grid's own sort (header clicks).
+fn sort_summary(model: &ResultModel, grid: &DataGridState, state: &ToolbarState) -> Option<SortSummary> {
+    let text = state.order_text.trim();
+    if !text.is_empty() {
+        let parts: Vec<&str> = text.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+        let mut first = parts.first()?.to_string();
+        for suffix in [" nulls first", " nulls last"] {
+            if first.to_ascii_lowercase().ends_with(suffix) {
+                first.truncate(first.len() - suffix.len());
+            }
+        }
+        let lower = first.to_ascii_lowercase();
+        let (name, descending) = if lower.ends_with(" desc") {
+            (first[..first.len() - 5].trim(), true)
+        } else if lower.ends_with(" asc") {
+            (first[..first.len() - 4].trim(), false)
+        } else {
+            (first.trim(), false)
+        };
+        return Some(SortSummary { name: name.to_string(), descending, more: parts.len() - 1 });
+    }
+    let first = grid.sort.first()?;
+    Some(SortSummary { name: model.column_name(first.column).to_string(), descending: first.descending, more: grid.sort.len() - 1 })
+}
+
+/// The parts of the sort chip: "Sort", the arrow, the column (and "+n"), ×.
+struct ChipParts {
+    sort: std::sync::Arc<egui::Galley>,
+    name: Option<std::sync::Arc<egui::Galley>>,
+}
+
+fn chip_parts(ui: &Ui, sort: Option<&SortSummary>) -> ChipParts {
+    let sort_g = ui.painter().layout_no_wrap(tr("Sort").to_string(), egui::FontId::proportional(12.5), egui::Color32::PLACEHOLDER);
+    let name = sort.map(|s| {
+        let text = if s.more > 0 { format!("{} +{}", s.name, s.more) } else { s.name.clone() };
+        ui.painter().layout_no_wrap(text, egui::FontId::monospace(12.0), egui::Color32::PLACEHOLDER)
+    });
+    ChipParts { sort: sort_g, name }
+}
+
+/// Width of the sort chip: 10 | Sort 6 ↓ 6 column 6 × | 6, or 10 | ↕ 6 Sort | 10 without an ordering.
+fn sort_chip_width(ui: &Ui, sort: Option<&SortSummary>) -> f32 {
+    let parts = chip_parts(ui, sort);
+    match &parts.name {
+        Some(n) => (10.0 + parts.sort.size().x + 6.0 + 13.0 + 6.0 + n.size().x.min(220.0) + 6.0 + 20.0 + 6.0).ceil(),
+        None => (10.0 + 13.0 + 6.0 + parts.sort.size().x + 10.0).ceil(),
+    }
+}
+
+/// The ORDER BY as a chip: "Sort ↓ created_at ×". Returns the chip (a click opens the ORDER BY
+/// editor) and whether × was clicked (the ordering is removed).
+fn sort_chip(ui: &mut Ui, sort: Option<&SortSummary>, width: f32) -> (egui::Response, bool) {
+    let p = ternarygrid_ui::pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, FIELD_H), egui::Sense::click());
+    let label = match sort {
+        Some(s) => format!("{} {} {}", tr("Sort"), s.name, if s.descending { "DESC" } else { "ASC" }),
+        None => tr("Sort").to_string(),
+    };
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+    let resp = resp.on_hover_text(tr("Order rows by (ORDER BY)"));
+    let x_rect = egui::Rect::from_center_size(egui::pos2(rect.right() - 6.0 - 10.0, rect.center().y), egui::vec2(20.0, 20.0));
+    let remove = sort.is_some().then(|| {
+        let r = ui.interact(x_rect, resp.id.with("remove"), egui::Sense::click()).on_hover_text(tr("Remove sort"));
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("Remove sort")));
+        r
+    });
+    if !ui.is_rect_visible(rect) {
+        return (resp, remove.is_some_and(|r| r.clicked()));
+    }
+    let painter = ui.painter();
+    let hovered = resp.hovered() && !remove.as_ref().is_some_and(|r| r.hovered());
+    painter.rect(rect, ternarygrid_ui::style::RADIUS, if hovered { p.hover } else { p.surface }, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+    let parts = chip_parts(ui, sort);
+    let cy = rect.center().y;
+    let mut x = rect.left() + 10.0;
+    let icon_font = ternarygrid_ui::style::icon_font(13.0);
+    match (sort, parts.name) {
+        (Some(s), Some(name)) => {
+            painter.galley(egui::pos2(x, cy - parts.sort.size().y / 2.0), parts.sort.clone(), p.text_muted);
+            x += parts.sort.size().x + 6.0;
+            let arrow = if s.descending { icon::ARROW_DOWN } else { icon::ARROW_UP };
+            painter.text(egui::pos2(x + 6.5, cy), egui::Align2::CENTER_CENTER, arrow, icon_font, p.accent_text);
+            x += 13.0 + 6.0;
+            let clip = egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x_rect.left() - 4.0, rect.bottom()));
+            ui.painter().with_clip_rect(clip.intersect(ui.clip_rect())).galley(egui::pos2(x, cy - name.size().y / 2.0), name, p.text);
+            if let Some(r) = &remove {
+                if r.hovered() {
+                    painter.rect_filled(x_rect, ternarygrid_ui::style::RADIUS, p.hover);
+                }
+                painter.text(x_rect.center(), egui::Align2::CENTER_CENTER, icon::X, ternarygrid_ui::style::icon_font(12.0), if r.hovered() { p.text } else { p.text_muted });
+            }
+        }
+        _ => {
+            painter.text(egui::pos2(x + 6.5, cy), egui::Align2::CENTER_CENTER, icon::ARROWS_DOWN_UP, icon_font, p.text_muted);
+            x += 13.0 + 6.0;
+            painter.galley(egui::pos2(x, cy - parts.sort.size().y / 2.0), parts.sort, p.text_muted);
+        }
+    }
+    (resp, remove.is_some_and(|r| r.clicked()))
+}
+
 /// A monospace field with its keyword inside on the left, column suggestions and, once
 /// something was applied, a clock on the right that lists the history (a pick applies it).
 fn prefixed_field(
@@ -400,17 +536,21 @@ fn prefixed_field(
     apply: &mut bool,
 ) -> egui::Response {
     let p = ternarygrid_ui::pal(ui);
-    let font = egui::FontId::monospace(11.0);
+    let font = egui::FontId::monospace(11.5);
     let prefix_w = ui.painter().layout_no_wrap(f.prefix.to_string(), font.clone(), p.accent_text).size().x;
     let history = !f.history.is_empty();
-    let margin = egui::Margin { left: (prefix_w + 18.0).min(120.0) as i8, right: if history { 28 } else { 8 }, top: 6, bottom: 6 };
+    // 30 points high (the mockups' fields): the text's row in the middle.
+    let text_font = egui::FontId::monospace(12.5);
+    let row_h = ui.fonts_mut(|fonts| fonts.row_height(&text_font));
+    let pad_y = ((FIELD_H - row_h) / 2.0).round().max(2.0);
+    let margin = egui::Margin { left: (prefix_w + 18.0).min(120.0) as i8, right: if history { 28 } else { 8 }, top: pad_y as i8, bottom: pad_y as i8 };
     let id = ui.id().with(f.salt);
-    let hint = RichText::new(f.hint).color(p.text_faint);
+    let hint = RichText::new(f.hint).font(egui::FontId::monospace(12.5)).color(p.text_faint);
     let resp = crate::suggest::suggest_edit(
         ui,
         id,
         text,
-        |t| t.hint_text(hint).desired_width(f.width).font(egui::TextStyle::Monospace).margin(margin),
+        |t| t.hint_text(hint).desired_width(f.width).font(text_font).margin(margin).min_size(egui::vec2(0.0, FIELD_H)),
         columns,
         f.keywords,
         quote,
@@ -447,87 +587,64 @@ fn prefixed_field(
     resp
 }
 
-/// The footer of a result: refresh and auto refresh, the status with the fetch buttons
-/// next to the row count they change, pending changes (Save / Discard, only while there
-/// are some), row operations, the view switcher, Chart / Spatial, Export and the panels.
+/// The footer of a result: on the left the status ("400 rows · more available · 286 ms"),
+/// Fetch next and ⋯ (refresh, auto refresh, fetch all, the total count, row operations,
+/// Chart, Spatial view, the panels); in the middle the pending changes with Discard and
+/// Save (only while there are some); on the right the views, Export and the panel toggle.
 pub struct ResultToolbar<'a> {
     model: &'a mut ResultModel,
     grid: &'a mut DataGridState,
     state: &'a mut ToolbarState,
+    fetch_size: usize,
 }
 
 impl<'a> ResultToolbar<'a> {
     /// New toolbar.
     pub fn new(model: &'a mut ResultModel, grid: &'a mut DataGridState, state: &'a mut ToolbarState) -> Self {
-        ResultToolbar { model, grid, state }
+        ResultToolbar { model, grid, state, fetch_size: 0 }
+    }
+
+    /// The rows one "Fetch next" reads (its label says how many; 0: "Fetch more").
+    pub fn fetch_size(mut self, rows: usize) -> Self {
+        self.fetch_size = rows;
+        self
     }
 
     /// Show it. Returns actions for the application.
     pub fn show(self, ui: &mut Ui) -> Vec<GridAction> {
-        let ResultToolbar { model, grid, state } = self;
+        let ResultToolbar { model, grid, state, fetch_size } = self;
         let mut actions = Vec::new();
         auto_refresh_tick(ui, model, grid.is_editing(), state, &mut actions);
         let p = ternarygrid_ui::pal(ui);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            // --- refresh, auto refresh
-            if kit::icon_button_ex(ui, icon::ARROWS_CLOCKWISE, tr("Refresh (Cmd+R)"), false, 26.0).clicked() {
-                actions.push(GridAction::Refresh);
-            }
-            let resp = match state.auto_refresh_secs {
-                None => kit::icon_button_ex(ui, icon::TIMER, tr("Auto refresh"), false, 26.0),
-                Some(s) => kit::button_full(ui, kit::Kind::Ghost, Some(icon::TIMER), &auto_label(s), true, true).on_hover_text(tr("Auto refresh")),
-            };
-            Popup::menu(&resp).show(|ui| {
-                for choice in AUTO_REFRESH_CHOICES {
-                    let text = match choice {
-                        None => tr("Off").to_string(),
-                        Some(s) => auto_label(s),
-                    };
-                    if ui.selectable_label(state.auto_refresh_secs == choice, text).clicked() {
-                        set_auto_refresh(ui, state, choice, &mut actions);
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(tr("Custom (s)"));
-                    if state.custom_refresh_secs == 0 {
-                        state.custom_refresh_secs = 15;
-                    }
-                    ui.add(egui::DragValue::new(&mut state.custom_refresh_secs).range(1..=86_400));
-                    if ui.button(tr("Set")).clicked() {
-                        let s = state.custom_refresh_secs.max(1);
-                        set_auto_refresh(ui, state, Some(s), &mut actions);
-                        ui.close();
-                    }
-                });
-            });
-            kit::vdivider(ui, 16.0);
-            // --- status: the row count stands out; the fetch buttons follow it
+        let row = ui.horizontal(|ui| {
+            ui.set_min_height(FOOTER_H);
+            ui.spacing_mut().item_spacing.x = 10.0;
+            // --- status: the row count stands out; Fetch next follows it
             let (rows, mut rest) = status_parts(model);
             if state.auto_refresh_secs.is_some() && (model.has_changes() || model.fetch.fetching) {
                 rest.push_str(" · ");
                 rest.push_str(tr("auto refresh paused"));
             }
-            ui.scope(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.add(egui::Label::new(RichText::new(rows).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))).color(p.text)));
-                ui.add(egui::Label::new(RichText::new(rest).color(p.text_muted)));
-            });
+            let mut job = egui::text::LayoutJob::default();
+            let size = 12.5;
+            job.append(&rows, 0.0, egui::TextFormat::simple(ternarygrid_ui::style::medium(ui.ctx(), size), p.text));
+            job.append(&rest, 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), p.text_muted));
+            let status = ui.add(egui::Label::new(job).selectable(false));
+            if let Some(at) = model.fetch.fetched_at {
+                status.on_hover_text(trf("Read at {}", &[&fetched_at_text(at, chrono::Local::now())]));
+            }
             let fetching = model.fetch.fetching;
             if model.fetch.has_more {
-                ui.add_enabled_ui(!fetching, |ui| {
-                    if kit::button_full(ui, kit::Kind::Ghost, Some(icon::CARET_DOUBLE_DOWN), tr("Fetch more"), true, false).on_hover_text(tr("Fetch next page")).clicked() {
-                        actions.push(GridAction::FetchMore);
-                    }
-                    if kit::icon_button_ex(ui, icon::ARROW_LINE_DOWN, tr("Fetch all rows"), false, 26.0).clicked() {
-                        actions.push(GridAction::FetchAll);
-                    }
-                });
+                let label = if fetch_size > 0 { trf("Fetch next {}", &[&fetch_size]) } else { tr("Fetch more").to_string() };
+                let r = ui.add_enabled_ui(!fetching, |ui| flat_button(ui, None, &label, Flat::Link)).inner.on_hover_text(tr("Fetch next page"));
+                if r.clicked() {
+                    actions.push(GridAction::FetchMore);
+                }
             }
-            if !model.fetch.counting && kit::icon_button_ex(ui, icon::HASH, tr("Calculate total row count"), false, 26.0).clicked() {
-                actions.push(GridAction::CountTotal);
+            // Auto refresh on: its interval, a click changes it.
+            if let Some(s) = state.auto_refresh_secs {
+                let r = flat_button(ui, Some(icon::TIMER), &auto_label(s), Flat::Accent).on_hover_text(tr("Auto refresh"));
+                Popup::menu(&r).id(ui.id().with("auto_refresh_chip")).show(|ui| auto_refresh_menu(ui, state, &mut actions));
             }
             // A long fetch (fetch all, a slow query) stops here, next to "fetching…".
             if let Some(running) = model.fetch.fetching_for() {
@@ -540,116 +657,368 @@ impl<'a> ResultToolbar<'a> {
                     ui.ctx().request_repaint_after(crate::grid::CANCEL_AFTER - running);
                 }
             }
-            // --- right, right to left: panels, export, views, rows, pending changes, messages
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let visible = !state.open_panels.is_empty() && !state.panels_hidden;
-                let panels = kit::icon_button_ex(ui, icon::CARET_DOWN, tr("Choose panels"), false, 20.0);
-                Popup::menu(&panels).id(ui.id().with("panels_menu")).show(|ui| {
-                    for (kind, ic, name) in PANELS {
-                        let open = state.is_panel_open(kind);
-                        if ui.add(Button::selectable(open, kit::with_icon(ic, tr(name)))).clicked() {
-                            actions.push(GridAction::TogglePanel(kind));
-                            ui.close();
+            // ⋯: what the footer does besides fetching the next rows.
+            let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More result actions"), false, 26.0);
+            Popup::menu(&more).id(ui.id().with("result_more")).show(|ui| {
+                ui.set_min_width(240.0);
+                more_menu(ui, model, grid, state, &mut actions);
+            });
+            // A failed fetch popped up once; a click shows it again.
+            if let Some(e) = &model.fetch.error {
+                let label = egui::Label::new(RichText::new(format!("{} {}", icon::WARNING_CIRCLE, e)).size(12.5).color(p.err)).truncate().sense(egui::Sense::click());
+                if ui.add(label).on_hover_text(tr("Show the error")).clicked() {
+                    state.error_popup = Some(e.clone());
+                }
+            }
+            let left_end = ui.min_rect().right();
+            // --- right, right to left: the panel toggle, Export, the views
+            let right_start = ui
+                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let visible = !state.open_panels.is_empty() && !state.panels_hidden;
+                    if panel_toggle(ui, visible).clicked() {
+                        if visible {
+                            state.panels_hidden = true;
+                        } else {
+                            if state.open_panels.is_empty() {
+                                state.set_panel_open(PanelKind::Value, true);
+                            }
+                            state.panels_hidden = false;
                         }
                     }
-                });
-                if kit::icon_toggle(ui, icon::SIDEBAR_SIMPLE, if visible { tr("Hide panels") } else { tr("Show panels") }, visible).clicked() {
-                    if visible {
-                        state.panels_hidden = true;
-                    } else {
-                        if state.open_panels.is_empty() {
-                            state.set_panel_open(PanelKind::Value, true);
-                        }
-                        state.panels_hidden = false;
+                    if flat_button(ui, Some(icon::EXPORT), tr("Export"), Flat::Plain).on_hover_text(tr("Export…")).clicked() {
+                        actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
                     }
-                }
-                if kit::ghost(ui, Some(icon::EXPORT), tr("Export")).on_hover_text(tr("Export…")).clicked() {
-                    actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
-                }
-                kit::vdivider(ui, 16.0);
-                if kit::icon_button_ex(ui, icon::MAP_TRIFOLD, tr("Spatial view"), false, 26.0).clicked() {
-                    actions.push(GridAction::ShowSpatial);
-                }
-                if kit::icon_button_ex(ui, icon::CHART_BAR, tr("Chart"), false, 26.0).clicked() {
-                    actions.push(GridAction::ShowChart);
-                }
-                // --- views: one segmented control (laid out right to left: added reversed)
-                let views = [
-                    (ResultViewKind::Grid, icon::TABLE, tr("Grid")),
-                    (ResultViewKind::Text, icon::TEXT_AA, tr("Text")),
-                    (ResultViewKind::Record, icon::ROWS, tr("Record")),
-                    (ResultViewKind::Json, icon::BRACKETS_CURLY, tr("JSON")),
-                    (ResultViewKind::Xml, icon::BRACKETS_ANGLE, tr("XML")),
-                ];
-                let segments: Vec<kit::Segment> = views.iter().map(|(k, ic, tip)| kit::Segment { icon: ic, tooltip: tip, on: state.view == *k }).collect();
-                let clicked = ui.scope(|ui| kit::button_group(ui, &segments).iter().position(|r| r.clicked())).inner;
-                if let Some(i) = clicked {
-                    let kind = views[i].0;
-                    if state.view != kind {
+                    if let Some(kind) = view_switch(ui, state.view)
+                        && state.view != kind
+                    {
                         state.view = kind;
                         actions.push(GridAction::SwitchView(kind));
                     }
-                }
-                kit::vdivider(ui, 16.0);
-                // --- rows (right to left: delete, duplicate, add)
-                let notify = |r: Result<usize, String>, actions: &mut Vec<GridAction>| {
-                    if let Err(e) = r {
-                        actions.push(GridAction::Notify { message: e, error: true });
+                    if !model.is_editable()
+                        && let Some(r) = model.read_only_reason()
+                    {
+                        ui.label(RichText::new(format!("{} {}", icon::LOCK_SIMPLE, r.short_label())).size(12.0).color(p.warn)).on_hover_text(r.message());
                     }
-                };
-                if model.is_editable() {
-                    if kit::icon_button_ex(ui, icon::TRASH, tr("Delete selected rows"), false, 26.0).clicked() {
-                        notify(grid::delete_selected(model, grid), &mut actions);
+                    // Errors open a pop-up (the result viewer); other messages show here.
+                    if let Some((message, _)) = state.notice.clone().filter(|(_, error)| !error) {
+                        if kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 20.0).clicked() {
+                            state.notice = None;
+                        }
+                        ui.add(egui::Label::new(RichText::new(format!("{} {message}", icon::INFO)).size(12.5).color(p.text)).truncate()).on_hover_text(message);
                     }
-                    if kit::icon_button_ex(ui, icon::COPY_SIMPLE, tr("Duplicate selected rows"), false, 26.0).clicked() {
-                        notify(grid::duplicate_selected(model, grid), &mut actions);
-                    }
-                    if kit::icon_button_ex(ui, icon::ROWS_PLUS_BOTTOM, tr("Add row"), false, 26.0).clicked() {
-                        notify(grid::add_row(model, grid), &mut actions);
-                    }
-                } else if let Some(r) = model.read_only_reason() {
-                    ui.label(RichText::new(format!("{} {}", icon::LOCK_SIMPLE, r.short_label())).color(p.warn)).on_hover_text(r.message());
-                }
-                // --- pending changes: only while there are some (Cmd+S saves, as always)
-                let pending = model.pending_counts().total();
-                if pending > 0 {
-                    ui.add_space(4.0);
-                    let bg = ui.painter().add(egui::Shape::Noop);
-                    let save = kit::button_full(ui, kit::Kind::Primary, Some(icon::FLOPPY_DISK), tr("Save"), true, false)
-                        .on_hover_text(trf("Save {} pending change(s) (Cmd+S)", &[&pending]));
-                    if save.clicked() {
-                        actions.push(grid::save_action(model));
-                    }
-                    // Discard drops them at once: they are only pending.
-                    let discard = kit::button_full(ui, kit::Kind::Ghost, None, tr("Discard"), true, false).on_hover_text(tr("Discard pending changes"));
-                    if discard.clicked() {
-                        model.discard_changes();
-                        actions.push(GridAction::ChangesDiscarded);
-                    }
-                    let count = if pending == 1 { tr("1 change").to_string() } else { trf("{} changes", &[&pending]) };
-                    let label = ui.label(RichText::new(count).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))).color(p.text));
-                    let dot = kit::dot(ui, p.warn, 3.5);
-                    let rect = save.rect.union(discard.rect).union(label.rect).union(dot.rect).expand2(egui::vec2(6.0, 2.0));
-                    ui.painter().set(bg, egui::Shape::rect_filled(rect, 8, ternarygrid_ui::soft(p.warn, if ui.visuals().dark_mode { 0.16 } else { 0.12 })));
-                    ui.add_space(8.0);
-                }
-                // A failed fetch popped up once; a click shows it again.
-                if let Some(e) = &model.fetch.error {
-                    let label = egui::Label::new(RichText::new(format!("{} {}", icon::WARNING_CIRCLE, e)).color(p.err)).truncate().sense(egui::Sense::click());
-                    if ui.add(label).on_hover_text(tr("Show the error")).clicked() {
-                        state.error_popup = Some(e.clone());
-                    }
-                }
-                // Errors open a pop-up (the result viewer); other messages show here.
-                if let Some((message, _)) = state.notice.clone().filter(|(_, error)| !error) {
-                    if kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 20.0).clicked() {
-                        state.notice = None;
-                    }
-                    ui.add(egui::Label::new(RichText::new(format!("{} {message}", icon::INFO)).color(p.text)).truncate()).on_hover_text(message);
-                }
-            });
+                    ui.min_rect().left()
+                })
+                .inner;
+            (left_end, right_start)
         });
+        // --- pending changes, between the two sides: only while there are some (Cmd+S saves, as always)
+        let pending = model.pending_counts().total();
+        if pending > 0 {
+            let (left_end, right_start) = row.inner;
+            let count = if pending == 1 { tr("1 change").to_string() } else { trf("{} changes", &[&pending]) };
+            let width = pending_width(ui, &count);
+            let x = (left_end + (right_start - left_end - width) / 2.0).max(left_end + 8.0);
+            let rect = egui::Rect::from_center_size(egui::pos2(x + width / 2.0, row.response.rect.center().y), egui::vec2(width, 32.0));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            match pending_pill(&mut child, &count, pending) {
+                Some(true) => actions.push(grid::save_action(model)),
+                Some(false) => {
+                    // Discard drops them at once: they are only pending.
+                    model.discard_changes();
+                    actions.push(GridAction::ChangesDiscarded);
+                }
+                None => {}
+            }
+        }
         actions
+    }
+}
+
+/// Height of the footer's row.
+const FOOTER_H: f32 = 30.0;
+
+/// The look of a [`flat_button`].
+#[derive(Clone, Copy, PartialEq)]
+enum Flat {
+    /// Text colour, regular weight (Export, Discard).
+    Plain,
+    /// Accent text, medium weight (Fetch next).
+    Link,
+    /// Accent text on the soft accent (an active setting).
+    Accent,
+}
+
+/// A frameless button of the footer: 26 points high, 8 (10 with an icon) at the sides, 12.5 point text.
+fn flat_button(ui: &mut Ui, icon: Option<&str>, text: &str, look: Flat) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let font = if look == Flat::Plain { egui::FontId::proportional(12.5) } else { ternarygrid_ui::style::medium(ui.ctx(), 12.5) };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::PLACEHOLDER);
+    let (h, pad, gap) = if icon.is_some() { (28.0, 10.0, 6.0) } else { (26.0, 8.0, 0.0) };
+    let icon_w = if icon.is_some() { 14.0 + gap } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + icon_w + 2.0 * pad, h), egui::Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let fill = match look {
+            Flat::Accent => p.accent_soft,
+            _ if enabled && resp.hovered() => p.hover,
+            _ => egui::Color32::TRANSPARENT,
+        };
+        painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, fill);
+        let color = match look {
+            Flat::Plain => p.text,
+            Flat::Link | Flat::Accent => p.accent_text,
+        };
+        let fade = |c: egui::Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+        let mut x = rect.left() + pad;
+        if let Some(i) = icon {
+            let icon_color = if look == Flat::Plain { p.text_muted } else { color };
+            painter.text(egui::pos2(x + 7.0, rect.center().y), egui::Align2::CENTER_CENTER, i, ternarygrid_ui::style::icon_font(14.0), fade(icon_color));
+            x += icon_w;
+        }
+        painter.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, fade(color));
+    }
+    resp
+}
+
+/// The panels' toggle: a window with a pane at the right, 28 square.
+fn panel_toggle(ui: &mut Ui, on: bool) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let tip = if on { tr("Hide panels") } else { tr("Show panels") };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, tip));
+    let resp = resp.on_hover_text(tr("Value, metadata and statistics panels"));
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, p.accent_soft);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, p.hover);
+    }
+    let color = if on {
+        p.accent_text
+    } else if resp.hovered() {
+        p.text
+    } else {
+        p.text_muted
+    };
+    // The mockup's 24-unit icon at 15 points: a 17 × 15 window, the pane from 14.5.
+    let s = 15.0 / 24.0;
+    let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(17.0 * s, 15.0 * s));
+    let stroke = egui::Stroke::new(1.15, color);
+    painter.rect_stroke(icon, 1.8 * s, stroke, egui::StrokeKind::Middle);
+    let x = icon.left() + 11.0 * s;
+    painter.vline(x, icon.y_range(), stroke);
+    resp
+}
+
+/// The views of the rows: one pill, the shown one raised.
+const VIEWS: [(ResultViewKind, &str, &str); 5] = [
+    (ResultViewKind::Grid, icon::TABLE, "Grid"),
+    (ResultViewKind::Text, icon::TEXT_AA, "Text"),
+    (ResultViewKind::Record, icon::LIST_DASHES, "Record"),
+    (ResultViewKind::Json, icon::BRACKETS_CURLY, "JSON"),
+    (ResultViewKind::Xml, icon::BRACKETS_ANGLE, "XML"),
+];
+
+/// The view switcher (laid out right to left: the pill is allocated at once). Returns the view clicked.
+fn view_switch(ui: &mut Ui, current: ResultViewKind) -> Option<ResultViewKind> {
+    let p = ternarygrid_ui::pal(ui);
+    let (bw, bh, pad, gap) = (30.0, 24.0, 2.0, 2.0);
+    let n = VIEWS.len() as f32;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(n * bw + (n - 1.0) * gap + 2.0 * pad, bh + 2.0 * pad), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 7, p.subtle);
+    let mut clicked = None;
+    for (i, (kind, ic, name)) in VIEWS.iter().enumerate() {
+        let r = egui::Rect::from_min_size(egui::pos2(rect.left() + pad + i as f32 * (bw + gap), rect.top() + pad), egui::vec2(bw, bh));
+        let resp = ui.interact(r, ui.id().with(("view", i)), egui::Sense::click());
+        let tip = trf("{} view", &[&tr(name)]);
+        let on = current == *kind;
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, tr(name)));
+        let resp = resp.on_hover_text(tip);
+        if on {
+            ui.painter().rect(r, 5, p.surface, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(r, 5, p.hover);
+        }
+        let color = if on || resp.hovered() { p.text } else { p.text_muted };
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, *ic, ternarygrid_ui::style::icon_font(15.0), color);
+        if resp.clicked() {
+            clicked = Some(*kind);
+        }
+    }
+    clicked
+}
+
+/// Width of the pending changes pill: 12 | ● 8 n changes 8 Discard 8 Save ⌘S | 4.
+fn pending_width(ui: &Ui, count: &str) -> f32 {
+    let w = |t: &str, f: egui::FontId| ui.painter().layout_no_wrap(t.to_string(), f, egui::Color32::PLACEHOLDER).size().x;
+    let medium = ternarygrid_ui::style::medium(ui.ctx(), 12.5);
+    let label = w(count, medium.clone());
+    let discard = w(tr("Discard"), egui::FontId::proportional(12.5)) + 20.0;
+    let save = w(tr("Save"), medium) + 8.0 + w(SAVE_KEYS, egui::FontId::proportional(11.0)) + 20.0;
+    (12.0 + 7.0 + 8.0 + label + 8.0 + discard + 8.0 + save + 4.0).ceil()
+}
+
+/// The keys of Save, shown in its button.
+const SAVE_KEYS: &str = if cfg!(target_os = "macos") { "⌘S" } else { "Ctrl+S" };
+
+/// "● 2 changes  Discard  Save ⌘S" on the changed cells' tint. `Some(true)`: Save, `Some(false)`: Discard.
+fn pending_pill(ui: &mut Ui, count: &str, pending: usize) -> Option<bool> {
+    let p = ternarygrid_ui::pal(ui);
+    let rect = ui.max_rect();
+    let modified = crate::theme::GridTheme::from_visuals(ui.visuals()).modified;
+    ui.painter().rect_filled(rect, 8, modified);
+    ui.spacing_mut().item_spacing.x = 8.0;
+    ui.add_space(12.0);
+    kit::dot(ui, p.warn, 3.5);
+    ui.label(RichText::new(count).font(ternarygrid_ui::style::medium(ui.ctx(), 12.5)).color(p.text));
+    let mut out = None;
+    if key_button(ui, None, tr("Discard"), None, false, 26.0).on_hover_text(tr("Discard pending changes")).clicked() {
+        out = Some(false);
+    }
+    if key_button(ui, None, tr("Save"), Some(SAVE_KEYS), true, 26.0).on_hover_text(trf("Save {} pending change(s) (Cmd+S)", &[&pending])).clicked() {
+        out = Some(true);
+    }
+    out
+}
+
+/// A button with its keys after the text (Save ⌘S, Copy ⌘↩): primary (accent) or quiet,
+/// `height` high, 10 (12 when 28 or more) at the sides, an optional icon before the text.
+pub(crate) fn key_button(ui: &mut Ui, icon: Option<&str>, text: &str, keys: Option<&str>, primary: bool, height: f32) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let size = if height >= 28.0 { 13.0 } else { 12.5 };
+    let font = if primary { ternarygrid_ui::style::medium(ui.ctx(), size) } else { egui::FontId::proportional(size) };
+    let g = ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::PLACEHOLDER);
+    let k = keys.map(|k| ui.painter().layout_no_wrap(k.to_string(), egui::FontId::proportional(11.0), egui::Color32::PLACEHOLDER));
+    let pad = if height >= 28.0 { 12.0 } else { 10.0 };
+    let icon_w = if icon.is_some() { 14.0 + 6.0 } else { 0.0 };
+    let width = 2.0 * pad + icon_w + g.size().x + k.as_ref().map_or(0.0, |k| 8.0 + k.size().x);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
+    let painter = ui.painter();
+    let hovered = resp.hovered();
+    let (fill, color) = if primary { (if hovered { p.accent_hover } else { p.accent }, p.on_accent) } else { (if hovered { p.hover } else { egui::Color32::TRANSPARENT }, p.text) };
+    painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, fill);
+    let mut x = rect.left() + pad;
+    if let Some(i) = icon {
+        painter.text(egui::pos2(x + 7.0, rect.center().y), egui::Align2::CENTER_CENTER, i, ternarygrid_ui::style::icon_font(14.0), color);
+        x += icon_w;
+    }
+    let gw = g.size().x;
+    painter.galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, color);
+    if let Some(k) = k {
+        painter.galley(egui::pos2(x + gw + 8.0, rect.center().y - k.size().y / 2.0), k, color.gamma_multiply(0.8));
+    }
+    resp
+}
+
+/// The auto refresh choices (the ⋯ menu's submenu and the interval chip).
+fn auto_refresh_menu(ui: &mut Ui, state: &mut ToolbarState, actions: &mut Vec<GridAction>) {
+    for choice in AUTO_REFRESH_CHOICES {
+        let text = match choice {
+            None => tr("Off").to_string(),
+            Some(s) => auto_label(s),
+        };
+        if ui.selectable_label(state.auto_refresh_secs == choice, text).clicked() {
+            set_auto_refresh(ui, state, choice, actions);
+            ui.close();
+        }
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(tr("Custom (s)"));
+        if state.custom_refresh_secs == 0 {
+            state.custom_refresh_secs = 15;
+        }
+        ui.add(egui::DragValue::new(&mut state.custom_refresh_secs).range(1..=86_400));
+        if ui.button(tr("Set")).clicked() {
+            let s = state.custom_refresh_secs.max(1);
+            set_auto_refresh(ui, state, Some(s), actions);
+            ui.close();
+        }
+    });
+}
+
+/// The footer's ⋯ menu: refresh, auto refresh, fetching, rows, Chart / Spatial view, panels.
+fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, state: &mut ToolbarState, actions: &mut Vec<GridAction>) {
+    let cmd = egui::Modifiers::COMMAND;
+    let item = |ui: &mut Ui, ic: &str, text: &str, keys: Option<egui::KeyboardShortcut>| {
+        let mut b = Button::new(kit::with_icon(ic, text));
+        if let Some(k) = keys {
+            b = b.shortcut_text(ui.ctx().format_shortcut(&k));
+        }
+        ui.add(b)
+    };
+    if item(ui, icon::ARROWS_CLOCKWISE, tr("Refresh"), Some(egui::KeyboardShortcut::new(cmd, Key::R))).clicked() {
+        actions.push(GridAction::Refresh);
+        ui.close();
+    }
+    ui.menu_button(kit::with_icon(icon::TIMER, tr("Auto refresh")), |ui| auto_refresh_menu(ui, state, actions));
+    let fetching = model.fetch.fetching;
+    if model.fetch.has_more && ui.add_enabled(!fetching, Button::new(kit::with_icon(icon::ARROW_LINE_DOWN, tr("Fetch all rows")))).clicked() {
+        actions.push(GridAction::FetchAll);
+        ui.close();
+    }
+    if ui.add_enabled(!model.fetch.counting, Button::new(kit::with_icon(icon::HASH, tr("Calculate total row count")))).clicked() {
+        actions.push(GridAction::CountTotal);
+        ui.close();
+    }
+    if model.is_editable() {
+        ui.separator();
+        let notify = |r: Result<usize, String>, actions: &mut Vec<GridAction>| {
+            if let Err(e) = r {
+                actions.push(GridAction::Notify { message: e, error: true });
+            }
+        };
+        if item(ui, icon::ROWS_PLUS_BOTTOM, tr("Add row"), Some(egui::KeyboardShortcut::new(egui::Modifiers::NONE, Key::Insert))).clicked() {
+            notify(grid::add_row(model, grid), actions);
+            ui.close();
+        }
+        if item(ui, icon::ROWS_PLUS_TOP, tr("Add row before"), Some(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Insert))).clicked() {
+            grid.request(crate::grid::GridCommand::AddRowBefore);
+            ui.close();
+        }
+        if item(ui, icon::COPY_SIMPLE, tr("Duplicate selected rows"), Some(egui::KeyboardShortcut::new(cmd, Key::D))).clicked() {
+            notify(grid::duplicate_selected(model, grid), actions);
+            ui.close();
+        }
+        let cmd_alt = cmd | egui::Modifiers::ALT;
+        if item(ui, icon::ARROW_FAT_LINE_DOWN, tr("Copy from row above"), Some(egui::KeyboardShortcut::new(cmd_alt, Key::ArrowUp))).clicked() {
+            grid.request(crate::grid::GridCommand::CopyFromAbove);
+            ui.close();
+        }
+        if item(ui, icon::ARROW_FAT_LINE_UP, tr("Copy from row below"), Some(egui::KeyboardShortcut::new(cmd_alt, Key::ArrowDown))).clicked() {
+            grid.request(crate::grid::GridCommand::CopyFromBelow);
+            ui.close();
+        }
+        if item(ui, icon::TRASH, tr("Delete selected rows"), Some(egui::KeyboardShortcut::new(egui::Modifiers::NONE, Key::Delete))).clicked() {
+            notify(grid::delete_selected(model, grid), actions);
+            ui.close();
+        }
+        if model.can_undo() && item(ui, icon::ARROW_U_UP_LEFT, tr("Undo"), Some(egui::KeyboardShortcut::new(cmd, Key::Z))).clicked() {
+            model.undo();
+            ui.close();
+        }
+    }
+    ui.separator();
+    if item(ui, icon::CHART_BAR, tr("Chart"), None).clicked() {
+        actions.push(GridAction::ShowChart);
+        ui.close();
+    }
+    if item(ui, icon::MAP_TRIFOLD, tr("Spatial view"), None).clicked() {
+        actions.push(GridAction::ShowSpatial);
+        ui.close();
+    }
+    ui.separator();
+    ui.label(RichText::new(tr("Panels")).size(11.0).color(ternarygrid_ui::pal(ui).text_faint));
+    for (kind, ic, name) in PANELS {
+        let open = state.is_panel_open(kind) && !state.panels_hidden;
+        if ui.add(Button::selectable(open, kit::with_icon(ic, tr(name)))).clicked() {
+            actions.push(GridAction::TogglePanel(kind));
+            ui.close();
+        }
     }
 }
 
@@ -723,7 +1092,8 @@ mod tests {
         assert_eq!(status_text(&m), "1,234 rows · more available · total 5,000 · 42 ms");
         let at = chrono::Local::now();
         m.fetch.fetched_at = Some(at);
-        assert!(status_text(&m).ends_with(&format!("42 ms · {}", at.format("%H:%M:%S"))));
+        // When they were read is in the status's tooltip, not in its text.
+        assert!(status_text(&m).ends_with("42 ms"));
         let earlier = at - chrono::Duration::days(2);
         assert_eq!(fetched_at_text(earlier, at), earlier.format("%Y-%m-%d %H:%M").to_string());
         let mut s = ToolbarState::default();

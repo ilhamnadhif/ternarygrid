@@ -116,19 +116,34 @@ impl<'a> ReferencesPanel<'a> {
             ui.weak(tr("No foreign key relations are known for this result"));
             return actions;
         }
-        ui.horizontal_wrapped(|ui| {
-            for (i, r) in state.relations.iter().enumerate() {
-                let arrow = match r.direction {
-                    RelationDirection::References => "→",
-                    RelationDirection::ReferencedBy => "←",
-                };
-                let label = format!("{arrow} {}", r.table.display_path());
-                if ui.selectable_label(state.selected == Some(i), label).on_hover_text(r.name.clone().unwrap_or_default()).clicked() {
-                    state.selected = Some(i);
+        let pal = ternarygrid_ui::pal(ui);
+        ui.spacing_mut().item_spacing.y = 10.0;
+        // The relations as pills on one line (→ references, ← referenced by); the chosen one in the accent.
+        egui::ScrollArea::horizontal().id_salt("ternarygrid_references_chips").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let font = ternarygrid_ui::style::semibold(ui.ctx(), 12.0);
+                for (i, r) in state.relations.iter().enumerate() {
+                    let arrow = match r.direction {
+                        RelationDirection::References => "→",
+                        RelationDirection::ReferencedBy => "←",
+                    };
+                    let label = format!("{arrow} {}", r.table.display_path());
+                    let on = state.selected == Some(i);
+                    let (fg, bg) = if on { (pal.accent_text, pal.accent_soft) } else { (pal.text_muted, pal.subtle) };
+                    let g = ui.painter().layout_no_wrap(label.clone(), font.clone(), fg);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 14.0, 20.0), egui::Sense::click());
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, &label));
+                    ui.painter().rect_filled(rect, 10, if resp.hovered() && !on { pal.border_strong } else { bg });
+                    ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
+                    if resp.on_hover_text(r.name.clone().unwrap_or_default()).clicked() {
+                        state.selected = Some(i);
+                    }
                 }
-            }
+            });
         });
-        ui.separator();
+        let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0, pal.border));
         let Some(sel) = state.selected.filter(|s| *s < state.relations.len()) else { return actions };
         let Some((row, _)) = grid.active_cell() else {
             ui.weak(tr("Select a row to see related rows"));
@@ -156,8 +171,17 @@ impl<'a> ReferencesPanel<'a> {
         ui.horizontal(|ui| {
             let desc =
                 rel.columns.iter().zip(&key).map(|(c, v)| format!("{c} = {}", if v.is_null() { "NULL".into() } else { v.to_text().into_owned() })).collect::<Vec<_>>().join(", ");
-            ui.label(RichText::new(trf("{} where {}", &[&rel.table.display_path(), &desc])).strong());
-            if ui.button(format!("{} {}", egui_phosphor::regular::ARROW_SQUARE_OUT, tr("Open"))).clicked() {
+            let title = trf("{} where {}", &[&rel.table.display_path(), &desc]);
+            let open = ui
+                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let open = ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Ghost, Some(egui_phosphor::regular::ARROW_SQUARE_OUT), tr("Open"), true, false);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(title).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text)).truncate());
+                    });
+                    open
+                })
+                .inner;
+            if open.clicked() {
                 let link = ForeignKeyLink { name: rel.name.clone(), columns: rel.key_columns.clone(), ref_table: rel.table.clone(), ref_columns: rel.columns.clone() };
                 actions.push(GridAction::NavigateForeignKey { link, values: key.clone() });
             }
@@ -173,8 +197,19 @@ impl<'a> ReferencesPanel<'a> {
         }
         match state.related.as_mut() {
             Some((r, d)) if *r == sel && d.key == key => {
-                let options = state.options.clone();
-                let resp = DataGrid::new(&mut d.model, &mut d.grid, &options).id_salt(("ternarygrid_references_grid", sel)).show(ui);
+                let mut options = state.options.clone();
+                options.show_row_numbers = false;
+                // In a bordered box as tall as its rows (two at least), not the whole panel.
+                let rows = d.model.row_count().max(2) as f32;
+                let height = (33.0 + rows * 29.0 + 19.0).min(ui.available_height());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+                let resp = ui
+                    .scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(1.0)), |ui| {
+                        ui.set_clip_rect(rect.shrink(1.0).intersect(ui.clip_rect()));
+                        DataGrid::new(&mut d.model, &mut d.grid, &options).id_salt(("ternarygrid_references_grid", sel)).show(ui)
+                    })
+                    .inner;
+                ui.painter().rect_stroke(rect, 8, egui::Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
                 for a in resp.actions {
                     if let GridAction::NavigateForeignKey { .. } = a {
                         actions.push(a);

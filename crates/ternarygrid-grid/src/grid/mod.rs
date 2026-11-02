@@ -30,7 +30,7 @@ pub(crate) mod text;
 
 pub(crate) use editor::{ListChoice, value_list};
 pub(crate) use frame::detached_menu;
-pub(crate) use paint::{CANCEL_AFTER, kind_icon};
+pub(crate) use paint::CANCEL_AFTER;
 
 /// How long the UI thread waits at most for the row store when it reads a few
 /// cells: the fetch task may hold it while spilling pages to disk. The value
@@ -102,6 +102,9 @@ pub struct GridOptions {
     pub max_tooltip_chars: usize,
     /// Record view: hide the columns that are NULL or empty.
     pub record_hide_empty: bool,
+    /// Binary values read as their size ("‹binary · 64 B›", images as "‹PNG image · 2 KB›")
+    /// instead of their bytes in the format's encoding (the value panel shows them).
+    pub binary_summary: bool,
 }
 
 impl std::fmt::Debug for GridOptions {
@@ -116,10 +119,11 @@ impl std::fmt::Debug for GridOptions {
 }
 
 impl GridOptions {
-    /// Height of a row whose text is `text_h` high (grid and record view).
-    pub fn row_height_for(&self, text_h: f32) -> f32 {
-        let pad = if self.compact_rows { 4.0 } else { 8.0 };
-        self.row_height.unwrap_or((text_h + pad).round()).max(text_h + 2.0)
+    /// Height of a row (its line included) for text of `font_size` points: 29 at 13
+    /// points, 34 with normal (roomier) rows (grid and record view).
+    pub fn row_height_for(&self, font_size: f32) -> f32 {
+        let scale = if self.compact_rows { 29.0 / 13.0 } else { 34.0 / 13.0 };
+        self.row_height.unwrap_or((font_size * scale).round()).max(font_size + 4.0)
     }
 }
 
@@ -140,6 +144,7 @@ impl Default for GridOptions {
             max_copy_cells: 1_000_000,
             max_tooltip_chars: 2_000,
             record_hide_empty: false,
+            binary_summary: true,
         }
     }
 }

@@ -5,7 +5,7 @@ use super::frame::{Geo, GridFrame, PAD, fk_button_rect};
 
 /// A fetch running this long offers Cancel.
 pub(crate) const CANCEL_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
-use super::input::{MENU_ZONE, SORT_ZONE};
+use super::input::MENU_ZONE;
 use super::state::BodyCache;
 use super::state::Drag;
 use super::text::{GlyphCache, Placed, TextBatch, layout_slow, place_slow};
@@ -27,6 +27,8 @@ struct ColInfo<'o> {
     is_virtual: bool,
     fk: bool,
     dict: bool,
+    /// Values in the monospace font (UUIDs, JSON, XML, addresses, arrays).
+    mono: bool,
     fmt: PreparedFormat<'o>,
 }
 
@@ -97,10 +99,9 @@ impl GridFrame<'_> {
         self.paint_corner(ui, &geo);
         self.paint_scrollbars(ui, &geo);
         self.paint_overlays(ui, &geo);
-        // Outer border.
-        painter.rect_stroke(geo.rect, 0.0, Stroke::new(1.0, self.theme.line), StrokeKind::Inside);
+        // Focused: a faint accent frame (the active cell shows where the keys go).
         if self.focused {
-            let c = mix(self.theme.active_border, self.theme.bg, 0.4);
+            let c = mix(self.theme.active_border, self.theme.bg, 0.6);
             painter.rect_stroke(geo.rect, 0.0, Stroke::new(1.0, c), StrokeKind::Inside);
         }
     }
@@ -140,14 +141,17 @@ impl GridFrame<'_> {
                     is_virtual: model.is_virtual_column(col),
                     fk: model.foreign_key_for_column(col).is_some(),
                     dict: options.show_descriptions && model.dictionary(col).is_some(),
+                    mono: matches!(model.column_kind(col), DataKind::Uuid | DataKind::Json | DataKind::Xml | DataKind::Network | DataKind::Array | DataKind::Range),
                     fmt: PreparedFormat::new(fmt, self.state.columns.get(col).and_then(|c| c.format.as_ref())),
                 }
             })
             .collect();
         let null_text = fmt.null_text.as_str();
         // NULL in faint italics: laid out once per frame, placed in each NULL cell.
+        let small_font = FontId::new(font.size * 12.0 / 13.0, font.family.clone());
+        let mono_font = FontId::monospace(font.size * 12.0 / 13.0);
         let null_galley = (!null_text.is_empty()).then(|| {
-            let format = TextFormat { font_id: font.clone(), color: theme.null, italics: true, ..Default::default() };
+            let format = TextFormat { font_id: small_font.clone(), color: theme.null, italics: true, ..Default::default() };
             painter.layout_job(LayoutJob::single_section(null_text.to_string(), format))
         });
         let default_text = tr("[DEFAULT]");
@@ -155,14 +159,19 @@ impl GridFrame<'_> {
         let selection = &self.state.rt.selection;
         let ranges = selection.ranges();
         let glyphs: &mut GlyphCache = &mut self.state.rt.glyphs;
+        let glyphs_mono: &mut GlyphCache = &mut self.state.rt.glyphs_mono;
+        let glyphs_small: &mut GlyphCache = &mut self.state.rt.glyphs_small;
         let mut batch = TextBatch::new();
+        let mut batch_mono = TextBatch::new();
+        let mut batch_small = TextBatch::new();
         let mut sink = Sink { painter: &painter, shapes: Vec::with_capacity(1024) };
         let mut lines: Vec<Line> = Vec::new();
         let hover = self.hover_cell;
         let command_down = ui.input(|i| i.modifiers.command);
         let pointer = hover.and(ui.input(|i| i.pointer.hover_pos()));
         let fk_icon = |color| painter.layout_no_wrap(egui_phosphor::regular::ARROW_SQUARE_OUT.to_string(), FontId::new(font.size * 0.85, font.family.clone()), color);
-        let (fk_idle, fk_hot) = (fk_icon(theme.weak), fk_icon(theme.link));
+        let (fk_idle, fk_hot) = (fk_icon(theme.link), fk_icon(theme.link));
+        let active_row = (!self.state.rt.selection.is_empty()).then(|| self.state.rt.selection.active().row);
         let mut tooltip: Option<(Rect, String)> = None;
         let max_tip = options.max_tooltip_chars;
         let striped = options.striped;
@@ -272,6 +281,10 @@ impl GridFrame<'_> {
                                 let text = trf("‹{} image · {}›", &[&kind, &byte_size_text(b.len())]);
                                 CellLook { text: text.into(), color: theme.weak, align: Align::Min, badge: None, suffix: None, checkbox: None }
                             }
+                            Value::Bytes(b) if options.binary_summary => {
+                                let text = trf("‹binary · {}›", &[&byte_size_text(b.len())]);
+                                CellLook { text: text.into(), color: theme.weak, align: Align::Min, badge: None, suffix: None, checkbox: None }
+                            }
                             Value::Bytes(_) => CellLook { text: info.fmt.format(v), color: theme.weak, align: Align::Min, badge: None, suffix: None, checkbox: None },
                             _ => {
                                 let text = info.fmt.format(v);
@@ -321,17 +334,22 @@ impl GridFrame<'_> {
                         sink.rect_filled(bg, CornerRadius::same(3), mix(theme.bg, theme.text, 0.12));
                         fk_hover = Some(b);
                     }
-                    if hover.is_some_and(|h| h.row == row) {
+                    if hover.is_some_and(|h| h.row == row) || active_row == Some(row) {
                         let g = if hot { fk_hot.clone() } else { fk_idle.clone() };
-                        let color = if hot { theme.link } else { theme.weak };
+                        let color = theme.link;
                         sink.galley(b.center() - g.rect.size() / 2.0, g, color);
                     }
                 }
                 let null = matches!(cell, CellRef::Value(v) if v.is_null());
+                let binary = matches!(cell, CellRef::Value(Value::Bytes(_)));
                 let placed = match &null_galley {
                     Some(g) if null && g.size().x <= text_rect.width() => {
                         sink.galley(pos2(text_rect.left(), text_rect.center().y - g.size().y / 2.0), g.clone(), theme.null);
                         Placed { elided: false, width: g.size().x, left: text_rect.left() }
+                    }
+                    _ if binary => place_text(glyphs_small, &mut sink, &mut batch_small, &small_font, &look.text, text_rect, look.align, look.color),
+                    _ if info.mono && matches!(cell, CellRef::Value(_)) => {
+                        place_text(glyphs_mono, &mut sink, &mut batch_mono, &mono_font, &look.text, text_rect, look.align, look.color)
                     }
                     _ => place_text(glyphs, &mut sink, &mut batch, &font, &look.text, text_rect, look.align, look.color),
                 };
@@ -405,8 +423,10 @@ impl GridFrame<'_> {
             self.hover_tooltip = None;
             return;
         }
-        if let Some(text) = batch.into_shape(glyphs) {
-            sink.shapes.push(text);
+        for (b, cache) in [(batch, &*glyphs), (batch_mono, &*glyphs_mono), (batch_small, &*glyphs_small)] {
+            if let Some(text) = b.into_shape(cache) {
+                sink.shapes.push(text);
+            }
         }
         for l in &lines {
             sink.hline(l.x0..=l.x1, l.y, Stroke::new(1.0, l.color));
@@ -418,19 +438,20 @@ impl GridFrame<'_> {
             let x = (geo.col_left(pos + 1, sx) - 0.5).round() + 0.5;
             sink.vline(x, body.top()..=last_row_bottom, line);
         }
-        let faint = Stroke::new(1.0, mix(theme.line, theme.bg, 0.45));
         for row in rows.clone() {
             let y = (geo.row_top(row + 1, sy) - 0.5).round() + 0.5;
-            sink.hline(body.left()..=content_right, y, faint);
+            sink.hline(body.left()..=content_right, y, line);
         }
         // Active cell.
         if let Some(p) = (!self.state.rt.selection.is_empty()).then(|| self.state.rt.selection.active())
             && rows.contains(&p.row)
             && cols.contains(&p.col)
         {
+            // Above the row's line, inside the column's.
             let r = geo.cell_rect(p.row, p.col, sx, sy);
-            let stroke = if self.focused { theme.active_border } else { mix(theme.active_border, theme.bg, 0.5) };
-            sink.rect_stroke(r, 0.0, Stroke::new(2.0, stroke), StrokeKind::Inside);
+            let r = Rect::from_min_max(r.min, pos2(r.right() - 1.0, r.bottom() - 1.0));
+            let stroke = if self.focused { theme.active_border } else { mix(theme.active_border, theme.bg, 0.25) };
+            sink.rect_stroke(r, 0.0, Stroke::new(1.5, stroke), StrokeKind::Inside);
         }
         // Drop indicator while moving a column.
         if let Drag::Move { active: true, .. } = self.state.rt.drag
@@ -451,35 +472,40 @@ impl GridFrame<'_> {
         }
         let painter = ui.painter_at(geo.rownums);
         let theme = self.theme;
-        painter.rect_filled(geo.rownums, 0.0, theme.header_bg);
         let sy = self.state.rt.scroll_y;
         let rows = geo.visible_rows(sy);
         let mut batch = TextBatch::new();
-        let font = self.font.clone();
+        let font = FontId::new(self.font.size * 11.5 / 13.0, self.font.family.clone());
         let model = &*self.model;
         let selection = &self.state.rt.selection;
-        let glyphs = &mut self.state.rt.glyphs;
+        let glyphs = &mut self.state.rt.glyphs_rownum;
+        let striped = self.options.striped;
         let mut buf = String::with_capacity(12);
         for row in rows.clone() {
             let y0 = geo.row_top(row, sy);
             let r = Rect::from_min_max(pos2(geo.rownums.left(), y0), pos2(geo.rownums.right(), y0 + geo.row_h));
-            if selection.row_has_selection(row) {
-                painter.rect_filled(r, 0.0, theme.header_selected_bg);
-            }
             let state = model.row_state(row);
-            let marker = match state {
-                RowState::Inserted => Some(theme.bool_true),
-                RowState::Deleted => Some(theme.error),
-                RowState::Modified => Some(theme.warn),
-                RowState::Unchanged => None,
+            let bg = if selection.is_row_selected(row) {
+                Some(theme.header_selected_bg)
+            } else {
+                match state {
+                    RowState::Inserted => Some(theme.inserted),
+                    RowState::Deleted => Some(theme.deleted),
+                    _ if striped && row % 2 == 1 => Some(theme.stripe),
+                    _ => None,
+                }
             };
-            if let Some(c) = marker {
-                painter.rect_filled(Rect::from_min_size(r.min, vec2(3.0, geo.row_h)), 0.0, c);
+            if let Some(c) = bg {
+                painter.rect_filled(r, 0.0, c);
             }
             buf.clear();
-            use std::fmt::Write as _;
-            let _ = write!(buf, "{}", row + 1);
-            let inner = r.shrink2(vec2(PAD + 2.0, 0.0));
+            if state == RowState::Inserted {
+                buf.push('+');
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(buf, "{}", row + 1);
+            }
+            let inner = Rect::from_min_max(pos2(r.left() + 4.0, r.top()), pos2(r.right() - PAD, r.bottom()));
             let color = if state == RowState::Inserted { theme.bool_true } else { theme.rownum_text };
             if glyphs.place(&painter, &mut batch, &buf, inner, Align::Max, color).is_none() {
                 place_slow(&painter, &font, &buf, inner, Align::Max, color);
@@ -488,13 +514,14 @@ impl GridFrame<'_> {
         batch.paint(&painter, glyphs);
         let line = Stroke::new(1.0, theme.line);
         painter.vline(geo.rownums.right() - 0.5, geo.rownums.y_range(), line);
-        let faint = Stroke::new(1.0, mix(theme.line, theme.bg, 0.45));
         for row in rows {
             let y = (geo.row_top(row + 1, sy) - 0.5).round() + 0.5;
-            painter.hline(geo.rownums.x_range(), y, faint);
+            painter.hline(geo.rownums.x_range(), y, line);
         }
     }
 
+    /// The header: per column its name in semibold, the key / link icon and the sort arrow
+    /// after it, the database type faint at the right (▾ of the column menu there on hover).
     fn paint_header(&mut self, ui: &Ui, geo: &Geo) {
         let painter = ui.painter_at(geo.header);
         let theme = self.theme;
@@ -504,88 +531,90 @@ impl GridFrame<'_> {
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|p| geo.header.contains(*p));
         let key_cols: Vec<usize> = self.model.editability().as_ref().map(|t| t.key_columns.clone()).unwrap_or_default();
         let multi_sort = self.state.sort.len() > 1;
+        let scale = self.font.size / 13.0;
+        let name_font = ternarygrid_ui::style::semibold(ui.ctx(), (12.5 * scale * 2.0).round() / 2.0);
+        let type_font = FontId::monospace((10.5 * scale * 2.0).round() / 2.0);
+        let icon_font = ternarygrid_ui::style::icon_font((13.0 * scale).round());
+        let icon_w = (13.0 * scale).round();
         for pos in cols.clone() {
             let col = geo.cols[pos];
             let x0 = geo.col_left(pos, sx);
             let x1 = geo.col_left(pos + 1, sx);
-            let r = Rect::from_min_max(pos2(x0, geo.header.top()), pos2(x1, geo.header.bottom()));
+            let r = Rect::from_min_max(pos2(x0, geo.header.top()), pos2(x1, geo.header.bottom() - 1.0));
+            let header_hover = hover.is_some_and(|p| r.contains(p));
             if self.state.rt.selection.is_column_selected(pos) {
                 painter.rect_filled(r, 0.0, theme.header_selected_bg);
-            } else if hover.is_some_and(|p| r.contains(p)) {
+            } else if header_hover {
                 painter.rect_filled(r, 0.0, mix(theme.header_bg, theme.text, 0.05));
             }
+            let menu = Rect::from_min_max(pos2(r.right() - MENU_ZONE, r.top()), r.max);
+            let menu_open = self.state.rt.header_popup.is_some_and(|(c, ..)| c == col);
+            // The icons after the name: key or link, the sort arrow (and its rank).
+            let mut icons: [Option<(&str, Color32)>; 2] = [None, None];
+            if key_cols.contains(&col) {
+                icons[0] = Some((egui_phosphor::regular::KEY, theme.warn));
+            } else if self.model.foreign_key_for_column(col).is_some() {
+                icons[0] = Some((egui_phosphor::regular::LINK_SIMPLE, theme.weak));
+            }
+            let sort_idx = self.state.sort.iter().position(|k| k.column == col);
+            if let Some(i) = sort_idx {
+                let arrow = if self.state.sort[i].descending { egui_phosphor::regular::ARROW_DOWN } else { egui_phosphor::regular::ARROW_UP };
+                icons[1] = Some((arrow, theme.link));
+            }
+            let icons_w: f32 = icons.iter().flatten().count() as f32 * (icon_w + 6.0);
+            // The type at the right while it fits next to the name; ▾ instead while hovered.
+            let inner_w = r.width() - 2.0 * PAD;
+            let name = self.model.column_name(col);
+            let name_g = painter.layout_no_wrap(name.to_string(), name_font.clone(), theme.header_text);
+            let ty = self.model.column_meta(col).map(|m| m.type_name.as_str()).unwrap_or_default();
+            let show_menu = menu_open || header_hover;
+            let type_g = (!ty.is_empty() && !show_menu).then(|| painter.layout_no_wrap(ty.to_string(), type_font.clone(), theme.weak));
+            let right_w = if show_menu { MENU_ZONE - PAD + 6.0 } else { type_g.as_ref().map_or(0.0, |g| g.size().x + 8.0) };
+            let type_fits = type_g.is_some() && name_g.size().x + icons_w + right_w <= inner_w;
+            let name_max = (inner_w - icons_w - if type_fits || show_menu { right_w } else { 0.0 }).max(0.0);
             let is_virtual = self.model.is_virtual_column(col);
             let mut left = r.left() + PAD;
-            // Type icon (DBeaver's 123 / AZ), then key / FK icons.
-            if let Some(ti) = kind_icon(self.model.column_kind(col))
-                && r.width() > 64.0
-            {
-                let small = FontId::new(self.font.size * 0.85, self.font.family.clone());
-                let ir = painter.text(pos2(left, r.center().y), Align2::LEFT_CENTER, ti, small, theme.weak);
-                left = ir.right() + 4.0;
+            if name_max > 4.0 {
+                let g = if name_g.size().x <= name_max && !is_virtual {
+                    name_g
+                } else {
+                    let mut job =
+                        LayoutJob::single_section(name.to_string(), TextFormat { font_id: name_font.clone(), color: theme.header_text, italics: is_virtual, ..Default::default() });
+                    job.wrap = TextWrapping { max_width: name_max, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                    painter.layout_job(job)
+                };
+                let w = g.size().x;
+                painter.galley(pos2(left, r.center().y - g.size().y / 2.0), g, theme.header_text);
+                left += w + 6.0;
             }
-            let icon = if key_cols.contains(&col) {
-                Some((egui_phosphor::regular::KEY, theme.warn))
-            } else if self.model.foreign_key_for_column(col).is_some() {
-                Some((egui_phosphor::regular::LINK_SIMPLE, theme.link))
-            } else {
-                None
-            };
-            if let Some((icon, color)) = icon
-                && r.width() > 48.0
-            {
-                let small = FontId::new(self.font.size * 0.9, self.font.family.clone());
-                let ir = painter.text(pos2(left, r.center().y), Align2::LEFT_CENTER, icon, small, color);
-                left = ir.right() + 3.0;
+            for (icon, color) in icons.into_iter().flatten() {
+                if left + icon_w > r.right() - PAD {
+                    break;
+                }
+                painter.text(pos2(left + icon_w / 2.0, r.center().y), Align2::CENTER_CENTER, icon, icon_font.clone(), color);
+                if multi_sort && icon != egui_phosphor::regular::KEY && icon != egui_phosphor::regular::LINK_SIMPLE {
+                    let tiny = FontId::new(self.font.size * 0.6, self.font.family.clone());
+                    let n = sort_idx.map_or(0, |i| i + 1);
+                    painter.text(pos2(left + icon_w + 1.0, r.bottom() - 6.0), Align2::LEFT_BOTTOM, n.to_string(), tiny, theme.weak);
+                }
+                left += icon_w + 6.0;
             }
-            let name = self.model.column_name(col);
-            let text_rect = Rect::from_min_max(pos2(left, r.top()), pos2(r.right() - SORT_ZONE - MENU_ZONE, r.bottom()));
-            if text_rect.width() > 4.0 {
-                let mut job =
-                    LayoutJob::single_section(name.to_string(), TextFormat { font_id: self.font.clone(), color: theme.header_text, italics: is_virtual, ..Default::default() });
-                job.wrap = TextWrapping { max_width: text_rect.width(), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-                let g = painter.layout_job(job);
-                painter.galley(pos2(text_rect.left(), r.center().y - g.rect.height() / 2.0), g, theme.header_text);
+            if type_fits && let Some(g) = type_g {
+                painter.galley(pos2(r.right() - PAD - g.size().x, r.center().y - g.size().y / 2.0), g, theme.weak);
             }
-            // Column menu button (▾).
-            let menu = Rect::from_min_max(pos2(r.right() - MENU_ZONE, r.top()), r.max);
-            let header_hover = hover.is_some_and(|p| r.contains(p));
-            let menu_open = self.state.rt.header_popup.is_some_and(|(c, ..)| c == col);
-            let menu_color = if menu_open || hover.is_some_and(|p| menu.contains(p)) {
-                theme.header_text
-            } else if header_hover {
-                theme.weak
-            } else {
-                theme.weak.gamma_multiply(0.55)
-            };
-            if r.width() > MENU_ZONE + 8.0 {
-                if menu_open || hover.is_some_and(|p| menu.contains(p)) {
-                    painter.rect_filled(menu.shrink(2.0), CornerRadius::same(3), mix(theme.header_bg, theme.text, 0.10));
+            // Column menu button (▾), while the header is hovered or its menu open.
+            if show_menu && r.width() > MENU_ZONE + 8.0 {
+                let menu_hover = hover.is_some_and(|p| menu.contains(p));
+                if menu_open || menu_hover {
+                    painter.rect_filled(menu.shrink(4.0), CornerRadius::same(4), mix(theme.header_bg, theme.text, 0.10));
                 }
                 let small = FontId::new(self.font.size * 0.8, self.font.family.clone());
-                painter.text(menu.center(), Align2::CENTER_CENTER, egui_phosphor::regular::CARET_DOWN, small, menu_color);
-            }
-            // Sort indicator.
-            let sort_idx = self.state.sort.iter().position(|k| k.column == col);
-            let zone = Rect::from_min_max(pos2(r.right() - MENU_ZONE - SORT_ZONE, r.top()), pos2(r.right() - MENU_ZONE, r.bottom()));
-            // The whole header cell sorts on click; hint the sort arrow while hovering it.
-            let zone_hover = header_hover && !hover.is_some_and(|p| menu.contains(p));
-            if let Some(i) = sort_idx {
-                let k = self.state.sort[i];
-                let icon = if k.descending { egui_phosphor::regular::ARROW_DOWN } else { egui_phosphor::regular::ARROW_UP };
-                let small = FontId::new(self.font.size * 0.85, self.font.family.clone());
-                painter.text(zone.center(), Align2::CENTER_CENTER, icon, small.clone(), theme.active_border);
-                if multi_sort {
-                    let tiny = FontId::new(self.font.size * 0.6, self.font.family.clone());
-                    painter.text(pos2(zone.right() - 2.0, zone.bottom() - 2.0), Align2::RIGHT_BOTTOM, (i + 1).to_string(), tiny, theme.weak);
-                }
-            } else if zone_hover {
-                let small = FontId::new(self.font.size * 0.85, self.font.family.clone());
-                painter.text(zone.center(), Align2::CENTER_CENTER, egui_phosphor::regular::ARROW_UP, small, theme.weak);
+                let color = if menu_open || menu_hover { theme.header_text } else { theme.weak };
+                painter.text(menu.center(), Align2::CENTER_CENTER, egui_phosphor::regular::CARET_DOWN, small, color);
             }
             painter.vline((x1 - 0.5).round() + 0.5, r.y_range(), Stroke::new(1.0, theme.line));
         }
-        painter.hline(geo.header.x_range(), geo.header.bottom() - 0.5, Stroke::new(1.0, theme.line));
+        painter.hline(geo.header.x_range(), geo.header.bottom() - 0.5, Stroke::new(1.0, theme.border));
         // Ghost of a column being moved.
         if let (Drag::Move { from, active: true, .. }, Some(p)) = (self.state.rt.drag, self.pointer())
             && let Some(&col) = geo.cols.get(from)
@@ -594,7 +623,7 @@ impl GridFrame<'_> {
             let ghost = Rect::from_center_size(pos2(p.x, geo.header.center().y), vec2(w, geo.header.height()));
             let fg = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, self.id.with("ghost")));
             fg.rect_filled(ghost, CornerRadius::same(3), theme.header_selected_bg.gamma_multiply(0.85));
-            fg.text(ghost.center(), Align2::CENTER_CENTER, self.model.column_name(col), self.font.clone(), theme.header_text);
+            fg.text(ghost.center(), Align2::CENTER_CENTER, self.model.column_name(col), name_font, theme.header_text);
         }
     }
 
@@ -608,38 +637,38 @@ impl GridFrame<'_> {
         if self.state.rt.selection.is_all() {
             painter.rect_filled(geo.corner, 0.0, theme.header_selected_bg);
         }
-        let (icon, color) = if self.model.is_editable() && self.options.allow_editing {
-            (egui_phosphor::regular::PENCIL_SIMPLE, theme.weak)
-        } else {
-            (egui_phosphor::regular::LOCK_SIMPLE, theme.warn)
-        };
-        painter.text(geo.corner.center(), Align2::CENTER_CENTER, icon, self.font.clone(), color);
         painter.vline(geo.corner.right() - 0.5, geo.corner.y_range(), Stroke::new(1.0, theme.line));
-        painter.hline(geo.corner.x_range(), geo.corner.bottom() - 0.5, Stroke::new(1.0, theme.line));
+        painter.hline(geo.corner.x_range(), geo.corner.bottom() - 0.5, Stroke::new(1.0, theme.border));
     }
 
+    /// Thin thumbs over the cells while the pointer is on the grid, a bar is dragged or
+    /// a moment after a scroll (no track).
     fn paint_scrollbars(&mut self, ui: &Ui, geo: &Geo) {
+        let now = ui.input(|i| i.time);
+        let dragging = matches!(self.state.rt.drag, Drag::VThumb { .. } | Drag::HThumb { .. });
+        let recent = now < self.state.rt.bars_until;
+        if recent {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(self.state.rt.bars_until - now + 0.02));
+        }
+        if !(dragging || recent || ui.rect_contains_pointer(geo.rect)) {
+            return;
+        }
         let painter = ui.painter_at(geo.rect);
-        // A thumb that stands out from the track in both themes, stronger when used.
-        let track_c = mix(self.theme.bg, self.theme.text, 0.05);
-        let (thumb_c, active_c) = (mix(self.theme.bg, self.theme.text, 0.32), mix(self.theme.bg, self.theme.text, 0.55));
+        let (thumb_c, active_c) = (mix(self.theme.bg, self.theme.text, 0.28), mix(self.theme.bg, self.theme.text, 0.5));
         let hover_pos = ui.input(|i| i.pointer.hover_pos());
         if let Some(bar) = geo.vbar {
-            painter.rect_filled(bar, 0.0, track_c);
             let (thumb, _) = self.v_thumb(bar);
             let active = matches!(self.state.rt.drag, Drag::VThumb { .. }) || hover_pos.is_some_and(|p| bar.contains(p));
-            let c = if active { active_c } else { thumb_c };
-            painter.rect_filled(thumb.shrink2(vec2(1.0, 0.0)), CornerRadius::same(4), c);
+            let w = if active { 7.0 } else { 5.0 };
+            let r = Rect::from_min_max(pos2(thumb.right() - w, thumb.top()), thumb.max);
+            painter.rect_filled(r, CornerRadius::same(4), if active { active_c } else { thumb_c });
         }
         if let Some(bar) = geo.hbar {
-            painter.rect_filled(bar, 0.0, track_c);
             let (thumb, _) = self.h_thumb(bar);
             let active = matches!(self.state.rt.drag, Drag::HThumb { .. }) || hover_pos.is_some_and(|p| bar.contains(p));
-            let c = if active { active_c } else { thumb_c };
-            painter.rect_filled(thumb.shrink2(vec2(0.0, 1.0)), CornerRadius::same(4), c);
-        }
-        if let (Some(v), Some(h)) = (geo.vbar, geo.hbar) {
-            painter.rect_filled(Rect::from_min_max(pos2(v.left(), h.top()), pos2(v.right(), h.bottom())), 0.0, track_c);
+            let h = if active { 7.0 } else { 5.0 };
+            let r = Rect::from_min_max(pos2(thumb.left(), thumb.bottom() - h), thumb.max);
+            painter.rect_filled(r, CornerRadius::same(4), if active { active_c } else { thumb_c });
         }
     }
 
@@ -722,30 +751,6 @@ impl GridFrame<'_> {
             ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap());
         });
     }
-}
-
-/// Small icon of a column's kind in its header; `None` for other types.
-pub(crate) fn kind_icon(kind: DataKind) -> Option<&'static str> {
-    use egui_phosphor::regular as i;
-    Some(match kind {
-        DataKind::Bool => i::TOGGLE_LEFT,
-        DataKind::Int | DataKind::Float | DataKind::Decimal => i::HASH,
-        DataKind::Text => i::TEXT_T,
-        DataKind::Enum => i::TAG,
-        DataKind::Binary | DataKind::Bit => i::BINARY,
-        DataKind::Date => i::CALENDAR_BLANK,
-        DataKind::Time | DataKind::TimeTz => i::CLOCK,
-        DataKind::DateTime | DataKind::DateTimeTz => i::CALENDAR_DOTS,
-        DataKind::Interval => i::HOURGLASS,
-        DataKind::Uuid => i::FINGERPRINT,
-        DataKind::Json => i::BRACKETS_CURLY,
-        DataKind::Xml => i::CODE,
-        DataKind::Array => i::BRACKETS_SQUARE,
-        DataKind::Geometry => i::MAP_PIN,
-        DataKind::Network => i::NETWORK,
-        DataKind::Range => i::ARROWS_LEFT_RIGHT,
-        DataKind::Other => return None,
-    })
 }
 
 /// Place text with the fast path, falling back to egui layout.

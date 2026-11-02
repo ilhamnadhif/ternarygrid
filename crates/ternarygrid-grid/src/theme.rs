@@ -19,6 +19,8 @@ pub struct GridTheme {
     pub stripe: Color32,
     /// Grid lines.
     pub line: Color32,
+    /// The line under the header and over the grid.
+    pub border: Color32,
     /// Header / row number background.
     pub header_bg: Color32,
     /// Header text.
@@ -27,8 +29,6 @@ pub struct GridTheme {
     pub header_selected_bg: Color32,
     /// Row numbers.
     pub rownum_text: Color32,
-    /// Values of the record view (one colour, no stripes).
-    pub record_bg: Color32,
     /// Normal text.
     pub text: Color32,
     /// Weak text (defaults, descriptions, binary values).
@@ -60,39 +60,41 @@ pub struct GridTheme {
 }
 
 impl GridTheme {
-    /// Theme for `visuals`.
+    /// Theme for `visuals`: the design's colours (the palette of `ternarygrid_ui`, and the
+    /// grid's own tints: stripes, lines, the selection, changed, new and deleted rows).
     pub fn from_visuals(v: &Visuals) -> Self {
-        let bg = v.extreme_bg_color;
-        let text = v.text_color();
         let dark = v.dark_mode;
-        let green = if dark { Color32::from_rgb(0x3f, 0xb9, 0x50) } else { Color32::from_rgb(0x1a, 0x7f, 0x37) };
-        let header_base = v.widgets.noninteractive.weak_bg_fill;
+        let p = ternarygrid_ui::style::palette(dark);
+        let rgb = |d: u32, l: u32| {
+            let c = if dark { d } else { l };
+            Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+        };
+        let bg = p.surface;
+        let sel = rgb(0x224444, 0xd4e7e4);
         GridTheme {
             bg,
-            stripe: mix(bg, text, if dark { 0.035 } else { 0.022 }),
-            // Hairlines: a little off the rows, so the values stand out and not the lines.
-            line: mix(bg, text, if dark { 0.075 } else { 0.08 }),
-            header_bg: mix(header_base, bg, 0.25),
-            header_text: v.strong_text_color(),
+            stripe: rgb(0x262830, 0xfafafb),
+            line: rgb(0x33353e, 0xededf2),
+            border: p.border,
+            header_bg: p.header,
+            header_text: p.text,
             // Selected headers and the record view's field: the header tinted with the selection.
-            header_selected_bg: mix(header_base, v.selection.bg_fill, if dark { 0.6 } else { 0.45 }),
-            // Row numbers recede: they locate, the values are read.
-            rownum_text: mix(v.weak_text_color(), bg, 0.15),
-            record_bg: if dark { mix(bg, text, 0.053) } else { bg },
-            text,
-            weak: v.weak_text_color(),
-            null: mix(v.weak_text_color(), bg, 0.2),
-            selection: v.selection.bg_fill.gamma_multiply(if dark { 0.55 } else { 0.45 }),
-            active_border: v.selection.stroke.color,
-            modified: mix(bg, v.warn_fg_color, if dark { 0.28 } else { 0.30 }),
-            inserted: mix(bg, green, if dark { 0.26 } else { 0.20 }),
-            deleted: mix(bg, v.error_fg_color, if dark { 0.26 } else { 0.18 }),
-            link: v.hyperlink_color,
-            badge_bg: mix(bg, text, 0.13),
-            badge_text: mix(text, bg, 0.25),
-            error: v.error_fg_color,
-            warn: v.warn_fg_color,
-            bool_true: green,
+            header_selected_bg: mix(p.header, sel, 0.7),
+            rownum_text: p.text_faint,
+            text: p.text,
+            weak: p.text_faint,
+            null: p.text_faint,
+            selection: sel,
+            active_border: p.accent,
+            modified: rgb(0x4b443b, 0xf3ead6),
+            inserted: rgb(0x1f3a2b, 0xe6f4ea),
+            deleted: rgb(0x43282b, 0xfbe9e7),
+            link: p.accent_text,
+            badge_bg: mix(bg, p.text, 0.13),
+            badge_text: mix(p.text, bg, 0.25),
+            error: p.err,
+            warn: p.warn,
+            bool_true: p.ok,
         }
     }
 }

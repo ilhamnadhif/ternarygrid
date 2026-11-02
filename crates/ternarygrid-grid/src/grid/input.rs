@@ -17,7 +17,7 @@ const RESIZE_GRAB: f32 = 4.0;
 /// Width of the sort indicator zone at the right of a header cell.
 pub(super) const SORT_ZONE: f32 = 16.0;
 /// Width of the column menu button (▾) at the right of a header.
-pub(super) const MENU_ZONE: f32 = 16.0;
+pub(super) const MENU_ZONE: f32 = 24.0;
 
 impl GridFrame<'_> {
     /// Handle all input. Returns the body, header and row number responses.
@@ -1098,13 +1098,17 @@ impl GridFrame<'_> {
         Some(text)
     }
 
-    /// Room the header of `col` needs: its name, type and key / link icons, the
-    /// sort and menu zones.
+    /// Room the header of `col` needs: its name (semibold), the key / link icon and a sort
+    /// arrow after it, its type at the right.
     pub(crate) fn header_width(&mut self, painter: &egui::Painter, col: usize) -> f32 {
+        let scale = self.font.size / 13.0;
         let name = self.model.column_name(col).to_string();
+        let name_w = painter.layout_no_wrap(name, ternarygrid_ui::style::semibold(&self.ctx, (12.5 * scale * 2.0).round() / 2.0), egui::Color32::WHITE).size().x;
+        let ty = self.model.column_meta(col).map(|m| m.type_name.clone()).unwrap_or_default();
+        let type_w = if ty.is_empty() { 0.0 } else { painter.layout_no_wrap(ty, egui::FontId::monospace((10.5 * scale * 2.0).round() / 2.0), egui::Color32::WHITE).size().x + 8.0 };
         let keyed = self.model.editability().as_ref().is_ok_and(|t| t.key_columns.contains(&col)) || self.model.foreign_key_for_column(col).is_some();
-        let icons = usize::from(super::paint::kind_icon(self.model.column_kind(col)).is_some()) + usize::from(keyed);
-        self.measure(painter, &name) + 2.0 * super::frame::PAD + SORT_ZONE + MENU_ZONE + icons as f32 * (self.font.size * 0.9 + 4.0) + 4.0
+        let icons = 1 + usize::from(keyed);
+        name_w + type_w + icons as f32 * ((13.0 * scale).round() + 6.0) + 2.0 * super::frame::PAD + 2.0
     }
 
     /// Initial widths, as in DBeaver: columns nobody sized (still at their default

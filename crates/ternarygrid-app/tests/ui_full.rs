@@ -762,7 +762,16 @@ fn settings_grid_menu_and_editor_helpers() {
     });
     wait(&mut h, "product data", |h| has(h, "Data grid,") && !has(h, "Data grid, 0 rows"));
     // Its keys are read in the background: the footer's row buttons show once it is editable.
-    wait(&mut h, "product editable", |h| has(h, "Add row") && !has(h, "No source table"));
+    // (Add row and the other row actions are in the footer's ⋯ menu.)
+    wait(&mut h, "product editable", |h| {
+        let (_, tab) = h.state_mut().dock.find_active_focused().expect("a focused tab");
+        tab.view
+            .as_any_mut()
+            .downcast_mut::<ternarygrid_app::tabs::object::ObjectEditorTab>()
+            .and_then(|o| o.data.as_mut())
+            .and_then(|d| d.panel.as_ref())
+            .is_some_and(|p| p.model.is_editable())
+    });
     let body = h.query_all_by_label_contains("Data grid,").next().unwrap().rect();
     let cell = egui::pos2(body.left() + 40.0, body.top() + 30.0);
     let open = move |h: &mut H| {
@@ -780,7 +789,10 @@ fn settings_grid_menu_and_editor_helpers() {
     pause(&mut h);
     open(&mut h);
     frames(&mut h, 2);
-    click(&mut h, "Columns");
+    // The menu's Columns (the object's page tabs have a "Columns" too).
+    pause(&mut h);
+    h.query_all_by_label_contains("Columns").last().expect("the menu's Columns").click();
+    frames(&mut h, 2);
     click(&mut h, "Show all");
     assert!(rows_label(&h).contains("5 columns"), "{}", rows_label(&h));
     // Filter by value, then clear filter and order from the grid toolbar.
@@ -800,6 +812,8 @@ fn settings_grid_menu_and_editor_helpers() {
     }
     wait(&mut h, "filtered", |h| rows_label(h).starts_with("Data grid, 1 rows") || (discarded && rows_label(h).starts_with("Data grid, 0 rows")));
     no_errors(&mut h, "filter by value");
+    // The filter bar's ⋯ menu has Clear filter and order.
+    click(&mut h, "Filter options");
     click(&mut h, "Clear filter and order");
     wait(&mut h, "filter cleared", |h| {
         let n = rows_label(h).split(',').nth(1).unwrap_or_default().to_string();

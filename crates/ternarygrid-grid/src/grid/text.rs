@@ -140,11 +140,6 @@ impl GlyphCache {
         self.canary = Some(canary);
     }
 
-    /// Height of one text line.
-    pub fn row_height(&self) -> f32 {
-        self.row_height
-    }
-
     fn glyph(&mut self, painter: &Painter, c: char) -> Option<&GlyphInfo> {
         if !self.glyphs.contains_key(&c) {
             let info = if is_simple_char(c) { self.layout_glyph(painter, c) } else { None };
