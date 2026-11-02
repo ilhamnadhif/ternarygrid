@@ -239,6 +239,13 @@ impl ErViewState {
         self.fit_pending = true;
     }
 
+    /// Where table `key` was drawn on screen in the last frame (tests click on it).
+    #[doc(hidden)]
+    pub fn screen_rect(&self, diagram: &ErDiagram, key: &str) -> Option<Rect> {
+        let r = diagram.table_rect(key)?;
+        Some(self.view().rect_to_screen(self.last_canvas.min, r))
+    }
+
     /// Centres the view on a table and selects it (e.g. from a search box).
     pub fn reveal(&mut self, diagram: &ErDiagram, key: &str) {
         if let Some(r) = diagram.table_rect(key) {
@@ -250,15 +257,24 @@ impl ErViewState {
     }
 }
 
-/// Theme dependent colors.
+/// Theme dependent colors (the design tokens of `ternarygrid_ui::style`).
 struct Palette {
+    /// Behind the dotted grid.
     canvas: Color32,
+    /// The grid's dots.
     grid: Color32,
+    /// The overview map's background.
+    map: Color32,
     box_fill: Color32,
     box_stroke: Stroke,
+    /// Shadow under the boxes.
+    shadow: Color32,
     header_table: Color32,
     header_view: Color32,
+    /// The kind icon of the header bands.
+    header_icon: Color32,
     text: Color32,
+    /// Schema names, types and comments.
     weak: Color32,
     strong: Color32,
     line: Color32,
@@ -269,50 +285,37 @@ struct Palette {
     fk: Color32,
     note_fill: Color32,
     note_stroke: Color32,
+    /// The family of table names and key columns (semibold).
+    bold: egui::FontFamily,
 }
 
 impl Palette {
-    fn new(v: &egui::Visuals) -> Self {
+    fn new(ctx: &egui::Context, v: &egui::Visuals) -> Self {
         let dark = v.dark_mode;
+        let p = ternarygrid_ui::style::palette(dark);
+        let rgb = |c: u32| Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
         Palette {
-            canvas: v.extreme_bg_color,
-            grid: v
-                .widgets
-                .noninteractive
-                .bg_stroke
-                .color
-                .gamma_multiply(0.45),
-            box_fill: v.window_fill,
-            box_stroke: Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color),
-            header_table: colors::tint(
-                v,
-                colors::categorical(0, dark),
-                if dark { 0.22 } else { 0.14 },
-            ),
-            header_view: colors::tint(
-                v,
-                colors::categorical(6, dark),
-                if dark { 0.22 } else { 0.14 },
-            ),
-            text: v.text_color(),
-            weak: v.weak_text_color(),
-            strong: v.strong_text_color(),
-            line: v.text_color().gamma_multiply(0.55),
-            highlight: v.selection.stroke.color,
-            selection: Stroke::new(2.0, v.selection.stroke.color),
-            row_hover: v.selection.bg_fill.gamma_multiply(0.35),
-            pk: colors::categorical(3, dark),
-            fk: colors::categorical(0, dark),
-            note_fill: colors::tint(
-                v,
-                Color32::from_rgb(0xfa, 0xd3, 0x4a),
-                if dark { 0.20 } else { 0.32 },
-            ),
-            note_stroke: colors::tint(
-                v,
-                Color32::from_rgb(0xd9, 0xb1, 0x2a),
-                if dark { 0.45 } else { 0.6 },
-            ),
+            canvas: p.surface,
+            grid: p.border,
+            map: p.canvas,
+            box_fill: p.surface,
+            box_stroke: Stroke::new(1.0, p.border_strong),
+            shadow: Color32::from_black_alpha(if dark { 56 } else { 28 }),
+            header_table: p.accent_soft,
+            header_view: if dark { rgb(0x2f2a44) } else { rgb(0xede7fb) },
+            header_icon: p.accent_text,
+            text: p.text,
+            weak: p.text_faint,
+            strong: p.text,
+            line: p.border_strong,
+            highlight: p.accent,
+            selection: Stroke::new(2.0, p.accent),
+            row_hover: ternarygrid_ui::style::soft(p.accent, if dark { 0.16 } else { 0.10 }),
+            pk: p.warn,
+            fk: p.info,
+            note_fill: if dark { rgb(0x4a4126) } else { rgb(0xfff4c2) },
+            note_stroke: if dark { rgb(0x8a7a3e) } else { rgb(0xd9b12a) },
+            bold: ternarygrid_ui::style::semibold(ctx, 13.0).family,
         }
     }
 
@@ -354,7 +357,7 @@ pub fn show_er(ui: &mut Ui, diagram: &mut ErDiagram, state: &mut ErViewState) ->
     let size_stable = state.last_canvas.size() == rect.size();
     state.last_canvas = rect;
     let origin = rect.min;
-    let pal = Palette::new(ui.visuals());
+    let pal = Palette::new(ui.ctx(), ui.visuals());
 
     // keep indices valid after external model edits
     if state
@@ -824,131 +827,198 @@ fn hit_test(
 
 // ---------------------------------------------------------------- toolbar
 
+/// A select box of the toolbar, as tall as its buttons.
+fn toolbar_combo<R>(
+    ui: &mut Ui,
+    id: &str,
+    text: &str,
+    width: f32,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    ui.scope(|ui| {
+        let text_h = ui.text_style_height(&egui::TextStyle::Button);
+        let s = ui.spacing_mut();
+        s.interact_size.y = TOOLBAR_H;
+        s.button_padding = vec2(10.0, ((TOOLBAR_H - text_h) / 2.0).max(2.0));
+        ui.visuals_mut().widgets.inactive.bg_stroke.color = p.border;
+        egui::ComboBox::from_id_salt(id)
+            .icon(ternarygrid_ui::kit::combo_caret)
+            .selected_text(text)
+            .width(width)
+            .show_ui(ui, add)
+            .response
+    })
+    .inner
+}
+
+/// Height of the toolbar's buttons and select boxes.
+const TOOLBAR_H: f32 = 26.0;
+
 fn toolbar(
     ui: &mut Ui,
     diagram: &mut ErDiagram,
     state: &mut ErViewState,
     events: &mut Vec<ErEvent>,
 ) {
-    ui.horizontal(|ui| {
-        let center = if state.last_canvas.is_positive() {
-            state.last_canvas.center()
-        } else {
-            Pos2::ZERO
-        };
-        let origin = if state.last_canvas.is_positive() {
-            state.last_canvas.min
-        } else {
-            Pos2::ZERO
-        };
-        if ui
-            .button(ternarygrid_icons::ic(icon::MAGNIFYING_GLASS_MINUS))
-            .on_hover_text(tr("Zoom out"))
+    use ternarygrid_ui::kit::{self, Kind};
+    let p = ternarygrid_ui::pal(ui);
+    let frame = egui::Frame::new().inner_margin(egui::Margin {
+        left: 16,
+        right: 16,
+        top: 7,
+        bottom: 7,
+    });
+    frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.set_min_height(TOOLBAR_H);
+            let center = if state.last_canvas.is_positive() {
+                state.last_canvas.center()
+            } else {
+                Pos2::ZERO
+            };
+            let origin = if state.last_canvas.is_positive() {
+                state.last_canvas.min
+            } else {
+                Pos2::ZERO
+            };
+            let zoom_by = |state: &mut ErViewState, factor: f32| {
+                let mut v = state.view();
+                v.zoom_around(origin, center, factor, ZOOM_RANGE.0, ZOOM_RANGE.1);
+                state.set_view(v);
+            };
+            if kit::icon_button_ex(
+                ui,
+                icon::MAGNIFYING_GLASS_MINUS,
+                tr("Zoom out"),
+                false,
+                26.0,
+            )
             .clicked()
-        {
-            let mut v = state.view();
-            v.zoom_around(origin, center, 1.0 / 1.25, ZOOM_RANGE.0, ZOOM_RANGE.1);
-            state.set_view(v);
-        }
-        if ui
-            .button(format!("{:.0}%", state.zoom * 100.0))
-            .on_hover_text(tr("Reset zoom to 100%"))
-            .clicked()
-        {
-            let mut v = state.view();
-            v.zoom_around(
-                origin,
-                center,
-                1.0 / v.zoom.max(1e-3),
-                ZOOM_RANGE.0,
-                ZOOM_RANGE.1,
-            );
-            state.set_view(v);
-        }
-        if ui
-            .button(ternarygrid_icons::ic(icon::MAGNIFYING_GLASS_PLUS))
-            .on_hover_text(tr("Zoom in"))
-            .clicked()
-        {
-            let mut v = state.view();
-            v.zoom_around(origin, center, 1.25, ZOOM_RANGE.0, ZOOM_RANGE.1);
-            state.set_view(v);
-        }
-        if ui
-            .button(ternarygrid_icons::ic(icon::CORNERS_OUT))
-            .on_hover_text(tr("Zoom to fit"))
-            .clicked()
-        {
-            state.fit_pending = true;
-        }
-        ui.separator();
-        let before = diagram.settings;
-        egui::ComboBox::from_id_salt("ternarygrid_er_columns")
-            .icon(ternarygrid_ui::kit::combo_caret)
-            .selected_text(tr(diagram.settings.columns.label()))
-            .show_ui(ui, |ui| {
-                for d in ColumnDisplay::ALL {
-                    ui.selectable_value(&mut diagram.settings.columns, d, tr(d.label()));
-                }
-            })
-            .response
+            {
+                zoom_by(state, 1.0 / 1.25);
+            }
+            let percent = format!("{:.0}%", state.zoom * 100.0);
+            if kit::button_ex(ui, Kind::Ghost, None, &percent, true)
+                .on_hover_text(tr("Reset zoom to 100%"))
+                .clicked()
+            {
+                let factor = 1.0 / state.zoom.max(1e-3);
+                zoom_by(state, factor);
+            }
+            if kit::icon_button_ex(ui, icon::MAGNIFYING_GLASS_PLUS, tr("Zoom in"), false, 26.0)
+                .clicked()
+            {
+                zoom_by(state, 1.25);
+            }
+            if kit::icon_button_ex(ui, icon::CORNERS_OUT, tr("Zoom to fit"), false, 26.0).clicked()
+            {
+                state.fit_pending = true;
+            }
+            kit::vdivider(ui, 18.0);
+            let before = diagram.settings;
+            toolbar_combo(
+                ui,
+                "ternarygrid_er_columns",
+                tr(diagram.settings.columns.label()),
+                140.0,
+                |ui| {
+                    for d in ColumnDisplay::ALL {
+                        ui.selectable_value(&mut diagram.settings.columns, d, tr(d.label()));
+                    }
+                },
+            )
             .on_hover_text(tr("Columns shown in the boxes"));
-        ui.toggle_value(&mut diagram.settings.show_types, tr("Types"))
-            .on_hover_text(tr("Show column types"));
-        ui.toggle_value(&mut diagram.settings.show_comments, tr("Comments"))
-            .on_hover_text(tr("Show table comments"));
-        egui::ComboBox::from_id_salt("ternarygrid_er_notation")
-            .icon(ternarygrid_ui::kit::combo_caret)
-            .selected_text(tr(diagram.settings.notation.label()))
-            .show_ui(ui, |ui| {
-                for n in [Notation::CrowsFoot, Notation::Simple] {
-                    ui.selectable_value(&mut diagram.settings.notation, n, tr(n.label()));
-                }
-            });
-        if diagram.settings != before {
-            events.push(ErEvent::SettingsChanged);
-        }
-        ui.separator();
-        if ui
-            .button((
-                ternarygrid_icons::ic(icon::TREE_STRUCTURE),
+            let s = &mut diagram.settings;
+            if kit::button_full(ui, Kind::Ghost, None, tr("Types"), true, s.show_types)
+                .on_hover_text(tr("Show column types"))
+                .clicked()
+            {
+                s.show_types = !s.show_types;
+            }
+            if kit::button_full(ui, Kind::Ghost, None, tr("Comments"), true, s.show_comments)
+                .on_hover_text(tr("Show table comments"))
+                .clicked()
+            {
+                s.show_comments = !s.show_comments;
+            }
+            toolbar_combo(
+                ui,
+                "ternarygrid_er_notation",
+                tr(diagram.settings.notation.label()),
+                130.0,
+                |ui| {
+                    for n in [Notation::CrowsFoot, Notation::Simple] {
+                        ui.selectable_value(&mut diagram.settings.notation, n, tr(n.label()));
+                    }
+                },
+            );
+            if diagram.settings != before {
+                events.push(ErEvent::SettingsChanged);
+            }
+            kit::vdivider(ui, 18.0);
+            if kit::button_ex(
+                ui,
+                Kind::Ghost,
+                Some(icon::TREE_STRUCTURE),
                 tr("Auto layout"),
-            ))
+                true,
+            )
             .on_hover_text(tr("Arrange all tables automatically"))
             .clicked()
-        {
-            diagram.relayout();
-            state.fit_pending = true;
-            events.push(ErEvent::TableMoved(
-                diagram.model.tables.iter().map(|t| t.key.clone()).collect(),
-            ));
-        }
-        ui.toggle_value(
-            &mut state.show_minimap,
-            ternarygrid_icons::ic(icon::MAP_TRIFOLD),
-        )
-        .on_hover_text(tr("Show overview map"));
-        ui.toggle_value(
-            &mut state.edit_mode,
-            (ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Edit mode")),
-        )
-        .on_hover_text(tr(
-            "Edit the schema from the diagram: create and change tables and foreign keys",
-        ));
-        if ui
-            .button((ternarygrid_icons::ic(icon::EXPORT), tr("Export…")))
-            .on_hover_text(tr("Export image"))
+            {
+                diagram.relayout();
+                state.fit_pending = true;
+                events.push(ErEvent::TableMoved(
+                    diagram.model.tables.iter().map(|t| t.key.clone()).collect(),
+                ));
+            }
+            if kit::icon_button_ex(
+                ui,
+                icon::MAP_TRIFOLD,
+                tr("Show overview map"),
+                state.show_minimap,
+                26.0,
+            )
             .clicked()
-        {
-            events.push(ErEvent::ExportRequested);
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.weak(trf(
-                "{} tables, {} relations",
-                &[&diagram.model.tables.len(), &diagram.model.relations.len()],
-            ));
+            {
+                state.show_minimap = !state.show_minimap;
+            }
+            if kit::button_full(
+                ui,
+                Kind::Ghost,
+                Some(icon::PENCIL_SIMPLE),
+                tr("Edit mode"),
+                true,
+                state.edit_mode,
+            )
+            .on_hover_text(tr(
+                "Edit the schema from the diagram: create and change tables and foreign keys",
+            ))
+            .clicked()
+            {
+                state.edit_mode = !state.edit_mode;
+            }
+            if kit::button_ex(ui, Kind::Ghost, Some(icon::EXPORT), tr("Export…"), true)
+                .on_hover_text(tr("Export image"))
+                .clicked()
+            {
+                events.push(ErEvent::ExportRequested);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let counts = trf(
+                    "{} tables, {} relations",
+                    &[&diagram.model.tables.len(), &diagram.model.relations.len()],
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(counts).size(12.0).color(p.text_faint))
+                        .truncate(),
+                );
+            });
         });
     });
+    ternarygrid_ui::parts::hline(ui);
 }
 
 // ---------------------------------------------------------------- menus
@@ -982,86 +1052,126 @@ fn context_menu_ui(
     selection: &BTreeSet<String>,
     edit_mode: bool,
 ) -> Option<MenuAction> {
+    use ternarygrid_ui::kit::with_icon;
+    let p = ternarygrid_ui::pal(ui);
     let mut action = None;
-    let mut item = |ui: &mut Ui, text: String, a: MenuAction| {
-        if ui.button(text).clicked() {
+    // An item: its icon and text (in red for the destructive ones).
+    let mut item = |ui: &mut Ui, glyph: &str, text: &str, a: MenuAction, danger: bool| {
+        let label = egui::RichText::new(with_icon(glyph, text));
+        let label = if danger { label.color(p.err) } else { label };
+        if ui.button(label).clicked() {
             action = Some(a);
             ui.close();
         }
     };
+    // The menu's title: what it acts on, faint.
+    let title = |ui: &mut Ui, text: &str| {
+        ui.add(
+            egui::Label::new(egui::RichText::new(text).color(p.text_faint))
+                .truncate()
+                .selectable(false),
+        );
+        ui.separator();
+    };
     match target {
         ContextTarget::Table(key) => {
             let keys = target_keys(key, selection);
-            ui.label(egui::RichText::new(key.as_str()).strong());
-            ui.separator();
+            let name = diagram
+                .model
+                .table(key)
+                .map_or(key.as_str(), |t| t.name.as_str());
+            title(ui, name);
             item(
                 ui,
-                format!("{} {}", icon::ARROW_SQUARE_OUT, tr("Open")),
+                icon::EYE,
+                tr("Open"),
                 MenuAction::Emit(ErEvent::OpenTable(key.clone())),
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::TABLE, tr("View data")),
+                icon::TABLE,
+                tr("View data"),
                 MenuAction::Emit(ErEvent::ViewData(key.clone())),
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::CODE, tr("Generate DDL")),
+                icon::FILE_CODE,
+                tr("Generate DDL"),
                 MenuAction::Emit(ErEvent::GenerateDdl(keys.clone())),
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::GRAPH, tr("Add related tables")),
+                icon::PLUS,
+                tr("Add related tables"),
                 MenuAction::Emit(ErEvent::AddRelatedTables(key.clone())),
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::LINK, tr("Select related tables")),
+                icon::LINK,
+                tr("Select related tables"),
                 MenuAction::SelectRelated(key.clone()),
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::EYE_SLASH, tr("Remove from diagram")),
+                icon::MINUS,
+                tr("Remove from diagram"),
                 MenuAction::RemoveTables(keys.clone()),
+                false,
             );
             if edit_mode {
                 ui.separator();
                 item(
                     ui,
-                    format!("{} {}", icon::PENCIL_SIMPLE, tr("Edit table…")),
+                    icon::PENCIL_SIMPLE,
+                    tr("Edit table…"),
                     MenuAction::Emit(ErEvent::EditTable(key.clone())),
+                    false,
                 );
                 item(
                     ui,
-                    format!("{} {}", icon::PLUS, tr("Add column…")),
+                    icon::PLUS,
+                    tr("Add column…"),
                     MenuAction::Emit(ErEvent::AddColumn(key.clone())),
+                    false,
                 );
                 item(
                     ui,
-                    format!("{} {}", icon::TRASH, tr("Delete table…")),
+                    icon::TRASH,
+                    tr("Delete table…"),
                     MenuAction::Emit(ErEvent::DeleteTables(keys)),
+                    true,
                 );
             }
         }
         ContextTarget::Relation(i) => {
             if let Some(r) = diagram.model.relations.get(*i) {
-                ui.label(egui::RichText::new(r.name.as_str()).strong());
-                ui.separator();
+                title(ui, r.name.as_str());
                 item(
                     ui,
-                    format!("{} {}", icon::LINK, tr("Select both tables")),
+                    icon::LINK,
+                    tr("Select both tables"),
                     MenuAction::SelectTables(vec![r.from_table.clone(), r.to_table.clone()]),
+                    false,
                 );
                 if edit_mode {
                     item(
                         ui,
-                        format!("{} {}", icon::PENCIL_SIMPLE, tr("Edit foreign key…")),
+                        icon::PENCIL_SIMPLE,
+                        tr("Edit foreign key…"),
                         MenuAction::Emit(ErEvent::EditRelation(r.clone())),
+                        false,
                     );
                     item(
                         ui,
-                        format!("{} {}", icon::TRASH, tr("Delete foreign key…")),
+                        icon::TRASH,
+                        tr("Delete foreign key…"),
                         MenuAction::Emit(ErEvent::DeleteRelation(r.clone())),
+                        true,
                     );
                 }
             }
@@ -1069,47 +1179,63 @@ fn context_menu_ui(
         ContextTarget::Note(i) => {
             item(
                 ui,
-                format!("{} {}", icon::PENCIL_SIMPLE, tr("Edit note")),
+                icon::PENCIL_SIMPLE,
+                tr("Edit note"),
                 MenuAction::EditNote(*i),
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::TRASH, tr("Delete note")),
+                icon::TRASH,
+                tr("Delete note"),
                 MenuAction::DeleteNote(*i),
+                true,
             );
         }
         ContextTarget::Background(pos) => {
             item(
                 ui,
-                format!("{} {}", icon::CORNERS_OUT, tr("Zoom to fit")),
+                icon::CORNERS_OUT,
+                tr("Zoom to fit"),
                 MenuAction::Fit,
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::TREE_STRUCTURE, tr("Auto layout")),
+                icon::TREE_STRUCTURE,
+                tr("Auto layout"),
                 MenuAction::Relayout,
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::SELECTION_ALL, tr("Select all")),
+                icon::SELECTION_ALL,
+                tr("Select all"),
                 MenuAction::SelectAll,
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::NOTE, tr("Add note")),
+                icon::NOTE,
+                tr("Add note"),
                 MenuAction::AddNote(*pos),
+                false,
             );
             item(
                 ui,
-                format!("{} {}", icon::EXPORT, tr("Export image…")),
+                icon::EXPORT,
+                tr("Export image…"),
                 MenuAction::Emit(ErEvent::ExportRequested),
+                false,
             );
             if edit_mode {
                 ui.separator();
                 item(
                     ui,
-                    format!("{} {}", icon::PLUS, tr("Create table here…")),
+                    icon::PLUS,
+                    tr("Create table here…"),
                     MenuAction::Emit(ErEvent::CreateTable { pos: *pos }),
+                    false,
                 );
             }
         }
@@ -1234,25 +1360,32 @@ fn paint_canvas(
         .rect_to_world(origin, rect)
         .expand(40.0 / zoom.max(1e-3));
 
-    // grid
-    let step = 100.0;
-    if step * zoom >= 24.0 {
-        let stroke = Stroke::new(1.0, pal.grid);
+    // dotted grid: a dot every 20 units, every 100 or 500 when zoomed out (one mesh, a
+    // bounded number of dots)
+    let mut step = 20.0;
+    while step * zoom < 14.0 {
+        step *= 5.0;
+    }
+    let (nx, ny) = (visible.width() / step, visible.height() / step);
+    if nx * ny <= 12_000.0 {
+        let mut mesh = egui::Mesh::default();
+        let dot = Vec2::splat(if zoom >= 0.8 { 1.6 } else { 1.3 });
         let mut x = (visible.left() / step).floor() * step;
         while x <= visible.right() {
-            let sx = view.to_screen(origin, pos2(x, 0.0)).x;
-            painter.vline(sx, rect.y_range(), stroke);
+            let mut y = (visible.top() / step).floor() * step;
+            while y <= visible.bottom() {
+                let p = view.to_screen(origin, pos2(x, y));
+                if rect.contains(p) {
+                    mesh.add_colored_rect(Rect::from_center_size(p, dot), pal.grid);
+                }
+                y += step;
+            }
             x += step;
         }
-        let mut y = (visible.top() / step).floor() * step;
-        while y <= visible.bottom() {
-            let sy = view.to_screen(origin, pos2(0.0, y)).y;
-            painter.hline(rect.x_range(), sy, stroke);
-            y += step;
-        }
+        painter.add(mesh);
     }
 
-    // highlight sets
+    // highlight sets: the relations of the hovered and the selected tables
     let hovered_table = state
         .hover
         .as_ref()
@@ -1263,7 +1396,6 @@ fn paint_canvas(
         _ => None,
     };
     let mut hot_relations: BTreeSet<usize> = BTreeSet::new();
-    let mut hot_tables: BTreeSet<String> = BTreeSet::new();
     for (i, r) in diagram.model.relations.iter().enumerate() {
         let touches = |k: &str| hovered_table.as_deref() == Some(k) || state.selection.contains(k);
         if touches(&r.from_table)
@@ -1272,8 +1404,6 @@ fn paint_canvas(
             || state.selected_relation == Some(i)
         {
             hot_relations.insert(i);
-            hot_tables.insert(r.from_table.clone());
-            hot_tables.insert(r.to_table.clone());
         }
     }
 
@@ -1368,8 +1498,8 @@ fn paint_canvas(
         };
         let srect = view.rect_to_screen(origin, st.rect);
         let is_selected = state.selection.contains(&t.key);
-        let is_hot =
-            hot_tables.contains(&t.key) || hovered_table.as_deref() == Some(t.key.as_str());
+        // The hovered box is outlined; the selected one and its relations are in the accent.
+        let is_hot = hovered_table.as_deref() == Some(t.key.as_str());
         let row_highlight = hovered_column
             .filter(|(tk, _)| *tk == t.key)
             .or(connect_source.filter(|(tk, _)| *tk == t.key))
@@ -1395,25 +1525,27 @@ fn paint_canvas(
             continue;
         }
         let r = view.rect_to_screen(origin, n.rect());
-        let radius = (4.0 * zoom).clamp(0.0, 8.0);
+        let radius = (CORNER_RADIUS * zoom).clamp(0.0, 8.0);
         painter.rect_filled(r, radius, pal.note_fill);
-        let stroke = if state.selected_note == Some(i) {
-            pal.selection
-        } else {
-            Stroke::new(1.0, pal.note_stroke)
-        };
-        painter.rect_stroke(r, radius, stroke, StrokeKind::Inside);
+        if state.selected_note == Some(i) {
+            painter.rect_stroke(r, radius, pal.selection, StrokeKind::Inside);
+        }
         if state.editing_note != Some(i)
             && let Some(px) = font_px(12.0, zoom)
         {
-            let galley = painter.layout(
+            let mut job = egui::text::LayoutJob::single_section(
                 n.text.clone(),
-                egui::FontId::proportional(px),
-                Color32::PLACEHOLDER,
-                (r.width() - 12.0 * zoom).max(10.0),
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(px),
+                    color: Color32::PLACEHOLDER,
+                    line_height: Some(px * 1.4),
+                    ..Default::default()
+                },
             );
+            job.wrap.max_width = (r.width() - 20.0 * zoom).max(10.0);
+            let galley = painter.layout_job(job);
             let clip = painter.with_clip_rect(r.shrink(2.0).intersect(painter.clip_rect()));
-            clip.galley(r.min + vec2(6.0, 5.0) * zoom, galley, pal.text);
+            clip.galley(r.min + vec2(10.0, 9.0) * zoom, galley, pal.text);
         }
         // resize handle
         if zoom > 0.4 {
@@ -1574,6 +1706,27 @@ fn paint_markers(
     }
 }
 
+/// Lays out and paints one line of text in `font` (elided at `max_width`); returns its rect.
+fn text_in(
+    painter: &Painter,
+    pos: Pos2,
+    align: Align2,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_width: f32,
+) -> Rect {
+    let mut job =
+        egui::text::LayoutJob::simple_singleline(text.to_owned(), font, Color32::PLACEHOLDER);
+    if max_width.is_finite() {
+        job.wrap = egui::text::TextWrapping::truncate_at_width(max_width.max(1.0));
+    }
+    paint::paint_galley(painter, pos, align, painter.layout_job(job), color)
+}
+
+/// One box: a soft shadow, the header band tinted by kind (its icon, the name in semibold and
+/// the schema, faint), then a row per listed column with its key or link icon and its faint
+/// type at the right. Zoomed out, the rows become bars and then disappear (level of detail).
 #[allow(clippy::too_many_arguments)]
 fn paint_table(
     ui: &Ui,
@@ -1589,29 +1742,40 @@ fn paint_table(
     row_highlight: Option<&str>,
 ) {
     let v = ui.visuals();
+
     let radius_f = (CORNER_RADIUS * zoom).clamp(0.0, 12.0);
     let radius = radius_f.round() as u8;
+    if zoom >= 0.35 {
+        let shadow = egui::Shadow {
+            offset: [0, 2],
+            blur: 6,
+            spread: 0,
+            color: pal.shadow,
+        };
+        painter.add(shadow.as_shape(srect, radius));
+    }
     painter.rect_filled(srect, radius, pal.box_fill);
     let header_h = HEADER_HEIGHT * zoom;
     let header = Rect::from_min_size(srect.min, vec2(srect.width(), header_h.min(srect.height())));
     let header_fill = pal.header(v, t.kind, t.status);
+    let bottom = if srect.height() > header_h + 1.0 {
+        0
+    } else {
+        radius
+    };
     painter.rect_filled(
         header,
         CornerRadius {
             nw: radius,
             ne: radius,
-            sw: 0,
-            se: 0,
+            sw: bottom,
+            se: bottom,
         },
         header_fill,
     );
-    if srect.height() > header_h + 1.0 {
-        painter.hline(srect.x_range(), header.bottom(), pal.box_stroke);
-    }
 
     // header text
     if let Some(px) = font_px(HEADER_FONT, zoom) {
-        let icon_px = px;
         let icon_glyph = if t.kind == ErTableKind::View {
             icon::EYE
         } else {
@@ -1624,8 +1788,8 @@ fn paint_table(
             pos2(left, cy),
             Align2::LEFT_CENTER,
             icon_glyph,
-            icon_px,
-            pal.weak,
+            px,
+            pal.header_icon,
             false,
             f32::INFINITY,
         );
@@ -1648,14 +1812,13 @@ fn paint_table(
             _ => 0.0,
         };
         let max_w = (srect.right() - PAD_X * zoom - schema_w - name_x).max(10.0);
-        paint::text(
+        text_in(
             painter,
             pos2(name_x, cy),
             Align2::LEFT_CENTER,
             &t.name,
-            px,
+            egui::FontId::new((px * 0.96 * 2.0).round() / 2.0, pal.bold.clone()),
             pal.strong,
-            false,
             max_w,
         );
     }
@@ -1699,58 +1862,59 @@ fn paint_table(
         match row_px {
             Some(px) => {
                 let ix = srect.left() + PAD_X * zoom;
-                if col.pk {
-                    paint::text(
-                        painter,
-                        pos2(ix, cy),
-                        Align2::LEFT_CENTER,
-                        icon::KEY,
-                        px,
-                        pal.pk,
-                        false,
-                        f32::INFINITY,
-                    );
+                let key_icon = if col.pk {
+                    Some((icon::KEY, pal.pk))
                 } else if col.fk {
+                    Some((icon::LINK_SIMPLE, pal.fk))
+                } else {
+                    None
+                };
+                if let Some((glyph, color)) = key_icon {
                     paint::text(
                         painter,
                         pos2(ix, cy),
                         Align2::LEFT_CENTER,
-                        icon::LINK_SIMPLE,
-                        px,
-                        pal.fk,
+                        glyph,
+                        (px * 0.92 * 2.0).round() / 2.0,
+                        color,
                         false,
                         f32::INFINITY,
                     );
                 }
                 let name_x = srect.left() + geom.name_x * zoom;
                 let type_x = srect.left() + geom.type_x * zoom;
+                let right = srect.right() - PAD_X * zoom;
                 let has_type = show_types && !col.data_type.is_empty();
                 let name_max = if has_type {
                     type_x - name_x - 6.0 * zoom
                 } else {
-                    srect.right() - PAD_X * zoom - name_x
+                    right - name_x
                 };
-                let name_color = if col.pk { pal.strong } else { pal.text };
-                paint::text(
+                let font = if col.pk {
+                    egui::FontId::new(px, pal.bold.clone())
+                } else {
+                    egui::FontId::proportional(px)
+                };
+                text_in(
                     painter,
                     pos2(name_x, cy),
                     Align2::LEFT_CENTER,
                     &col.name,
-                    px,
-                    name_color,
-                    false,
+                    font,
+                    pal.text,
                     name_max.max(8.0),
                 );
                 if has_type {
+                    // Types in a smaller monospace, right-aligned.
                     paint::text(
                         painter,
-                        pos2(type_x, cy),
-                        Align2::LEFT_CENTER,
+                        pos2(right, cy),
+                        Align2::RIGHT_CENTER,
                         &col.data_type,
-                        px,
+                        (px * 0.875 * 2.0).round() / 2.0,
                         pal.weak,
-                        false,
-                        (srect.right() - PAD_X * zoom - type_x).max(8.0),
+                        true,
+                        (right - type_x).max(8.0),
                     );
                 }
             }
@@ -1773,7 +1937,7 @@ fn paint_table(
         }
     }
 
-    // outline
+    // outline: 2 px accent when selected, the accent when hovered
     let stroke = if selected {
         pal.selection
     } else if hot {
@@ -1786,6 +1950,8 @@ fn paint_table(
     painter.rect_stroke(srect, radius, stroke, StrokeKind::Inside);
 }
 
+/// The overview map in the bottom right corner: the boxes, and the visible part of the
+/// diagram in the accent; a click or a drag moves the view there.
 #[allow(clippy::too_many_arguments)]
 fn minimap(
     ui: &Ui,
@@ -1799,34 +1965,44 @@ fn minimap(
 ) {
     let Some(bounds) = scene.bounds() else { return };
     let bounds = bounds.expand(20.0);
-    let max = vec2(200.0, 140.0).min(canvas.size() * 0.3);
+    let max = vec2(200.0, 120.0).min(canvas.size() * 0.3);
     if max.x < 40.0 || max.y < 30.0 {
         return;
     }
-    let scale = (max.x / bounds.width()).min(max.y / bounds.height());
+    let pad = 8.0;
+    let scale = ((max.x - 2.0 * pad) / bounds.width()).min((max.y - 2.0 * pad) / bounds.height());
     let size = bounds.size() * scale;
-    let inner = Rect::from_min_size(canvas.max - size - vec2(12.0, 12.0), size);
-    let frame = inner.expand(4.0);
+    let frame = Rect::from_min_size(canvas.max - max - vec2(16.0, 16.0), max);
+    let inner = Rect::from_center_size(frame.center(), size);
     state.minimap_rect = Some(frame);
     let to_map = |p: Pos2| inner.min + (p - bounds.min) * scale;
-    painter.rect_filled(frame, 4.0, pal.box_fill.gamma_multiply(0.92));
-    painter.rect_stroke(frame, 4.0, pal.box_stroke, StrokeKind::Inside);
+    painter.rect(
+        frame,
+        8.0,
+        pal.map,
+        Stroke::new(1.0, pal.box_stroke.color.gamma_multiply(0.6)),
+        StrokeKind::Inside,
+    );
     let v = ui.visuals();
     for st in &scene.tables {
         let Some(t) = diagram.model.tables.get(st.table) else {
             continue;
         };
         let r = Rect::from_min_max(to_map(st.rect.min), to_map(st.rect.max));
-        let mut fill = pal.header(v, t.kind, t.status);
-        if state.selection.contains(&t.key) {
-            fill = pal.highlight;
-        }
-        painter.rect_filled(r, 0.0, fill);
+        let fill = if state.selection.contains(&t.key) {
+            pal.highlight
+        } else if t.status.is_some() {
+            pal.header(v, t.kind, t.status)
+        } else {
+            pal.line
+        };
+        painter.rect_filled(r, 1.0, fill);
     }
     let view = state.view();
     let visible = view.rect_to_world(canvas.min, canvas);
-    let vr = Rect::from_min_max(to_map(visible.min), to_map(visible.max)).intersect(frame);
-    painter.rect_stroke(vr, 0.0, Stroke::new(1.5, pal.highlight), StrokeKind::Inside);
+    let vr =
+        Rect::from_min_max(to_map(visible.min), to_map(visible.max)).intersect(frame.shrink(2.0));
+    painter.rect_stroke(vr, 3.0, Stroke::new(1.5, pal.highlight), StrokeKind::Inside);
 
     let resp = ui.interact(frame, base_id.with("minimap"), Sense::click_and_drag());
     if (resp.clicked() || resp.dragged())

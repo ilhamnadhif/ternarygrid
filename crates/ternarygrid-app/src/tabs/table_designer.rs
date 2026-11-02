@@ -17,10 +17,11 @@ use crate::conn::session::SessionHandle;
 use crate::cx::AppContext;
 use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
-use egui::{RichText, Ui};
+use egui::{Align, Color32, CornerRadius, FontId, Layout, Margin, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType, vec2};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 use ternarygrid_core::ddl::{CheckDef, ColumnDef, FkAction, ForeignKeyDef, IndexColumn, IndexDef, KeyDef, SchemaSnapshot, TableDef, TriggerDef};
@@ -28,6 +29,7 @@ use ternarygrid_core::dialect::ansi;
 use ternarygrid_core::meta::{ObjectRef, SchemaRef};
 use ternarygrid_core::value::DataKind;
 use ternarygrid_core::{DbKind, DbResult, Dialect, Value, tr, trf};
+use ternarygrid_ui::{kit, parts, style};
 
 // ------------------------------------------------------------ type helpers
 
@@ -874,8 +876,7 @@ impl TableDesignerTab {
             }
         }
         for (i, f) in m.fks.iter().enumerate() {
-            let cols = m.resolve_all(&f.cols);
-            if f.ref_table.trim().is_empty() || cols.is_empty() || cols.len() != f.ref_columns.len() || f.ref_columns.iter().any(|c| c.trim().is_empty()) {
+            if fk_incomplete(m, f) {
                 out.push(trf("Foreign key {} needs a referenced table and the same number of columns on both sides.", &[&opt(&f.name).unwrap_or_else(|| format!("#{}", i + 1))]));
             }
         }
@@ -1016,239 +1017,268 @@ impl TableDesignerTab {
 
     // ---------------------------------------------------------------- UI
 
+    /// The table's name and place, the main action and the problems that stop it.
     fn toolbar(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
         let issues = self.issues();
         let stmts = self.statements();
-        ui.horizontal(|ui| {
-            ui.label(tr("Table"));
-            ui.add(egui::TextEdit::singleline(&mut self.model.name).hint_text(tr("table name")).desired_width(200.0).id_salt(("td_name", self.uid)));
-            let schema = self.schema.schema.clone().unwrap_or_default();
-            let conn = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default();
-            ui.weak(trf("in {} ({})", &[&schema, &conn]));
-            ui.separator();
-            let can = issues.is_empty() && !stmts.is_empty() && self.exec.is_none();
-            let label = if self.is_create() { tr("Create table…") } else { tr("Apply changes…") };
-            if ui.add_enabled(can, egui::Button::new(RichText::new(format!("{} {label}", icon::PLAY)).strong())).clicked() {
-                self.confirm = true;
-            }
-            if ui.add_enabled(!stmts.is_empty(), egui::Button::new((ternarygrid_icons::ic(icon::FILE_SQL), tr("Open in SQL editor")))).clicked() {
-                cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: Some(self.schema.clone()), text: Some(script_text(&stmts)) });
-            }
-            if !self.is_create() {
-                if ui.add_enabled(self.model != self.baseline, egui::Button::new((ternarygrid_icons::ic(icon::ARROW_COUNTER_CLOCKWISE), tr("Revert")))).clicked() {
-                    self.model = self.baseline.clone();
+        egui::Frame::new().inner_margin(Margin::symmetric(16, 10)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.set_min_height(style::CONTROL_H);
+                ui.label(RichText::new(tr("Table")).size(12.5).color(p.text_muted));
+                field(ui, &mut self.model.name, ("td_name", self.uid), 220.0, style::CONTROL_H, tr("table name"), false);
+                let schema = self.schema.schema.clone().unwrap_or_default();
+                let conn = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default();
+                ui.label(RichText::new(trf("in {} ({})", &[&schema, &conn])).size(12.0).color(p.text_faint));
+                kit::vdivider(ui, 18.0);
+                let can = issues.is_empty() && !stmts.is_empty() && self.exec.is_none();
+                let label = if self.is_create() { tr("Create table…") } else { tr("Apply changes…") };
+                if ui.add_enabled_ui(can, |ui| kit::button_ex(ui, kit::Kind::Primary, Some(icon::PLAY), label, true)).inner.clicked() {
+                    self.confirm = true;
                 }
-                if ui.button(ternarygrid_icons::ic(icon::ARROW_CLOCKWISE)).on_hover_text(tr("Reload the table")).clicked() {
-                    self.original = None;
-                    self.load_error = None;
+                if ui.add_enabled_ui(!stmts.is_empty(), |ui| kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), true)).inner.clicked() {
+                    cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: Some(self.schema.clone()), text: Some(script_text(&stmts)) });
                 }
+                if !self.is_create() {
+                    if ui.add_enabled_ui(self.model != self.baseline, |ui| kit::button_ex(ui, kit::Kind::Ghost, None, tr("Revert"), true)).inner.clicked() {
+                        self.model = self.baseline.clone();
+                    }
+                    if kit::icon_button(ui, icon::ARROW_CLOCKWISE, tr("Reload the table")).clicked() {
+                        self.original = None;
+                        self.load_error = None;
+                    }
+                }
+                if self.exec.is_some() {
+                    parts::spinner_label(ui, tr("Executing…"));
+                }
+            });
+        });
+        parts::hline(ui);
+        if issues.is_empty() && self.exec_error.is_none() {
+            return;
+        }
+        egui::Frame::new().inner_margin(Margin { left: 16, right: 16, top: 8, bottom: 2 }).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for i in issues.iter().take(4) {
+                warning_line(ui, i);
             }
-            if self.exec.is_some() {
-                ui.spinner();
-                ui.weak(tr("Executing…"));
+            if issues.len() > 4 {
+                ui.label(RichText::new(trf("… and {} more", &[&(issues.len() - 4)])).size(12.0).color(p.text_faint));
+            }
+            if let Some(e) = &self.exec_error {
+                crate::widgets::error_box(ui, e);
             }
         });
-        let dark = ui.visuals().dark_mode;
-        for i in issues.iter().take(4) {
-            ui.label(RichText::new(format!("{} {i}", icon::WARNING)).color(crate::theme::warning_color(dark)));
-        }
-        if issues.len() > 4 {
-            ui.weak(trf("… and {} more", &[&(issues.len() - 4)]));
-        }
-        if let Some(e) = &self.exec_error {
-            crate::widgets::error_box(ui, e);
-        }
     }
 
+    /// The pages, each with its count.
     fn pages_ui(&mut self, ui: &mut Ui) {
         let m = &self.model;
+        let n = |k: usize| Some(k.to_string());
         let pages = [
-            (Page::Columns, trf("Columns ({})", &[&m.columns.len()])),
-            (Page::Keys, trf("Keys ({})", &[&(usize::from(!m.pk.is_empty()) + m.uniques.len())])),
-            (Page::Indexes, trf("Indexes ({})", &[&m.indexes.len()])),
-            (Page::ForeignKeys, trf("Foreign keys ({})", &[&m.fks.len()])),
-            (Page::Checks, trf("Checks ({})", &[&m.checks.len()])),
-            (Page::Triggers, trf("Triggers ({})", &[&m.triggers.len()])),
-            (Page::Options, tr("Options").to_string()),
+            (Page::Columns, tr("Columns"), n(m.columns.len())),
+            (Page::Keys, tr("Keys"), n(usize::from(!m.pk.is_empty()) + m.uniques.len())),
+            (Page::Indexes, tr("Indexes"), n(m.indexes.len())),
+            (Page::ForeignKeys, tr("Foreign keys"), n(m.fks.len())),
+            (Page::Checks, tr("Checks"), n(m.checks.len())),
+            (Page::Triggers, tr("Triggers"), n(m.triggers.len())),
+            (Page::Options, tr("Options"), None),
         ];
-        ui.horizontal(|ui| {
-            for (p, label) in pages {
-                ui.selectable_value(&mut self.page, p, label);
-            }
+        egui::Frame::new().inner_margin(Margin { left: 10, right: 16, top: 0, bottom: 0 }).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (page, label, count) in pages {
+                    if kit::underline_tab(ui, None, label, count.as_deref(), self.page == page, 34.0).clicked() {
+                        self.page = page;
+                    }
+                }
+            });
         });
+        parts::hline(ui);
     }
 
     fn columns_page(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("Add column"))).clicked() {
-                let n = self.model.columns.len() + 1;
-                let mut name = format!("column{n}");
-                let mut k = n;
-                while self.model.columns.iter().any(|c| c.name == name) {
-                    k += 1;
-                    name = format!("column{k}");
+        egui::Frame::new().inner_margin(Margin::symmetric(16, 10)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add column"), true).clicked() {
+                    let n = self.model.columns.len() + 1;
+                    let mut name = format!("column{n}");
+                    let mut k = n;
+                    while self.model.columns.iter().any(|c| c.name == name) {
+                        k += 1;
+                        name = format!("column{k}");
+                    }
+                    let (_, text_type) = new_column_types(self.kind);
+                    let row = self.new_column(name, text_type);
+                    let at = self.selected.map(|s| s + 1).unwrap_or(self.model.columns.len()).min(self.model.columns.len());
+                    self.model.columns.insert(at, row);
+                    self.selected = Some(at);
                 }
-                let (_, text_type) = new_column_types(self.kind);
-                let row = self.new_column(name, text_type);
-                let at = self.selected.map(|s| s + 1).unwrap_or(self.model.columns.len()).min(self.model.columns.len());
-                self.model.columns.insert(at, row);
-                self.selected = Some(at);
-            }
-            let sel = self.selected.filter(|s| *s < self.model.columns.len());
-            if ui.add_enabled(sel.is_some(), egui::Button::new((ternarygrid_icons::ic(icon::MINUS), tr("Remove")))).clicked()
-                && let Some(i) = sel
-            {
-                let uid = self.model.columns[i].uid;
-                self.model.remove_column(uid);
-                self.selected = if self.model.columns.is_empty() { None } else { Some(i.min(self.model.columns.len() - 1)) };
-            }
-            if ui.add_enabled(sel.is_some_and(|i| i > 0), egui::Button::new(ternarygrid_icons::ic(icon::ARROW_UP))).on_hover_text(tr("Move up")).clicked()
-                && let Some(i) = sel
-            {
-                self.model.columns.swap(i, i - 1);
-                self.selected = Some(i - 1);
-            }
-            if ui
-                .add_enabled(sel.is_some_and(|i| i + 1 < self.model.columns.len()), egui::Button::new(ternarygrid_icons::ic(icon::ARROW_DOWN)))
-                .on_hover_text(tr("Move down"))
-                .clicked()
-                && let Some(i) = sel
-            {
-                self.model.columns.swap(i, i + 1);
-                self.selected = Some(i + 1);
-            }
+                let sel = self.selected.filter(|s| *s < self.model.columns.len());
+                if ui.add_enabled_ui(sel.is_some(), |ui| kit::button_ex(ui, kit::Kind::Ghost, Some(icon::MINUS), tr("Remove"), true)).inner.clicked()
+                    && let Some(i) = sel
+                {
+                    let uid = self.model.columns[i].uid;
+                    self.model.remove_column(uid);
+                    self.selected = if self.model.columns.is_empty() { None } else { Some(i.min(self.model.columns.len() - 1)) };
+                }
+                if ui.add_enabled_ui(sel.is_some_and(|i| i > 0), |ui| kit::icon_button_ex(ui, icon::ARROW_UP, tr("Move up"), false, 26.0)).inner.clicked()
+                    && let Some(i) = sel
+                {
+                    self.model.columns.swap(i, i - 1);
+                    self.selected = Some(i - 1);
+                }
+                let last = self.model.columns.len();
+                if ui.add_enabled_ui(sel.is_some_and(|i| i + 1 < last), |ui| kit::icon_button_ex(ui, icon::ARROW_DOWN, tr("Move down"), false, 26.0)).inner.clicked()
+                    && let Some(i) = sel
+                {
+                    self.model.columns.swap(i, i + 1);
+                    self.selected = Some(i + 1);
+                }
+            });
         });
         let types = common_types(self.kind);
         let auto_ok = supports_auto_increment(self.kind);
         let uid = self.uid;
-        let row_h = ui.spacing().interact_size.y + 6.0;
         let selected = &mut self.selected;
         let Model { columns, pk, .. } = &mut self.model;
         let n = columns.len();
-        TableBuilder::new(ui)
-            .id_salt(("td_cols", uid))
-            .striped(true)
-            .resizable(true)
-            .auto_shrink([false, false])
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(30.0))
-            .column(Column::initial(160.0).at_least(60.0).clip(true))
-            .column(Column::initial(190.0).at_least(90.0).clip(true))
-            .column(Column::initial(70.0).at_least(40.0).clip(true))
-            .column(Column::exact(60.0))
-            .column(Column::initial(150.0).at_least(50.0).clip(true))
-            .column(Column::exact(32.0))
-            .column(Column::exact(44.0))
-            .column(Column::remainder().at_least(80.0).clip(true))
-            .header(row_h, |mut h| {
-                for (label, tip) in [
-                    ("#", ""),
-                    (tr("Name"), ""),
-                    (tr("Data type"), ""),
-                    (tr("Length"), tr("Length or precision, e.g. 255 or 10,2")),
-                    (tr("Not null"), ""),
-                    (tr("Default"), tr("Default value as an SQL expression, e.g. 0, 'text' or now()")),
-                    (tr("PK"), tr("Primary key")),
-                    (tr("Auto"), tr("Auto increment / identity")),
-                    (tr("Comment"), ""),
-                ] {
-                    h.col(|ui| {
-                        let r = ui.strong(label);
-                        if !tip.is_empty() {
-                            r.on_hover_text(tip);
+        egui::Frame::new().inner_margin(Margin { left: 16, right: 16, top: 0, bottom: 12 }).show(ui, |ui| {
+            table_frame(ui, |ui| {
+                // Widths of the mockup's grid: fixed for the flags, shares of the rest for the texts.
+                let spacing = ui.spacing().item_spacing.x;
+                let unit = ((ui.available_width() - (30.0 + 84.0 + 70.0 + 44.0 + 50.0) - 8.0 * spacing) / 4.9).max(40.0);
+                let max_h = (ui.available_height() - HEADER_H - 4.0).max(ROW_H * 2.0);
+                TableBuilder::new(ui)
+                    .id_salt(("td_cols", uid))
+                    .striped(true)
+                    .resizable(true)
+                    .sense(Sense::click())
+                    .auto_shrink([false, true])
+                    .max_scroll_height(max_h)
+                    .cell_layout(Layout::left_to_right(Align::Center))
+                    .column(Column::exact(30.0))
+                    .column(Column::initial(unit * 1.2).at_least(60.0).clip(true))
+                    .column(Column::initial(unit * 1.3).at_least(90.0).clip(true))
+                    .column(Column::initial(84.0).at_least(40.0).clip(true))
+                    .column(Column::exact(70.0))
+                    .column(Column::initial(unit).at_least(50.0).clip(true))
+                    .column(Column::exact(44.0))
+                    .column(Column::exact(50.0))
+                    .column(Column::remainder().at_least(80.0).clip(true))
+                    .header(HEADER_H, |mut h| {
+                        for (label, tip) in [
+                            ("#", ""),
+                            (tr("Name"), ""),
+                            (tr("Data type"), ""),
+                            (tr("Length"), tr("Length or precision, e.g. 255 or 10,2")),
+                            (tr("Not null"), ""),
+                            (tr("Default"), tr("Default value as an SQL expression, e.g. 0, 'text' or now()")),
+                            (tr("PK"), tr("Primary key")),
+                            (tr("Auto"), tr("Auto increment / identity")),
+                            (tr("Comment"), ""),
+                        ] {
+                            h.col(|ui| {
+                                let r = header_label(ui, label);
+                                if !tip.is_empty() {
+                                    r.on_hover_text(tip);
+                                }
+                            });
                         }
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(row_h, n, |mut row| {
-                    let i = row.index();
-                    let Some(c) = columns.get_mut(i) else { return };
-                    let cu = c.uid;
-                    row.set_selected(*selected == Some(i));
-                    row.col(|ui| {
-                        if ui.selectable_label(*selected == Some(i), format!("{}", i + 1)).clicked() {
-                            *selected = Some(i);
-                        }
-                    });
-                    let mut focus = false;
-                    row.col(|ui| {
-                        let r = ui.add(egui::TextEdit::singleline(&mut c.name).id_salt(("td_cn", uid, cu)).desired_width(f32::INFINITY));
-                        focus |= r.gained_focus();
-                    });
-                    row.col(|ui| {
-                        ui.horizontal(|ui| {
-                            let w = (ui.available_width() - 26.0).max(40.0);
-                            let r = ui.add(egui::TextEdit::singleline(&mut c.type_text).id_salt(("td_ct", uid, cu)).desired_width(w));
-                            focus |= r.gained_focus();
-                            ui.menu_button(icon::CARET_DOWN, |ui| {
-                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                                    for t in types {
-                                        if ui.button(*t).clicked() {
-                                            c.type_text = t.to_string();
-                                            c.length = default_length(t).map(str::to_string).unwrap_or_default();
-                                            ui.close();
+                    })
+                    .body(|body| {
+                        body.rows(ROW_H, n, |mut row| {
+                            let i = row.index();
+                            let Some(c) = columns.get_mut(i) else { return };
+                            let cu = c.uid;
+                            row.set_selected(*selected == Some(i));
+                            let mut focus = false;
+                            row.col(|ui| {
+                                let p = ternarygrid_ui::pal(ui);
+                                ui.add_space(4.0);
+                                if ui.add(egui::Label::new(RichText::new(format!("{}", i + 1)).size(12.0).color(p.text_faint)).sense(Sense::click())).clicked() {
+                                    focus = true;
+                                }
+                            });
+                            row.col(|ui| {
+                                focus |= field(ui, &mut c.name, ("td_cn", uid, cu), f32::INFINITY, FIELD_H, "", false).gained_focus();
+                            });
+                            row.col(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                let w = (ui.available_width() - 24.0).max(40.0);
+                                focus |= field(ui, &mut c.type_text, ("td_ct", uid, cu), w, FIELD_H, "", true).gained_focus();
+                                let b = kit::icon_button_ex(ui, icon::CARET_DOWN, tr("Common types"), false, 22.0);
+                                egui::Popup::menu(&b).show(|ui| {
+                                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                        for t in types {
+                                            if ui.button(*t).clicked() {
+                                                c.type_text = t.to_string();
+                                                c.length = default_length(t).map(str::to_string).unwrap_or_default();
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                            row.col(|ui| {
+                                focus |= field(ui, &mut c.length, ("td_cl", uid, cu), 70.0, FIELD_H, "", false).gained_focus();
+                            });
+                            row.col(|ui| {
+                                ui.add_space(4.0);
+                                check(ui, &mut c.not_null, "");
+                            });
+                            row.col(|ui| {
+                                focus |= field(ui, &mut c.default, ("td_cd", uid, cu), f32::INFINITY, FIELD_H, "", true).gained_focus();
+                            });
+                            row.col(|ui| {
+                                ui.add_space(4.0);
+                                let mut on = pk.contains(&cu);
+                                if check(ui, &mut on, "").changed() {
+                                    if on {
+                                        pk.push(cu);
+                                        c.not_null = true;
+                                    } else {
+                                        pk.retain(|u| *u != cu);
+                                    }
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.add_space(4.0);
+                                ui.add_enabled_ui(auto_ok, |ui| {
+                                    if check(ui, &mut c.auto_increment, "").changed() && !c.auto_increment {
+                                        let d = c.default.trim_start().to_ascii_uppercase();
+                                        if d.starts_with("GENERATED ") || d.starts_with("NEXTVAL(") {
+                                            c.default.clear();
                                         }
                                     }
                                 });
                             });
-                        });
-                    });
-                    row.col(|ui| {
-                        let r = ui.add(egui::TextEdit::singleline(&mut c.length).id_salt(("td_cl", uid, cu)).desired_width(f32::INFINITY));
-                        focus |= r.gained_focus();
-                    });
-                    row.col(|ui| {
-                        ui.checkbox(&mut c.not_null, "");
-                    });
-                    row.col(|ui| {
-                        let r = ui.add(egui::TextEdit::singleline(&mut c.default).id_salt(("td_cd", uid, cu)).desired_width(f32::INFINITY));
-                        focus |= r.gained_focus();
-                    });
-                    row.col(|ui| {
-                        let mut on = pk.contains(&cu);
-                        if ui.checkbox(&mut on, "").changed() {
-                            if on {
-                                pk.push(cu);
-                                c.not_null = true;
-                            } else {
-                                pk.retain(|u| *u != cu);
-                            }
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.add_enabled_ui(auto_ok, |ui| {
-                            if ui.checkbox(&mut c.auto_increment, "").changed() && !c.auto_increment {
-                                let d = c.default.trim_start().to_ascii_uppercase();
-                                if d.starts_with("GENERATED ") || d.starts_with("NEXTVAL(") {
-                                    c.default.clear();
-                                }
+                            row.col(|ui| {
+                                focus |= field(ui, &mut c.comment, ("td_cc", uid, cu), f32::INFINITY, FIELD_H, "", false).gained_focus();
+                            });
+                            if focus || row.response().clicked() {
+                                *selected = Some(i);
                             }
                         });
                     });
-                    row.col(|ui| {
-                        let r = ui.add(egui::TextEdit::singleline(&mut c.comment).id_salt(("td_cc", uid, cu)).desired_width(f32::INFINITY));
-                        focus |= r.gained_focus();
-                    });
-                    if focus {
-                        *selected = Some(i);
-                    }
-                });
             });
+        });
     }
 
-    /// Menu button choosing columns (in click order).
-    fn columns_picker(ui: &mut Ui, columns: &[ColRow], model: &Model, cols: &mut Vec<ColRef>) -> bool {
+    /// Picker choosing columns (in click order); a select box that stays open while ticking.
+    fn columns_picker(ui: &mut Ui, id: impl Hash + std::fmt::Debug, columns: &[ColRow], model: &Model, cols: &mut Vec<ColRef>, width: f32, h: f32) -> bool {
         let label = {
             let names = model.resolve_all(cols);
             if names.is_empty() { tr("(choose columns)").to_string() } else { names.join(", ") }
         };
         let mut changed = false;
-        ui.menu_button(label, |ui| {
+        select(ui, id, label, width, h, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
             for c in columns {
                 let pos = cols.iter().position(|r| matches!(r, ColRef::Col(u, _) if *u == c.uid));
                 let mut on = pos.is_some();
-                if ui.checkbox(&mut on, c.name.trim()).changed() {
+                if check(ui, &mut on, c.name.trim()).changed() {
                     match pos {
                         Some(p) => {
                             cols.remove(p);
@@ -1264,45 +1294,59 @@ impl TableDesignerTab {
 
     fn keys_page(&mut self, ui: &mut Ui) {
         let uid = self.uid;
-        ui.strong(tr("Primary key"));
-        ui.horizontal(|ui| {
-            ui.label(tr("Name"));
-            let mut name = self.model.pk_name.clone().unwrap_or_default();
-            if ui.add(egui::TextEdit::singleline(&mut name).hint_text(tr("(default)")).desired_width(180.0).id_salt(("td_pkn", uid))).changed() {
-                self.model.pk_name = opt(&name);
-            }
-        });
-        if self.model.pk.is_empty() {
-            ui.weak(tr("No primary key. Tick PK on the columns page."));
-        }
-        let mut swap: Option<(usize, usize)> = None;
-        let mut remove: Option<usize> = None;
-        let n = self.model.pk.len();
-        for (i, u) in self.model.pk.iter().enumerate() {
-            let name = self.model.name_of(*u).unwrap_or_default();
+        let p = ternarygrid_ui::pal(ui);
+        ui.label(kit::section_title(ui, tr("Primary key")));
+        kit::card(ui).corner_radius(CornerRadius::same(style::RADIUS_LG)).inner_margin(Margin::same(12)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
             ui.horizontal(|ui| {
-                ui.label(format!("{}. {name}", i + 1));
-                if ui.add_enabled(i > 0, egui::Button::new(ternarygrid_icons::ic(icon::ARROW_UP)).small()).clicked() {
-                    swap = Some((i, i - 1));
-                }
-                if ui.add_enabled(i + 1 < n, egui::Button::new(ternarygrid_icons::ic(icon::ARROW_DOWN)).small()).clicked() {
-                    swap = Some((i, i + 1));
-                }
-                if ui.small_button(ternarygrid_icons::ic(icon::X)).on_hover_text(tr("Remove from the primary key")).clicked() {
-                    remove = Some(i);
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.set_min_height(style::CONTROL_H);
+                ui.label(RichText::new(tr("Name")).color(p.text_muted));
+                let mut name = self.model.pk_name.clone().unwrap_or_default();
+                if field(ui, &mut name, ("td_pkn", uid), 220.0, style::CONTROL_H, tr("(default)"), false).changed() {
+                    self.model.pk_name = opt(&name);
                 }
             });
-        }
-        if let Some((a, b)) = swap {
-            self.model.pk.swap(a, b);
-        }
-        if let Some(i) = remove {
-            self.model.pk.remove(i);
-        }
+            if self.model.pk.is_empty() {
+                ui.label(RichText::new(tr("No primary key. Tick PK on the columns page.")).color(p.text_faint));
+            }
+            let mut swap: Option<(usize, usize)> = None;
+            let mut remove: Option<usize> = None;
+            let n = self.model.pk.len();
+            for (i, u) in self.model.pk.iter().enumerate() {
+                let name = self.model.name_of(*u).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.add_sized([22.0, 24.0], egui::Label::new(RichText::new(format!("{}.", i + 1)).color(p.text_faint)));
+                    ui.label(RichText::new(icon::KEY).color(p.warn));
+                    ui.allocate_ui_with_layout(vec2(180.0, 24.0), Layout::left_to_right(Align::Center), |ui| {
+                        ui.set_min_width(180.0);
+                        ui.add(egui::Label::new(RichText::new(name).monospace()).truncate());
+                    });
+                    if ui.add_enabled_ui(i > 0, |ui| kit::icon_button_ex(ui, icon::ARROW_UP, tr("Move up"), false, 24.0)).inner.clicked() {
+                        swap = Some((i, i - 1));
+                    }
+                    if ui.add_enabled_ui(i + 1 < n, |ui| kit::icon_button_ex(ui, icon::ARROW_DOWN, tr("Move down"), false, 24.0)).inner.clicked() {
+                        swap = Some((i, i + 1));
+                    }
+                    if kit::icon_button_ex(ui, icon::X, tr("Remove from the primary key"), false, 24.0).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some((a, b)) = swap {
+                self.model.pk.swap(a, b);
+            }
+            if let Some(i) = remove {
+                self.model.pk.remove(i);
+            }
+        });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.strong(tr("Unique keys"));
-            if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("Add unique key"))).clicked() {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.label(kit::section_title(ui, tr("Unique keys")));
+            if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add unique key"), true).clicked() {
                 let id = self.next();
                 self.model.uniques.push(KeyRow { uid: id, name: String::new(), cols: Vec::new() });
             }
@@ -1311,83 +1355,125 @@ impl TableDesignerTab {
         let snapshot = self.model.clone();
         let mut remove: Option<usize> = None;
         for (i, k) in self.model.uniques.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut k.name).hint_text(tr("name (optional)")).desired_width(180.0).id_salt(("td_uk", uid, k.uid)));
-                Self::columns_picker(ui, &columns, &snapshot, &mut k.cols);
-                if ui.small_button(ternarygrid_icons::ic(icon::TRASH)).on_hover_text(tr("Remove")).clicked() {
-                    remove = Some(i);
-                }
+            item_card(ui, false, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.set_min_height(style::CONTROL_H);
+                    field(ui, &mut k.name, ("td_uk", uid, k.uid), 220.0, style::CONTROL_H, tr("name (optional)"), false);
+                    Self::columns_picker(ui, ("td_ukc", uid, k.uid), &columns, &snapshot, &mut k.cols, 260.0, style::CONTROL_H);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 26.0).clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
             });
         }
         if let Some(i) = remove {
             self.model.uniques.remove(i);
         }
+        if self.model.uniques.is_empty() {
+            ui.label(RichText::new(tr("No unique keys.")).color(p.text_faint));
+        }
     }
 
     fn indexes_page(&mut self, ui: &mut Ui) {
         let uid = self.uid;
-        if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("Add index"))).clicked() {
+        let p = ternarygrid_ui::pal(ui);
+        if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add index"), true).clicked() {
             let id = self.next();
             let name = format!("{}_idx{}", self.model.name.trim(), self.model.indexes.len() + 1).trim_start_matches('_').to_string();
             self.model.indexes.push(IndexRow { uid: id, name, parts: Vec::new(), unique: false, method: String::new(), predicate: String::new(), edited: true, orig: None });
+        }
+        if self.model.indexes.is_empty() {
+            ui.label(RichText::new(tr("No indexes besides the primary and unique keys.")).color(p.text_faint));
+            return;
         }
         let columns = self.model.columns.clone();
         let snapshot = self.model.clone();
         let pg = self.kind.is_postgres_family();
         let mut remove: Option<usize> = None;
-        egui::Grid::new(("td_idx", uid)).num_columns(6).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
-            ui.strong(tr("Name"));
-            ui.strong(tr("Columns"));
-            ui.strong(tr("Unique"));
-            ui.strong(tr("Method"));
-            ui.strong(if pg { tr("Partial (WHERE)") } else { "" });
-            ui.label("");
-            ui.end_row();
-            for (i, x) in self.model.indexes.iter_mut().enumerate() {
-                let mut changed = ui.add(egui::TextEdit::singleline(&mut x.name).desired_width(180.0).id_salt(("td_ixn", uid, x.uid))).changed();
-                let mut cols: Vec<ColRef> = x.parts.iter().filter_map(|(p, _)| p.as_ref().ok().cloned()).collect();
-                let exprs: Vec<String> = x.parts.iter().filter_map(|(p, _)| p.as_ref().err().cloned()).collect();
-                ui.horizontal(|ui| {
-                    if Self::columns_picker(ui, &columns, &snapshot, &mut cols) {
-                        let old = std::mem::take(&mut x.parts);
-                        let desc_of = |r: &ColRef| old.iter().find(|(p, _)| p.as_ref().ok() == Some(r)).is_some_and(|(_, d)| *d);
-                        let mut parts: Vec<(Result<ColRef, String>, bool)> = cols.into_iter().map(|r| (Ok(r.clone()), desc_of(&r))).collect();
-                        parts.extend(old.iter().filter(|(p, _)| p.is_err()).cloned());
-                        x.parts = parts;
-                        changed = true;
+        let indexes = &mut self.model.indexes;
+        let n = indexes.len();
+        table_frame(ui, |ui| {
+            TableBuilder::new(ui)
+                .id_salt(("td_idx", uid))
+                .striped(true)
+                .resizable(true)
+                .auto_shrink([false, true])
+                .vscroll(false)
+                .cell_layout(Layout::left_to_right(Align::Center))
+                .column(Column::initial(200.0).at_least(80.0).clip(true))
+                .column(Column::initial(260.0).at_least(100.0).clip(true))
+                .column(Column::exact(60.0))
+                .column(Column::initial(120.0).at_least(60.0).clip(true))
+                .column(Column::remainder().at_least(80.0).clip(true))
+                .column(Column::exact(32.0))
+                .header(HEADER_H, |mut h| {
+                    for label in [tr("Name"), tr("Columns"), tr("Unique"), tr("Method"), if pg { tr("Partial (WHERE)") } else { "" }, ""] {
+                        h.col(|ui| {
+                            header_label(ui, label);
+                        });
                     }
-                    if !exprs.is_empty() {
-                        ui.weak(trf("+ {} expression(s)", &[&exprs.len()]));
-                    }
+                })
+                .body(|body| {
+                    body.rows(ROW_H, n, |mut row| {
+                        let i = row.index();
+                        let Some(x) = indexes.get_mut(i) else { return };
+                        let mut changed = false;
+                        row.col(|ui| {
+                            changed |= field(ui, &mut x.name, ("td_ixn", uid, x.uid), f32::INFINITY, FIELD_H, "", false).changed();
+                        });
+                        row.col(|ui| {
+                            let mut cols: Vec<ColRef> = x.parts.iter().filter_map(|(p, _)| p.as_ref().ok().cloned()).collect();
+                            let exprs = x.parts.iter().filter(|(p, _)| p.is_err()).count();
+                            let w = if exprs > 0 { (ui.available_width() - 90.0).max(80.0) } else { ui.available_width() };
+                            if Self::columns_picker(ui, ("td_ixc", uid, x.uid), &columns, &snapshot, &mut cols, w, FIELD_H) {
+                                let old = std::mem::take(&mut x.parts);
+                                let desc_of = |r: &ColRef| old.iter().find(|(p, _)| p.as_ref().ok() == Some(r)).is_some_and(|(_, d)| *d);
+                                let mut parts: Vec<(Result<ColRef, String>, bool)> = cols.into_iter().map(|r| (Ok(r.clone()), desc_of(&r))).collect();
+                                parts.extend(old.iter().filter(|(p, _)| p.is_err()).cloned());
+                                x.parts = parts;
+                                changed = true;
+                            }
+                            if exprs > 0 {
+                                let p = ternarygrid_ui::pal(ui);
+                                ui.label(RichText::new(trf("+ {} expression(s)", &[&exprs])).size(12.0).color(p.text_faint));
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.add_space(4.0);
+                            changed |= check(ui, &mut x.unique, "").changed();
+                        });
+                        row.col(|ui| {
+                            changed |= field(ui, &mut x.method, ("td_ixm", uid, x.uid), f32::INFINITY, FIELD_H, tr("default"), true).changed();
+                        });
+                        row.col(|ui| {
+                            if pg {
+                                changed |= field(ui, &mut x.predicate, ("td_ixp", uid, x.uid), f32::INFINITY, FIELD_H, "", true).changed();
+                            }
+                        });
+                        row.col(|ui| {
+                            if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 26.0).clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        if changed {
+                            x.edited = true;
+                        }
+                    });
                 });
-                changed |= ui.checkbox(&mut x.unique, "").changed();
-                changed |= ui.add(egui::TextEdit::singleline(&mut x.method).hint_text(tr("default")).desired_width(90.0).id_salt(("td_ixm", uid, x.uid))).changed();
-                if pg {
-                    changed |= ui.add(egui::TextEdit::singleline(&mut x.predicate).desired_width(160.0).id_salt(("td_ixp", uid, x.uid))).changed();
-                } else {
-                    ui.label("");
-                }
-                if ui.small_button(ternarygrid_icons::ic(icon::TRASH)).on_hover_text(tr("Remove")).clicked() {
-                    remove = Some(i);
-                }
-                if changed {
-                    x.edited = true;
-                }
-                ui.end_row();
-            }
         });
         if let Some(i) = remove {
             self.model.indexes.remove(i);
-        }
-        if self.model.indexes.is_empty() {
-            ui.weak(tr("No indexes besides the primary and unique keys."));
         }
     }
 
     fn fk_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let uid = self.uid;
+        let p = ternarygrid_ui::pal(ui);
         let own_schema = self.schema.schema.clone().unwrap_or_default();
-        if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("Add foreign key"))).clicked() {
+        if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add foreign key"), true).clicked() {
             let id = self.next();
             self.model.fks.push(FkRow {
                 uid: id,
@@ -1434,37 +1520,36 @@ impl TableDesignerTab {
         let this_table = self.model.name.trim().to_string();
         let mut remove: Option<usize> = None;
         for (i, f) in self.model.fks.iter_mut().enumerate() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut f.name).hint_text(tr("name (optional)")).desired_width(160.0).id_salt(("td_fkn", uid, f.uid)));
+            let bad = fk_incomplete(&snapshot, f);
+            item_card(ui, bad, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.set_min_height(style::CONTROL_H);
+                    field(ui, &mut f.name, ("td_fkn", uid, f.uid), 220.0, style::CONTROL_H, tr("name (optional)"), false);
                     let before = f.cols.clone();
-                    if Self::columns_picker(ui, &columns, &snapshot, &mut f.cols) {
+                    if Self::columns_picker(ui, ("td_fkcols", uid, f.uid), &columns, &snapshot, &mut f.cols, 160.0, style::CONTROL_H) {
                         // Keep each referenced column paired with its column.
                         let old = std::mem::take(&mut f.ref_columns);
                         f.ref_columns = f.cols.iter().map(|r| before.iter().position(|b| b == r).and_then(|p| old.get(p).cloned()).unwrap_or_default()).collect();
                     }
-                    ui.label("→");
-                    egui::ComboBox::from_id_salt(("td_fks", uid, f.uid))
-                        .icon(ternarygrid_ui::kit::combo_caret)
-                        .selected_text(if f.ref_schema.is_empty() { "—".to_string() } else { f.ref_schema.clone() })
-                        .width(120.0)
-                        .show_ui(ui, |ui| {
-                            for s in &schema_names {
-                                if ui.selectable_label(&f.ref_schema == s, s).clicked() && &f.ref_schema != s {
-                                    f.ref_schema = s.clone();
-                                    f.ref_table.clear();
-                                    f.ref_columns.clear();
-                                }
+                    arrow(ui, 14.0);
+                    let schema_text = if f.ref_schema.is_empty() { "—".to_string() } else { f.ref_schema.clone() };
+                    select(ui, ("td_fks", uid, f.uid), schema_text, 120.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        for s in &schema_names {
+                            if ui.selectable_label(&f.ref_schema == s, s).clicked() && &f.ref_schema != s {
+                                f.ref_schema = s.clone();
+                                f.ref_table.clear();
+                                f.ref_columns.clear();
                             }
-                        });
+                        }
+                    });
                     let snap = snaps.get(f.ref_schema.trim());
                     let mut tables: Vec<String> = snap.map(|s| s.tables.iter().map(|t| t.name.clone()).collect()).unwrap_or_default();
                     if f.ref_schema.trim() == own_schema && !this_table.is_empty() && !tables.contains(&this_table) {
                         tables.push(this_table.clone());
                     }
                     let label = if f.ref_table.is_empty() { tr("Table…").to_string() } else { f.ref_table.clone() };
-                    egui::ComboBox::from_id_salt(("td_fkt", uid, f.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(170.0).show_ui(ui, |ui| {
+                    select(ui, ("td_fkt", uid, f.uid), label, 180.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                         for t in &tables {
                             if ui.selectable_label(&f.ref_table == t, t).clicked() && &f.ref_table != t {
                                 f.ref_table = t.clone();
@@ -1474,11 +1559,13 @@ impl TableDesignerTab {
                         }
                     });
                     if snap.is_none() && !f.ref_schema.is_empty() {
-                        ui.spinner();
+                        ui.add(egui::Spinner::new().size(14.0).color(p.accent_text));
                     }
-                    if ui.small_button(ternarygrid_icons::ic(icon::TRASH)).on_hover_text(tr("Remove")).clicked() {
-                        remove = Some(i);
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 26.0).clicked() {
+                            remove = Some(i);
+                        }
+                    });
                 });
                 // One referenced column per column.
                 let n = f.cols.len();
@@ -1491,36 +1578,35 @@ impl TableDesignerTab {
                     snaps.get(f.ref_schema.trim()).and_then(|s| s.table(f.ref_table.trim())).map(|t| t.columns.iter().map(|c| c.name.clone()).collect()).unwrap_or_default()
                 };
                 let names = snapshot.resolve_all(&f.cols);
-                ui.horizontal_wrapped(|ui| {
-                    for (j, name) in names.iter().enumerate() {
-                        ui.label(format!("{name} →"));
+                for (j, name) in names.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.set_min_height(FIELD_H);
+                        ui.label(RichText::new(name).monospace().size(12.0).color(p.text));
+                        arrow(ui, 13.0);
                         let cur = f.ref_columns.get(j).cloned().unwrap_or_default();
-                        egui::ComboBox::from_id_salt(("td_fkc", uid, f.uid, j))
-                            .icon(ternarygrid_ui::kit::combo_caret)
-                            .selected_text(if cur.is_empty() { tr("column…").to_string() } else { cur.clone() })
-                            .width(130.0)
-                            .show_ui(ui, |ui| {
-                                for rc in &ref_cols {
-                                    if ui.selectable_label(&cur == rc, rc).clicked()
-                                        && let Some(slot) = f.ref_columns.get_mut(j)
-                                    {
-                                        *slot = rc.clone();
-                                    }
+                        let text = if cur.is_empty() { tr("column…").to_string() } else { cur.clone() };
+                        select(ui, ("td_fkc", uid, f.uid, j), text, 180.0, FIELD_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                            for rc in &ref_cols {
+                                if ui.selectable_label(&cur == rc, rc).clicked()
+                                    && let Some(slot) = f.ref_columns.get_mut(j)
+                                {
+                                    *slot = rc.clone();
                                 }
-                            });
-                    }
-                });
+                            }
+                        });
+                    });
+                }
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.set_min_height(FIELD_H);
                     for (label, action, salt) in [(tr("On update"), &mut f.on_update, "u"), (tr("On delete"), &mut f.on_delete, "d")] {
-                        ui.label(label);
-                        egui::ComboBox::from_id_salt(("td_fka", uid, f.uid, salt)).icon(ternarygrid_ui::kit::combo_caret).selected_text(action.sql()).width(110.0).show_ui(
-                            ui,
-                            |ui| {
-                                for a in FkAction::ALL {
-                                    ui.selectable_value(action, a, a.sql());
-                                }
-                            },
-                        );
+                        ui.label(RichText::new(label).size(12.5).color(p.text_muted));
+                        select(ui, ("td_fka", uid, f.uid, salt), action.sql(), 140.0, FIELD_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                            for a in FkAction::ALL {
+                                ui.selectable_value(action, a, a.sql());
+                            }
+                        });
                     }
                 });
             });
@@ -1529,44 +1615,47 @@ impl TableDesignerTab {
             self.model.fks.remove(i);
         }
         if self.model.fks.is_empty() {
-            ui.weak(tr("No foreign keys."));
+            ui.label(RichText::new(tr("No foreign keys.")).color(p.text_faint));
         }
     }
 
     fn checks_page(&mut self, ui: &mut Ui) {
         let uid = self.uid;
-        if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("Add check"))).clicked() {
+        let p = ternarygrid_ui::pal(ui);
+        if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add check"), true).clicked() {
             let id = self.next();
             self.model.checks.push(CheckRow { uid: id, name: String::new(), expression: String::new() });
         }
         let mut remove: Option<usize> = None;
         for (i, c) in self.model.checks.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut c.name).hint_text(tr("name (optional)")).desired_width(160.0).id_salt(("td_chn", uid, c.uid)));
-                ui.add(
-                    egui::TextEdit::singleline(&mut c.expression)
-                        .hint_text(tr("condition, e.g. price >= 0"))
-                        .code_editor()
-                        .desired_width((ui.available_width() - 40.0).max(120.0))
-                        .id_salt(("td_che", uid, c.uid)),
-                );
-                if ui.small_button(ternarygrid_icons::ic(icon::TRASH)).on_hover_text(tr("Remove")).clicked() {
-                    remove = Some(i);
-                }
+            item_card(ui, c.expression.trim().is_empty(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.set_min_height(style::CONTROL_H);
+                    field(ui, &mut c.name, ("td_chn", uid, c.uid), 220.0, style::CONTROL_H, tr("name (optional)"), false);
+                    let w = (ui.available_width() - 34.0).max(120.0);
+                    field(ui, &mut c.expression, ("td_che", uid, c.uid), w, style::CONTROL_H, tr("condition, e.g. price >= 0"), true);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 26.0).clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
             });
         }
         if let Some(i) = remove {
             self.model.checks.remove(i);
         }
         if self.model.checks.is_empty() {
-            ui.weak(tr("No check constraints."));
+            ui.label(RichText::new(tr("No check constraints.")).color(p.text_faint));
         }
     }
 
     fn triggers_page(&mut self, ui: &mut Ui) {
         let uid = self.uid;
+        let p = ternarygrid_ui::pal(ui);
         let pg = self.kind.is_postgres_family();
-        if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("Add trigger"))).clicked() {
+        if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add trigger"), true).clicked() {
             let id = self.next();
             let name = format!("{}_trg{}", self.model.name.trim(), self.model.triggers.len() + 1).trim_start_matches('_').to_string();
             self.model.triggers.push(TriggerRow {
@@ -1591,12 +1680,13 @@ impl TableDesignerTab {
         }
         let events: &[&str] = if pg { &["INSERT", "UPDATE", "DELETE", "TRUNCATE"] } else { &["INSERT", "UPDATE", "DELETE"] };
         for (i, t) in self.model.triggers.iter_mut().enumerate() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_width(ui.available_width());
+            item_card(ui, false, |ui| {
                 let mut changed = false;
-                ui.horizontal_wrapped(|ui| {
-                    changed |= ui.add(egui::TextEdit::singleline(&mut t.name).desired_width(160.0).id_salt(("td_trn", uid, t.uid))).changed();
-                    egui::ComboBox::from_id_salt(("td_trt", uid, t.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(t.timing.clone()).width(100.0).show_ui(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.set_min_height(style::CONTROL_H);
+                    changed |= field(ui, &mut t.name, ("td_trn", uid, t.uid), 240.0, style::CONTROL_H, "", false).changed();
+                    select(ui, ("td_trt", uid, t.uid), t.timing.clone(), 130.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                         for timing in ["BEFORE", "AFTER", "INSTEAD OF"] {
                             if ui.selectable_label(t.timing == timing, timing).clicked() && t.timing != timing {
                                 t.timing = timing.to_string();
@@ -1606,7 +1696,7 @@ impl TableDesignerTab {
                     });
                     for e in events {
                         let mut on = t.events.iter().any(|x| x == e);
-                        if ui.checkbox(&mut on, *e).changed() {
+                        if check(ui, &mut on, e).changed() {
                             if on {
                                 t.events.push(e.to_string());
                             } else {
@@ -1617,33 +1707,41 @@ impl TableDesignerTab {
                     }
                     if pg {
                         let mut row = t.for_each_row;
-                        egui::ComboBox::from_id_salt(("td_trl", uid, t.uid))
-                            .icon(ternarygrid_ui::kit::combo_caret)
-                            .selected_text(if row { tr("for each row") } else { tr("for each statement") })
-                            .width(140.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut row, true, tr("for each row"));
-                                ui.selectable_value(&mut row, false, tr("for each statement"));
-                            });
+                        let level = if row { tr("for each row") } else { tr("for each statement") };
+                        select(ui, ("td_trl", uid, t.uid), level, 150.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                            ui.selectable_value(&mut row, true, tr("for each row"));
+                            ui.selectable_value(&mut row, false, tr("for each statement"));
+                        });
                         if row != t.for_each_row {
                             t.for_each_row = row;
                             changed = true;
                         }
-                        ui.checkbox(&mut t.enabled, tr("Enabled"));
+                        check(ui, &mut t.enabled, tr("Enabled"));
                     }
-                    if ui.small_button(ternarygrid_icons::ic(icon::TRASH)).on_hover_text(tr("Remove")).clicked() {
-                        remove = Some(i);
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 26.0).clicked() {
+                            remove = Some(i);
+                        }
+                    });
                 });
                 let hint = if pg { tr("Function to execute, e.g. audit_changes()") } else { tr("Statement, e.g. SET NEW.updated_at = NOW() or BEGIN … END") };
-                changed |= ui
-                    .add(egui::TextEdit::multiline(&mut t.body).hint_text(hint).code_editor().desired_rows(2).desired_width(f32::INFINITY).id_salt(("td_trb", uid, t.uid)))
-                    .changed();
+                let body = egui::TextEdit::multiline(&mut t.body)
+                    .hint_text(RichText::new(hint).color(p.text_faint))
+                    .code_editor()
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .margin(Margin::symmetric(10, 8))
+                    .id_salt(("td_trb", uid, t.uid));
+                let r = ui.add(body);
+                if r.has_focus() {
+                    style::focus_halo(ui, r.rect, style::RADIUS);
+                }
+                changed |= r.changed();
                 if changed {
                     t.edited = true;
                 }
-                if let Some(p) = previews.get(i).filter(|p| !p.is_empty()) {
-                    ui.add(egui::Label::new(RichText::new(p).monospace().weak()).wrap());
+                if let Some(text) = previews.get(i).filter(|p| !p.is_empty()) {
+                    ui.add(egui::Label::new(RichText::new(text).monospace().size(11.5).color(p.text_faint)).wrap());
                 }
             });
         }
@@ -1651,23 +1749,30 @@ impl TableDesignerTab {
             self.model.triggers.remove(i);
         }
         if self.model.triggers.is_empty() {
-            ui.weak(tr("No triggers."));
+            ui.label(RichText::new(tr("No triggers.")).color(p.text_faint));
         }
     }
 
     fn options_page(&mut self, ui: &mut Ui) {
         let uid = self.uid;
-        ui.strong(tr("Comment"));
-        ui.add(egui::TextEdit::multiline(&mut self.model.comment).desired_rows(3).desired_width(f32::INFINITY).id_salt(("td_comment", uid)));
+        let p = ternarygrid_ui::pal(ui);
+        ui.label(kit::section_title(ui, tr("Comment")));
+        let r =
+            ui.add(egui::TextEdit::multiline(&mut self.model.comment).desired_rows(3).desired_width(f32::INFINITY).margin(Margin::symmetric(10, 8)).id_salt(("td_comment", uid)));
+        if r.has_focus() {
+            style::focus_halo(ui, r.rect, style::RADIUS);
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.strong(tr("Table options"));
-            if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("Add option"))).clicked() {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.label(kit::section_title(ui, tr("Table options")));
+            if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add option"), true).clicked() {
                 self.model.options.push(OptionRow::default());
             }
             let suggestions = option_suggestions(self.kind);
             if !suggestions.is_empty() {
-                ui.menu_button(tr("Suggestions"), |ui| {
+                let b = kit::button_ex(ui, kit::Kind::Ghost, Some(icon::CARET_DOWN), tr("Suggestions"), true);
+                egui::Popup::menu(&b).show(|ui| {
                     for s in suggestions {
                         if ui.button(*s).clicked() {
                             if !self.model.options.iter().any(|o| o.key.trim() == *s) {
@@ -1680,36 +1785,49 @@ impl TableDesignerTab {
             }
         });
         let mut remove: Option<usize> = None;
-        egui::Grid::new(("td_opts", uid)).num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
-            for (i, o) in self.model.options.iter_mut().enumerate() {
-                ui.add(egui::TextEdit::singleline(&mut o.key).hint_text(tr("option")).desired_width(160.0).id_salt(("td_ok", uid, i)));
-                ui.add(egui::TextEdit::singleline(&mut o.value).hint_text(tr("value")).desired_width(260.0).id_salt(("td_ov", uid, i)));
-                if ui.small_button(ternarygrid_icons::ic(icon::TRASH)).on_hover_text(tr("Remove")).clicked() {
+        for (i, o) in self.model.options.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.set_min_height(style::CONTROL_H);
+                field(ui, &mut o.key, ("td_ok", uid, i), 180.0, style::CONTROL_H, tr("option"), true);
+                field(ui, &mut o.value, ("td_ov", uid, i), 300.0, style::CONTROL_H, tr("value"), false);
+                if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 26.0).clicked() {
                     remove = Some(i);
                 }
-                ui.end_row();
-            }
-        });
+            });
+        }
         if let Some(i) = remove {
             self.model.options.remove(i);
         }
         if self.model.options.is_empty() {
-            ui.weak(tr("No table options."));
+            ui.label(RichText::new(tr("No table options.")).color(p.text_faint));
         }
     }
 
+    /// The statements the design runs, at the bottom of the tab.
     fn preview_ui(&mut self, ui: &mut Ui) {
+        let p = ternarygrid_ui::pal(ui);
         let stmts = self.statements();
         let text = script_text(&stmts);
-        ui.horizontal(|ui| {
-            ui.strong(tr("DDL preview"));
-            ui.weak(trf("{} statement(s)", &[&stmts.len()]));
-            if ui.add_enabled(!stmts.is_empty(), egui::Button::new((ternarygrid_icons::ic(icon::COPY), tr("Copy")))).clicked() {
-                ui.ctx().copy_text(text.clone());
-            }
+        egui::Frame::new().inner_margin(Margin { left: 16, right: 12, top: 8, bottom: 8 }).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.set_min_height(24.0);
+                ui.label(RichText::new(tr("DDL preview")).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+                if stmts.is_empty() {
+                    let none = if self.is_create() { tr("Nothing to create yet.") } else { tr("No changes.") };
+                    ui.label(RichText::new(none).size(12.0).color(p.text_faint));
+                    return;
+                }
+                ui.label(RichText::new(trf("{} statement(s)", &[&stmts.len()])).size(12.0).color(p.text_faint));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), true).clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                });
+            });
         });
         if stmts.is_empty() {
-            ui.weak(if self.is_create() { tr("Nothing to create yet.") } else { tr("No changes.") });
             return;
         }
         if let Some(lang) = &self.lang {
@@ -1723,53 +1841,77 @@ impl TableDesignerTab {
             let stmts = self.statements();
             let text = script_text(&stmts);
             let conn = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default();
-            let mut close = false;
-            let mut run = false;
+            let title = if self.table.is_none() { tr("Create the table") } else { tr("Apply the changes") };
+            let (mut run, mut cancel) = (false, false);
             let lang = self.lang.as_ref();
-            let modal = egui::Modal::new(egui::Id::new(("td_confirm", self.uid))).show(ui.ctx(), |ui| {
-                ui.heading(if self.table.is_none() { tr("Create the table") } else { tr("Apply the changes") });
-                ui.label(trf("Run {} statement(s) on \"{}\"?", &[&stmts.len(), &conn]));
-                if !transactional_ddl(self.kind) {
-                    ui.weak(tr("This database commits each DDL statement on its own; a failure leaves the statements before it applied."));
-                }
-                let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-                ui.allocate_ui(egui::vec2(640.0, 280.0), |ui| {
-                    if let Some(lang) = lang {
-                        ternarygrid_editor::CodeView::new(&text, lang, &theme).id_salt(("td_confirm_ddl", self.uid)).show(ui);
+            let transactional = transactional_ddl(self.kind);
+            let uid = self.uid;
+            let (resp, ()) = parts::Dialog::new(title).icon(icon::PLAY).width(640.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("td_confirm", uid)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 12.0;
+                    ui.label(RichText::new(trf("Run {} statement(s) on \"{}\"?", &[&stmts.len(), &conn])).size(13.5));
+                    if !transactional {
+                        parts::callout(
+                            ui,
+                            parts::Tone::Warning,
+                            None,
+                            tr("This database commits each DDL statement on its own; a failure leaves the statements before it applied."),
+                            |_| {},
+                        );
                     }
-                });
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(format!("{} {}", icon::PLAY, tr("Execute"))).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        run = true;
-                        close = true;
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        close = true;
-                    }
-                });
-            });
+                    let lines = text.lines().count().max(1);
+                    let h = (lines as f32 * 20.0 + 24.0).clamp(64.0, 320.0);
+                    parts::bordered(ui).show(ui, |ui| {
+                        let w = ui.available_width();
+                        ui.allocate_ui(vec2(w, h), |ui| {
+                            ui.set_min_size(vec2(w, h));
+                            if let Some(lang) = lang {
+                                let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
+                                ternarygrid_editor::CodeView::new(&text, lang, &theme).id_salt(("td_confirm_ddl", uid)).show(ui);
+                            }
+                        });
+                    });
+                },
+                |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if danger_solid(ui, icon::PLAY, tr("Execute")).clicked() {
+                            run = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
             if run {
                 self.start_execute(cx);
             }
-            if close || modal.should_close() {
+            if run || cancel || resp.close {
                 self.confirm = false;
             }
         }
         if self.close_prompt {
             let mut decided: Option<bool> = None;
             let title = self.title();
-            let modal = egui::Modal::new(egui::Id::new(("td_close", self.uid))).show(ui.ctx(), |ui| {
-                ui.heading(tr("Unsaved changes"));
-                ui.label(trf("Discard the changes to \"{}\"?", &[&title]));
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Discard")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        decided = Some(false);
-                    }
-                });
-            });
+            let (resp, ()) = parts::Dialog::new(tr("Unsaved changes")).icon(icon::WARNING).width(460.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("td_close", self.uid)),
+                |ui| {
+                    ui.label(trf("Discard the changes to \"{}\"?", &[&title]));
+                },
+                |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::button_ex(ui, kit::Kind::Danger, None, tr("Discard"), false).clicked() {
+                            decided = Some(true);
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            decided = Some(false);
+                        }
+                    });
+                },
+            );
             match decided {
                 Some(true) => {
                     self.close_prompt = false;
@@ -1779,7 +1921,7 @@ impl TableDesignerTab {
                     }
                 }
                 Some(false) => self.close_prompt = false,
-                None if modal.should_close() => self.close_prompt = false,
+                None if resp.close => self.close_prompt = false,
                 None => {}
             }
         }
@@ -1893,6 +2035,186 @@ impl TableDesignerTab {
     }
 }
 
+/// The foreign key lacks its referenced table or a referenced column for each column.
+fn fk_incomplete(m: &Model, f: &FkRow) -> bool {
+    let cols = m.resolve_all(&f.cols);
+    f.ref_table.trim().is_empty() || cols.is_empty() || cols.len() != f.ref_columns.len() || f.ref_columns.iter().any(|c| c.trim().is_empty())
+}
+
+// ------------------------------------------------------------------- look
+
+/// Height of a table's header row and of its editable rows.
+const HEADER_H: f32 = 32.0;
+const ROW_H: f32 = 36.0;
+/// Height of the fields inside rows (cards and the toolbar use `style::CONTROL_H`).
+const FIELD_H: f32 = 26.0;
+
+/// A single-line field `h` tall (monospace for SQL), outlined like the mockups' inputs, with
+/// the kit's focus halo.
+pub(crate) fn field(ui: &mut Ui, text: &mut String, id: impl Hash + std::fmt::Debug, width: f32, h: f32, hint: &str, mono: bool) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.inactive.bg_stroke.color = p.border;
+        let mut edit = egui::TextEdit::singleline(text).id_salt(id).desired_width(width).min_size(vec2(0.0, h)).vertical_align(Align::Center).margin(Margin::symmetric(8, 2));
+        if !hint.is_empty() {
+            edit = edit.hint_text(RichText::new(hint).color(p.text_faint));
+        }
+        if mono {
+            edit = edit.font(egui::TextStyle::Monospace);
+        }
+        let r = ui.add(edit);
+        if r.has_focus() {
+            style::focus_halo(ui, r.rect, style::RADIUS);
+        }
+        r
+    })
+    .inner
+}
+
+/// A select box `width` × `h` showing `text`; `add` fills its menu.
+pub(crate) fn select<R>(
+    ui: &mut Ui,
+    id: impl Hash + std::fmt::Debug,
+    text: impl Into<egui::WidgetText>,
+    width: f32,
+    h: f32,
+    close: egui::PopupCloseBehavior,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> Option<R> {
+    let p = ternarygrid_ui::pal(ui);
+    ui.scope(|ui| {
+        let text_h = ui.text_style_height(&egui::TextStyle::Button);
+        let s = ui.spacing_mut();
+        s.interact_size.y = h;
+        s.button_padding = vec2(10.0, ((h - text_h) / 2.0).max(2.0));
+        ui.visuals_mut().widgets.inactive.bg_stroke.color = p.border;
+        ui.set_max_width(width);
+        egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(text).width(width).truncate().close_behavior(close).show_ui(ui, add).inner
+    })
+    .inner
+}
+
+/// A check box (accent fill and a white tick when on) with an optional label.
+pub(crate) fn check(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    let galley = (!label.is_empty()).then(|| ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(style::body_size(ui.ctx())), Color32::PLACEHOLDER));
+    let width = 16.0 + galley.as_ref().map_or(0.0, |g| g.size().x + 8.0);
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(width, 20.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let (enabled, checked) = (ui.is_enabled(), *on);
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, checked, label));
+    if ui.is_rect_visible(rect) {
+        let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+        let b = Rect::from_center_size(egui::pos2(rect.left() + 8.0, rect.center().y), Vec2::splat(16.0));
+        let hovered = enabled && resp.hovered();
+        let (fill, stroke) = if checked { (p.accent, p.accent) } else { (p.surface, if hovered { p.text_muted } else { p.border_strong }) };
+        let painter = ui.painter();
+        painter.rect(b, CornerRadius::same(4), fade(fill), Stroke::new(1.5, fade(stroke)), StrokeKind::Inside);
+        if checked {
+            let c = b.center();
+            let tick = vec![egui::pos2(c.x - 3.8, c.y + 0.2), egui::pos2(c.x - 1.2, c.y + 2.8), egui::pos2(c.x + 3.8, c.y - 2.6)];
+            painter.add(egui::Shape::line(tick, Stroke::new(1.8, fade(p.on_accent))));
+        }
+        if let Some(g) = galley {
+            painter.galley(egui::pos2(b.right() + 8.0, rect.center().y - g.size().y / 2.0), g, fade(p.text));
+        }
+        if resp.has_focus() {
+            style::focus_halo(ui, b, 4);
+        }
+    }
+    resp
+}
+
+/// A red, filled button: the confirmation that changes the database.
+fn danger_solid(ui: &mut Ui, glyph: &str, text: &str) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    let base = if ui.visuals().dark_mode { Color32::from_rgb(0xc4, 0x35, 0x2b) } else { p.err };
+    let size = style::body_size(ui.ctx());
+    let label = ui.painter().layout_no_wrap(text.to_string(), style::medium(ui.ctx(), size), Color32::PLACEHOLDER);
+    let glyph = ui.painter().layout_no_wrap(glyph.to_string(), style::icon_font(size + 2.0), Color32::PLACEHOLDER);
+    let content_w = label.size().x + glyph.size().x + 6.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(content_w + 24.0, style::CONTROL_H), Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, text));
+    if ui.is_rect_visible(rect) {
+        let fill = if enabled && resp.hovered() { crate::theme::darken(base, 0.12) } else { base };
+        let fg = if enabled { Color32::WHITE } else { Color32::WHITE.gamma_multiply(0.6) };
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(style::RADIUS), if enabled { fill } else { fill.gamma_multiply(0.5) });
+        if resp.has_focus() {
+            painter.rect_stroke(rect.expand(2.0), CornerRadius::same(style::RADIUS + 2), Stroke::new(1.5, base), StrokeKind::Outside);
+        }
+        let x = rect.center().x - content_w / 2.0;
+        let gw = glyph.size().x;
+        painter.galley(egui::pos2(x, rect.center().y - glyph.size().y / 2.0), glyph, fg);
+        painter.galley(egui::pos2(x + gw + 6.0, rect.center().y - label.size().y / 2.0), label, fg);
+    }
+    resp
+}
+
+/// A problem of the design: a warning icon and the text in the warning colour.
+fn warning_line(ui: &mut Ui, text: &str) {
+    let p = ternarygrid_ui::pal(ui);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.label(RichText::new(icon::WARNING).size(14.0).color(p.warn));
+        ui.add(egui::Label::new(RichText::new(text).size(12.5).color(p.warn)).wrap());
+    });
+}
+
+/// The faint arrow between a column and the column it references.
+fn arrow(ui: &mut Ui, size: f32) {
+    let p = ternarygrid_ui::pal(ui);
+    ui.label(RichText::new("→").size(size).color(p.text_faint));
+}
+
+/// A column name in a table's header row.
+fn header_label(ui: &mut Ui, text: &str) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    ui.add_space(2.0);
+    ui.add(egui::Label::new(RichText::new(text).font(style::semibold(ui.ctx(), 12.0)).color(p.text_muted)).truncate())
+}
+
+/// The card of one key, foreign key, check or trigger; its border warns while it is incomplete.
+fn item_card<R>(ui: &mut Ui, warn: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let p = ternarygrid_ui::pal(ui);
+    let stroke = Stroke::new(1.0, if warn { p.warn } else { p.border });
+    egui::Frame::new()
+        .fill(p.surface)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(style::RADIUS_LG))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            add(ui)
+        })
+        .inner
+}
+
+/// A bordered table (columns, indexes): `add` lays out an `egui_extras` table whose header row
+/// is [`HEADER_H`] tall; its band on the header colour is painted here.
+fn table_frame<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let p = ternarygrid_ui::pal(ui);
+    parts::bordered(ui)
+        .inner_margin(Margin { left: 6, right: 6, top: 0, bottom: 0 })
+        .show(ui, |ui| {
+            let r = ui.max_rect();
+            let band = Rect::from_min_max(egui::pos2(r.left() - 6.0, r.top()), egui::pos2(r.right() + 6.0, r.top() + HEADER_H));
+            ui.painter().rect_filled(band, CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, p.header);
+            ui.painter().hline(band.x_range(), band.bottom() - 0.5, Stroke::new(1.0, p.border));
+            ui.spacing_mut().item_spacing = vec2(8.0, 2.0);
+            // egui_extras draws the resize handles of resizable columns as lines in this
+            // colour at rest: the mockups' tables have no column lines (hovered ones still show).
+            ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
+            add(ui)
+        })
+        .inner
+}
+
 /// Statements as one script.
 fn script_text(stmts: &[String]) -> String {
     let mut s = String::new();
@@ -1945,20 +2267,15 @@ impl TabView for TableDesignerTab {
         self.tab_id = cx.current_tab;
         self.poll(cx);
         if !cx.conns.is_connected(&self.conn) {
-            ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-                ui.label(tr("The connection is closed."));
-                if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
+            kit::empty_state(ui, icon::PLUGS, tr("The connection is closed."), "", |ui| {
+                if kit::primary_icon(ui, icon::PLUGS_CONNECTED, tr("Connect")).clicked() {
                     cx.push(AppCommand::Connect(self.conn.clone()));
                 }
             });
             return;
         }
         let Some(session) = self.session(cx) else {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.weak(tr("Opening a session…"));
-            });
+            egui::Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| parts::spinner_label(ui, tr("Opening a session…")));
             ui.ctx().request_repaint_after(Duration::from_millis(100));
             return;
         };
@@ -1974,41 +2291,54 @@ impl TabView for TableDesignerTab {
         }
         if let Some(table) = self.table.clone().filter(|_| self.original.is_none()) {
             if let Some(e) = self.load_error.clone() {
-                crate::widgets::error_box(ui, &e);
-                if ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Retry"))).clicked() {
-                    self.load_error = None;
-                }
+                egui::Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| {
+                    crate::widgets::error_box(ui, &e);
+                    if kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked() {
+                        self.load_error = None;
+                    }
+                });
                 return;
             }
             if self.load.is_none() {
                 self.load = Some(cx.backend.spawn(async move { session.lock().await.table_definition(&table).await }));
             }
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.weak(tr("Reading the table definition…"));
-            });
+            egui::Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| parts::spinner_label(ui, tr("Reading the table definition…")));
             ui.ctx().request_repaint_after(Duration::from_millis(100));
             return;
         }
+        // The toolbar and its problems, the pages, the page and the DDL preview at the bottom.
         self.toolbar(ui, cx);
-        ui.separator();
-        egui::Panel::bottom(egui::Id::new(("td_preview", self.uid))).resizable(true).default_size(200.0).size_range(80.0..=f32::INFINITY).show(ui, |ui| self.preview_ui(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.pages_ui(ui);
-            ui.separator();
-            match self.page {
-                Page::Columns => self.columns_page(ui),
-                page => {
-                    egui::ScrollArea::vertical().id_salt(("td_page", self.uid)).auto_shrink([false, false]).show(ui, |ui| match page {
-                        Page::Keys => self.keys_page(ui),
-                        Page::Indexes => self.indexes_page(ui),
-                        Page::ForeignKeys => self.fk_page(ui, cx),
-                        Page::Checks => self.checks_page(ui),
-                        Page::Triggers => self.triggers_page(ui),
-                        Page::Options => self.options_page(ui),
-                        Page::Columns => {}
+        self.pages_ui(ui);
+        let p = ternarygrid_ui::pal(ui);
+        egui::Panel::bottom(egui::Id::new(("td_preview", self.uid)))
+            .resizable(true)
+            .default_size(230.0)
+            .size_range(80.0..=f32::INFINITY)
+            .frame(egui::Frame::new().fill(p.canvas))
+            .show(ui, |ui| self.preview_ui(ui));
+        egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| match self.page {
+            Page::Columns => self.columns_page(ui),
+            page => {
+                let max_w = match page {
+                    Page::ForeignKeys => 980.0,
+                    Page::Indexes | Page::Triggers => 1100.0,
+                    _ => 860.0,
+                };
+                egui::ScrollArea::vertical().id_salt(("td_page", self.uid)).auto_shrink([false, false]).show(ui, |ui| {
+                    egui::Frame::new().inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
+                        ui.set_max_width(ui.available_width().min(max_w));
+                        ui.spacing_mut().item_spacing.y = 12.0;
+                        match page {
+                            Page::Keys => self.keys_page(ui),
+                            Page::Indexes => self.indexes_page(ui),
+                            Page::ForeignKeys => self.fk_page(ui, cx),
+                            Page::Checks => self.checks_page(ui),
+                            Page::Triggers => self.triggers_page(ui),
+                            Page::Options => self.options_page(ui),
+                            Page::Columns => {}
+                        }
                     });
-                }
+                });
             }
         });
         self.dialogs(ui, cx);
