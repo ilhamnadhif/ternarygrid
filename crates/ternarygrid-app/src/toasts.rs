@@ -123,7 +123,7 @@ impl Toasts {
                         ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                             ui.set_width(w);
                             ui.spacing_mut().item_spacing.y = 3.0;
-                            ui.add(egui::Label::new(RichText::new(&t.title).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(p.text)).wrap());
+                            crate::dialogs::semibold_text(ui, &t.title, 13.0, p.text, None, false);
                             if let Some(d) = &t.detail {
                                 let short: String = d.chars().take(600).collect();
                                 ui.add(egui::Label::new(RichText::new(short).size(12.0).color(p.text_muted)).wrap());
@@ -135,7 +135,7 @@ impl Toasts {
                                 }
                             }
                         });
-                        if ternarygrid_ui::kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 22.0).clicked() {
+                        if ternarygrid_ui::kit::icon_button_sized(ui, icon::X, tr("Dismiss"), false, 22.0, 11.0).clicked() {
                             close = Some(i);
                         }
                     });

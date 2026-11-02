@@ -1,5 +1,5 @@
 //! Modal and floating dialogs owned by the application, and the pieces they
-//! share on top of `ternarygrid_ui` (form fields, a red filled button, tables,
+//! share on top of `ternarygrid_ui` (form fields, notes, semibold text, tables,
 //! SQL previews): every dialog is a [`Dialog`] with the icon badge, title,
 //! subtitle and × in its header and the buttons in its footer, as in the
 //! design canvas "TernaryGrid modern redesign".
@@ -15,7 +15,7 @@ use crate::command::AppCommand;
 use crate::conn::{ConnectionManager, Credentials, PromptField};
 use crate::cx::AppContext;
 use connection::ConnectionDialog;
-use egui::{Align, Align2, Color32, CornerRadius, Id, Layout, Margin, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType, vec2};
+use egui::{Align, Align2, Color32, CornerRadius, Id, Layout, Margin, Rect, Response, RichText, Sense, Stroke, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType, vec2};
 use egui_phosphor::regular as icon;
 use std::cell::Cell;
 use ternarygrid_core::config::{SecretSlot, secret_key};
@@ -382,7 +382,7 @@ impl Dialogs {
                     },
                     |ui| {
                         right(ui, |ui| {
-                            if danger_button(ui, Some(icon::TRASH), tr("Delete folder")).clicked() {
+                            if kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Delete folder"), false).clicked() {
                                 ok.set(true);
                             }
                             if cancel_button(ui).clicked() {
@@ -515,7 +515,7 @@ impl Dialogs {
                     disconnect.set(true);
                 }
                 right(ui, |ui| {
-                    if ui.add_enabled_ui(!connected, |ui| danger_button(ui, Some(icon::TRASH), tr("Delete"))).inner.clicked() {
+                    if ui.add_enabled_ui(!connected, |ui| kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Delete"), false)).inner.clicked() {
                         delete.set(true);
                     }
                     if cancel_button(ui).clicked() {
@@ -561,7 +561,7 @@ fn about_body(ui: &mut Ui) {
         ui.painter().rect_filled(rect, CornerRadius::same(16), p.accent);
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon::TABLE, style::icon_font(34.0), Color32::WHITE);
         ui.add_space(8.0);
-        ui.label(RichText::new("TernaryGrid").font(style::semibold(ui.ctx(), 22.0)).color(p.text));
+        kit::semibold_label(ui, "TernaryGrid", 22.0, p.text);
         ui.label(RichText::new(format!("{} {}", tr("Version"), env!("CARGO_PKG_VERSION"))).size(12.5).color(p.text_muted));
         ui.label(RichText::new(tr("A fast, lightweight database client, written in Rust.")).color(p.text));
         ui.label(RichText::new(tr("License: MIT OR Apache-2.0")).size(12.0).color(p.text_faint));
@@ -678,40 +678,41 @@ fn shortcuts_body(ui: &mut Ui, cx: &mut AppContext, filter: &mut String) {
         muted(ui, tr("No shortcut matches the filter."));
         return;
     }
-    let (line, _) = table_colors(ui);
     let max_h = (ui.ctx().content_rect().height() - 300.0).max(200.0);
-    egui::ScrollArea::vertical().id_salt("shortcuts_scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+    // The columns as wide as the design's; the scroll bar in the body's right padding.
+    let full = ui.available_rect_before_wrap();
+    let mut area = ui.new_child(UiBuilder::new().max_rect(full.with_max_x(full.right() + 14.0)).layout(Layout::top_down(Align::Min)));
+    egui::ScrollArea::vertical().id_salt("shortcuts_scroll").max_height(max_h).auto_shrink([false, true]).show(&mut area, |ui| {
         let gap = 28.0;
-        // Room at the right for the scroll bar over the second column.
-        let col_w = ((ui.available_width() - gap - 14.0) / 2.0).floor();
-        for pair in groups.chunks(2) {
+        let col_w = ((full.width() - gap) / 2.0).floor();
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for (i, pair) in groups.chunks(2).enumerate() {
+            if i > 0 {
+                ui.add_space(18.0);
+            }
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
                 for (group, rows) in pair {
                     ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
                         ui.set_width(col_w);
+                        // The design's rows: 28 points and a hairline, 4 apart.
                         ui.spacing_mut().item_spacing.y = 4.0;
-                        ui.label(RichText::new(*group).font(style::semibold(ui.ctx(), 12.0)).color(p.text_faint));
-                        ui.spacing_mut().item_spacing.y = 0.0;
+                        kit::semibold_label(ui, group, 12.0, p.text_faint);
                         for (label, keys) in rows {
                             let (rect, _) = ui.allocate_exact_size(vec2(col_w, 29.0), Sense::hover());
-                            ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, line));
+                            ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, p.line));
                             ui.painter().text(egui::pos2(rect.left(), rect.center().y - 0.5), Align2::LEFT_CENTER, *label, egui::FontId::proportional(13.0), p.text);
                             let mut x = rect.right();
                             for k in keys.iter().rev() {
-                                let g = ui.painter().layout_no_wrap(k.clone(), style::medium(ui.ctx(), style::SMALL), p.text_muted);
-                                let r = Rect::from_min_size(egui::pos2(x - g.size().x - 12.0, rect.center().y - 10.5), vec2(g.size().x + 12.0, 20.0));
-                                ui.painter().rect(r, CornerRadius::same(4), p.surface, Stroke::new(1.0, p.border_strong), StrokeKind::Inside);
-                                ui.painter().galley(r.center() - g.size() / 2.0, g, p.text_muted);
-                                x = r.left() - 6.0;
+                                x = kit::paint_kbd_text(ui.painter(), ui.ctx(), k, x, rect.center().y - 0.5, &p).left() - 6.0;
                             }
                         }
                     });
                 }
             });
-            ui.add_space(18.0);
         }
     });
+    ui.allocate_exact_size(vec2(full.width(), area.min_rect().height()), Sense::hover());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -746,27 +747,23 @@ pub fn form_row_w<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&m
 
 // Not generic: compiled once for every form row.
 fn form_row_dyn(ui: &mut Ui, label: &str, label_w: f32, add: &mut dyn FnMut(&mut Ui)) {
-    let p = style::pal(ui);
-    // As tall as the controls (a row of radio buttons is shorter than a field), which
-    // are centred on each other.
+    // The kit's row is at least `interact_size.y` high (30 in a form): a row of check boxes or
+    // radio buttons is shorter in the design (17), so the row starts at no height.
     let control_h = ui.spacing().interact_size.y;
     ui.spacing_mut().interact_size.y = 0.0;
-    ui.horizontal_top(|ui| {
-        let gap = ui.spacing().item_spacing.x;
-        ui.spacing_mut().item_spacing.x = 16.0;
-        ui.allocate_ui_with_layout(vec2(label_w, 0.0), Layout::top_down(Align::Min), |ui| {
-            ui.set_width(label_w);
-            if !label.is_empty() {
-                ui.add_space(6.0);
-                ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
-            }
-        });
-        ui.spacing_mut().item_spacing.x = gap;
+    let add = &mut |ui: &mut Ui| {
+        ui.spacing_mut().interact_size.y = control_h;
+        add(ui)
+    };
+    if label.is_empty() {
+        // Without a label the design's row has no line of text in the label column either.
         ui.horizontal(|ui| {
-            ui.spacing_mut().interact_size.y = control_h;
+            ui.add_space(label_w + 16.0);
             add(ui)
         });
-    });
+    } else {
+        parts::form_row(ui, label, label_w, add);
+    }
     ui.spacing_mut().interact_size.y = control_h;
 }
 
@@ -807,12 +804,6 @@ pub fn dim_topmost(ctx: &egui::Context) {
     let shown = egui::Area::new(Id::new(SCRIM)).order(egui::Order::Middle).interactable(false).fixed_pos(rect.min).show(ctx, |ui| ui.painter().rect_filled(rect, 0.0, scrim));
     ctx.move_to_top(shown.response.layer_id);
     ctx.set_sublayer(shown.response.layer_id, window);
-}
-
-/// The first item of a row, centred on the controls after it (a row starts as tall as
-/// a line of text: what comes first would sit above their middle).
-pub fn row_lead(ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)) {
-    ui.allocate_ui_with_layout(vec2(ui.available_width(), CONTROL_H), Layout::left_to_right(Align::Center), |ui| add(ui));
 }
 
 /// Lay out `add` from the right edge (the main actions of a footer: primary first).
@@ -935,7 +926,35 @@ pub fn muted(ui: &mut Ui, text: &str) -> Response {
 /// A semibold line (the headings of a confirmation's lists).
 pub fn strong(ui: &mut Ui, text: &str) -> Response {
     let p = style::pal(ui);
-    ui.add(egui::Label::new(RichText::new(text).font(style::semibold(ui.ctx(), 13.0)).color(p.text)).wrap())
+    semibold_text(ui, text, 13.0, p.text, None, false)
+}
+
+/// Text in the design's semibold (600: the medium weight painted twice, see
+/// `kit::paint_semibold`), wrapping (`one_line`: cut with … instead), on lines `factor` times
+/// its size apart as [`label_lh`] (`None`: the font's own).
+pub fn semibold_text(ui: &mut Ui, text: &str, size: f32, color: Color32, factor: Option<f32>, one_line: bool) -> Response {
+    let font = style::medium(ui.ctx(), size);
+    let row = ui.fonts_mut(|f| f.row_height(&font));
+    let lh = factor.map(|f| (size * f * 2.0).floor() / 2.0);
+    let half = lh.map_or(0.0, |lh| ((lh - row) / 2.0).max(0.0));
+    let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat { font_id: font, color, line_height: lh, ..Default::default() });
+    job.wrap =
+        egui::text::TextWrapping { max_width: ui.available_width() - 0.5, max_rows: if one_line { 1 } else { usize::MAX }, break_anywhere: false, overflow_character: Some('…') };
+    let galley = ui.painter().layout_job(job);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(0.5, 0.0), Sense::hover());
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    kit::paint_semibold(ui.painter(), rect.min + vec2(0.0, half), galley, color);
+    resp
+}
+
+/// A value shown read-only in a form row: as the design's text in a row, 3 points down (its
+/// line level with the label's), semibold or not.
+pub fn value_text(ui: &mut Ui, text: &str, color: Color32, semibold: bool) -> Response {
+    ui.vertical(|ui| {
+        ui.add_space(3.0);
+        if semibold { semibold_text(ui, text, 13.0, color, None, true) } else { ui.label(RichText::new(text).color(color)) }
+    })
+    .inner
 }
 
 /// A validation message under a field.
@@ -951,33 +970,19 @@ pub fn bullets(ui: &mut Ui, items: impl IntoIterator<Item = String>, color: Colo
     }
 }
 
-/// The fill of a [`note`] of `tone`, as in the design.
-fn note_fill(ui: &Ui, tone: Tone) -> Color32 {
-    let p = style::pal(ui);
-    let dark = ui.visuals().dark_mode;
-    let rgb = |d: u32, l: u32| {
-        let c = if dark { d } else { l };
-        Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
-    };
-    match tone {
-        Tone::Info => p.accent_soft,
-        Tone::Warning => rgb(0x3f3826, 0xfbf3df),
-        Tone::Error => rgb(0x4a3a40, 0xfbe9e7),
-        Tone::Success => rgb(0x253b2b, 0xe3f4e7),
-    }
-}
-
-/// A note on the soft fill of its tone: the tone's icon and the text (wrapping,
-/// selectable). As tall as its text, also in a modal.
+/// A note on the soft fill of its tone: the tone's icon and the text (wrapping, selectable)
+/// on the design's lines of 1.45 (`parts::callout` keeps the font's shorter lines), as tall
+/// as its text, also in a form.
 pub fn note(ui: &mut Ui, tone: Tone, text: &str) -> Response {
     let p = style::pal(ui);
     let color = tone.color(&p);
     egui::Frame::new()
-        .fill(note_fill(ui, tone))
+        .fill(tone.fill(ui))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin { left: 12, right: 12, top: 10, bottom: 10 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().interact_size.y = 0.0;
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // The icon level with the first line (the icon font sits a little low).
@@ -992,11 +997,6 @@ pub fn note(ui: &mut Ui, tone: Tone, text: &str) -> Response {
 /// An error in a dialog's body.
 pub fn error_note(ui: &mut Ui, text: &str) -> Response {
     note(ui, Tone::Error, text)
-}
-
-/// The red filled button of a destructive confirmation.
-pub fn danger_button(ui: &mut Ui, icon: Option<&str>, text: &str) -> Response {
-    kit::button_ex(ui, Kind::DangerFilled, icon, text, false)
 }
 
 /// A status line (test result, error) in a footer: its icon and text in at
@@ -1153,11 +1153,12 @@ pub struct Column<'a> {
     pub title: &'a str,
     pub width: W,
     pub right: bool,
+    pub center: bool,
 }
 
 impl<'a> Column<'a> {
     pub fn new(title: &'a str, width: W) -> Self {
-        Column { title, width, right: false }
+        Column { title, width, right: false, center: false }
     }
 
     /// Aligned to the right (numbers).
@@ -1165,14 +1166,11 @@ impl<'a> Column<'a> {
         self.right = true;
         self
     }
-}
 
-/// The hairline between rows and the fill of every other row.
-fn table_colors(ui: &Ui) -> (Color32, Color32) {
-    if ui.visuals().dark_mode {
-        (Color32::from_rgb(0x33, 0x35, 0x3e), Color32::from_rgb(0x26, 0x28, 0x30))
-    } else {
-        (Color32::from_rgb(0xed, 0xed, 0xf2), Color32::from_rgb(0xfa, 0xfa, 0xfb))
+    /// Centred (a column of check boxes).
+    pub fn center(mut self) -> Self {
+        self.center = true;
+        self
     }
 }
 
@@ -1195,7 +1193,6 @@ pub fn table(
 // Not generic: compiled once for every table.
 fn table_dyn(ui: &mut Ui, id: Id, cols: &[Column<'_>], rows: usize, row_h: f32, max_h: f32, cell: &mut dyn FnMut(&mut Ui, Option<usize>, usize)) {
     let p = style::pal(ui);
-    let (line, stripe) = table_colors(ui);
     parts::bordered(ui).show(ui, |ui| {
         let w = ui.available_width();
         ui.set_width(w);
@@ -1214,14 +1211,20 @@ fn table_dyn(ui: &mut Ui, id: Id, cols: &[Column<'_>], rows: usize, row_h: f32, 
             for (c, col) in cols.iter().enumerate() {
                 let r = Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x + widths[c], rect.bottom()));
                 x += widths[c];
-                let inner = r.shrink2(vec2(10.0, 0.0));
+                let inner = if col.center { r } else { r.shrink2(vec2(10.0, 0.0)) };
                 if row.is_none() && !col.title.is_empty() {
-                    let font = style::semibold(ui.ctx(), 12.0);
-                    let (pos, align) = if col.right { (inner.right_center(), Align2::RIGHT_CENTER) } else { (inner.left_center(), Align2::LEFT_CENTER) };
-                    ui.painter().with_clip_rect(r).text(pos, align, col.title, font, p.text_muted);
+                    let g = ui.painter().layout_no_wrap(col.title.to_string(), style::medium(ui.ctx(), 12.0), p.text_muted);
+                    let x = if col.right { inner.right() - g.size().x - 0.35 } else { inner.left() };
+                    kit::paint_semibold(&ui.painter().with_clip_rect(r), egui::pos2(x, inner.center().y - g.size().y / 2.0), g, p.text_muted);
                     continue;
                 }
-                let layout = if col.right { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
+                let layout = if col.right {
+                    Layout::right_to_left(Align::Center)
+                } else if col.center {
+                    Layout::centered_and_justified(egui::Direction::LeftToRight)
+                } else {
+                    Layout::left_to_right(Align::Center)
+                };
                 let mut child = ui.new_child(UiBuilder::new().id_salt((id, row, c)).max_rect(inner).layout(layout));
                 child.shrink_clip_rect(r);
                 child.spacing_mut().item_spacing = vec2(6.0, 0.0);
@@ -1241,9 +1244,9 @@ fn table_dyn(ui: &mut Ui, id: Id, cols: &[Column<'_>], rows: usize, row_h: f32, 
                 }
                 if r % 2 == 1 {
                     let radius = if r + 1 == rows { CornerRadius { nw: 0, ne: 0, sw: 7, se: 7 } } else { CornerRadius::ZERO };
-                    ui.painter().rect_filled(rect, radius, stripe);
+                    ui.painter().rect_filled(rect, radius, p.stripe);
                 }
-                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, line));
+                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, p.line));
                 draw_row(ui, rect.with_max_y(rect.bottom() - 1.0), Some(r));
             }
         });

@@ -499,19 +499,16 @@ impl Updates {
                                 ui.add_space(6.0);
                             }
                             if notes.len() > 1 || !n.date.is_empty() {
-                                let line = RichText::new(format!("{} {}", n.version, n.date)).color(p.text_muted);
-                                dialogs::label_lh(ui, line, style::semibold(ui.ctx(), 12.5), 1.5, false);
+                                dialogs::semibold_text(ui, &format!("{} {}", n.version, n.date), 12.5, p.text_muted, Some(1.5), true);
                             }
                             markdown(ui, &n.body, 8.0, Some(1.5));
                         }
                     });
                 },
                 |ui| {
-                    dialogs::row_lead(ui, &mut |ui| {
-                        if ui.add(egui::Link::new(RichText::new(tr("All release notes")).underline().color(style::pal(ui).accent_text))).clicked() {
-                            all.set(true);
-                        }
-                    });
+                    if ui.add(egui::Link::new(RichText::new(tr("All release notes")).underline().color(style::pal(ui).accent_text))).clicked() {
+                        all.set(true);
+                    }
                     right(ui, |ui| {
                         if kit::primary(ui, tr("Continue")).clicked() {
                             close.set(true);
@@ -540,12 +537,12 @@ impl Updates {
                 |ui| {
                     let p = style::pal(ui);
                     ui.spacing_mut().item_spacing.y = 10.0;
-                    dialogs::form_row(ui, tr("Current version"), |ui| ui.label(RichText::new(current_version()).color(p.text)));
+                    dialogs::form_row(ui, tr("Current version"), |ui| dialogs::value_text(ui, current_version(), p.text, false));
                     let new = match &r.date {
                         Some(d) => format!("{} ({d})", r.version),
                         None => r.version.clone(),
                     };
-                    dialogs::form_row(ui, tr("New version"), |ui| ui.label(RichText::new(new).font(style::semibold(ui.ctx(), 13.0)).color(p.text)));
+                    dialogs::form_row(ui, tr("New version"), |ui| dialogs::value_text(ui, &new, p.text, true));
                     if !r.notes.is_empty() {
                         dialogs::muted(ui, tr("What's new:"));
                         kit::card(ui).corner_radius(egui::CornerRadius::same(style::RADIUS_LG)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
@@ -612,7 +609,7 @@ impl Updates {
             let dark = ctx.global_style().visuals.dark_mode;
             let p = ternarygrid_ui::palette(dark);
             // At the bottom right, above the status bar (as far right as the design has it).
-            egui::Area::new(egui::Id::new("ternarygrid_update_question")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(0.0, -63.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Area::new(egui::Id::new("ternarygrid_update_question")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(0.0, -60.0)).order(egui::Order::Foreground).show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(p.surface)
                     .stroke(egui::Stroke::new(1.0, p.border))
@@ -622,10 +619,12 @@ impl Updates {
                     .show(ui, |ui| {
                         ui.set_width(360.0);
                         ui.spacing_mut().item_spacing.y = 10.0;
+                        // Rows as tall as their content.
+                        ui.spacing_mut().interact_size.y = 0.0;
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             ui.label(RichText::new(icon::ARROW_UP).font(style::icon_font(16.0)).color(p.accent_text));
-                            ui.label(RichText::new(tr("Check for updates automatically?")).font(style::semibold(ui.ctx(), 13.5)).color(p.text));
+                            kit::semibold_label(ui, tr("Check for updates automatically?"), 13.5, p.text);
                         });
                         let text = tr("TernaryGrid can look for a new release when it starts and every few hours. Only the GitHub release page is contacted; nothing about you or your databases is sent.");
                         dialogs::label_lh(ui, RichText::new(text).color(p.text_muted), egui::FontId::proportional(12.5), 1.5, false);
@@ -749,7 +748,7 @@ impl Updates {
                         ),
                         crate::selfupdate::Stage::Verifying => (1.0, tr("Verifying…").to_string()),
                     };
-                    parts::progress(ui, fraction, f32::INFINITY);
+                    parts::progress_h(ui, fraction, f32::INFINITY, 8.0);
                     dialogs::muted(ui, &text);
                 }
                 Install::Ready { .. } => {
@@ -836,7 +835,7 @@ fn markdown(ui: &mut egui::Ui, text: &str, gap: f32, lh: Option<f32>) {
         if t.trim().is_empty() {
             continue;
         } else if let Some(h) = t.strip_prefix("### ").or_else(|| t.strip_prefix("## ")).or_else(|| t.strip_prefix("# ")) {
-            line(ui, plain(h), style::semibold(ui.ctx(), 13.5));
+            dialogs::semibold_text(ui, &plain(h), 13.5, p.text, lh, false);
         } else if let Some(b) = t.trim_start().strip_prefix("- ").or_else(|| t.trim_start().strip_prefix("* ")) {
             let indent = (t.len() - t.trim_start().len()) as f32 * 4.0;
             ui.horizontal_top(|ui| {
