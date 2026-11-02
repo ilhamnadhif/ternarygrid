@@ -8,6 +8,7 @@ use egui_phosphor::regular as icon;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use ternarygrid_core::{tr, trf};
+use ternarygrid_ui::kit;
 
 const MAX_HISTORY: usize = 30;
 
@@ -141,8 +142,15 @@ pub fn duration_text(d: Duration) -> String {
 
 /// Status line text: fetched rows, more available, total, elapsed.
 pub fn status_text(model: &ResultModel) -> String {
+    let (rows, rest) = status_parts(model);
+    rows + &rest
+}
+
+/// The status in two parts: the row count (`1,234 rows`) and the rest (` · more available · 42 ms`).
+fn status_parts(model: &ResultModel) -> (String, String) {
     let rows = crate::format::group_thousands(&model.row_count().to_string());
-    let mut s = trf("{} rows", &[&rows]);
+    let rows = trf("{} rows", &[&rows]);
+    let mut s = String::new();
     if model.has_client_view() && model.row_count() != model.stored_row_count() {
         s.push_str(&trf(" (of {} fetched)", &[&crate::format::group_thousands(&model.stored_row_count().to_string())]));
     }
@@ -168,7 +176,7 @@ pub fn status_text(model: &ResultModel) -> String {
         s.push_str(" · ");
         s.push_str(&fetched_at_text(at, chrono::Local::now()));
     }
-    s
+    (rows, s)
 }
 
 /// `09:35:51` for today, `2026-10-21 09:35` for an earlier day.
@@ -176,8 +184,9 @@ fn fetched_at_text(at: chrono::DateTime<chrono::Local>, now: chrono::DateTime<ch
     if at.date_naive() == now.date_naive() { at.format("%H:%M:%S").to_string() } else { at.format("%Y-%m-%d %H:%M").to_string() }
 }
 
-/// The filter bar: WHERE / client filter with history, ORDER BY, apply/clear
-/// and the client/server toggle.
+/// The filter bar: the WHERE (or client filter) field and the ORDER BY field, each with
+/// its keyword inside, column suggestions and history; Apply; clear; and a ⋯ menu with
+/// where filters run (the database or the fetched rows) and the table's default filter.
 pub struct FilterBar<'a> {
     model: &'a mut ResultModel,
     grid: &'a mut DataGridState,
@@ -202,72 +211,48 @@ impl<'a> FilterBar<'a> {
     pub fn show(self, ui: &mut Ui) -> Vec<GridAction> {
         let FilterBar { model, grid, state, dialect } = self;
         let kind = dialect.as_ref().map(|d| d.kind());
+        // Redis has no server side filter: the read commands take no condition.
+        let redis = kind == Some(ternarygrid_core::DbKind::Redis);
+        if redis {
+            grid.mode = DataMode::Client;
+        }
         // Column names for the suggestions, written as SQL (server) or as typed (client).
         let columns: Vec<String> = model.columns().iter().map(|c| c.name.clone()).collect();
         let simple = |n: &str| n.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_') && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-        let server_mode = grid.mode == DataMode::Server;
+        let server = grid.mode == DataMode::Server;
         let quote = move |n: &str| -> String {
             match &dialect {
-                Some(d) if server_mode => d.quote_ident(n),
+                Some(d) if server => d.quote_ident(n),
                 _ if simple(n) => n.to_string(),
                 _ => format!("\"{}\"", n.replace('"', "\"\"")),
             }
         };
+        let p = ternarygrid_ui::pal(ui);
         let mut actions = Vec::new();
         let mut apply = false;
         let mut clear = false;
         ui.horizontal(|ui| {
-            // Where filter and order apply: re-run on the server, or the fetched rows.
-            let mut client = grid.mode == DataMode::Client;
-            // Each button says what it does: the words alone mean little to a new user.
-            let server_hint = tr("Server: the database filters and sorts. The query runs again with your WHERE / ORDER BY, over all rows of the table.");
-            let client_hint = tr("Client: TernaryGrid filters and sorts the rows already fetched, without asking the database. Fast, but only those rows.");
-            ui.scope(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
-                let left = egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 };
-                let right = egui::CornerRadius { nw: 0, sw: 0, ne: 4, se: 4 };
-                if ui.add(Button::new(tr("Server")).selected(!client).corner_radius(left).stroke(stroke)).on_hover_text(server_hint).clicked() {
-                    client = false;
+            ui.spacing_mut().item_spacing.x = 6.0;
+            // The two fields share what the buttons leave: Apply, clear and ⋯.
+            let gap = ui.spacing().item_spacing.x;
+            let apply_w = kit::button_width(ui, Some(icon::PLAY), tr("Apply"), false);
+            let flexible = (ui.available_width() - apply_w - 2.0 * 28.0 - 4.0 * gap).max(200.0);
+            // The keyword says where the filter runs: the database (WHERE) or the fetched rows.
+            let (prefix, prefix_tip, hint) = match kind {
+                _ if !server => (
+                    "FILTER",
+                    tr("Filters the rows already fetched, in TernaryGrid, without asking the database. Fast, but only those rows. Switch in ⋯."),
+                    tr("e.g. amount > 100 and city = 'Bandung'"),
+                ),
+                Some(ternarygrid_core::DbKind::MongoDb) => ("QUERY", tr("Query document sent to the database. Switch in ⋯."), tr("e.g. {status: \"open\"}")),
+                _ => {
+                    ("WHERE", tr("WHERE condition sent to the database: the query runs again over all rows of the table. Switch in ⋯."), tr("e.g. status = 'open' and price > 100"))
                 }
-                if ui.add(Button::new(tr("Client")).selected(client).corner_radius(right).stroke(stroke)).on_hover_text(client_hint).clicked() {
-                    client = true;
-                }
-            });
-            // Redis has no server side filter: the read commands take no condition.
-            if kind == Some(ternarygrid_core::DbKind::Redis) {
-                client = true;
-            }
-            grid.mode = if client { DataMode::Client } else { DataMode::Server };
-            let server = !client;
-            ui.add_space(4.0);
-            ui.label(RichText::new(icon::FUNNEL).size(15.0)).on_hover_text(if server {
-                tr("WHERE condition sent to the database")
-            } else {
-                tr("Client side filter expression (see help)")
-            });
-            // The inputs share what is left after the fixed widgets: the
-            // ORDER BY label, two history buttons and the trailing buttons.
-            let label_w = ui.fonts_mut(|f| f.layout_no_wrap(tr("ORDER BY").to_string(), egui::TextStyle::Body.resolve(ui.style()), egui::Color32::WHITE).rect.width());
-            let button = ui.spacing().interact_size.y + ui.spacing().button_padding.x * 2.0 + ui.spacing().item_spacing.x;
-            let trailing = label_w + button * 6.0 + ui.spacing().item_spacing.x * 4.0;
-            let flexible = (ui.available_width() - trailing).max(160.0);
-            let hint = match kind {
-                _ if !server => tr("Filter, e.g. amount > 100 and city = 'Bandung'"),
-                Some(ternarygrid_core::DbKind::MongoDb) => tr("Query document, e.g. {status: \"open\"}"),
-                _ => tr("WHERE condition, e.g. status = 'open'"),
             };
             const WHERE_WORDS: [&str; 10] = ["AND", "OR", "NOT", "IS NULL", "IS NOT NULL", "LIKE", "ILIKE", "IN", "BETWEEN", "NULL"];
-            let filter_resp = crate::suggest::suggest_edit(
-                ui,
-                ui.id().with("filter_where"),
-                &mut state.filter_text,
-                |t| t.hint_text(hint).desired_width(flexible * 0.62).font(egui::TextStyle::Monospace),
-                &columns,
-                &WHERE_WORDS,
-                &quote,
-                &mut state.rt.where_suggest,
-            );
+            let label = if server { tr("Filter rows in the database") } else { tr("Filter the fetched rows") };
+            let field = Field { salt: "filter_where", prefix, label, prefix_tip, hint, width: flexible * 0.62, keywords: &WHERE_WORDS, history: &state.filter_history };
+            let filter_resp = prefixed_field(ui, field, &mut state.filter_text, &columns, &quote, &mut state.rt.where_suggest, &mut apply);
             if filter_resp.changed() {
                 state.rt.filter_error = None;
             }
@@ -284,31 +269,49 @@ impl<'a> FilterBar<'a> {
             if !server {
                 filter_resp.clone().on_hover_text(crate::expr::help_text());
             }
-            history_button(ui, "filter_history", &state.filter_history.clone(), &mut state.filter_text, &mut apply);
-            ui.label(tr("ORDER BY"));
-            let order_resp = crate::suggest::suggest_edit(
-                ui,
-                ui.id().with("filter_order"),
-                &mut state.order_text,
-                |t| t.hint_text(tr("column [DESC], …")).desired_width(flexible * 0.38).font(egui::TextStyle::Monospace),
-                &columns,
+            let field = Field {
+                salt: "filter_order",
+                prefix: "ORDER BY",
+                label: tr("Order rows by"),
+                prefix_tip: if server { tr("ORDER BY sent to the database") } else { tr("Sorts the fetched rows") },
+                hint: tr("e.g. created_at DESC, name"),
+                width: flexible * 0.38,
                 // The client sort knows no NULLS FIRST / LAST (NULLs sort first).
-                if server_mode { &["ASC", "DESC", "NULLS FIRST", "NULLS LAST"] } else { &["ASC", "DESC"] },
-                &quote,
-                &mut state.rt.order_suggest,
-            );
+                keywords: if server { &["ASC", "DESC", "NULLS FIRST", "NULLS LAST"] } else { &["ASC", "DESC"] },
+                history: &state.order_history,
+            };
+            let order_resp = prefixed_field(ui, field, &mut state.order_text, &columns, &quote, &mut state.rt.order_suggest, &mut apply);
             if order_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 apply = true;
             }
-            history_button(ui, "order_history", &state.order_history.clone(), &mut state.order_text, &mut apply);
-            if ui.button(ternarygrid_icons::ic(icon::PLAY)).on_hover_text(tr("Apply filter and order (Enter)")).clicked() {
+            if kit::button_ex(ui, kit::Kind::Primary, Some(icon::PLAY), tr("Apply"), false).on_hover_text(tr("Apply filter and order (Enter)")).clicked() {
                 apply = true;
             }
-            if ui.button(ternarygrid_icons::ic(icon::X)).on_hover_text(tr("Clear filter and order")).clicked() {
-                clear = true;
-            }
-            if crate::model::source_table(model.columns()).is_ok() {
-                ui.menu_button(icon::DOTS_THREE, |ui| {
+            let filtered = !state.filter_text.trim().is_empty() || !state.order_text.trim().is_empty() || !grid.sort.is_empty() || model.has_client_view();
+            ui.add_enabled_ui(filtered, |ui| {
+                if kit::icon_button(ui, icon::X, tr("Clear filter and order")).clicked() {
+                    clear = true;
+                }
+            });
+            let menu = kit::icon_button(ui, icon::DOTS_THREE, tr("Filter options"));
+            Popup::menu(&menu).id(ui.id().with("filter_options")).show(|ui| {
+                ui.set_min_width(280.0);
+                ui.label(kit::section_title(ui, tr("Filter and sort")));
+                // Each choice says what it does: the words alone mean little to a new user.
+                let server_hint = tr("The database filters and sorts. The query runs again with your WHERE / ORDER BY, over all rows of the table.");
+                let client_hint = tr("TernaryGrid filters and sorts the rows already fetched, without asking the database. Fast, but only those rows.");
+                let on_server = ui
+                    .add_enabled(!redis, egui::RadioButton::new(server, tr("Server: in the database, over all rows")))
+                    .on_hover_text(server_hint)
+                    .on_disabled_hover_text(tr("Redis has no server side filter: its read commands take no condition."));
+                if on_server.clicked() {
+                    grid.mode = DataMode::Server;
+                }
+                if ui.radio(!server, tr("Client: over the fetched rows")).on_hover_text(client_hint).clicked() {
+                    grid.mode = DataMode::Client;
+                }
+                if crate::model::source_table(model.columns()).is_ok() {
+                    ui.separator();
                     let some = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
                     if ui.button((ternarygrid_icons::ic(icon::PUSH_PIN), tr("Save as default filter"))).on_hover_text(tr("Applied whenever this table's data is opened")).clicked()
                     {
@@ -319,11 +322,11 @@ impl<'a> FilterBar<'a> {
                         actions.push(GridAction::DefaultFilter { where_clause: None, order_by: None });
                         ui.close();
                     }
-                });
-            }
+                }
+            });
         });
         if let Some(e) = &state.rt.filter_error {
-            ui.colored_label(ui.visuals().error_fg_color, e);
+            ui.label(RichText::new(e).color(p.err));
         }
         if clear {
             state.filter_text.clear();
@@ -370,21 +373,82 @@ impl<'a> FilterBar<'a> {
     }
 }
 
-fn history_button(ui: &mut Ui, salt: &str, history: &[String], target: &mut String, apply: &mut bool) {
-    let resp = ui.add_enabled(!history.is_empty(), Button::new(ternarygrid_icons::ic(icon::CARET_DOWN)).small()).on_hover_text(tr("History"));
-    Popup::menu(&resp).id(ui.id().with(salt)).close_behavior(PopupCloseBehavior::CloseOnClick).show(|ui| {
-        ui.set_min_width(240.0);
-        for h in history {
-            if ui.button(RichText::new(h).monospace()).clicked() {
-                *target = h.clone();
-                *apply = true;
-            }
-        }
-    });
+/// What [`prefixed_field`] shows.
+struct Field<'a> {
+    salt: &'static str,
+    /// The keyword inside the field, on the left (`WHERE`, `ORDER BY`).
+    prefix: &'a str,
+    /// Its accessible name.
+    label: &'a str,
+    prefix_tip: &'a str,
+    hint: &'a str,
+    width: f32,
+    keywords: &'a [&'a str],
+    history: &'a [String],
 }
 
-/// The result toolbar: refresh, auto refresh, fetching, save/cancel,
-/// row operations, export, view switcher, panel toggles and the status text.
+/// A monospace field with its keyword inside on the left, column suggestions and, once
+/// something was applied, a clock on the right that lists the history (a pick applies it).
+fn prefixed_field(
+    ui: &mut Ui,
+    f: Field<'_>,
+    text: &mut String,
+    columns: &[String],
+    quote: &dyn Fn(&str) -> String,
+    suggest: &mut crate::suggest::Suggest,
+    apply: &mut bool,
+) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let font = egui::FontId::monospace(11.0);
+    let prefix_w = ui.painter().layout_no_wrap(f.prefix.to_string(), font.clone(), p.accent_text).size().x;
+    let history = !f.history.is_empty();
+    let margin = egui::Margin { left: (prefix_w + 18.0).min(120.0) as i8, right: if history { 28 } else { 8 }, top: 6, bottom: 6 };
+    let id = ui.id().with(f.salt);
+    let hint = RichText::new(f.hint).color(p.text_faint);
+    let resp = crate::suggest::suggest_edit(
+        ui,
+        id,
+        text,
+        |t| t.hint_text(hint).desired_width(f.width).font(egui::TextStyle::Monospace).margin(margin),
+        columns,
+        f.keywords,
+        quote,
+        suggest,
+    );
+    // The keyword is painted, not a label: give the field its name for screen readers.
+    ui.ctx().accesskit_node_builder(resp.id, |node| node.set_label(f.label));
+    let r = resp.rect;
+    if resp.has_focus() {
+        ternarygrid_ui::style::focus_halo(ui, r, ternarygrid_ui::style::RADIUS);
+    }
+    ui.painter().text(egui::pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, f.prefix, font, p.accent_text);
+    let prefix_rect = egui::Rect::from_min_max(egui::pos2(r.left() + 4.0, r.top()), egui::pos2(r.left() + 14.0 + prefix_w, r.bottom()));
+    ui.interact(prefix_rect, id.with("prefix"), egui::Sense::hover()).on_hover_text(f.prefix_tip);
+    if history {
+        let hr = egui::Rect::from_center_size(egui::pos2(r.right() - 15.0, r.center().y), egui::vec2(22.0, 22.0));
+        let h = ui.interact(hr, id.with("history"), egui::Sense::click()).on_hover_text(tr("History"));
+        h.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("History")));
+        if h.hovered() {
+            ui.painter().rect_filled(hr, 4, p.hover);
+        }
+        let color = if h.hovered() { p.text } else { p.text_faint };
+        ui.painter().text(hr.center(), egui::Align2::CENTER_CENTER, icon::CLOCK_COUNTER_CLOCKWISE, ternarygrid_ui::style::icon_font(14.0), color);
+        Popup::menu(&h).id(id.with("history_popup")).close_behavior(PopupCloseBehavior::CloseOnClick).show(|ui| {
+            ui.set_min_width(240.0);
+            for item in f.history {
+                if ui.button(RichText::new(item).monospace()).clicked() {
+                    *text = item.clone();
+                    *apply = true;
+                }
+            }
+        });
+    }
+    resp
+}
+
+/// The footer of a result: refresh and auto refresh, the status with the fetch buttons
+/// next to the row count they change, pending changes (Save / Discard, only while there
+/// are some), row operations, the view switcher, Chart / Spatial, Export and the panels.
 pub struct ResultToolbar<'a> {
     model: &'a mut ResultModel,
     grid: &'a mut DataGridState,
@@ -398,26 +462,21 @@ impl<'a> ResultToolbar<'a> {
     }
 
     /// Show it. Returns actions for the application.
-    ///
-    /// Groups, left to right: refresh · save, cancel · rows (add, duplicate,
-    /// delete) · export · view (segmented) · side panels; on the
-    /// right the status, a message of the application and the fetch
-    /// buttons next to the row count they change.
     pub fn show(self, ui: &mut Ui) -> Vec<GridAction> {
         let ResultToolbar { model, grid, state } = self;
         let mut actions = Vec::new();
         auto_refresh_tick(ui, model, grid.is_editing(), state, &mut actions);
+        let p = ternarygrid_ui::pal(ui);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            // --- refresh
-            if ui.button((ternarygrid_icons::ic(icon::ARROWS_CLOCKWISE), tr("Refresh"))).on_hover_text(tr("Refresh (Cmd+R)")).clicked() {
+            // --- refresh, auto refresh
+            if kit::icon_button_ex(ui, icon::ARROWS_CLOCKWISE, tr("Refresh (Cmd+R)"), false, 26.0).clicked() {
                 actions.push(GridAction::Refresh);
             }
-            let label = match state.auto_refresh_secs {
-                None => icon::TIMER.to_string(),
-                Some(s) => format!("{} {}", icon::TIMER, auto_label(s)),
+            let resp = match state.auto_refresh_secs {
+                None => kit::icon_button_ex(ui, icon::TIMER, tr("Auto refresh"), false, 26.0),
+                Some(s) => kit::button_full(ui, kit::Kind::Ghost, Some(icon::TIMER), &auto_label(s), true, true).on_hover_text(tr("Auto refresh")),
             };
-            let resp = ui.add(Button::new(label).selected(state.auto_refresh_secs.is_some())).on_hover_text(tr("Auto refresh"));
             Popup::menu(&resp).show(|ui| {
                 for choice in AUTO_REFRESH_CHOICES {
                     let text = match choice {
@@ -443,123 +502,149 @@ impl<'a> ResultToolbar<'a> {
                     }
                 });
             });
-            group_separator(ui);
-            // --- save / cancel: a group of their own next to Refresh, with labels (DBeaver)
-            let pending = model.pending_counts().total();
-            // Save stands out while there is something to save.
-            let save = if pending > 0 {
-                let v = ui.visuals();
-                Button::new(RichText::new(format!("{} {} ({pending})", icon::FLOPPY_DISK, tr("Save"))).color(v.strong_text_color()).strong())
-                    .fill(v.selection.bg_fill)
-                    .stroke(egui::Stroke::new(1.0, v.hyperlink_color))
-            } else {
-                Button::new((ternarygrid_icons::ic(icon::FLOPPY_DISK), tr("Save")))
-            };
-            if ui.add_enabled(pending > 0, save).on_hover_text(trf("Save {} pending change(s) (Cmd+S)", &[&pending])).clicked() {
-                actions.push(grid::save_action(model));
+            kit::vdivider(ui, 16.0);
+            // --- status: the row count stands out; the fetch buttons follow it
+            let (rows, mut rest) = status_parts(model);
+            if state.auto_refresh_secs.is_some() && (model.has_changes() || model.fetch.fetching) {
+                rest.push_str(" · ");
+                rest.push_str(tr("auto refresh paused"));
             }
-            // Cancel discards at once (as in DBeaver): the changes are only pending.
-            if ui.add_enabled(pending > 0, Button::new((ternarygrid_icons::ic(icon::X_CIRCLE), tr("Cancel")))).on_hover_text(tr("Discard pending changes")).clicked() {
-                model.discard_changes();
-                actions.push(GridAction::ChangesDiscarded);
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add(egui::Label::new(RichText::new(rows).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))).color(p.text)));
+                ui.add(egui::Label::new(RichText::new(rest).color(p.text_muted)));
+            });
+            let fetching = model.fetch.fetching;
+            if model.fetch.has_more {
+                ui.add_enabled_ui(!fetching, |ui| {
+                    if kit::button_full(ui, kit::Kind::Ghost, Some(icon::CARET_DOUBLE_DOWN), tr("Fetch more"), true, false).on_hover_text(tr("Fetch next page")).clicked() {
+                        actions.push(GridAction::FetchMore);
+                    }
+                    if kit::icon_button_ex(ui, icon::ARROW_LINE_DOWN, tr("Fetch all rows"), false, 26.0).clicked() {
+                        actions.push(GridAction::FetchAll);
+                    }
+                });
             }
-            group_separator(ui);
-            // --- rows
-            let editable = model.is_editable();
-            let notify = |r: Result<usize, String>, actions: &mut Vec<GridAction>| {
-                if let Err(e) = r {
-                    actions.push(GridAction::Notify { message: e, error: true });
+            if !model.fetch.counting && kit::icon_button_ex(ui, icon::HASH, tr("Calculate total row count"), false, 26.0).clicked() {
+                actions.push(GridAction::CountTotal);
+            }
+            // A long fetch (fetch all, a slow query) stops here, next to "fetching…".
+            if let Some(running) = model.fetch.fetching_for() {
+                if running >= crate::grid::CANCEL_AFTER {
+                    let stop = Button::new(RichText::new(icon::STOP_CIRCLE).color(p.err)).frame_when_inactive(false);
+                    if ui.add(stop).on_hover_text(tr("Stop the query")).clicked() {
+                        actions.push(GridAction::CancelFetch);
+                    }
+                } else {
+                    ui.ctx().request_repaint_after(crate::grid::CANCEL_AFTER - running);
                 }
-            };
-            if ui.add_enabled(editable, Button::new(ternarygrid_icons::ic(icon::ROWS_PLUS_BOTTOM))).on_hover_text(tr("Add row")).clicked() {
-                notify(grid::add_row(model, grid), &mut actions);
             }
-            if ui.add_enabled(editable, Button::new(ternarygrid_icons::ic(icon::COPY_SIMPLE))).on_hover_text(tr("Duplicate selected rows")).clicked() {
-                notify(grid::duplicate_selected(model, grid), &mut actions);
-            }
-            if ui.add_enabled(editable, Button::new(ternarygrid_icons::ic(icon::TRASH))).on_hover_text(tr("Delete selected rows")).clicked() {
-                notify(grid::delete_selected(model, grid), &mut actions);
-            }
-            if !editable && let Some(r) = model.read_only_reason() {
-                ui.label(RichText::new(format!("{} {}", icon::LOCK_SIMPLE, r.short_label())).color(ui.visuals().warn_fg_color)).on_hover_text(r.message());
-            }
-            group_separator(ui);
-            // --- export
-            if ui.button((ternarygrid_icons::ic(icon::EXPORT), tr("Export"))).on_hover_text(tr("Export…")).clicked() {
-                actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
-            }
-            group_separator(ui);
-            // --- view: one segmented control
-            let views = [
-                (ResultViewKind::Grid, icon::TABLE, tr("Grid")),
-                (ResultViewKind::Text, icon::TEXT_AA, tr("Text")),
-                (ResultViewKind::Record, icon::ROWS, tr("Record")),
-                (ResultViewKind::Json, icon::BRACKETS_CURLY, tr("JSON")),
-                (ResultViewKind::Xml, icon::BRACKETS_ANGLE, tr("XML")),
-            ];
-            let mut items: Vec<(&str, &str, bool)> = views.iter().map(|(k, ic, tip)| (*ic, *tip, state.view == *k)).collect();
-            items.push((icon::CHART_BAR, tr("Chart"), false));
-            items.push((icon::MAP_TRIFOLD, tr("Spatial view"), false));
-            match segmented(ui, &items) {
-                Some(i) if i < views.len() => {
+            // --- right, right to left: panels, export, views, rows, pending changes, messages
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let visible = !state.open_panels.is_empty() && !state.panels_hidden;
+                let panels = kit::icon_button_ex(ui, icon::CARET_DOWN, tr("Choose panels"), false, 20.0);
+                Popup::menu(&panels).id(ui.id().with("panels_menu")).show(|ui| {
+                    for (kind, ic, name) in PANELS {
+                        let open = state.is_panel_open(kind);
+                        if ui.add(Button::selectable(open, kit::with_icon(ic, tr(name)))).clicked() {
+                            actions.push(GridAction::TogglePanel(kind));
+                            ui.close();
+                        }
+                    }
+                });
+                if kit::icon_toggle(ui, icon::SIDEBAR_SIMPLE, if visible { tr("Hide panels") } else { tr("Show panels") }, visible).clicked() {
+                    if visible {
+                        state.panels_hidden = true;
+                    } else {
+                        if state.open_panels.is_empty() {
+                            state.set_panel_open(PanelKind::Value, true);
+                        }
+                        state.panels_hidden = false;
+                    }
+                }
+                if kit::ghost(ui, Some(icon::EXPORT), tr("Export")).on_hover_text(tr("Export…")).clicked() {
+                    actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
+                }
+                kit::vdivider(ui, 16.0);
+                if kit::icon_button_ex(ui, icon::MAP_TRIFOLD, tr("Spatial view"), false, 26.0).clicked() {
+                    actions.push(GridAction::ShowSpatial);
+                }
+                if kit::icon_button_ex(ui, icon::CHART_BAR, tr("Chart"), false, 26.0).clicked() {
+                    actions.push(GridAction::ShowChart);
+                }
+                // --- views: one segmented control (laid out right to left: added reversed)
+                let views = [
+                    (ResultViewKind::Grid, icon::TABLE, tr("Grid")),
+                    (ResultViewKind::Text, icon::TEXT_AA, tr("Text")),
+                    (ResultViewKind::Record, icon::ROWS, tr("Record")),
+                    (ResultViewKind::Json, icon::BRACKETS_CURLY, tr("JSON")),
+                    (ResultViewKind::Xml, icon::BRACKETS_ANGLE, tr("XML")),
+                ];
+                let segments: Vec<kit::Segment> = views.iter().map(|(k, ic, tip)| kit::Segment { icon: ic, tooltip: tip, on: state.view == *k }).collect();
+                let clicked = ui.scope(|ui| kit::button_group(ui, &segments).iter().position(|r| r.clicked())).inner;
+                if let Some(i) = clicked {
                     let kind = views[i].0;
                     if state.view != kind {
                         state.view = kind;
                         actions.push(GridAction::SwitchView(kind));
                     }
                 }
-                Some(i) if i == views.len() => actions.push(GridAction::ShowChart),
-                Some(_) => actions.push(GridAction::ShowSpatial),
-                None => {}
-            }
-            // --- right: fetch buttons, status, messages (right to left)
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let fetching = model.fetch.fetching;
-                if ui.add_enabled(!model.fetch.counting, Button::new(ternarygrid_icons::ic(icon::HASH))).on_hover_text(tr("Calculate total row count")).clicked() {
-                    actions.push(GridAction::CountTotal);
-                }
-                if model.fetch.has_more {
-                    if ui.add_enabled(!fetching, Button::new(ternarygrid_icons::ic(icon::ARROW_LINE_DOWN))).on_hover_text(tr("Fetch all rows")).clicked() {
-                        actions.push(GridAction::FetchAll);
+                kit::vdivider(ui, 16.0);
+                // --- rows (right to left: delete, duplicate, add)
+                let notify = |r: Result<usize, String>, actions: &mut Vec<GridAction>| {
+                    if let Err(e) = r {
+                        actions.push(GridAction::Notify { message: e, error: true });
                     }
-                    if ui.add_enabled(!fetching, Button::new(ternarygrid_icons::ic(icon::CARET_DOUBLE_DOWN))).on_hover_text(tr("Fetch next page")).clicked() {
-                        actions.push(GridAction::FetchMore);
+                };
+                if model.is_editable() {
+                    if kit::icon_button_ex(ui, icon::TRASH, tr("Delete selected rows"), false, 26.0).clicked() {
+                        notify(grid::delete_selected(model, grid), &mut actions);
                     }
-                }
-                // A long fetch (fetch all, a slow query) stops with the icon next to
-                // "fetching…" (not a second "Cancel" beside Save / Cancel).
-                if let Some(running) = model.fetch.fetching_for() {
-                    if running >= crate::grid::CANCEL_AFTER {
-                        let stop = Button::new(RichText::new(icon::STOP_CIRCLE).color(ui.visuals().error_fg_color)).frame_when_inactive(false);
-                        if ui.add(stop).on_hover_text(tr("Stop the query")).clicked() {
-                            actions.push(GridAction::CancelFetch);
-                        }
-                    } else {
-                        ui.ctx().request_repaint_after(crate::grid::CANCEL_AFTER - running);
+                    if kit::icon_button_ex(ui, icon::COPY_SIMPLE, tr("Duplicate selected rows"), false, 26.0).clicked() {
+                        notify(grid::duplicate_selected(model, grid), &mut actions);
                     }
+                    if kit::icon_button_ex(ui, icon::ROWS_PLUS_BOTTOM, tr("Add row"), false, 26.0).clicked() {
+                        notify(grid::add_row(model, grid), &mut actions);
+                    }
+                } else if let Some(r) = model.read_only_reason() {
+                    ui.label(RichText::new(format!("{} {}", icon::LOCK_SIMPLE, r.short_label())).color(p.warn)).on_hover_text(r.message());
                 }
-                let mut status = status_text(model);
-                if state.auto_refresh_secs.is_some() && (model.has_changes() || model.fetch.fetching) {
-                    status.push_str(" · ");
-                    status.push_str(tr("auto refresh paused"));
+                // --- pending changes: only while there are some (Cmd+S saves, as always)
+                let pending = model.pending_counts().total();
+                if pending > 0 {
+                    ui.add_space(4.0);
+                    let bg = ui.painter().add(egui::Shape::Noop);
+                    let save = kit::button_full(ui, kit::Kind::Primary, Some(icon::FLOPPY_DISK), tr("Save"), true, false)
+                        .on_hover_text(trf("Save {} pending change(s) (Cmd+S)", &[&pending]));
+                    if save.clicked() {
+                        actions.push(grid::save_action(model));
+                    }
+                    // Discard drops them at once: they are only pending.
+                    let discard = kit::button_full(ui, kit::Kind::Ghost, None, tr("Discard"), true, false).on_hover_text(tr("Discard pending changes"));
+                    if discard.clicked() {
+                        model.discard_changes();
+                        actions.push(GridAction::ChangesDiscarded);
+                    }
+                    let count = if pending == 1 { tr("1 change").to_string() } else { trf("{} changes", &[&pending]) };
+                    let label = ui.label(RichText::new(count).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))).color(p.text));
+                    let dot = kit::dot(ui, p.warn, 3.5);
+                    let rect = save.rect.union(discard.rect).union(label.rect).union(dot.rect).expand2(egui::vec2(6.0, 2.0));
+                    ui.painter().set(bg, egui::Shape::rect_filled(rect, 8, ternarygrid_ui::soft(p.warn, if ui.visuals().dark_mode { 0.16 } else { 0.12 })));
+                    ui.add_space(8.0);
                 }
-                ui.add(egui::Label::new(RichText::new(status).color(ui.visuals().weak_text_color())).truncate());
                 // A failed fetch popped up once; a click shows it again.
                 if let Some(e) = &model.fetch.error {
-                    let label =
-                        egui::Label::new(RichText::new(format!("{} {}", icon::WARNING_CIRCLE, e)).color(ui.visuals().error_fg_color)).truncate().sense(egui::Sense::click());
+                    let label = egui::Label::new(RichText::new(format!("{} {}", icon::WARNING_CIRCLE, e)).color(p.err)).truncate().sense(egui::Sense::click());
                     if ui.add(label).on_hover_text(tr("Show the error")).clicked() {
                         state.error_popup = Some(e.clone());
                     }
                 }
-                // Errors open a pop-up (the result viewer).
-                if let Some((message, error)) = state.notice.clone().filter(|(_, error)| !error) {
-                    if ui.small_button(ternarygrid_icons::ic(icon::X)).on_hover_text(tr("Dismiss")).clicked() {
+                // Errors open a pop-up (the result viewer); other messages show here.
+                if let Some((message, _)) = state.notice.clone().filter(|(_, error)| !error) {
+                    if kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 20.0).clicked() {
                         state.notice = None;
                     }
-                    let color = if error { ui.visuals().error_fg_color } else { ui.visuals().text_color() };
-                    let ic = if error { icon::WARNING_CIRCLE } else { icon::INFO };
-                    ui.add(egui::Label::new(RichText::new(format!("{ic} {message}")).color(color)).truncate()).on_hover_text(message);
+                    ui.add(egui::Label::new(RichText::new(format!("{} {message}", icon::INFO)).color(p.text)).truncate()).on_hover_text(message);
                 }
             });
         });
@@ -567,31 +652,14 @@ impl<'a> ResultToolbar<'a> {
     }
 }
 
-/// Space and a line between toolbar groups.
-fn group_separator(ui: &mut Ui) {
-    ui.add_space(2.0);
-    ui.separator();
-    ui.add_space(2.0);
-}
-
-/// Connected toggle buttons; returns the index of the clicked one.
-fn segmented(ui: &mut Ui, items: &[(&str, &str, bool)]) -> Option<usize> {
-    let mut clicked = None;
-    let n = items.len();
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
-        for (i, (ic, tip, selected)) in items.iter().enumerate() {
-            let (first, last) = (i == 0, i + 1 == n);
-            let r = 4;
-            let corners = egui::CornerRadius { nw: if first { r } else { 0 }, sw: if first { r } else { 0 }, ne: if last { r } else { 0 }, se: if last { r } else { 0 } };
-            if ui.add(Button::new(*ic).selected(*selected).corner_radius(corners).stroke(stroke)).on_hover_text(*tip).clicked() {
-                clicked = Some(i);
-            }
-        }
-    });
-    clicked
-}
+/// The side panels: kind, icon and name.
+pub(crate) const PANELS: [(PanelKind, &str, &str); 5] = [
+    (PanelKind::Value, icon::EYE, "Value"),
+    (PanelKind::Metadata, icon::INFO, "Metadata"),
+    (PanelKind::Grouping, icon::STACK, "Grouping"),
+    (PanelKind::Calc, icon::CALCULATOR, "Calc"),
+    (PanelKind::References, icon::TREE_STRUCTURE, "References"),
+];
 
 fn auto_label(secs: u64) -> String {
     if secs.is_multiple_of(60) { trf("{} min", &[&(secs / 60)]) } else { trf("{} s", &[&secs]) }

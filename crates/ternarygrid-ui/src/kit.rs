@@ -117,6 +117,20 @@ pub fn button_full(ui: &mut Ui, kind: Kind, icon: Option<&str>, text: &str, smal
     resp
 }
 
+/// The width [`button_ex`] gives a button, so a row can leave room for it before laying out
+/// the widgets that share what is left.
+pub fn button_width(ui: &Ui, icon: Option<&str>, text: &str, small: bool) -> f32 {
+    let size = if small { style::SMALL + 1.0 } else { style::body_size(ui.ctx()) };
+    let height = if small { 24.0 } else { style::CONTROL_H };
+    if text.is_empty() {
+        return height;
+    }
+    let pad = if small { 8.0 } else { 12.0 };
+    let text_w = ui.painter().layout_no_wrap(text.to_string(), style::medium(ui.ctx(), size), Color32::PLACEHOLDER).size().x;
+    let icon_w = icon.map_or(0.0, |i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size + 2.0), Color32::PLACEHOLDER).size().x + 6.0);
+    (text_w + icon_w + pad * 2.0).max(height)
+}
+
 pub fn primary(ui: &mut Ui, text: &str) -> Response {
     button_ex(ui, Kind::Primary, None, text, false)
 }

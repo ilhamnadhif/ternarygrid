@@ -54,6 +54,24 @@ impl Viewer {
         })
     }
 
+    /// Centres of the accessibility nodes labelled exactly `text`, top to bottom.
+    fn find_all_exact(&self, text: &str) -> Vec<Pos2> {
+        let Some(update) = self.output.accesskit_update.as_ref() else { return Vec::new() };
+        let mut found: Vec<Pos2> = update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.label().is_some_and(|l| l == text))
+            .filter_map(|(_, n)| n.bounds().map(|b| Pos2::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)))
+            .collect();
+        found.sort_by(|a, b| a.y.total_cmp(&b.y));
+        found
+    }
+
+    /// The filter bar's Apply (the topmost: a panel can have an Apply of its own).
+    fn filter_apply(&self) -> Option<Pos2> {
+        self.find_all_exact("Apply").first().copied()
+    }
+
     /// Centre of the first text input holding `text`.
     fn find_input(&self, text: &str) -> Option<Pos2> {
         let update = self.output.accesskit_update.as_ref()?;
@@ -152,8 +170,8 @@ fn client_filter_from_filter_bar() {
     let mut v = Viewer::new(editable_model(100));
     v.state.toolbar.filter_text = "id >= 90 and flag".into();
     v.state.toolbar.order_text = "id desc".into();
-    // Press Enter in the filter field: simulate by clicking the apply button (labelled ▶ icon).
-    let apply = v.find(egui_phosphor::regular::PLAY).expect("apply button");
+    // Press Enter in the filter field: simulate by clicking the filter bar's Apply.
+    let apply = v.filter_apply().expect("apply button");
     v.click(apply);
     v.wait_jobs();
     assert_eq!(v.model.row_count(), 5);
@@ -191,7 +209,7 @@ fn server_mode_filter_bar_emits_query_change() {
     let mut v = Viewer::new(editable_model(10));
     v.state.grid.mode = crate::grid::DataMode::Server;
     v.state.toolbar.filter_text = "status = 'open'".into();
-    let apply = v.find(egui_phosphor::regular::PLAY).expect("apply button");
+    let apply = v.filter_apply().expect("apply button");
     v.frame(vec![Event::PointerMoved(apply)]);
     v.frame(vec![press(apply, PointerButton::Primary, Modifiers::NONE)]);
     v.frame(vec![release(apply, PointerButton::Primary, Modifiers::NONE)]);
@@ -211,7 +229,8 @@ fn value_panel_edits_active_cell() {
     v.click(editor);
     v.frame(vec![crate::test_support::key(egui::Key::End, Modifiers::NONE)]);
     v.frame(vec![Event::Text("!".into())]);
-    let apply = v.find("Apply").expect("apply button");
+    // The value panel's Apply: below the filter bar's.
+    let apply = v.find_all_exact("Apply").last().copied().expect("apply button");
     v.click(apply);
     assert_eq!(v.model.cell(2, 1), Some(Value::text("name 2!")));
 }
@@ -634,13 +653,14 @@ fn record_view_has_the_grids_menu_and_keys() {
 }
 
 #[test]
-fn cancel_discards_pending_changes_at_once() {
+fn discard_drops_pending_changes_at_once() {
     let mut v = Viewer::new(editable_model(3));
     v.model.set_value(1, 1, ternarygrid_core::Value::text("changed")).unwrap();
     v.frame(vec![]);
     assert!(v.model.has_changes());
-    let cancel = v.find("Cancel").expect("Cancel button");
-    v.click(cancel);
+    assert!(v.find("1 change").is_some(), "the footer counts the pending change");
+    let discard = v.find("Discard").expect("Discard button");
+    v.click(discard);
     assert!(!v.model.has_changes(), "no Discard / Keep question first");
     assert!(v.actions.iter().any(|a| matches!(a, GridAction::ChangesDiscarded)));
     v.frame(vec![]);
@@ -653,7 +673,7 @@ fn a_long_fetch_shows_a_spinner_then_cancel() {
     v.model.fetch.fetching = true;
     v.frame(vec![]);
     assert!(v.find("Fetching…").is_some(), "the spinner's text");
-    // Not the Cancel of Save / Cancel in the toolbar: the one over the grid's body.
+    // The Cancel over the grid's body (not a button of the footer).
     let cancel_in_body = |v: &Viewer| {
         let (body, ..) = v.state.grid.rt.last_geometry.unwrap();
         let update = v.output.accesskit_update.as_ref()?;
@@ -730,7 +750,7 @@ fn filter_by_value_runs_the_filter_the_box_shows() {
     // Client mode combines the same way: (filter before) AND (new condition).
     let mut v = Viewer::new(editable_model(10));
     v.state.toolbar.filter_text = "id > 1".into();
-    let apply = v.find(egui_phosphor::regular::PLAY).expect("apply button");
+    let apply = v.filter_apply().expect("apply button");
     v.click(apply);
     v.wait_jobs();
     assert_eq!(v.model.row_count(), 8);

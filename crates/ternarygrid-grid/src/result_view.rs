@@ -11,7 +11,7 @@ use crate::toolbar::{FilterBar, ResultToolbar, ToolbarState};
 use crate::views::{DocumentKind, DocumentView, DocumentViewState, RecordView, RecordViewState, TextView, TextViewState};
 use egui::{Frame, Id, Panel, Ui};
 use serde::{Deserialize, Serialize};
-use ternarygrid_core::{tr, trf};
+use ternarygrid_core::tr;
 
 /// All state of a result tab. The grid layout and toolbar settings are
 /// serialisable; panel caches are transient.
@@ -170,102 +170,25 @@ fn fetch_error_bar(ui: &mut Ui, message: &str) -> bool {
     close
 }
 
-const PANELS: [PanelKind; 5] = [PanelKind::Value, PanelKind::Metadata, PanelKind::Grouping, PanelKind::Calc, PanelKind::References];
-
 fn panel_icon(p: PanelKind) -> &'static str {
-    use egui_phosphor::regular as icon;
-    match p {
-        PanelKind::Value => icon::EYE,
-        PanelKind::Metadata => icon::INFO,
-        PanelKind::Grouping => icon::STACK,
-        PanelKind::Calc => icon::CALCULATOR,
-        PanelKind::References => icon::TREE_STRUCTURE,
-    }
+    crate::toolbar::PANELS.iter().find(|(k, ..)| *k == p).map_or("", |(_, icon, _)| icon)
 }
 
 fn panel_name(p: PanelKind) -> &'static str {
-    match p {
-        PanelKind::Value => tr("Value"),
-        PanelKind::Metadata => tr("Metadata"),
-        PanelKind::Grouping => tr("Grouping"),
-        PanelKind::Calc => tr("Calc"),
-        PanelKind::References => tr("References"),
-    }
-}
-
-/// Each panel's colour (its icon in the strip and its tab).
-fn panel_color(p: PanelKind, dark: bool) -> egui::Color32 {
-    let (light, dim) = match p {
-        PanelKind::Value => (0x2F6FDB, 0x6CA2F5),
-        PanelKind::Metadata => (0x0E8A8A, 0x4CC3C3),
-        PanelKind::Grouping => (0xC26A00, 0xE9A84F),
-        PanelKind::Calc => (0x7B4FD6, 0xAE8CF2),
-        PanelKind::References => (0x2E8B3E, 0x6CC97B),
-    };
-    let c = if dark { dim } else { light };
-    egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
-}
-
-/// The strip at the right edge (as in DBeaver): show or hide the panels, and a
-/// button per panel. A panel's button opens it, or closes it when it is shown.
-fn panel_strip(ui: &mut Ui, state: &mut ResultViewState) {
-    use egui::{Button, RichText};
-    use egui_phosphor::regular as icon;
-    let visible = state.panels_visible();
-    let dark = ui.visuals().dark_mode;
-    let size = egui::vec2(24.0, 24.0);
-    ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing.y = 4.0;
-        let tip = if visible { tr("Hide panels") } else { tr("Show panels") };
-        if ui.add(Button::new(RichText::new(icon::SIDEBAR_SIMPLE).size(15.0)).selected(visible).min_size(size)).on_hover_text(tip).clicked() {
-            if visible {
-                state.toolbar.panels_hidden = true;
-            } else if state.toolbar.open_panels.is_empty() {
-                state.open_panel(PanelKind::Value);
-            } else {
-                state.toolbar.panels_hidden = false;
-            }
-        }
-        let y = ui.cursor().top() + 1.0;
-        let x = ui.max_rect().x_range();
-        ui.painter().hline(x.shrink(3.0), y, ui.visuals().widgets.noninteractive.bg_stroke);
-        ui.add_space(6.0);
-        for p in PANELS {
-            let open = state.toolbar.is_panel_open(p);
-            let shown = visible && state.active_panel == Some(p);
-            let text = RichText::new(panel_icon(p)).size(15.0).color(panel_color(p, dark));
-            let mut b = Button::new(text).min_size(size).selected(shown);
-            if !open {
-                b = b.frame_when_inactive(false);
-            }
-            let r = ui.add(b);
-            // Open but not shown: a dot next to it.
-            if open && !shown {
-                let c = egui::pos2(r.rect.right() - 2.0, r.rect.top() + 3.0);
-                ui.painter().circle_filled(c, 2.5, panel_color(p, dark));
-            }
-            let tip = if shown { trf("{} (click to close)", &[&panel_name(p)]) } else { panel_name(p).to_string() };
-            if r.on_hover_text(tip).clicked() {
-                if shown {
-                    state.toolbar.set_panel_open(p, false);
-                } else {
-                    state.open_panel(p);
-                }
-            }
-        }
-    });
+    crate::toolbar::PANELS.iter().find(|(k, ..)| *k == p).map_or("", |(.., name)| tr(name))
 }
 
 /// A panel tab: its icon, its name (`named`), and × to close it. Returns (select, close).
 fn panel_tab(ui: &mut Ui, p: PanelKind, selected: bool, named: bool) -> (bool, bool) {
     use egui::{Button, CornerRadius, Label, Margin, RichText, Sense};
     let v = ui.visuals().clone();
-    let fill = if selected { v.widgets.inactive.weak_bg_fill } else { egui::Color32::TRANSPARENT };
+    let pal = ternarygrid_ui::pal(ui);
+    let fill = if selected { pal.subtle } else { egui::Color32::TRANSPARENT };
     // The icon and the name select the tab; the frame itself takes no clicks:
     // sensed after the ×, it would cover it and swallow its clicks.
     let inner = Frame::new().fill(fill).corner_radius(CornerRadius::same(4)).inner_margin(Margin::symmetric(6, 3)).show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        let icon = ui.add(Label::new(RichText::new(panel_icon(p)).color(panel_color(p, v.dark_mode))).sense(Sense::click()));
+        let icon = ui.add(Label::new(RichText::new(panel_icon(p)).color(if selected { pal.accent_text } else { pal.text_muted })).sense(Sense::click()));
         let mut clicked = icon.clicked();
         if !named {
             icon.on_hover_text(panel_name(p));
@@ -322,13 +245,15 @@ impl<'a> ResultViewer<'a> {
         let id = ui.make_persistent_id(id_salt);
         let mut actions: Vec<GridAction> = Vec::new();
         let mut grid_response = None;
-        let bar_frame = Frame::new().inner_margin(egui::Margin::symmetric(4, 3)).fill(ui.visuals().panel_fill);
-        Panel::top(id.with("filter_bar")).frame(bar_frame).show(ui, |ui| {
+        let canvas = ternarygrid_ui::pal(ui).canvas;
+        let filter_frame = Frame::new().inner_margin(egui::Margin { left: 8, right: 6, top: 6, bottom: 6 }).fill(canvas);
+        let footer_frame = Frame::new().inner_margin(egui::Margin { left: 6, right: 6, top: 3, bottom: 3 }).fill(canvas);
+        Panel::top(id.with("filter_bar")).frame(filter_frame).show(ui, |ui| {
             actions.extend(FilterBar::new(model, &mut state.grid, &mut state.toolbar).dialect(options.dialect.clone()).show(ui));
         });
         // "Filter by value" in server mode adds to the WHERE the filter box shows.
         state.grid.set_server_filter(&state.toolbar.filter_text);
-        Panel::bottom(id.with("toolbar")).frame(bar_frame).show(ui, |ui| {
+        Panel::bottom(id.with("toolbar")).frame(footer_frame).show(ui, |ui| {
             actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).show(ui));
         });
         // Errors in a pop-up: a refused edit or a failed save each time, a failed fetch once.
@@ -345,11 +270,6 @@ impl<'a> ResultViewer<'a> {
         if let Some(message) = state.toolbar.error_popup.clone() {
             error_popup(ui, id, &message, model, state, &mut actions);
         }
-        Panel::right(id.with("panel_strip"))
-            .resizable(false)
-            .exact_size(32.0)
-            .frame(Frame::new().inner_margin(egui::Margin::symmetric(3, 6)).fill(ui.visuals().panel_fill))
-            .show(ui, |ui| panel_strip(ui, state));
         if state.panels_visible() {
             if state.active_panel.is_none_or(|p| !state.toolbar.is_panel_open(p)) {
                 state.active_panel = state.toolbar.open_panels.last().copied();
@@ -499,8 +419,14 @@ impl<'a> ResultViewer<'a> {
                         _ => {}
                     }
                 }
-                GridAction::TogglePanel(p) if state.toolbar.is_panel_open(*p) => {
-                    state.active_panel = Some(*p);
+                // From the footer's panel menu: show a panel, or close the one shown.
+                GridAction::TogglePanel(p) => {
+                    if state.panels_visible() && state.active_panel == Some(*p) {
+                        state.toolbar.set_panel_open(*p, false);
+                    } else {
+                        state.open_panel(*p);
+                    }
+                    ui.ctx().request_repaint();
                 }
                 _ => {}
             }

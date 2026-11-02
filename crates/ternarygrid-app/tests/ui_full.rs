@@ -757,6 +757,8 @@ fn settings_grid_menu_and_editor_helpers() {
         page: ternarygrid_app::command::ObjectPage::Data,
     });
     wait(&mut h, "product data", |h| has(h, "Data grid,") && !has(h, "Data grid, 0 rows"));
+    // Its keys are read in the background: the footer's row buttons show once it is editable.
+    wait(&mut h, "product editable", |h| has(h, "Add row") && !has(h, "No source table"));
     let body = h.query_all_by_label_contains("Data grid,").next().unwrap().rect();
     let cell = egui::pos2(body.left() + 40.0, body.top() + 30.0);
     let open = move |h: &mut H| {
@@ -794,7 +796,7 @@ fn settings_grid_menu_and_editor_helpers() {
     }
     wait(&mut h, "filtered", |h| rows_label(h).starts_with("Data grid, 1 rows") || (discarded && rows_label(h).starts_with("Data grid, 0 rows")));
     no_errors(&mut h, "filter by value");
-    click(&mut h, egui_phosphor::regular::X);
+    click(&mut h, "Clear filter and order");
     wait(&mut h, "filter cleared", |h| {
         let n = rows_label(h).split(',').nth(1).unwrap_or_default().to_string();
         if discarded { n.trim().split(' ').next().and_then(|c| c.parse::<usize>().ok()).is_some_and(|c| c > 1) } else { n == all }
@@ -1815,7 +1817,7 @@ fn boolean_check_boxes_in_the_record_view() {
     h.query_all_by_role(egui::accesskit::Role::CheckBox).find(|n| n.accesskit_node().label().as_deref() == Some("false")).unwrap().click();
     frames(&mut h, 3);
     assert!(boxes(&h).iter().any(|l| l == "true"), "toggled: {:?}", boxes(&h));
-    assert!(has(&h, "Save (1)"), "one pending change: {:?}", labels(&h));
+    assert!(has(&h, "1 change"), "one pending change: {:?}", labels(&h));
     assert!(h.query_all_by_role(egui::accesskit::Role::TextInput).all(|n| n.accesskit_node().value().as_deref() != Some("false")), "no text field for a boolean");
 }
 
@@ -1863,7 +1865,7 @@ fn filter_box_suggests_columns() {
     // The only field with text (its hint is gone once something is typed).
     let where_box = |h: &H| -> Option<String> { h.query_all_by_role(egui::accesskit::Role::TextInput).filter_map(|n| n.accesskit_node().value()).find(|v| !v.is_empty()) };
     // "na" offers the column "name"; Tab takes it.
-    field_with_hint(&mut h, "WHERE condition", "na");
+    field_with_hint(&mut h, "status = 'open'", "na");
     frames(&mut h, 2);
     assert!(has(&h, " name"), "the column is offered: {:?}", labels(&h));
     h.key_press(Key::Tab);

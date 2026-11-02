@@ -11,6 +11,7 @@ authors.workspace = true
 uuid.workspace = true
 ternarygrid-core.workspace = true
 ternarygrid-icons.workspace = true
+ternarygrid-ui.workspace = true
 egui.workspace = true
 egui-phosphor.workspace = true
 serde.workspace = true

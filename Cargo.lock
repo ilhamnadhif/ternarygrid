@@ -6774,6 +6774,7 @@ dependencies = [
  "serde_json",
  "ternarygrid-core",
  "ternarygrid-icons",
+ "ternarygrid-ui",
  "tracing",
  "uuid",
 ]
