@@ -785,6 +785,7 @@ impl SqlEditorTab {
                     }
                     let title = result_title(&sql, self.results.len() + 1);
                     let mut panel = ResultPanel::new(self.conn.clone().unwrap_or_default(), title, src, None);
+                    panel.full_bars = true;
                     if self.fetch_all_results {
                         panel.src.fetch_more(cx.backend, usize::MAX, None);
                     }
@@ -1526,7 +1527,6 @@ impl SqlEditorTab {
         // A hairline under the tabs, across the panel.
         let bottom = tabs.response.rect.bottom();
         ui.painter().hline(ui.max_rect().x_range(), bottom - 0.5, egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border));
-        ui.add_space(1.0);
         if let Some(i) = close {
             if self.result_has_changes(i) {
                 cx.toasts.info(tr("Save or discard the data changes first."));
