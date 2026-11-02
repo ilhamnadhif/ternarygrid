@@ -2,16 +2,17 @@
 //! existing or a new table, with a live preview, type guessing, column
 //! mapping, conversion options and a report of the rows that failed.
 
+use super::wizard::{self, Clicked, Form, W, col, line};
 use super::{
-    COMMON_KINDS, MessageLog, Running, TaskSaver, char_edit, combo, connection_name, current_schema, error_text, kind_label, lines_edit, next_uid, not_connected, on_error_options,
-    opt_char_edit, opt_number, opt_text, progress_ui, reload_table_def, schema_combo, schema_tables, section, steps_ui, table_def_of, text_table, transaction_options,
+    COMMON_KINDS, MessageLog, Running, TaskSaver, char_edit, combo, connection_name, current_schema, delimiter_choice, error_text, kind_label, lines_edit, next_uid, not_connected,
+    on_error_options, opt_char_edit, opt_number, opt_text, progress_ui, reload_table_def, schema_combo, schema_tables, section, table_def_of, transaction_options,
 };
 use crate::backend::Job;
 use crate::command::AppCommand;
 use crate::cx::AppContext;
 use crate::tabs::TabView;
 use crate::transferexec::{AppSessionFactory, database_of, import_task_config};
-use egui::{RichText, Ui};
+use egui::{RichText, Ui, vec2};
 use egui_phosphor::regular as icon;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +23,8 @@ use ternarygrid_transfer::{
     BinaryEncoding, ColumnMapping, CsvHeader, CsvReadOptions, EscapeStyle, ImportJob, ImportMapping, ImportMode, ImportSourceConfig, ImportSummary, InferOptions, JsonInputFormat,
     JsonReadOptions, OnError, PeekableSource, RowSource, SessionFactory, SheetSelector, XlsxReadOptions, XmlReadOptions, infer_columns, run_import_job, xlsx_sheet_names,
 };
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts::{self, Tone};
 
 const PAGE_FILE: usize = 0;
 const PAGE_TARGET: usize = 1;
@@ -633,76 +636,122 @@ impl ImportTab {
         section(ui, tr("File"));
         let id = self.uid;
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.path).hint_text(tr("path of the file")).desired_width(420.0));
-            if r.changed()
-                && let Some(f) = ImportFileFormat::from_path(Path::new(self.path.trim()))
-            {
-                self.format = f;
-            }
-            if ui.button((ternarygrid_icons::ic(icon::FOLDER_OPEN), tr("Browse…"))).clicked()
-                && let Some(p) = rfd::FileDialog::new()
-                    .set_title(tr("File to import"))
-                    .add_filter(tr("Data files"), &["csv", "tsv", "txt", "tab", "xlsx", "xlsm", "xls", "ods", "xml", "json", "jsonl", "ndjson"])
-                    .add_filter(tr("All files"), &["*"])
-                    .pick_file()
-            {
-                self.set_file(p);
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if kit::secondary(ui, Some(icon::FOLDER_OPEN), tr("Browse…")).clicked()
+                    && let Some(p) = rfd::FileDialog::new()
+                        .set_title(tr("File to import"))
+                        .add_filter(tr("Data files"), &["csv", "tsv", "txt", "tab", "xlsx", "xlsm", "xls", "ods", "xml", "json", "jsonl", "ndjson"])
+                        .add_filter(tr("All files"), &["*"])
+                        .pick_file()
+                {
+                    self.set_file(p);
+                }
+                let r = ui.add(line(&mut self.path).font(egui::TextStyle::Monospace).hint_text(tr("path of the file")).desired_width(f32::INFINITY));
+                if r.changed()
+                    && let Some(f) = ImportFileFormat::from_path(Path::new(self.path.trim()))
+                {
+                    self.format = f;
+                }
+            });
         });
         ui.horizontal(|ui| {
-            ui.label(tr("Format"));
-            for f in ImportFileFormat::ALL {
-                ui.selectable_value(&mut self.format, f, f.label());
-            }
+            wizard::muted(ui, tr("Format"));
+            let formats: Vec<(ImportFileFormat, &str)> = ImportFileFormat::ALL.iter().map(|f| (*f, f.label())).collect();
+            parts::segmented(ui, &mut self.format, &formats);
         });
-        ui.separator();
-        egui::Grid::new(("imp_reader", id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| match self.format {
-            ImportFileFormat::Csv | ImportFileFormat::Tsv => csv_reader_ui(ui, id, &mut self.csv, self.format == ImportFileFormat::Tsv),
+        wizard::form(ui, ("imp_reader", id), 2, 130.0, |f| match self.format {
+            ImportFileFormat::Csv | ImportFileFormat::Tsv => csv_reader_ui(f, id, &mut self.csv, self.format == ImportFileFormat::Tsv),
             ImportFileFormat::Xlsx => {
                 let sheets = match &self.sheets {
                     Some((p, names)) if *p == self.path.trim() => names.clone(),
                     _ => Vec::new(),
                 };
-                xlsx_reader_ui(ui, id, &mut self.xlsx, &sheets);
+                xlsx_reader_ui(f, id, &mut self.xlsx, &sheets);
             }
-            ImportFileFormat::Xml => xml_reader_ui(ui, id, &mut self.xml),
-            ImportFileFormat::Json => json_reader_ui(ui, id, &mut self.json),
+            ImportFileFormat::Xml => xml_reader_ui(f, id, &mut self.xml),
+            ImportFileFormat::Json => json_reader_ui(f, id, &mut self.json),
         });
         ui.horizontal(|ui| {
-            ui.label(tr("Rows read for the preview and the type guess"));
+            wizard::muted(ui, tr("Rows read for the preview and the type guess"));
             ui.add(egui::DragValue::new(&mut self.sample_rows).range(10..=100_000));
         });
 
         section(ui, tr("Preview"));
         if self.path.trim().is_empty() {
-            ui.weak(tr("Choose a file to see its first rows."));
+            wizard::faint(ui, tr("Choose a file to see its first rows."));
             return;
         }
         if let Some((config, e)) = &self.preview_error
             && *config == self.source_config()
         {
             crate::widgets::error_box(ui, e);
-            if ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Retry"))).clicked() {
+            if kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked() {
                 self.preview_error = None;
             }
             return;
         }
         if self.preview_job.is_some() || !self.preview_ready() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.weak(tr("Reading the file…"));
-            });
+            parts::spinner_label(ui, tr("Reading the file…"));
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
         let Some(p) = &self.preview else { return };
+        let pal = ternarygrid_ui::pal(ui);
         let more = if p.rows.len() >= self.sample_rows { "+" } else { "" };
-        ui.weak(trf("{} columns, {}{} rows read", &[&p.columns.len(), &p.rows.len(), &more]));
-        for w in p.warnings.iter().take(5) {
-            ui.label(RichText::new(format!("{} {w}", icon::WARNING)).color(crate::theme::warning_color(ui.visuals().dark_mode)));
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = 16.0;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                wizard::faint(ui, &trf("{} columns, {}{} rows read", &[&p.columns.len(), &p.rows.len(), &more]));
+                for w in p.warnings.iter().take(5) {
+                    ui.label(RichText::new(w).size(12.5).color(pal.warn));
+                }
+            });
+        });
+        // Like the data grid: row numbers, the column names with their types, NULL in italics.
+        let font = egui::FontId::proportional(ternarygrid_ui::style::body_size(ui.ctx()));
+        let text_w = |ui: &Ui, s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x;
+        let rows: Vec<&Row> = p.rows.iter().take(PREVIEW_ROWS).collect();
+        let mut cols = vec![col("", W::Px(44.0)).right()];
+        for (i, c) in p.columns.iter().enumerate() {
+            let head = text_w(ui, &c.name) + text_w(ui, &c.type_name) * 0.85 + 34.0;
+            let widest = rows.iter().filter_map(|r| r.get(i)).map(|v| text_w(ui, preview_text(v).lines().next().unwrap_or(""))).fold(0.0, f32::max) + 24.0;
+            cols.push(col(&c.name, W::Px(head.max(widest).clamp(80.0, 280.0))));
         }
-        let headers: Vec<String> = p.columns.iter().map(|c| c.name.clone()).collect();
-        let rows: Vec<Vec<String>> = p.rows.iter().take(PREVIEW_ROWS).map(|r| r.iter().map(preview_text).collect()).collect();
-        text_table(ui, ("imp_preview", id), &headers, &rows, 260.0);
+        wizard::table(
+            ui,
+            ("imp_preview", id),
+            &cols,
+            28.0,
+            Some(260.0),
+            rows.len(),
+            |ui, c| {
+                if c > 0
+                    && let Some(m) = p.columns.get(c - 1)
+                {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(&m.type_name).monospace().size(10.5).color(pal.text_faint));
+                    });
+                }
+            },
+            |ui, r, c| {
+                if c == 0 {
+                    ui.label(RichText::new((r + 1).to_string()).size(11.5).color(pal.text_faint));
+                    return;
+                }
+                let Some(v) = rows[r].get(c - 1) else { return };
+                if v.is_null() {
+                    ui.label(RichText::new("NULL").italics().size(12.0).color(pal.text_faint));
+                    return;
+                }
+                let full = preview_text(v);
+                let first: String = full.chars().take(200).collect();
+                let first = first.lines().next().unwrap_or("").to_string();
+                let resp = ui.add(egui::Label::new(first.clone()).truncate());
+                if full.len() > first.len() {
+                    resp.on_hover_text(full.chars().take(2000).collect::<String>());
+                }
+            },
+        );
     }
 
     fn target_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
@@ -711,39 +760,37 @@ impl ImportTab {
         section(ui, tr("Target table"));
         if cx.conns.live(&conn).is_none() {
             ui.horizontal(|ui| {
-                ui.weak(tr("Connect to choose the target table."));
-                if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
+                wizard::faint(ui, tr("Connect to choose the target table."));
+                if kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Connect")).clicked() {
                     cx.push(AppCommand::Connect(conn.clone()));
                 }
             });
             return;
         }
         ui.horizontal(|ui| {
-            ui.radio_value(&mut self.target, ImportTarget::Existing, tr("Existing table"));
-            ui.radio_value(&mut self.target, ImportTarget::New, tr("New table"));
-        });
-        egui::Grid::new(("imp_target", id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Schema"));
+            ui.spacing_mut().item_spacing.x = 16.0;
+            wizard::radio_value(ui, &mut self.target, ImportTarget::Existing, tr("Existing table"));
+            wizard::radio_value(ui, &mut self.target, ImportTarget::New, tr("New table"));
+            ui.spacing_mut().item_spacing.x = 8.0;
+            kit::vdivider(ui, 18.0);
+            wizard::muted(ui, tr("Schema"));
             if schema_combo(ui, cx, &conn, ("imp_schema", id), &mut self.schema) && self.target == ImportTarget::Existing {
                 self.table = None;
             }
-            ui.end_row();
             match self.target {
                 ImportTarget::Existing => {
-                    ui.label(tr("Table"));
+                    wizard::muted(ui, tr("Table"));
                     self.table_combo(ui, cx);
-                    ui.end_row();
                 }
                 ImportTarget::New => {
-                    ui.label(tr("Name"));
-                    ui.add(egui::TextEdit::singleline(&mut self.new_name).hint_text(tr("new_table")).desired_width(240.0));
-                    ui.end_row();
+                    wizard::muted(ui, tr("Name"));
+                    ui.add(line(&mut self.new_name).hint_text(tr("new_table")).desired_width(220.0));
                 }
             }
         });
         if let Some(e) = &self.mapping_error {
             crate::widgets::error_box(ui, e);
-            if ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Retry"))).clicked()
+            if kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked()
                 && let Some(t) = self.table.clone()
             {
                 reload_table_def(cx, &conn, &t);
@@ -753,14 +800,11 @@ impl ImportTab {
         }
         section(ui, tr("Columns"));
         if self.preview.is_none() {
-            ui.weak(tr("The columns appear once the file has been read."));
+            wizard::faint(ui, tr("The columns appear once the file has been read."));
             return;
         }
         if self.mapping_for != self.current_key() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.weak(tr("Preparing the column mapping…"));
-            });
+            parts::spinner_label(ui, tr("Preparing the column mapping…"));
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             return;
         }
@@ -775,14 +819,11 @@ impl ImportTab {
         let Some(schema) = self.schema.clone().or_else(|| current_schema(cx, &conn)) else { return };
         let tables = schema_tables(cx, &conn, &schema, false);
         let label = self.table.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| tr("Choose…").to_string());
-        egui::ComboBox::from_id_salt(("imp_table", self.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(240.0).height(360.0).show_ui(
+        egui::ComboBox::from_id_salt(("imp_table", self.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(200.0).height(360.0).show_ui(
             ui,
             |ui| match &tables {
                 None => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.weak(tr("Loading…"));
-                    });
+                    parts::spinner_label(ui, tr("Loading…"));
                 }
                 Some(Err(e)) => {
                     ui.label(e.full_text());
@@ -809,45 +850,72 @@ impl ImportTab {
         let dialect = cx.conns.live(&self.conn).map(|l| l.dialect.clone());
         let names = self.preview_columns();
         ui.horizontal(|ui| {
-            if ui.button((ternarygrid_icons::ic(icon::MAGIC_WAND), tr("Guess types again"))).clicked() {
+            if wizard::ghost(ui, Some(icon::MAGIC_WAND), tr("Guess types again")).clicked() {
                 self.columns_edited = false;
                 self.mapping_for = None;
             }
-            ui.weak(tr("Key columns become the primary key of the new table."));
+            wizard::faint(ui, tr("Key columns become the primary key of the new table."));
         });
+        let pal = ternarygrid_ui::pal(ui);
         let samples: Vec<String> = (0..self.columns.len()).map(|i| self.sample_values(self.columns[i].source_index)).collect();
+        let states: Vec<bool> = self.columns.iter().map(|c| !c.skip).collect();
         let mut edited = false;
-        egui::ScrollArea::horizontal().id_salt(("imp_cols_h", id)).show(ui, |ui| {
-            egui::Grid::new(("imp_cols", id)).num_columns(7).spacing([10.0, 4.0]).striped(true).show(ui, |ui| {
-                ui.strong(tr("Import"));
-                ui.strong(tr("Source column"));
-                ui.strong(tr("Target column"));
-                ui.strong(tr("Type"));
-                ui.strong(tr("NULL"));
-                ui.strong(tr("Key"));
-                ui.strong(tr("Sample values"));
-                ui.end_row();
-                for (i, c) in self.columns.iter_mut().enumerate() {
-                    let mut import = !c.skip;
-                    if ui.checkbox(&mut import, "").changed() {
-                        c.skip = !import;
-                        edited = true;
-                    }
-                    ui.label(names.get(c.source_index).cloned().unwrap_or_default());
-                    let old_name = c.target_name.clone();
-                    if ui.add(egui::TextEdit::singleline(&mut c.target_name).desired_width(160.0)).changed() {
-                        edited = true;
-                        if let Some(k) = self.key_columns.iter_mut().find(|k| **k == old_name) {
-                            *k = c.target_name.clone();
+        let mut set_all = None;
+        let cols = [
+            col("", W::Px(32.0)),
+            col(tr("Source column"), W::Px(130.0)),
+            col(tr("Target column"), W::Fr(1.0)),
+            col(tr("Type"), W::Fr(1.0)),
+            col(tr("NULL"), W::Px(58.0)),
+            col(tr("Key"), W::Px(48.0)),
+            col(tr("Sample values"), W::Fr(1.6)),
+        ];
+        let (columns, keys) = (&mut self.columns, &mut self.key_columns);
+        wizard::table(
+            ui,
+            ("imp_cols", id),
+            &cols,
+            38.0,
+            None,
+            columns.len(),
+            |ui, c| {
+                if c == 0
+                    && let Some(on) = wizard::check_all(ui, &states)
+                {
+                    set_all = Some(on);
+                }
+            },
+            |ui, i, k| {
+                let c = &mut columns[i];
+                match k {
+                    0 => {
+                        let mut import = !c.skip;
+                        if wizard::check(ui, &mut import, "").changed() {
+                            c.skip = !import;
+                            edited = true;
                         }
                     }
-                    ui.horizontal(|ui| {
-                        if ui.add(egui::TextEdit::singleline(&mut c.target_type).desired_width(150.0)).changed() {
+                    1 => {
+                        ui.add(egui::Label::new(RichText::new(names.get(c.source_index).cloned().unwrap_or_default()).color(pal.text_muted)).truncate());
+                    }
+                    2 => {
+                        let old_name = c.target_name.clone();
+                        if ui.add(line(&mut c.target_name).desired_width(f32::INFINITY)).changed() {
+                            edited = true;
+                            if let Some(k) = keys.iter_mut().find(|k| **k == old_name) {
+                                *k = c.target_name.clone();
+                            }
+                        }
+                    }
+                    3 => {
+                        let menu_w = if dialect.is_some() { 28.0 } else { 0.0 };
+                        if ui.add(wizard::mono_line(&mut c.target_type, (ui.available_width() - menu_w).max(60.0))).changed() {
                             c.target_kind = None;
                             edited = true;
                         }
                         if let Some(d) = &dialect {
-                            ui.menu_button(icon::CARET_DOWN, |ui| {
+                            let r = wizard::icon_button(ui, icon::CARET_DOWN, tr("Types"), 22.0);
+                            egui::Popup::menu(&r).show(|ui| {
                                 for kind in COMMON_KINDS {
                                     let t = d.ddl().default_type_for(kind);
                                     if ui.button(format!("{t}  ({})", kind_label(kind))).clicked() {
@@ -859,24 +927,34 @@ impl ImportTab {
                                 }
                             });
                         }
-                    });
-                    if ui.checkbox(&mut c.nullable, "").changed() {
-                        edited = true;
                     }
-                    let mut key = self.key_columns.iter().any(|k| k.eq_ignore_ascii_case(&c.target_name));
-                    if ui.checkbox(&mut key, "").changed() {
-                        edited = true;
-                        if key {
-                            self.key_columns.push(c.target_name.clone());
-                        } else {
-                            self.key_columns.retain(|k| !k.eq_ignore_ascii_case(&c.target_name));
+                    4 => {
+                        if wizard::check(ui, &mut c.nullable, "").changed() {
+                            edited = true;
                         }
                     }
-                    ui.weak(samples.get(i).cloned().unwrap_or_default());
-                    ui.end_row();
+                    5 => {
+                        let mut key = keys.iter().any(|k| k.eq_ignore_ascii_case(&c.target_name));
+                        if wizard::check(ui, &mut key, "").changed() {
+                            edited = true;
+                            if key {
+                                keys.push(c.target_name.clone());
+                            } else {
+                                keys.retain(|k| !k.eq_ignore_ascii_case(&c.target_name));
+                            }
+                        }
+                    }
+                    _ => {
+                        let s = samples.get(i).cloned().unwrap_or_default();
+                        ui.add(egui::Label::new(RichText::new(&s).size(11.5).color(pal.text_faint)).truncate()).on_hover_text(s);
+                    }
                 }
-            });
-        });
+            },
+        );
+        if let Some(on) = set_all {
+            self.columns.iter_mut().for_each(|c| c.skip = !on);
+            edited = true;
+        }
         if edited {
             self.columns_edited = true;
         }
@@ -889,164 +967,166 @@ impl ImportTab {
         let Some(Ok(def)) = table_def_of(cx, &conn, &table) else { return };
         let names = self.preview_columns();
         ui.horizontal(|ui| {
-            if ui.button((ternarygrid_icons::ic(icon::ARROWS_CLOCKWISE), tr("Match by name again"))).clicked() {
+            if wizard::ghost(ui, Some(icon::ARROWS_CLOCKWISE), tr("Match by name again")).clicked() {
                 self.mapping_for = None;
             }
             if !self.key_columns.is_empty() {
-                ui.weak(trf("Key: {}", &[&self.key_columns.join(", ")]));
+                wizard::faint(ui, &trf("Key: {}", &[&self.key_columns.join(", ")]));
             }
         });
+        let pal = ternarygrid_ui::pal(ui);
         let samples: Vec<String> = (0..self.columns.len()).map(|i| self.sample_values(self.columns[i].source_index)).collect();
-        egui::Grid::new(("imp_map", id)).num_columns(4).spacing([10.0, 4.0]).striped(true).show(ui, |ui| {
-            ui.strong(tr("Source column"));
-            ui.strong(tr("Target column"));
-            ui.strong(tr("Type"));
-            ui.strong(tr("Sample values"));
-            ui.end_row();
-            for (i, c) in self.columns.iter_mut().enumerate() {
-                ui.label(names.get(c.source_index).cloned().unwrap_or_default());
-                let label = if c.skip { tr("(not imported)").to_string() } else { c.target_name.clone() };
-                egui::ComboBox::from_id_salt(("imp_map_col", id, i)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(200.0).show_ui(ui, |ui| {
-                    if ui.selectable_label(c.skip, tr("(not imported)")).clicked() {
-                        c.skip = true;
+        let cols = [col(tr("Source column"), W::Px(140.0)), col(tr("Target column"), W::Fr(1.2)), col(tr("Type"), W::Fr(0.8)), col(tr("Sample values"), W::Fr(1.6))];
+        let columns = &mut self.columns;
+        wizard::table(
+            ui,
+            ("imp_map", id),
+            &cols,
+            38.0,
+            None,
+            columns.len(),
+            |_, _| {},
+            |ui, i, k| {
+                let c = &mut columns[i];
+                match k {
+                    0 => {
+                        ui.add(egui::Label::new(RichText::new(names.get(c.source_index).cloned().unwrap_or_default()).color(pal.text_muted)).truncate());
                     }
-                    for col in &def.columns {
-                        let selected = !c.skip && c.target_name == col.name;
-                        if ui.selectable_label(selected, &col.name).clicked() {
-                            c.skip = col.generated.is_some();
-                            c.target_name = col.name.clone();
-                            c.target_type = col.data_type.clone();
-                            c.target_kind = Some(col.kind);
-                            c.nullable = col.nullable;
-                        }
+                    1 => {
+                        let label = if c.skip { tr("(not imported)").to_string() } else { c.target_name.clone() };
+                        egui::ComboBox::from_id_salt(("imp_map_col", id, i)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(ui.available_width()).show_ui(
+                            ui,
+                            |ui| {
+                                if ui.selectable_label(c.skip, tr("(not imported)")).clicked() {
+                                    c.skip = true;
+                                }
+                                for col in &def.columns {
+                                    let selected = !c.skip && c.target_name == col.name;
+                                    if ui.selectable_label(selected, &col.name).clicked() {
+                                        c.skip = col.generated.is_some();
+                                        c.target_name = col.name.clone();
+                                        c.target_type = col.data_type.clone();
+                                        c.target_kind = Some(col.kind);
+                                        c.nullable = col.nullable;
+                                    }
+                                }
+                            },
+                        );
                     }
-                });
-                ui.weak(if c.skip { String::new() } else { c.target_type.clone() });
-                ui.weak(samples.get(i).cloned().unwrap_or_default());
-                ui.end_row();
-            }
-        });
+                    2 => {
+                        wizard::faint(ui, if c.skip { "" } else { &c.target_type });
+                    }
+                    _ => {
+                        let s = samples.get(i).cloned().unwrap_or_default();
+                        ui.add(egui::Label::new(RichText::new(&s).size(11.5).color(pal.text_faint)).truncate()).on_hover_text(s);
+                    }
+                }
+            },
+        );
         let unmapped: Vec<&str> =
             def.columns.iter().filter(|col| col.generated.is_none() && !self.columns.iter().any(|c| !c.skip && c.target_name == col.name)).map(|col| col.name.as_str()).collect();
         if !unmapped.is_empty() {
-            ui.weak(trf("Table columns without a source (default value or NULL): {}", &[&unmapped.join(", ")]));
+            wizard::faint(ui, &trf("Table columns without a source (default value or NULL): {}", &[&unmapped.join(", ")]));
         }
     }
 
     fn options_page(&mut self, ui: &mut Ui, transactions: bool) {
         let id = self.uid;
-        section(ui, tr("Writing"));
-        let o = &mut self.options;
-        egui::Grid::new(("imp_opts", id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Existing rows"));
-            combo(
-                ui,
-                ("imp_mode", id),
-                &mut o.mode,
-                &[
-                    (ImportMode::Append, tr("Keep them and add the new rows").to_string()),
-                    (ImportMode::TruncateFirst, tr("Delete them first").to_string()),
-                    (ImportMode::Replace, tr("Insert or replace rows by key").to_string()),
-                ],
-            );
-            ui.end_row();
-            if o.mode == ImportMode::Replace {
-                ui.label(tr("Key columns"));
-                if self.key_columns.is_empty() {
-                    ui.label(RichText::new(tr("None: mark key columns on the Target page.")).color(crate::theme::warning_color(ui.visuals().dark_mode)));
-                } else {
-                    ui.label(self.key_columns.join(", "));
-                }
-                ui.end_row();
-                if !transactions {
-                    super::replace_without_transactions_ui(ui);
-                }
-            }
-            ui.label(tr("Rows per batch"));
-            ui.add(egui::DragValue::new(&mut o.batch_size).range(1..=1_000_000));
-            ui.end_row();
-            ui.label(tr("Rows per INSERT"));
-            ui.add(egui::DragValue::new(&mut o.rows_per_statement).range(1..=1000));
-            ui.end_row();
-            ui.label(tr("Transactions"));
-            combo(ui, ("imp_tx", id), &mut o.transaction, &transaction_options());
-            ui.end_row();
-            ui.label(tr("On error"));
-            combo(ui, ("imp_err", id), &mut o.on_error, &on_error_options());
-            ui.end_row();
-            if o.on_error != OnError::Abort {
-                ui.label(tr("Stop after"));
-                ui.horizontal(|ui| {
-                    opt_number(ui, &mut o.max_errors, tr("no limit"));
-                    ui.label(tr("failed rows"));
+        let (o, keys) = (&mut self.options, &self.key_columns);
+        ui.columns(2, |cols| {
+            let [left, right] = cols else { return };
+            left.spacing_mut().item_spacing.y = wizard::GAP;
+            right.spacing_mut().item_spacing.y = wizard::GAP;
+            section(left, tr("Writing"));
+            wizard::form(left, ("imp_opts", id), 1, 170.0, |f| {
+                f.row(tr("Existing rows"), |ui| {
+                    combo(
+                        ui,
+                        ("imp_mode", id),
+                        &mut o.mode,
+                        &[
+                            (ImportMode::Append, tr("Keep them and add the new rows").to_string()),
+                            (ImportMode::TruncateFirst, tr("Delete them first").to_string()),
+                            (ImportMode::Replace, tr("Insert or replace rows by key").to_string()),
+                        ],
+                    )
                 });
-                ui.end_row();
-            }
-        });
+                if o.mode == ImportMode::Replace {
+                    f.row(tr("Key columns"), |ui| {
+                        let p = ternarygrid_ui::pal(ui);
+                        if keys.is_empty() {
+                            ui.add(egui::Label::new(RichText::new(tr("None: mark key columns on the Target page.")).color(p.warn)).wrap());
+                        } else {
+                            ui.label(keys.join(", "));
+                        }
+                    });
+                    if !transactions {
+                        super::replace_without_transactions_ui(f);
+                    }
+                }
+                f.row(tr("Rows per batch"), |ui| ui.add(egui::DragValue::new(&mut o.batch_size).range(1..=1_000_000)));
+                f.row(tr("Rows per INSERT"), |ui| ui.add(egui::DragValue::new(&mut o.rows_per_statement).range(1..=1000)));
+                f.row(tr("Transactions"), |ui| combo(ui, ("imp_tx", id), &mut o.transaction, &transaction_options()));
+                f.row(tr("On error"), |ui| combo(ui, ("imp_err", id), &mut o.on_error, &on_error_options()));
+                if o.on_error != OnError::Abort {
+                    f.row(tr("Stop after"), |ui| {
+                        opt_number(ui, &mut o.max_errors, tr("no limit"));
+                        wizard::muted(ui, tr("failed rows"));
+                    });
+                }
+            });
 
-        section(ui, tr("Reading values"));
-        let c = &mut o.convert;
-        egui::Grid::new(("imp_conv", id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Date formats"));
-            lines_edit(ui, &mut c.date_formats, tr("one per line, e.g. %d/%m/%Y"), 260.0);
-            ui.end_row();
-            ui.label(tr("Timestamp formats"));
-            lines_edit(ui, &mut c.datetime_formats, tr("one per line, e.g. %d/%m/%Y %H:%M"), 260.0);
-            ui.end_row();
-            ui.label(tr("Time formats"));
-            lines_edit(ui, &mut c.time_formats, tr("one per line, e.g. %H.%M"), 260.0);
-            ui.end_row();
-            ui.label(tr("Decimal separator"));
-            char_edit(ui, &mut c.decimal_separator);
-            ui.end_row();
-            ui.label(tr("Thousands separator"));
-            opt_char_edit(ui, &mut c.thousands_separator, "");
-            ui.end_row();
-            ui.label(tr("NULL markers"));
-            lines_edit(ui, &mut c.null_values, tr("one per line, e.g. NULL or \\N"), 260.0);
-            ui.end_row();
-            ui.label(tr("Binary values"));
-            combo(
-                ui,
-                ("imp_bin", id),
-                &mut c.binary,
-                &[
-                    (None, tr("Detect").to_string()),
-                    (Some(BinaryEncoding::Hex), tr("Hexadecimal").to_string()),
-                    (Some(BinaryEncoding::Base64), tr("Base64").to_string()),
-                    (Some(BinaryEncoding::Text), tr("As text (UTF-8)").to_string()),
-                ],
-            );
-            ui.end_row();
-            ui.label(tr("Text"));
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut c.trim_text, tr("Trim spaces"));
-                ui.checkbox(&mut c.empty_text_as_null, tr("Empty text is NULL"));
+            section(right, tr("Reading values"));
+            let c = &mut o.convert;
+            wizard::form(right, ("imp_conv", id), 1, 170.0, |f| {
+                f.row(tr("Date formats"), |ui| lines_edit(ui, &mut c.date_formats, tr("one per line, e.g. %d/%m/%Y"), f32::INFINITY));
+                f.row(tr("Timestamp formats"), |ui| lines_edit(ui, &mut c.datetime_formats, tr("one per line, e.g. %d/%m/%Y %H:%M"), f32::INFINITY));
+                f.row(tr("Time formats"), |ui| lines_edit(ui, &mut c.time_formats, tr("one per line, e.g. %H.%M"), f32::INFINITY));
+                f.row(tr("Decimal separator"), |ui| char_edit(ui, &mut c.decimal_separator));
+                f.row(tr("Thousands separator"), |ui| opt_char_edit(ui, &mut c.thousands_separator, ""));
+                f.row(tr("NULL markers"), |ui| lines_edit(ui, &mut c.null_values, tr("one per line, e.g. NULL or \\N"), f32::INFINITY));
+                f.row(tr("Binary values"), |ui| {
+                    combo(
+                        ui,
+                        ("imp_bin", id),
+                        &mut c.binary,
+                        &[
+                            (None, tr("Detect").to_string()),
+                            (Some(BinaryEncoding::Hex), tr("Hexadecimal").to_string()),
+                            (Some(BinaryEncoding::Base64), tr("Base64").to_string()),
+                            (Some(BinaryEncoding::Text), tr("As text (UTF-8)").to_string()),
+                        ],
+                    )
+                });
+                f.row(tr("Text"), |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        wizard::check(ui, &mut c.trim_text, tr("Trim spaces"));
+                        wizard::check(ui, &mut c.empty_text_as_null, tr("Empty text is NULL"));
+                    });
+                });
+                f.row(tr("Time zone of timestamps"), |ui| {
+                    opt_number(ui, &mut c.default_offset_minutes, tr("local"));
+                    wizard::faint(ui, tr("minutes east of UTC")).on_hover_text(tr("minutes east of UTC, for timestamps without an offset"));
+                });
             });
-            ui.end_row();
-            ui.label(tr("Time zone of timestamps"));
-            ui.horizontal(|ui| {
-                opt_number(ui, &mut c.default_offset_minutes, tr("local"));
-                ui.weak(tr("minutes east of UTC, for timestamps without an offset"));
-            });
-            ui.end_row();
         });
 
         section(ui, tr("Type guessing (new tables)"));
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.infer.detect_bool, tr("Booleans"));
-            ui.checkbox(&mut self.infer.detect_json, tr("JSON"));
-            ui.checkbox(&mut self.infer.detect_uuid, tr("UUIDs"));
+            ui.spacing_mut().item_spacing.x = 16.0;
+            wizard::check(ui, &mut self.infer.detect_bool, tr("Booleans"));
+            wizard::check(ui, &mut self.infer.detect_json, tr("JSON"));
+            wizard::check(ui, &mut self.infer.detect_uuid, tr("UUIDs"));
         });
     }
 
     fn run_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if let Some(run) = &self.run {
-            section(ui, tr("Importing…"));
+            wizard::title(ui, tr("Importing…"));
             if progress_ui(ui, &run.progress, run.is_cancelling()) {
                 run.cancel();
             }
-            ui.add_space(6.0);
             self.log.ui(ui, ("imp_log", self.uid), 260.0);
             return;
         }
@@ -1056,9 +1136,9 @@ impl ImportTab {
                 self.result_ui(ui, cx, &summary);
             }
             Some(Err(e)) => {
-                section(ui, tr("The import failed"));
+                wizard::outcome(ui, Tone::Error, tr("The import failed"), None);
                 crate::widgets::error_box(ui, e);
-                if ui.button((ternarygrid_icons::ic(icon::ARROW_COUNTER_CLOCKWISE), tr("Change settings"))).clicked() {
+                if kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked() {
                     self.result = None;
                     self.page = PAGE_FILE;
                 }
@@ -1066,7 +1146,6 @@ impl ImportTab {
             None => self.summary_ui(ui, cx),
         }
         if self.result.is_some() {
-            ui.add_space(6.0);
             self.log.ui(ui, ("imp_log", self.uid), 220.0);
         }
     }
@@ -1074,81 +1153,98 @@ impl ImportTab {
     fn summary_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         section(ui, tr("Summary"));
         let mapped = self.columns.iter().filter(|c| !c.skip).count();
-        egui::Grid::new(("imp_sum", self.uid)).num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            ui.weak(tr("File"));
-            ui.label(self.path.trim());
-            ui.end_row();
-            ui.weak(tr("Format"));
-            ui.label(self.format.label());
-            ui.end_row();
-            ui.weak(tr("Connection"));
-            ui.label(connection_name(cx, &self.conn));
-            ui.end_row();
-            ui.weak(tr("Target table"));
-            let target = self.target_ref().map(|t| t.display_path()).unwrap_or_default();
-            ui.label(if self.target == ImportTarget::New { trf("{} (new)", &[&target]) } else { target });
-            ui.end_row();
-            ui.weak(tr("Columns"));
-            ui.label(trf("{} of {}", &[&mapped, &self.columns.len()]));
-            ui.end_row();
-        });
+        let target = self.target_ref().map(|t| t.display_path()).unwrap_or_default();
+        let target = if self.target == ImportTarget::New { trf("{} (new)", &[&target]) } else { target };
+        wizard::facts(
+            ui,
+            ("imp_sum", self.uid),
+            120.0,
+            &[
+                (tr("File"), self.path.trim().to_string(), None),
+                (tr("Format"), self.format.label().to_string(), None),
+                (tr("Connection"), connection_name(cx, &self.conn), None),
+                (tr("Target table"), target, None),
+                (tr("Columns"), trf("{} of {}", &[&mapped, &self.columns.len()]), None),
+            ],
+        );
         if let Err(e) = self.validate() {
-            ui.add_space(4.0);
             crate::widgets::error_box(ui, &e);
         }
     }
 
     fn result_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, s: &ImportSummary) {
-        let dark = ui.visuals().dark_mode;
-        section(ui, &describe(s));
-        egui::Grid::new(("imp_res", self.uid)).num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            ui.weak(tr("Rows read"));
-            ui.label(s.rows_read.to_string());
-            ui.end_row();
-            ui.weak(tr("Rows written"));
-            ui.label(RichText::new(s.rows_written.to_string()).color(crate::theme::success_color(dark)));
-            ui.end_row();
-            ui.weak(tr("Rows failed"));
-            let failed = RichText::new(s.rows_failed.to_string());
-            ui.label(if s.rows_failed > 0 { failed.color(crate::theme::error_color(dark)) } else { failed });
-            ui.end_row();
-            if s.created_table {
-                ui.weak(tr("Table"));
-                ui.label(tr("created"));
-                ui.end_row();
-            }
-            ui.weak(tr("Statements"));
-            ui.label(s.statements.to_string());
-            ui.end_row();
-            ui.weak(tr("Time"));
-            ui.label(crate::widgets::format_duration(std::time::Duration::from_millis(s.duration_ms)));
-            ui.end_row();
-        });
-        for w in &s.warnings {
-            ui.label(RichText::new(format!("{} {w}", icon::WARNING)).color(crate::theme::warning_color(dark)));
+        let p = ternarygrid_ui::pal(ui);
+        wizard::outcome(ui, Tone::Success, &describe(s), None);
+        let mut facts = vec![
+            (tr("Rows read"), s.rows_read.to_string(), None),
+            (tr("Rows written"), s.rows_written.to_string(), Some(p.ok)),
+            (tr("Rows failed"), s.rows_failed.to_string(), (s.rows_failed > 0).then_some(p.err)),
+        ];
+        if s.created_table {
+            facts.push((tr("Table"), tr("created").to_string(), None));
         }
-        if !s.errors.is_empty() {
-            section(ui, tr("Failed rows"));
-            if s.errors_truncated {
-                ui.weak(trf("Only the first {} failed rows are listed.", &[&s.errors.len()]));
+        facts.push((tr("Statements"), s.statements.to_string(), None));
+        facts.push((tr("Time"), crate::widgets::format_duration(std::time::Duration::from_millis(s.duration_ms)), None));
+        let mut save_report = false;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            let left_w = if s.errors.is_empty() { 300.0_f32.min(ui.available_width()) } else { 300.0 };
+            ui.allocate_ui_with_layout(vec2(left_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(left_w);
+                wizard::facts(ui, ("imp_res", self.uid), 110.0, &facts);
+            });
+            if !s.errors.is_empty() {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    parts::section_header(ui, tr("Failed rows"), |ui| {
+                        if ui.add_enabled_ui(self.report_job.is_none(), |ui| wizard::ghost(ui, Some(icon::FLOPPY_DISK), tr("Save report…"))).inner.clicked() {
+                            save_report = true;
+                        }
+                    });
+                    if s.errors_truncated {
+                        wizard::faint(ui, &trf("Only the first {} failed rows are listed.", &[&s.errors.len()]));
+                    }
+                    let cols = [col(tr("Row"), W::Px(80.0)), col(tr("Column"), W::Px(120.0)), col(tr("Error"), W::Fr(1.0))];
+                    wizard::table(
+                        ui,
+                        ("imp_errors", self.uid),
+                        &cols,
+                        30.0,
+                        Some(240.0),
+                        s.errors.len(),
+                        |_, _| {},
+                        |ui, r, c| {
+                            let e = &s.errors[r];
+                            match c {
+                                0 => {
+                                    ui.label(e.row.to_string());
+                                }
+                                1 => {
+                                    ui.add(egui::Label::new(e.column.clone().unwrap_or_default()).truncate());
+                                }
+                                _ => {
+                                    ui.add(egui::Label::new(&e.message).truncate()).on_hover_text(&e.message);
+                                }
+                            }
+                        },
+                    );
+                });
             }
-            let headers = vec![tr("Row").to_string(), tr("Column").to_string(), tr("Error").to_string()];
-            let rows: Vec<Vec<String>> = s.errors.iter().map(|e| vec![e.row.to_string(), e.column.clone().unwrap_or_default(), e.message.clone()]).collect();
-            text_table(ui, ("imp_errors", self.uid), &headers, &rows, 240.0);
-            if ui.add_enabled(self.report_job.is_none(), egui::Button::new((ternarygrid_icons::ic(icon::FLOPPY_DISK), tr("Save report…")))).clicked()
-                && let Some(path) = rfd::FileDialog::new().set_file_name("import-errors.csv").save_file()
-            {
-                let text = error_report(s);
-                self.report_job = Some(cx.backend.spawn(async move { tokio::fs::write(&path, text).await.map(|_| path) }));
-            }
+        });
+        if save_report && let Some(path) = rfd::FileDialog::new().set_file_name("import-errors.csv").save_file() {
+            let text = error_report(s);
+            self.report_job = Some(cx.backend.spawn(async move { tokio::fs::write(&path, text).await.map(|_| path) }));
+        }
+        for w in &s.warnings {
+            ui.label(RichText::new(format!("{} {w}", icon::WARNING)).color(p.warn));
         }
         ui.horizontal(|ui| {
             if let Some(target) = self.target_ref()
-                && ui.button((ternarygrid_icons::ic(icon::TABLE), tr("Open the table"))).clicked()
+                && kit::secondary(ui, Some(icon::TABLE), tr("Open the table")).clicked()
             {
                 cx.push(AppCommand::OpenObject { connection: self.conn.clone(), object: target, page: crate::command::ObjectPage::Data });
             }
-            if ui.button((ternarygrid_icons::ic(icon::ARROW_COUNTER_CLOCKWISE), tr("Change settings"))).clicked() {
+            if kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked() {
                 self.result = None;
                 self.page = PAGE_FILE;
                 // A created table exists now: import into it next time.
@@ -1164,30 +1260,26 @@ impl ImportTab {
     }
 
     fn footer(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let running = self.run.is_some();
-            if ui.add_enabled(self.page > PAGE_FILE && !running, egui::Button::new((ternarygrid_icons::ic(icon::CARET_LEFT), tr("Back")))).clicked() {
-                self.page -= 1;
-            }
-            let reachable = self.reachable();
-            if self.page < PAGE_RUN && ui.add_enabled(self.page < reachable && !running, egui::Button::new(format!("{} {}", tr("Next"), icon::CARET_RIGHT))).clicked() {
-                self.page += 1;
-            }
-            ui.separator();
-            let ok = reachable == PAGE_RUN && !running;
-            if ui.add_enabled(ok, crate::widgets::primary_button(ui, icon::PLAY, tr("Run import"))).clicked() {
-                self.start(cx);
-            }
-            if ui.add_enabled(ok && !self.saver.is_saving(), egui::Button::new((ternarygrid_icons::ic(icon::FLOPPY_DISK), tr("Save as task…")))).clicked() {
+        let running = self.run.is_some();
+        let reachable = self.reachable();
+        let ok = reachable == PAGE_RUN && !running;
+        let footer = wizard::Footer {
+            back: (self.page > PAGE_FILE).then_some(!running),
+            next: (self.page < PAGE_RUN).then_some(self.page < reachable && !running),
+            run: (tr("Run import"), ok),
+            save: Some((ok && !self.saver.is_saving(), None)),
+            error: self.error.as_deref(),
+        };
+        match wizard::footer(ui, &footer) {
+            Some(Clicked::Back) => self.page -= 1,
+            Some(Clicked::Next) => self.page += 1,
+            Some(Clicked::Run) => self.start(cx),
+            Some(Clicked::Save) => {
                 let target = self.target_ref().map(|t| t.name).unwrap_or_default();
                 self.saver.open(trf("Import {}", &[&target]));
             }
-            if let Some(e) = &self.error {
-                ui.label(RichText::new(e).color(crate::theme::error_color(ui.visuals().dark_mode)));
-            }
-        });
-        ui.add_space(2.0);
+            None => {}
+        }
     }
 }
 
@@ -1231,7 +1323,7 @@ fn table_name_from(stem: &str) -> String {
 // ------------------------------------------------------------ reader options
 
 fn encoding_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut String) {
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(value.clone()).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(value.clone()).width(160.0).show_ui(ui, |ui| {
         for e in ENCODINGS {
             if ui.selectable_label(value.eq_ignore_ascii_case(e), e).clicked() {
                 *value = e.to_string();
@@ -1240,119 +1332,85 @@ fn encoding_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value
     });
 }
 
-fn csv_reader_ui(ui: &mut Ui, id: u64, o: &mut CsvReadOptions, tsv: bool) {
+fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, tsv: bool) {
     if !tsv {
-        ui.label(tr("Delimiter"));
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut o.delimiter).desired_width(60.0));
-            for (d, label) in [(",", ","), (";", ";"), ("\t", "Tab"), ("|", "|")] {
-                if ui.selectable_label(o.delimiter == d, tr(label)).clicked() {
-                    o.delimiter = d.to_string();
+        f.row(tr("Delimiter"), |ui| {
+            ui.add(wizard::mono_line(&mut o.delimiter, 48.0));
+            delimiter_choice(ui, &mut o.delimiter);
+        });
+    }
+    f.row(tr("Header"), |ui| {
+        combo(
+            ui,
+            ("csv_rd_header", id),
+            &mut o.header,
+            &[
+                (CsvHeader::FirstRow, tr("The first row holds the column names").to_string()),
+                (CsvHeader::None, tr("No header row").to_string()),
+                (CsvHeader::Auto, tr("Detect").to_string()),
+            ],
+        )
+    });
+    f.row(tr("Skip rows"), |ui| {
+        ui.add(egui::DragValue::new(&mut o.skip_rows).range(0..=1_000_000));
+        wizard::faint(ui, tr("before the header"));
+    });
+    f.row(tr("Quote character"), |ui| opt_char_edit(ui, &mut o.quote_char, tr("none")));
+    f.row(tr("NULL text"), |ui| ui.add(line(&mut o.null_string).hint_text(tr("empty")).desired_width(140.0)));
+    f.row(tr("Encoding"), |ui| encoding_combo(ui, ("csv_rd_enc", id), &mut o.encoding));
+    f.row(tr("Quotes inside values"), |ui| {
+        combo(ui, ("csv_rd_escape", id), &mut o.escape, &[(EscapeStyle::Doubled, tr("Doubled (\"\")").to_string()), (EscapeStyle::Backslash, tr("Backslash (\\\")").to_string())])
+    });
+    f.row(tr("Comment lines"), |ui| opt_char_edit(ui, &mut o.comment_char, tr("none")));
+    f.row(tr("Spaces"), |ui| wizard::check(ui, &mut o.trim, tr("Trim spaces around values")));
+}
+
+fn xlsx_reader_ui(f: &mut Form<'_>, id: u64, o: &mut XlsxReadOptions, sheets: &[String]) {
+    f.row(tr("Sheet"), |ui| {
+        let current = match &o.sheet {
+            SheetSelector::Name(n) => n.clone(),
+            SheetSelector::Index(i) => sheets.get(*i).cloned().unwrap_or_else(|| trf("Sheet {}", &[&(i + 1)])),
+        };
+        egui::ComboBox::from_id_salt(("xlsx_sheet", id)).icon(ternarygrid_ui::kit::combo_caret).selected_text(current.clone()).width(180.0).show_ui(ui, |ui| {
+            if sheets.is_empty() {
+                ui.weak(tr("Loading…"));
+            }
+            for s in sheets {
+                if ui.selectable_label(*s == current, s).clicked() {
+                    o.sheet = SheetSelector::Name(s.clone());
                 }
             }
         });
-        ui.end_row();
-    }
-    ui.label(tr("Header"));
-    combo(
-        ui,
-        ("csv_rd_header", id),
-        &mut o.header,
-        &[
-            (CsvHeader::FirstRow, tr("The first row holds the column names").to_string()),
-            (CsvHeader::None, tr("No header row").to_string()),
-            (CsvHeader::Auto, tr("Detect").to_string()),
-        ],
-    );
-    ui.end_row();
-    ui.label(tr("Skip rows"));
-    ui.horizontal(|ui| {
+    });
+    f.row(tr("Header"), |ui| wizard::check(ui, &mut o.header, tr("The first row holds the column names")));
+    f.row(tr("Skip rows"), |ui| {
         ui.add(egui::DragValue::new(&mut o.skip_rows).range(0..=1_000_000));
-        ui.weak(tr("before the header"));
+        wizard::faint(ui, tr("before the header"));
     });
-    ui.end_row();
-    ui.label(tr("Quote character"));
-    opt_char_edit(ui, &mut o.quote_char, tr("none"));
-    ui.end_row();
-    ui.label(tr("Quotes inside values"));
-    combo(ui, ("csv_rd_escape", id), &mut o.escape, &[(EscapeStyle::Doubled, tr("Doubled (\"\")").to_string()), (EscapeStyle::Backslash, tr("Backslash (\\\")").to_string())]);
-    ui.end_row();
-    ui.label(tr("NULL text"));
-    ui.add(egui::TextEdit::singleline(&mut o.null_string).hint_text(tr("empty")).desired_width(100.0));
-    ui.end_row();
-    ui.label(tr("Comment lines"));
-    opt_char_edit(ui, &mut o.comment_char, tr("none"));
-    ui.end_row();
-    ui.label(tr("Spaces"));
-    ui.checkbox(&mut o.trim, tr("Trim spaces around values"));
-    ui.end_row();
-    ui.label(tr("Encoding"));
-    encoding_combo(ui, ("csv_rd_enc", id), &mut o.encoding);
-    ui.end_row();
+    f.row(tr("Empty rows"), |ui| wizard::check(ui, &mut o.skip_empty_rows, tr("Ignore")));
 }
 
-fn xlsx_reader_ui(ui: &mut Ui, id: u64, o: &mut XlsxReadOptions, sheets: &[String]) {
-    ui.label(tr("Sheet"));
-    let current = match &o.sheet {
-        SheetSelector::Name(n) => n.clone(),
-        SheetSelector::Index(i) => sheets.get(*i).cloned().unwrap_or_else(|| trf("Sheet {}", &[&(i + 1)])),
-    };
-    egui::ComboBox::from_id_salt(("xlsx_sheet", id)).icon(ternarygrid_ui::kit::combo_caret).selected_text(current.clone()).show_ui(ui, |ui| {
-        if sheets.is_empty() {
-            ui.weak(tr("Loading…"));
-        }
-        for s in sheets {
-            if ui.selectable_label(*s == current, s).clicked() {
-                o.sheet = SheetSelector::Name(s.clone());
-            }
-        }
-    });
-    ui.end_row();
-    ui.label(tr("Header"));
-    ui.checkbox(&mut o.header, tr("The first row holds the column names"));
-    ui.end_row();
-    ui.label(tr("Skip rows"));
-    ui.horizontal(|ui| {
-        ui.add(egui::DragValue::new(&mut o.skip_rows).range(0..=1_000_000));
-        ui.weak(tr("before the header"));
-    });
-    ui.end_row();
-    ui.label(tr("Empty rows"));
-    ui.checkbox(&mut o.skip_empty_rows, tr("Ignore"));
-    ui.end_row();
+fn xml_reader_ui(f: &mut Form<'_>, id: u64, o: &mut XmlReadOptions) {
+    f.row(tr("Row element"), |ui| opt_text(ui, &mut o.record_element, tr("every child of the root element"), 220.0));
+    f.row(tr("Attributes"), |ui| wizard::check(ui, &mut o.attributes_as_columns, tr("Attributes of the row element are columns")));
+    f.row(tr("Empty elements"), |ui| wizard::check(ui, &mut o.empty_as_null, tr("Read as NULL")));
+    f.row(tr("Encoding"), |ui| encoding_combo(ui, ("xml_rd_enc", id), &mut o.encoding));
 }
 
-fn xml_reader_ui(ui: &mut Ui, id: u64, o: &mut XmlReadOptions) {
-    ui.label(tr("Row element"));
-    opt_text(ui, &mut o.record_element, tr("every child of the root element"), 220.0);
-    ui.end_row();
-    ui.label(tr("Attributes"));
-    ui.checkbox(&mut o.attributes_as_columns, tr("Attributes of the row element are columns"));
-    ui.end_row();
-    ui.label(tr("Empty elements"));
-    ui.checkbox(&mut o.empty_as_null, tr("Read as NULL"));
-    ui.end_row();
-    ui.label(tr("Encoding"));
-    encoding_combo(ui, ("xml_rd_enc", id), &mut o.encoding);
-    ui.end_row();
-}
-
-fn json_reader_ui(ui: &mut Ui, id: u64, o: &mut JsonReadOptions) {
-    ui.label(tr("Structure"));
-    combo(
-        ui,
-        ("json_rd_fmt", id),
-        &mut o.format,
-        &[
-            (JsonInputFormat::Auto, tr("Detect").to_string()),
-            (JsonInputFormat::Array, tr("Array of objects").to_string()),
-            (JsonInputFormat::Lines, tr("One object per line").to_string()),
-        ],
-    );
-    ui.end_row();
-    ui.label(tr("Encoding"));
-    encoding_combo(ui, ("json_rd_enc", id), &mut o.encoding);
-    ui.end_row();
+fn json_reader_ui(f: &mut Form<'_>, id: u64, o: &mut JsonReadOptions) {
+    f.row(tr("Structure"), |ui| {
+        combo(
+            ui,
+            ("json_rd_fmt", id),
+            &mut o.format,
+            &[
+                (JsonInputFormat::Auto, tr("Detect").to_string()),
+                (JsonInputFormat::Array, tr("Array of objects").to_string()),
+                (JsonInputFormat::Lines, tr("One object per line").to_string()),
+            ],
+        )
+    });
+    f.row(tr("Encoding"), |ui| encoding_combo(ui, ("json_rd_enc", id), &mut o.encoding));
 }
 
 impl TabView for ImportTab {
@@ -1361,7 +1419,7 @@ impl TabView for ImportTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(820.0, 600.0))
+        Some(egui::vec2(940.0, 660.0))
     }
 
     fn title(&self) -> String {
@@ -1382,8 +1440,7 @@ impl TabView for ImportTab {
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll(cx);
         let uid = self.uid;
-        egui::Panel::top(egui::Id::new(("imp_top", uid))).show(ui, |ui| {
-            ui.add_space(4.0);
+        wizard::top_panel(ui, egui::Id::new(("imp_top", uid)), |ui| {
             // In a pop-up its title bar names the wizard and the connection.
             if !cx.popup {
                 ui.horizontal(|ui| {
@@ -1393,21 +1450,19 @@ impl TabView for ImportTab {
             }
             let steps = [tr("File"), tr("Target"), tr("Options"), tr("Run")];
             let reachable = if self.run.is_some() { self.page } else { self.reachable() };
-            if let Some(p) = steps_ui(ui, &steps, self.page, reachable.max(self.page))
+            let finished = self.page == PAGE_RUN && matches!(self.result, Some(Ok(_)));
+            if let Some(p) = wizard::steps(ui, &steps, self.page, reachable.max(self.page), finished)
                 && self.run.is_none()
             {
                 self.page = p;
             }
-            ui.add_space(2.0);
         });
-        egui::Panel::bottom(egui::Id::new(("imp_bottom", uid))).show(ui, |ui| self.footer(ui, cx));
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt(("imp_body", uid)).auto_shrink([false, false]).show(ui, |ui| match self.page {
-                PAGE_FILE => self.file_page(ui),
-                PAGE_TARGET => self.target_page(ui, cx),
-                PAGE_OPTIONS => self.options_page(ui, super::has_transactions(cx, &self.conn)),
-                _ => self.run_page(ui, cx),
-            });
+        wizard::bottom_panel(ui, egui::Id::new(("imp_bottom", uid)), |ui| self.footer(ui, cx));
+        wizard::body(ui, egui::Id::new(("imp_body", uid)), |ui| match self.page {
+            PAGE_FILE => self.file_page(ui),
+            PAGE_TARGET => self.target_page(ui, cx),
+            PAGE_OPTIONS => self.options_page(ui, super::has_transactions(cx, &self.conn)),
+            _ => self.run_page(ui, cx),
         });
         if let Some((name, folder)) = self.saver.ui(ui.ctx(), egui::Id::new(("imp_save", uid))) {
             self.save_task(cx, &name, folder);

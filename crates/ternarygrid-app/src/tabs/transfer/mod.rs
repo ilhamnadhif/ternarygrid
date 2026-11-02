@@ -15,6 +15,7 @@ pub mod export;
 pub mod import;
 pub mod migration;
 pub mod mock;
+pub(crate) mod wizard;
 
 pub use export::{ExportTab, ResultSource, grid_store_rows};
 pub use import::{ImportFileFormat, ImportTab, ImportTarget};
@@ -25,7 +26,7 @@ use crate::backend::Job;
 use crate::command::AppCommand;
 use crate::cx::AppContext;
 use crate::ops::{OpProgress, OpState};
-use egui::{RichText, Ui};
+use egui::{Margin, RichText, Ui};
 use egui_phosphor::regular as icon;
 use std::future::Future;
 use std::path::PathBuf;
@@ -37,6 +38,11 @@ use ternarygrid_core::meta::{ObjectInfo, ObjectKind, ObjectRef, SchemaRef};
 use ternarygrid_core::{DataKind, DbError, DbResult, ErrorKind, tr, trf};
 use ternarygrid_tasks::{TaskDef, TaskKind};
 use ternarygrid_transfer::{CancellationToken, MessageLevel, OnError, Progress, ProgressMessage, TransactionScope};
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts;
+use wizard::{Form, line};
+
+pub(crate) use wizard::section;
 
 /// Messages kept by a tab's log (older ones are dropped).
 const MAX_LOG_MESSAGES: usize = 2000;
@@ -128,54 +134,50 @@ fn copy_progress(progress: &Progress, op: &OpProgress) {
 
 // ----------------------------------------------------------------- progress
 
-/// Live counters of a running transfer. Returns true when Cancel was clicked.
+/// Live counters of a running transfer: the bar with the row count, the counters in two
+/// columns and Cancel. Returns true when Cancel was clicked.
 pub(crate) fn progress_ui(ui: &mut Ui, progress: &Progress, cancelling: bool) -> bool {
+    let p = ternarygrid_ui::pal(ui);
     let s = progress.snapshot();
     let rows_text = match s.total_rows {
         Some(t) => trf("{} of {} rows", &[&s.rows, &t]),
         None => trf("{} rows", &[&s.rows]),
     };
-    match s.fraction {
-        Some(f) => {
-            ui.add(egui::ProgressBar::new(f as f32).desired_width(ui.available_width().min(520.0)).text(rows_text));
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        match s.fraction {
+            Some(f) => {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(&rows_text).size(12.5).color(p.text_muted));
+                    parts::progress(ui, f as f32, f32::INFINITY);
+                });
+            }
+            None => {
+                ui.add(egui::Spinner::new().size(14.0).color(p.accent_text));
+                ui.label(RichText::new(&rows_text).size(12.5).color(p.text_muted));
+            }
         }
-        None => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(rows_text);
-            });
-        }
-    }
-    egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
-        ui.weak(tr("Speed"));
-        ui.label(trf("{} rows/s", &[&format!("{:.0}", s.rows_per_second)]));
-        ui.end_row();
-        if s.bytes > 0 {
-            ui.weak(tr("Written"));
-            ui.label(crate::widgets::format_bytes(s.bytes.min(i64::MAX as u64) as i64));
-            ui.end_row();
-        }
+    });
+    let value = |ui: &mut Ui, text: String, color: Option<egui::Color32>| {
+        ui.add(egui::Label::new(RichText::new(text).color(color.unwrap_or(p.text))).truncate());
+    };
+    ui.spacing_mut().interact_size.y = 20.0;
+    wizard::form(ui, "progress", 2, 100.0, |f| {
+        f.row(tr("Speed"), |ui| value(ui, trf("{} rows/s", &[&format!("{:.0}", s.rows_per_second)]), None));
+        let written = if s.bytes > 0 { crate::widgets::format_bytes(s.bytes.min(i64::MAX as u64) as i64) } else { "—".to_string() };
+        f.row(tr("Written"), |ui| value(ui, written, None));
         if s.items_total > 0 {
-            ui.weak(tr("Objects"));
-            ui.label(trf("{} of {}", &[&s.items_done, &s.items_total]));
-            ui.end_row();
+            f.row(tr("Objects"), |ui| value(ui, trf("{} of {}", &[&s.items_done, &s.items_total]), None));
         }
         if !s.active_items.is_empty() {
-            ui.weak(tr("Current"));
-            ui.label(s.active_items.join(", "));
-            ui.end_row();
+            f.row(tr("Current"), |ui| value(ui, s.active_items.join(", "), None));
         }
-        if s.errors > 0 {
-            ui.weak(tr("Errors"));
-            ui.label(RichText::new(s.errors.to_string()).color(crate::theme::error_color(ui.visuals().dark_mode)));
-            ui.end_row();
-        }
-        ui.weak(tr("Elapsed"));
-        ui.label(crate::widgets::format_duration(Duration::from_secs_f64(s.elapsed_secs.max(0.0))));
-        ui.end_row();
+        f.row(tr("Errors"), |ui| value(ui, s.errors.to_string(), (s.errors > 0).then_some(p.err)));
+        f.row(tr("Elapsed"), |ui| value(ui, crate::widgets::format_duration(Duration::from_secs_f64(s.elapsed_secs.max(0.0))), None));
     });
+    ui.spacing_mut().interact_size.y = ternarygrid_ui::style::CONTROL_H;
     let label = if cancelling { tr("Cancelling…") } else { tr("Cancel") };
-    let clicked = ui.add_enabled(!cancelling, egui::Button::new(format!("{} {label}", icon::STOP))).clicked();
+    let clicked = ui.add_enabled_ui(!cancelling, |ui| kit::button_ex(ui, Kind::Danger, Some(icon::STOP), label, true)).inner.clicked();
     ui.ctx().request_repaint_after(Duration::from_millis(100));
     clicked
 }
@@ -215,28 +217,31 @@ impl MessageLog {
         if self.messages.is_empty() {
             return;
         }
-        let dark = ui.visuals().dark_mode;
-        ui.horizontal(|ui| {
-            ui.strong(tr("Messages"));
-            if self.dropped > 0 {
-                ui.weak(trf("({} older messages not shown)", &[&self.dropped]));
-            }
-            if ui.small_button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).clicked() {
+        let p = ternarygrid_ui::pal(ui);
+        wizard::section_with(ui, tr("Messages"), |ui| {
+            if wizard::ghost(ui, Some(icon::COPY), tr("Copy")).clicked() {
                 ui.ctx().copy_text(self.text());
             }
-        });
-        egui::ScrollArea::vertical().id_salt(id).max_height(max_height).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
-            for m in &self.messages {
-                let (glyph, color) = match m.level {
-                    MessageLevel::Info => (icon::INFO, ui.visuals().weak_text_color()),
-                    MessageLevel::Warning => (icon::WARNING, crate::theme::warning_color(dark)),
-                    MessageLevel::Error => (icon::X_CIRCLE, crate::theme::error_color(dark)),
-                };
-                ui.horizontal_top(|ui| {
-                    ui.label(RichText::new(glyph).color(color));
-                    ui.add(egui::Label::new(RichText::new(format_message(m)).small()).wrap().selectable(true));
-                });
+            if self.dropped > 0 {
+                wizard::faint(ui, &trf("({} older messages not shown)", &[&self.dropped]));
             }
+        });
+        wizard::boxed(ui, Margin::symmetric(12, 8), |ui| {
+            egui::ScrollArea::vertical().id_salt(id).max_height(max_height).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for m in &self.messages {
+                    let (glyph, color) = match m.level {
+                        MessageLevel::Info => (icon::INFO, p.text_muted),
+                        MessageLevel::Warning => (icon::WARNING, p.warn),
+                        MessageLevel::Error => (icon::X_CIRCLE, p.err),
+                    };
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(RichText::new(glyph).font(ternarygrid_ui::style::icon_font(13.0)).color(color));
+                        ui.add(egui::Label::new(RichText::new(format_message(m)).monospace().size(11.5).color(p.text)).wrap().selectable(true));
+                    });
+                }
+            });
         });
     }
 }
@@ -278,39 +283,50 @@ impl TaskSaver {
         if !self.open {
             return None;
         }
-        let mut confirmed = None;
-        let mut close = false;
-        let modal = egui::Modal::new(id).show(ctx, |ui| {
-            ui.set_min_width(360.0);
-            ui.heading(tr("Save as task"));
-            ui.label(tr("The task runs the same transfer from the Tasks view, on a schedule or with ternarygrid --run-task."));
-            egui::Grid::new(id.with("grid")).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label(tr("Name"));
-                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(240.0));
-                ui.end_row();
-                ui.label(tr("Folder"));
-                ui.add(egui::TextEdit::singleline(&mut self.folder).hint_text(tr("optional, e.g. exports/nightly")).desired_width(240.0));
-                ui.end_row();
-            });
-            if let Some(e) = &self.error {
-                crate::widgets::error_box(ui, e);
-            }
-            ui.horizontal(|ui| {
-                // Not while a save runs: a second click would save the task twice.
-                let ok = !self.name.trim().is_empty() && self.job.is_none();
-                if ui.add_enabled(ok, egui::Button::new((ternarygrid_icons::ic(icon::FLOPPY_DISK), tr("Save")))).clicked() {
-                    let folder = Some(self.folder.trim().to_string()).filter(|f| !f.is_empty());
-                    confirmed = Some((self.name.trim().to_string(), folder));
+        let mut save = false;
+        let mut cancel = false;
+        // Not while a save runs: a second click would save the task twice.
+        let can_save = std::cell::Cell::new(false);
+        let saving = self.job.is_some();
+        let (name, folder, error) = (&mut self.name, &mut self.folder, &self.error);
+        let (resp, _) = parts::Dialog::new(tr("Save as task")).icon(icon::FLOPPY_DISK).width(480.0).show_modal(
+            ctx,
+            id,
+            |ui| {
+                let p = ternarygrid_ui::pal(ui);
+                ternarygrid_ui::style::form_spacing(ui);
+                ui.spacing_mut().item_spacing.y = 12.0;
+                ui.add(
+                    egui::Label::new(RichText::new(tr("The task runs the same transfer from the Tasks view, on a schedule or with ternarygrid --run-task.")).color(p.text_muted))
+                        .wrap(),
+                );
+                wizard::form(ui, id.with("grid"), 1, 64.0, |f| {
+                    f.row(tr("Name"), |ui| ui.add(line(name).desired_width(f32::INFINITY)));
+                    f.row(tr("Folder"), |ui| ui.add(line(folder).hint_text(tr("optional, e.g. exports/nightly")).desired_width(f32::INFINITY)));
+                });
+                if let Some(e) = error {
+                    crate::widgets::error_box(ui, e);
                 }
-                if ui.button(tr("Cancel")).clicked() {
-                    close = true;
-                }
-            });
-        });
-        if close || modal.should_close() {
+                can_save.set(!name.trim().is_empty() && !saving);
+            },
+            |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled_ui(can_save.get(), |ui| kit::primary_icon(ui, icon::FLOPPY_DISK, tr("Save"))).inner.clicked() {
+                        save = true;
+                    }
+                    if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                        cancel = true;
+                    }
+                });
+            },
+        );
+        if cancel || resp.close {
             self.open = false;
         }
-        confirmed
+        save.then(|| {
+            let folder = Some(self.folder.trim().to_string()).filter(|f| !f.is_empty());
+            (self.name.trim().to_string(), folder)
+        })
     }
 
     /// Store a new task in the background.
@@ -350,23 +366,6 @@ impl TaskSaver {
 
 // ------------------------------------------------------------------ widgets
 
-/// Wizard step buttons; returns the step the user clicked.
-pub(crate) fn steps_ui(ui: &mut Ui, steps: &[&str], current: usize, reachable: usize) -> Option<usize> {
-    let mut clicked = None;
-    ui.horizontal(|ui| {
-        for (i, s) in steps.iter().enumerate() {
-            if i > 0 {
-                ui.weak(icon::CARET_RIGHT);
-            }
-            let r = ui.add_enabled(i <= reachable, egui::Button::selectable(i == current, format!("{} {s}", i + 1)));
-            if r.clicked() {
-                clicked = Some(i);
-            }
-        }
-    });
-    clicked
-}
-
 /// Combo box over a fixed list of (value, label) pairs.
 pub(crate) fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut T, options: &[(T, String)]) -> bool {
     let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| l.clone()).unwrap_or_default();
@@ -385,7 +384,7 @@ pub(crate) fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Hash 
 /// Single line editor of an optional text (empty = `None`).
 pub(crate) fn opt_text(ui: &mut Ui, value: &mut Option<String>, hint: &str, width: f32) -> bool {
     let mut s = value.clone().unwrap_or_default();
-    let changed = ui.add(egui::TextEdit::singleline(&mut s).hint_text(hint).desired_width(width)).changed();
+    let changed = ui.add(line(&mut s).hint_text(hint).desired_width(width)).changed();
     if changed {
         *value = Some(s).filter(|s| !s.is_empty());
     }
@@ -396,10 +395,18 @@ pub(crate) fn opt_text(ui: &mut Ui, value: &mut Option<String>, hint: &str, widt
 /// while the field has focus, so intermediate (invalid) input such as `-` or
 /// an unfinished date can be typed; `apply` receives the text after every change.
 pub(crate) fn parsed_edit(ui: &mut Ui, shown: String, hint: &str, width: f32, multiline: bool, apply: impl FnOnce(&str)) -> bool {
+    parsed_edit_ex(ui, shown, hint, width, multiline, false, apply)
+}
+
+/// [`parsed_edit`], in the monospace font with `mono`.
+fn parsed_edit_ex(ui: &mut Ui, shown: String, hint: &str, width: f32, multiline: bool, mono: bool, apply: impl FnOnce(&str)) -> bool {
     let key = ui.next_auto_id().with("ternarygrid_parsed_edit");
     let mut text = ui.data(|d| d.get_temp::<String>(key)).unwrap_or(shown);
-    let edit = if multiline { egui::TextEdit::multiline(&mut text).desired_rows(2) } else { egui::TextEdit::singleline(&mut text) };
-    let r = ui.add(edit.hint_text(hint).desired_width(width));
+    let mut edit = if multiline { egui::TextEdit::multiline(&mut text).desired_rows(2) } else { egui::TextEdit::singleline(&mut text) };
+    if mono {
+        edit = edit.font(egui::TextStyle::Monospace);
+    }
+    let r = ui.add(edit.margin(wizard::INPUT_MARGIN).hint_text(hint).desired_width(width));
     let changed = r.changed();
     if changed {
         apply(&text);
@@ -414,7 +421,7 @@ pub(crate) fn parsed_edit(ui: &mut Ui, shown: String, hint: &str, width: f32, mu
 
 /// Editor of a single character (keeps the old value while empty).
 pub(crate) fn char_edit(ui: &mut Ui, value: &mut char) -> bool {
-    parsed_edit(ui, value.to_string(), "", 28.0, false, |t| {
+    parsed_edit_ex(ui, value.to_string(), "", 60.0, false, true, |t| {
         if let Some(c) = t.chars().next() {
             *value = c;
         }
@@ -423,12 +430,12 @@ pub(crate) fn char_edit(ui: &mut Ui, value: &mut char) -> bool {
 
 /// Editor of an optional character (empty = `None`).
 pub(crate) fn opt_char_edit(ui: &mut Ui, value: &mut Option<char>, hint: &str) -> bool {
-    parsed_edit(ui, value.map(String::from).unwrap_or_default(), hint, 28.0, false, |t| *value = t.chars().next())
+    parsed_edit_ex(ui, value.map(String::from).unwrap_or_default(), hint, 60.0, false, true, |t| *value = t.chars().next())
 }
 
 /// Editor of a list of texts, one per line.
 pub(crate) fn lines_edit(ui: &mut Ui, value: &mut Vec<String>, hint: &str, width: f32) -> bool {
-    parsed_edit(ui, value.join("\n"), hint, width, true, |t| {
+    parsed_edit_ex(ui, value.join("\n"), hint, width, true, true, |t| {
         *value = t.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect();
     })
 }
@@ -436,7 +443,7 @@ pub(crate) fn lines_edit(ui: &mut Ui, value: &mut Vec<String>, hint: &str, width
 /// Editor of an optional number (empty = `None`).
 pub(crate) fn opt_number<T: std::str::FromStr + ToString>(ui: &mut Ui, value: &mut Option<T>, hint: &str) -> bool {
     let shown = value.as_ref().map(T::to_string).unwrap_or_default();
-    parsed_edit(ui, shown, hint, 90.0, false, |t| {
+    parsed_edit(ui, shown, hint, 120.0, false, |t| {
         let t = t.trim();
         if t.is_empty() {
             *value = None;
@@ -455,55 +462,18 @@ pub(crate) fn number_edit<T: std::str::FromStr + ToString>(ui: &mut Ui, value: &
     })
 }
 
-/// Small table of text cells with a bounded height (previews, summaries).
-pub(crate) fn text_table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, headers: &[String], rows: &[Vec<String>], max_height: f32) {
-    use egui_extras::{Column, TableBuilder};
-    if headers.is_empty() {
-        return;
+/// The delimiter choices of CSV files next to the delimiter field.
+pub(crate) fn delimiter_choice(ui: &mut Ui, delimiter: &mut String) {
+    let mut current: &str = match delimiter.as_str() {
+        "," => ",",
+        ";" => ";",
+        "\t" => "\t",
+        "|" => "|",
+        _ => "",
+    };
+    if parts::segmented(ui, &mut current, &[(",", ","), (";", ";"), ("\t", tr("Tab")), ("|", "|")]) {
+        *delimiter = current.to_string();
     }
-    let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-    egui::ScrollArea::horizontal().id_salt(egui::Id::new(&id).with("h")).show(ui, |ui| {
-        let mut tb = TableBuilder::new(ui)
-            .id_salt(egui::Id::new(&id).with("t"))
-            .striped(true)
-            .resizable(true)
-            .max_scroll_height(max_height)
-            .auto_shrink([true, true])
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-        for _ in headers {
-            tb = tb.column(Column::auto().at_least(40.0).at_most(360.0).clip(true).resizable(true));
-        }
-        tb.header(row_h + 2.0, |mut header| {
-            for h in headers {
-                header.col(|ui| {
-                    ui.strong(h);
-                });
-            }
-        })
-        .body(|body| {
-            body.rows(row_h, rows.len(), |mut row| {
-                let i = row.index();
-                if let Some(cells) = rows.get(i) {
-                    for c in cells.iter().take(headers.len()) {
-                        row.col(|ui| {
-                            let first: String = c.chars().take(200).collect();
-                            let first = first.lines().next().unwrap_or("").to_string();
-                            let r = ui.add(egui::Label::new(first.clone()).truncate());
-                            if c.len() > first.len() {
-                                r.on_hover_text(c.chars().take(2000).collect::<String>());
-                            }
-                        });
-                    }
-                }
-            });
-        });
-    });
-}
-
-/// Section heading.
-pub(crate) fn section(ui: &mut Ui, text: &str) {
-    ui.add_space(6.0);
-    ui.label(RichText::new(text).strong());
 }
 
 /// Options of [`OnError`].
@@ -596,15 +566,20 @@ pub(crate) fn has_transactions(cx: &AppContext, conn: &str) -> bool {
 }
 
 /// Shown under a "Replace" choice for a database without transactions.
-pub(crate) fn replace_without_transactions_ui(ui: &mut Ui) {
-    ui.label("");
-    ui.label(
-        RichText::new(tr(
-            "This database has no transactions: replacing rows works only where it has an upsert of its own, otherwise the run is refused before anything is deleted.",
-        ))
-        .color(crate::theme::warning_color(ui.visuals().dark_mode)),
-    );
-    ui.end_row();
+pub(crate) fn replace_without_transactions_ui(f: &mut Form<'_>) {
+    f.note(|ui| {
+        let p = ternarygrid_ui::pal(ui);
+        ui.add(
+            egui::Label::new(
+                RichText::new(tr(
+                    "This database has no transactions: replacing rows works only where it has an upsert of its own, otherwise the run is refused before anything is deleted.",
+                ))
+                .size(12.5)
+                .color(p.warn),
+            )
+            .wrap(),
+        );
+    });
 }
 
 /// Display name of a connection.
