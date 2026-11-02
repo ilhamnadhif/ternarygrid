@@ -49,12 +49,14 @@ pub fn icon_heading(ui: &mut Ui, glyph: &str, text: impl Into<String>) -> egui::
 /// Virtualised, striped, resizable table of text cells.
 pub fn simple_table(ui: &mut Ui, id_salt: impl std::hash::Hash + std::fmt::Debug, headers: &[&str], rows: &[Vec<String>], selected: Option<usize>) -> TableResponse {
     // In its own ui: the column lines end at the last row, not at the bottom of the panel.
-    ui.scope(|ui| table_in(ui, id_salt, headers, rows, selected)).inner
+    // A bordered, rounded frame like the mockups' tables.
+    ternarygrid_ui::parts::bordered(ui).show(ui, |ui| ui.scope(|ui| table_in(ui, id_salt, headers, rows, selected)).inner).inner
 }
 
 fn table_in(ui: &mut Ui, id_salt: impl std::hash::Hash + std::fmt::Debug, headers: &[&str], rows: &[Vec<String>], selected: Option<usize>) -> TableResponse {
     let mut out = TableResponse::default();
-    let row_h = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
+    let row_h = ui.text_style_height(&egui::TextStyle::Body) + 12.0;
+    let pal = ternarygrid_ui::pal(ui);
     // Every column at least as wide as its header (plus the cell padding).
     let font = egui::TextStyle::Body.resolve(ui.style());
     let text_w = |ui: &mut Ui, s: &str| ui.fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).rect.width());
@@ -84,8 +86,10 @@ fn table_in(ui: &mut Ui, id_salt: impl std::hash::Hash + std::fmt::Debug, header
     tb.header(row_h + 2.0, |mut header| {
         for h in headers {
             header.col(|ui| {
+                // The header row on the header colour, its names muted and semibold.
+                ui.painter().rect_filled(ui.max_rect().expand2(egui::vec2(4.0, 0.0)), 0.0, pal.header);
                 ui.add_space(CELL_PAD);
-                ui.label(RichText::new(*h).strong());
+                ui.label(RichText::new(*h).font(ternarygrid_ui::style::semibold(ui.ctx(), 12.0)).color(pal.text_muted));
             });
         }
     })
@@ -140,17 +144,25 @@ pub fn property_grid(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug + C
             groups.push(g);
         }
     }
+    let pal = ternarygrid_ui::pal(ui);
     for g in groups {
         if let Some(name) = g {
-            ui.add_space(4.0);
-            ui.label(RichText::new(name).strong());
+            ui.add_space(6.0);
+            ui.label(RichText::new(name).font(ternarygrid_ui::style::semibold(ui.ctx(), 12.0)).color(pal.text_faint));
         }
-        egui::Grid::new((id, g.unwrap_or(""))).num_columns(2).striped(true).spacing([16.0, 4.0]).show(ui, |ui| {
-            for p in props.iter().filter(|p| p.group.as_deref() == g) {
-                ui.label(RichText::new(&p.name).weak());
-                ui.add(egui::Label::new(&p.value).wrap());
-                ui.end_row();
-            }
+        // Name / value rows in a bordered, striped list.
+        ternarygrid_ui::parts::bordered(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::Grid::new((id, g.unwrap_or(""))).num_columns(2).striped(true).min_col_width(180.0).spacing([16.0, 8.0]).show(ui, |ui| {
+                for p in props.iter().filter(|p| p.group.as_deref() == g) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(&p.name).color(pal.text_muted));
+                    });
+                    ui.add(egui::Label::new(&p.value).wrap());
+                    ui.end_row();
+                }
+            });
         });
     }
 }
@@ -161,16 +173,13 @@ pub fn load_state<T>(ui: &mut Ui, value: &Loadable<T>, retry: &mut bool) -> bool
     match value {
         Loadable::Loaded(_) => true,
         Loadable::NotLoaded | Loadable::Loading(_) => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.weak(tr("Loading…"));
-            });
+            ternarygrid_ui::parts::spinner_label(ui, tr("Loading…"));
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             false
         }
         Loadable::Failed(e) => {
             error_box(ui, &e.full_text());
-            if ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Retry"))).clicked() {
+            if ternarygrid_ui::kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked() {
                 *retry = true;
             }
             false
@@ -179,13 +188,7 @@ pub fn load_state<T>(ui: &mut Ui, value: &Loadable<T>, retry: &mut bool) -> bool
 }
 
 pub fn error_box(ui: &mut Ui, text: &str) {
-    let color = crate::theme::error_color(ui.visuals().dark_mode);
-    egui::Frame::group(ui.style()).stroke(egui::Stroke::new(1.0, color)).show(ui, |ui| {
-        ui.horizontal_top(|ui| {
-            ui.label(RichText::new(icon::WARNING_CIRCLE).color(color));
-            ui.add(egui::Label::new(RichText::new(text).color(color)).wrap().selectable(true));
-        });
-    });
+    ternarygrid_ui::parts::callout(ui, ternarygrid_ui::parts::Tone::Error, None, text, |_| {});
 }
 
 /// Read-only, selectable monospace text (DDL, scripts) coloured by `tokens`.

@@ -4,6 +4,7 @@
 //! screens use instead of styling egui widgets one by one.
 
 pub mod kit;
+pub mod parts;
 pub mod style;
 
 pub use style::{Palette, pal, palette, soft};
