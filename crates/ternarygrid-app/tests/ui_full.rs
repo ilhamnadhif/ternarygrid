@@ -1917,7 +1917,7 @@ fn ai_assistant_is_a_side_panel() {
     h.state_mut().ai_panel.as_mut().unwrap().reset();
     frames(&mut h, 2);
     assert!(h.state().ai_panel.as_ref().unwrap().turns().is_empty());
-    let history = egui_phosphor::regular::CLOCK_COUNTER_CLOCKWISE;
+    let history = "Conversation history";
     {
         let button = h.query_all_by_label(history).max_by(|a, b| a.rect().left().total_cmp(&b.rect().left())).expect("history button");
         button.click();
