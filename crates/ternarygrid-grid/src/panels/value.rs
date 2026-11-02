@@ -197,6 +197,8 @@ impl<'a> ValuePanel<'a> {
         };
         let cell_editable = options.allow_editing && model.can_edit_cell(row, col).is_ok();
         let pal = ternarygrid_ui::pal(ui);
+        // 12 between the header, the modes, the value and its actions.
+        ui.spacing_mut().item_spacing.y = 12.0;
         ui.horizontal(|ui| {
             ui.label(RichText::new(model.column_name(col)).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
             if let Some(m) = model.column_meta(col) {
@@ -207,7 +209,11 @@ impl<'a> ValuePanel<'a> {
             });
         });
         // Mode selector with the modes that make sense for the value.
-        let mut modes = vec![(ValueMode::Auto, tr("Auto")), (ValueMode::Text, tr("Text"))];
+        // Bytes are not text: Auto, Hex (and Image) for them.
+        let mut modes = vec![(ValueMode::Auto, tr("Auto"))];
+        if !matches!(value, Value::Bytes(_)) {
+            modes.push((ValueMode::Text, tr("Text")));
+        }
         let is_json = matches!(value, Value::Json(_)) || kind == DataKind::Json;
         if is_json || value.as_str().is_some_and(|s| s.trim_start().starts_with(['{', '['])) {
             modes.push((ValueMode::Json, "JSON"));
@@ -231,7 +237,6 @@ impl<'a> ValuePanel<'a> {
                 ternarygrid_ui::kit::checkbox(ui, &mut state.wrap, tr("Wrap"));
             });
         });
-        ui.add_space(4.0);
         let mode = match state.mode {
             // NULL has nothing to parse or decode: show the (empty) text editor.
             _ if value.is_null() => ValueMode::Text,
@@ -285,7 +290,6 @@ impl<'a> ValuePanel<'a> {
                         state.error = None;
                     }
                 });
-                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     use ternarygrid_ui::kit;
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -384,12 +388,11 @@ impl<'a> ValuePanel<'a> {
                     match &state.image {
                         Some(Ok((tex, size, label))) => {
                             ui.label(RichText::new(format!("{label} {} × {}", size[0], size[1])).size(12.5).color(pal.text_muted));
-                            ui.add_space(4.0);
                             // In a 220 high box, on a soft accent wash, scaled down to fit.
                             let w = ui.available_width();
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 220.0), egui::Sense::hover());
                             let mut mesh = egui::Mesh::default();
-                            let r = rect.shrink(1.0);
+                            let r = rect.shrink(2.0);
                             let (a, z) = (pal.accent_soft, pal.subtle);
                             mesh.colored_vertex(r.left_top(), a);
                             mesh.colored_vertex(r.right_top(), crate::theme::mix(a, z, 0.5));

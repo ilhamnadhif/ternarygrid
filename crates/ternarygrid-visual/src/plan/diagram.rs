@@ -529,12 +529,10 @@ fn paint_box(
 ) {
     let share = f.share(metric);
     let heat = colors::heat(share.map(|s| (s * 2.0) as f32).unwrap_or(0.0));
-    let radius = (5.0 * zoom).clamp(0.0, 10.0);
-    let fill = match share {
-        Some(s) if s >= 0.02 => colors::tint(v, heat, if v.dark_mode { 0.16 } else { 0.12 }),
-        _ => v.window_fill,
-    };
-    painter.rect_filled(srect, radius, fill);
+    // As the mockups' nodes: a card on the surface, the heat in its left bar and its share.
+    let p = ternarygrid_ui::style::palette(v.dark_mode);
+    let radius = (8.0 * zoom).clamp(0.0, 10.0);
+    painter.rect_filled(srect, radius, p.surface);
     let r8 = radius.round() as u8;
     let accent = Rect::from_min_size(srect.min, vec2((ACCENT_W * zoom).max(2.0), srect.height()));
     painter.rect_filled(
@@ -552,11 +550,11 @@ fn paint_box(
         },
     );
     let stroke = if selected {
-        Stroke::new(2.0, v.selection.stroke.color)
+        Stroke::new(2.0, p.accent)
     } else if hover {
-        Stroke::new(1.5, v.selection.stroke.color.gamma_multiply(0.7))
+        Stroke::new(1.5, p.accent.gamma_multiply(0.7))
     } else {
-        v.widgets.noninteractive.bg_stroke
+        Stroke::new(1.0, p.border)
     };
     painter.rect_stroke(srect, radius, stroke, StrokeKind::Inside);
 
@@ -575,8 +573,8 @@ fn paint_box(
                 ),
                 galley.size() + vec2(10.0, 2.0),
             );
-            painter.rect_filled(pill, pill.height() * 0.5, heat);
-            painter.galley(pill.min + vec2(5.0, 1.0), galley, colors::text_on(heat));
+            painter.rect_filled(pill, pill.height() * 0.5, p.subtle);
+            painter.galley_with_override_text_color(pill.min + vec2(5.0, 1.0), galley, heat);
             right = pill.left() - 4.0;
         }
         paint::text(
