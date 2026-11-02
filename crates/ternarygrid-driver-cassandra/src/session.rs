@@ -11,8 +11,7 @@ use scylla::frame::response::result::{CollectionType, ColumnType, NativeType};
 use scylla::statement::unprepared::Statement;
 use scylla::value::{CqlDate, CqlTime, CqlTimestamp, CqlValue, Row as CqlRow};
 use std::sync::Arc;
-use std::time::Duration;
-use ternarygrid_core::config::SslMode;
+use ternarygrid_core::config::{SslConfig, SslMode};
 use ternarygrid_core::ddl::*;
 use ternarygrid_core::dialect::Dialect;
 use ternarygrid_core::driver::{ServerInfo, parse_version_number};
@@ -21,7 +20,7 @@ use ternarygrid_core::plan::QueryPlan;
 use ternarygrid_core::value::{ColumnMeta, DataKind};
 use ternarygrid_core::{
     CancelHandle, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions, QueryCursor,
-    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value,
+    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value, trf,
 };
 
 /// Rows per page requested from the server.
@@ -135,10 +134,11 @@ fn kind_of(t: &ColumnType<'_>) -> DataKind {
             NativeType::Uuid | NativeType::Timeuuid => DataKind::Uuid,
             _ => DataKind::Other,
         },
-        ColumnType::Collection { .. } | ColumnType::Vector { .. } | ColumnType::Tuple(_) => {
-            DataKind::Array
-        }
-        ColumnType::UserDefinedType { .. } => DataKind::Json,
+        // Read as JSON text (`Value::Json`).
+        ColumnType::Collection { .. }
+        | ColumnType::Vector { .. }
+        | ColumnType::Tuple(_)
+        | ColumnType::UserDefinedType { .. } => DataKind::Json,
         _ => DataKind::Other,
     }
 }
@@ -165,7 +165,7 @@ fn kind_of_text(t: &str) -> DataKind {
             || t.starts_with("tuple<")
             || t.starts_with("vector<") =>
         {
-            DataKind::Array
+            DataKind::Json
         }
         _ => DataKind::Other,
     }
@@ -287,38 +287,68 @@ fn to_value(v: &CqlValue) -> Value {
     }
 }
 
-fn varint_text(v: &scylla::value::CqlVarint) -> String {
-    let bytes = v.as_signed_bytes_be_slice();
-    // Two's complement big-endian to decimal text (small values fast path).
-    if bytes.len() <= 16 {
-        let mut n: i128 = if bytes.first().is_some_and(|b| b & 0x80 != 0) {
-            -1
-        } else {
-            0
-        };
-        for b in bytes {
-            n = (n << 8) | *b as i128;
+/// A big-endian two's complement integer of any length: whether it is
+/// negative, and the decimal digits of its magnitude.
+fn signed_be_digits(bytes: &[u8]) -> (bool, String) {
+    let neg = bytes.first().is_some_and(|b| b & 0x80 != 0);
+    // The magnitude: negative numbers inverted plus one.
+    let mut mag: Vec<u8> = bytes.iter().map(|b| if neg { !b } else { *b }).collect();
+    if neg {
+        for b in mag.iter_mut().rev() {
+            let (v, carry) = b.overflowing_add(1);
+            *b = v;
+            if !carry {
+                break;
+            }
         }
-        n.to_string()
-    } else {
-        format!("0x{}", hex::encode(bytes))
+    }
+    // Base 256 to base 10^9 by repeated division.
+    let mut groups: Vec<u32> = Vec::new();
+    let mut start = mag.iter().position(|b| *b != 0).unwrap_or(mag.len());
+    while start < mag.len() {
+        let mut rem: u64 = 0;
+        for b in &mut mag[start..] {
+            let cur = (rem << 8) | u64::from(*b);
+            *b = (cur / 1_000_000_000) as u8;
+            rem = cur % 1_000_000_000;
+        }
+        groups.push(rem as u32);
+        while start < mag.len() && mag[start] == 0 {
+            start += 1;
+        }
+    }
+    let mut digits = groups
+        .pop()
+        .map_or_else(|| "0".to_string(), |g| g.to_string());
+    for g in groups.iter().rev() {
+        digits.push_str(&format!("{g:09}"));
+    }
+    (neg, digits)
+}
+
+fn varint_text(v: &scylla::value::CqlVarint) -> String {
+    match signed_be_digits(v.as_signed_bytes_be_slice()) {
+        (true, digits) => format!("-{digits}"),
+        (false, digits) => digits,
     }
 }
 
 fn decimal_text(d: &scylla::value::CqlDecimal) -> String {
     let (bytes, scale) = d.as_signed_be_bytes_slice_and_exponent();
-    let mut n: i128 = if bytes.first().is_some_and(|b| b & 0x80 != 0) {
-        -1
-    } else {
-        0
-    };
-    for b in bytes.iter().take(16) {
-        n = (n << 8) | *b as i128;
-    }
-    let neg = n < 0;
-    let digits = n.unsigned_abs().to_string();
-    let s = if scale <= 0 {
-        format!("{digits}{}", "0".repeat((-scale) as usize))
+    let (neg, digits) = signed_be_digits(bytes);
+    let s = if scale.unsigned_abs() > 1000 {
+        // Scientific notation instead of a thousand zeros.
+        let exp = digits.len() as i64 - 1 - i64::from(scale);
+        match digits.split_at(1) {
+            (head, "") => format!("{head}E{exp:+}"),
+            (head, tail) => format!("{head}.{tail}E{exp:+}"),
+        }
+    } else if scale <= 0 {
+        if digits == "0" {
+            digits
+        } else {
+            format!("{digits}{}", "0".repeat(scale.unsigned_abs() as usize))
+        }
     } else {
         let scale = scale as usize;
         let padded = format!("{:0>width$}", digits, width = scale + 1);
@@ -457,47 +487,98 @@ fn tls(params: &ConnectParams) -> DbResult<Option<Arc<rustls::ClientConfig>>> {
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| DbError::tls(e.to_string()))?;
-    let config = if params.ssl.mode == SslMode::VerifyFull {
-        let mut roots = rustls::RootCertStore::empty();
-        for c in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(c);
-        }
-        if let Some(ca) = params
-            .ssl
-            .ca_cert
-            .as_deref()
-            .filter(|c| !c.trim().is_empty())
-        {
-            let pem = std::fs::read(ca).map_err(|e| {
-                DbError::config(format!("Cannot read the CA certificate {ca}: {e}"))
-            })?;
-            for c in rustls::pki_types::pem::PemObject::pem_slice_iter(&pem).flatten() {
-                let _ = roots.add(c);
-            }
-        }
-        builder.with_root_certificates(roots).with_no_client_auth()
-    } else {
-        builder
+    let config = match params.ssl.mode {
+        SslMode::VerifyFull => builder
+            .with_root_certificates(root_store(&params.ssl)?)
+            .with_no_client_auth(),
+        // The chain must lead to a trusted root; the host name is not checked.
+        SslMode::VerifyCa => builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
-            .with_no_client_auth()
+            .with_custom_certificate_verifier(Arc::new(CertVerifier {
+                provider,
+                chain: Some(Arc::new(root_store(&params.ssl)?)),
+            }))
+            .with_no_client_auth(),
+        // Encrypted, any certificate.
+        _ => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(CertVerifier {
+                provider,
+                chain: None,
+            }))
+            .with_no_client_auth(),
     };
     Ok(Some(Arc::new(config)))
 }
 
-/// Accepts the server's certificate (require / verify-ca without a CA list).
-#[derive(Debug)]
-struct AnyCert(Arc<rustls::crypto::CryptoProvider>);
+/// Trust anchors: the system's and the configured CA certificate (only the
+/// latter with "use only the custom CA").
+fn root_store(ssl: &SslConfig) -> DbResult<rustls::RootCertStore> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    let ca = ssl
+        .ca_cert
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    if !(ssl.only_custom_ca && ca.is_some()) {
+        for c in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(c);
+        }
+    }
+    if let Some(ca) = ca {
+        let pem = std::fs::read(ca)
+            .map_err(|e| DbError::config(format!("Cannot read the CA certificate {ca}: {e}")))?;
+        let mut found = false;
+        for c in CertificateDer::pem_slice_iter(&pem) {
+            let c = c.map_err(|e| DbError::config(format!("Invalid PEM in {ca}: {e}")))?;
+            roots.add(c).map_err(|e| {
+                DbError::config(format!("The CA certificate {ca} cannot be used: {e}"))
+            })?;
+            found = true;
+        }
+        if !found {
+            return Err(DbError::config(format!("No certificate found in {ca}")));
+        }
+    }
+    if roots.is_empty() {
+        return Err(DbError::config(
+            "No trusted CA certificates: set the CA certificate of the server",
+        ));
+    }
+    Ok(roots)
+}
 
-impl rustls::client::danger::ServerCertVerifier for AnyCert {
+/// The server certificate check of require (`chain: None`, any certificate)
+/// and verify-ca (the chain must lead to a root of `chain`, whatever the host
+/// name: nodes are reached by address, often through a tunnel). Handshake
+/// signatures are always checked.
+#[derive(Debug)]
+struct CertVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    chain: Option<Arc<rustls::RootCertStore>>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for CertVerifier {
     fn verify_server_cert(
         &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _: &rustls::pki_types::ServerName<'_>,
         _: &[u8],
-        _: rustls::pki_types::UnixTime,
+        now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some(roots) = &self.chain {
+            let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
+            rustls::client::verify_server_cert_signed_by_trust_anchor(
+                &cert,
+                roots,
+                intermediates,
+                now,
+                self.provider.signature_verification_algorithms.all,
+            )?;
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(
@@ -506,7 +587,12 @@ impl rustls::client::danger::ServerCertVerifier for AnyCert {
         c: &rustls::pki_types::CertificateDer<'_>,
         d: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
     }
     fn verify_tls13_signature(
         &self,
@@ -514,10 +600,17 @@ impl rustls::client::danger::ServerCertVerifier for AnyCert {
         c: &rustls::pki_types::CertificateDer<'_>,
         d: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -541,6 +634,8 @@ pub struct CassandraSession {
     dialect: Arc<CqlDialect>,
     mode: TransactionMode,
     closed: bool,
+    /// Only statements that read run.
+    read_only: bool,
 }
 
 impl CassandraSession {
@@ -618,6 +713,7 @@ impl CassandraSession {
                 TransactionMode::Manual
             },
             closed: false,
+            read_only: params.read_only,
         })
     }
 
@@ -694,6 +790,11 @@ fn first_word(cql: &str) -> String {
         .next()
         .unwrap_or("")
         .to_ascii_uppercase()
+}
+
+/// Statements a read-only connection runs (by their first word).
+fn reads(word: &str) -> bool {
+    matches!(word, "SELECT" | "DESCRIBE" | "DESC" | "LIST" | "USE")
 }
 
 struct CqlCursor {
@@ -807,6 +908,12 @@ impl Session for CassandraSession {
                 header: None,
                 stream: None,
             }));
+        }
+        if self.read_only && !reads(&word) {
+            return Err(DbError::read_only(trf(
+                "The connection is read-only: {} changes data",
+                &[&word],
+            )));
         }
         if params.is_empty() {
             let mut st = Statement::new(cql).with_page_size(PAGE_SIZE);
@@ -1281,7 +1388,6 @@ fn update_header(
     result: scylla::response::query_result::QueryResult,
     word: &str,
 ) -> DbResult<ResultHeader> {
-    let _ = Duration::ZERO;
     if result.is_rows() {
         let rows = result.into_rows_result().map_err(err)?;
         // Lightweight transactions report `[applied]`.
@@ -1374,5 +1480,237 @@ mod tests {
         assert_eq!(decimal_text(&d), "-1");
         let v = scylla::value::CqlVarint::from_signed_bytes_be_slice(&[0x01, 0x00]);
         assert_eq!(varint_text(&v), "256");
+    }
+
+    /// `n` as big-endian two's complement bytes of `len` bytes.
+    fn be(n: i128, len: usize) -> Vec<u8> {
+        let b = n.to_be_bytes();
+        let fill = if n < 0 { 0xff } else { 0 };
+        let mut out = vec![fill; len.saturating_sub(16)];
+        out.extend_from_slice(&b[16usize.saturating_sub(len)..]);
+        out
+    }
+
+    #[test]
+    fn big_varints_and_decimals_are_exact() {
+        let varint =
+            |b: &[u8]| varint_text(&scylla::value::CqlVarint::from_signed_bytes_be_slice(b));
+        for n in [
+            0i128,
+            1,
+            -1,
+            127,
+            -128,
+            255,
+            -256,
+            i64::MAX as i128,
+            i128::MIN,
+            i128::MAX,
+        ] {
+            assert_eq!(varint(&be(n, 16)), n.to_string());
+            // Sign extension to more bytes does not change the value.
+            assert_eq!(varint(&be(n, 24)), n.to_string());
+        }
+        assert_eq!(varint(&[]), "0");
+        assert_eq!(varint(&[0x80]), "-128");
+        assert_eq!(varint(&[0x00, 0xff]), "255");
+        // 2^128 and -(2^128): 17 bytes.
+        let mut two_128 = vec![0x01];
+        two_128.extend([0u8; 16]);
+        assert_eq!(varint(&two_128), "340282366920938463463374607431768211456");
+        let mut minus = vec![0xff];
+        minus.extend([0u8; 16]);
+        assert_eq!(varint(&minus), "-340282366920938463463374607431768211456");
+        // 10^40 - 1 (17 bytes).
+        let n: Vec<u8> = {
+            let digits = "9".repeat(40);
+            let mut v: Vec<u8> = vec![0];
+            for d in digits.bytes() {
+                let mut carry = u32::from(d - b'0');
+                for b in v.iter_mut().rev() {
+                    let x = u32::from(*b) * 10 + carry;
+                    *b = (x & 0xff) as u8;
+                    carry = x >> 8;
+                }
+                while carry > 0 {
+                    v.insert(0, (carry & 0xff) as u8);
+                    carry >>= 8;
+                }
+                if v[0] & 0x80 != 0 {
+                    v.insert(0, 0);
+                }
+            }
+            v
+        };
+        assert!(n.len() > 16);
+        assert_eq!(varint(&n), "9".repeat(40));
+        let dec = |b: &[u8], scale: i32| {
+            decimal_text(
+                &scylla::value::CqlDecimal::from_signed_be_bytes_slice_and_exponent(b, scale),
+            )
+        };
+        assert_eq!(
+            dec(&n, 20),
+            format!("{}.{}", "9".repeat(20), "9".repeat(20))
+        );
+        assert_eq!(dec(&n, 45), format!("0.00000{}", "9".repeat(40)));
+        assert_eq!(dec(&minus, 2), "-3402823669209384634633746074317682114.56");
+        assert_eq!(dec(&[0x30, 0x39], -2), "1234500");
+        assert_eq!(dec(&[0x00], -3), "0");
+        assert_eq!(dec(&[0x00], 2), "0.00");
+        assert_eq!(dec(&[0xfb], 1), "-0.5");
+        // Huge exponents stay short.
+        assert_eq!(dec(&[0x0f], i32::MIN), "1.5E+2147483649");
+        assert_eq!(dec(&[0x07], i32::MAX), "7E-2147483647");
+    }
+
+    #[test]
+    fn collections_are_json() {
+        let list = ColumnType::Collection {
+            frozen: false,
+            typ: CollectionType::List(Box::new(ColumnType::Native(NativeType::Int))),
+        };
+        assert_eq!(kind_of(&list), DataKind::Json);
+        assert_eq!(
+            kind_of(&ColumnType::Tuple(vec![ColumnType::Native(
+                NativeType::Int
+            )])),
+            DataKind::Json
+        );
+        for t in [
+            "list<int>",
+            "set<text>",
+            "map<text, int>",
+            "frozen<address>",
+            "tuple<int, text>",
+            "vector<float, 3>",
+        ] {
+            assert_eq!(kind_of_text(t), DataKind::Json, "{t}");
+        }
+        assert!(matches!(
+            to_value(&CqlValue::Set(vec![CqlValue::Int(1)])),
+            Value::Json(_)
+        ));
+    }
+
+    #[test]
+    fn read_only_statements() {
+        for r in [
+            "SELECT * FROM t",
+            "  -- c\nselect 1",
+            "DESCRIBE TABLES",
+            "desc keyspaces",
+            "LIST ROLES",
+            "USE ks",
+            "/* x */ SELECT now() FROM system.local",
+        ] {
+            assert!(reads(&first_word(r)), "{r}");
+        }
+        for w in [
+            "INSERT INTO t (a) VALUES (1)",
+            "UPDATE t SET a = 1 WHERE k = 1",
+            "DELETE FROM t WHERE k = 1",
+            "TRUNCATE t",
+            "DROP TABLE t",
+            "CREATE TABLE t (k int PRIMARY KEY)",
+            "ALTER TABLE t ADD c int",
+            "BEGIN BATCH INSERT INTO t (a) VALUES (1); APPLY BATCH",
+            "GRANT SELECT ON t TO r",
+            "-- SELECT\nDELETE FROM t WHERE k = 1",
+        ] {
+            assert!(!reads(&first_word(w)), "{w}");
+        }
+    }
+
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----\nMIIBpDCCAUmgAwIBAgIUL2XsEFf1kDk7vY67A16GzGsrhuowCgYIKoZIzj0EAwIw\nHjEcMBoGA1UEAwwTVGVybmFyeUdyaWQgVGVzdCBDQTAgFw0yMDAxMDEwMDAwMDBa\nGA8yMTIwMDEwMTAwMDAwMFowHjEcMBoGA1UEAwwTVGVybmFyeUdyaWQgVGVzdCBD\nQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABLU6noWJYkgaGqqgE5iWtmEW1w2M\n6ZTOqqfnt/xCrUcLhVazZCwfOzyvc/uhxYp+CfW0Ah9/Lj5JE5TJYjt6W3KjYzBh\nMB0GA1UdDgQWBBQfodv+SRCKWh6Gln6RIZw7gngPSjAfBgNVHSMEGDAWgBQfodv+\nSRCKWh6Gln6RIZw7gngPSjAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB\nBjAKBggqhkjOPQQDAgNJADBGAiEAkyy4iZASrY8b4eAYKphrjfBXb6YpCzh0SP3J\nUaeQ7uwCIQC37CXScPmDgqF4DB901w/aH1kQaoHAVWZNnwHj2SwZrA==\n-----END CERTIFICATE-----";
+    const TEST_LEAF: &str = "-----BEGIN CERTIFICATE-----\nMIIByjCCAXCgAwIBAgIUfm4Hoi9BID/yV7YbxaXVlUtLS/MwCgYIKoZIzj0EAwIw\nHjEcMBoGA1UEAwwTVGVybmFyeUdyaWQgVGVzdCBDQTAgFw0yMDAxMDEwMDAwMDBa\nGA8yMTIwMDEwMTAwMDAwMFowGTEXMBUGA1UEAwwOZGIuZXhhbXBsZS5jb20wWTAT\nBgcqhkjOPQIBBggqhkjOPQMBBwNCAAReZiG2q/kCwK4LFDMPaDkFnSiaxKxK8MQv\nB7g6wJ3kOAskvokrx1J4fwhss8bFtDtjuxNtXvWpn8ox6O/+a1Moo4GOMIGLMAkG\nA1UdEwQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBkG\nA1UdEQQSMBCCDmRiLmV4YW1wbGUuY29tMB0GA1UdDgQWBBSwqq02QUoDHQbiZlbP\n+czsilzpHDAfBgNVHSMEGDAWgBQfodv+SRCKWh6Gln6RIZw7gngPSjAKBggqhkjO\nPQQDAgNIADBFAiEArqqAL3dNLHpVa9h83vgUghY3fTLA97zYtvNADUwrus8CIC4o\nIYleM8pdcMARwuKGQLNGEhVvIgp1yxWhiQAwtSlM\n-----END CERTIFICATE-----";
+    const OTHER_CA: &str = "-----BEGIN CERTIFICATE-----\nMIIBjDCCATOgAwIBAgIUHdq6N87PZsyAAHUs4ZDbTlzs15gwCgYIKoZIzj0EAwIw\nEzERMA8GA1UEAwwIT3RoZXIgQ0EwIBcNMjAwMTAxMDAwMDAwWhgPMjEyMDAxMDEw\nMDAwMDBaMBMxETAPBgNVBAMMCE90aGVyIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0D\nAQcDQgAERBiKzd/EIJuGEGJ3rGwPNT8SeK7wBgPh9/9k1Z+vKuQTJ7GEo6w8jv8D\n/6LBCyxlwHwYBfeJR3bX5AIKOPYco6NjMGEwHQYDVR0OBBYEFPCOkIL+p3V2HIuz\nws/vx20pxI4/MB8GA1UdIwQYMBaAFPCOkIL+p3V2HIuzws/vx20pxI4/MA8GA1Ud\nEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0cAMEQCIES6\nL2y9bQs5gAUsQXj1bpRsfrLz3JI/4m7lowp9akwXAiAIniE+bylWukkJaws17XW3\nWS+wigzgL1vf1jipY6l0aQ==\n-----END CERTIFICATE-----";
+
+    fn der(pem: &str) -> rustls::pki_types::CertificateDer<'static> {
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::CertificateDer::from_pem_slice(pem.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn verify_ca_checks_the_chain_not_the_name() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = |ca: &str| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(der(ca)).unwrap();
+            CertVerifier {
+                provider: provider.clone(),
+                chain: Some(Arc::new(roots)),
+            }
+        };
+        // The leaf is for db.example.com; the node is reached by address.
+        for name in ["10.0.0.7", "db.example.com", "127.0.0.1"] {
+            let name = ServerName::try_from(name).unwrap();
+            assert!(
+                verifier(TEST_CA)
+                    .verify_server_cert(&der(TEST_LEAF), &[], &name, &[], UnixTime::now())
+                    .is_ok()
+            );
+            // Signed by a CA that is not trusted.
+            assert!(
+                verifier(OTHER_CA)
+                    .verify_server_cert(&der(TEST_LEAF), &[], &name, &[], UnixTime::now())
+                    .is_err()
+            );
+        }
+        // require: any certificate.
+        let any = CertVerifier {
+            provider: provider.clone(),
+            chain: None,
+        };
+        assert!(
+            any.verify_server_cert(
+                &der(OTHER_CA),
+                &[],
+                &ServerName::try_from("x").unwrap(),
+                &[],
+                UnixTime::now()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn tls_modes_and_ca_files() {
+        let dir = std::env::temp_dir().join(format!("ternarygrid-cql-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, TEST_CA).unwrap();
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "not a certificate").unwrap();
+        let params = |mode, ca: Option<&std::path::Path>, only: bool| {
+            let mut cfg = ternarygrid_core::config::ConnectionConfig::new(DbKind::Cassandra, "t");
+            cfg.ssl.mode = mode;
+            cfg.ssl.ca_cert = ca.map(|p| p.display().to_string());
+            cfg.ssl.only_custom_ca = only;
+            ConnectParams::from_config(&cfg, None)
+        };
+        assert!(
+            tls(&params(SslMode::Disable, None, false))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tls(&params(SslMode::Require, None, false))
+                .unwrap()
+                .is_some()
+        );
+        for mode in [SslMode::VerifyCa, SslMode::VerifyFull] {
+            assert!(tls(&params(mode, Some(&ca), true)).unwrap().is_some());
+            assert!(tls(&params(mode, Some(&ca), false)).unwrap().is_some());
+            let e = tls(&params(mode, Some(&empty), true)).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::Config, "{e:?}");
+            let e = tls(&params(mode, Some(&dir.join("missing.pem")), false)).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::Config, "{e:?}");
+        }
+        let only = root_store(&params(SslMode::VerifyCa, Some(&ca), true).ssl).unwrap();
+        assert_eq!(only.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

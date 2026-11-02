@@ -6,14 +6,15 @@
 //! page while the grid fetches, so a hash of millions of fields neither blocks
 //! the server (as `HGETALL` would) nor fills the memory.
 
-use crate::dialect::{RedisDialect, arg, split_args};
+use crate::dialect::{COUNT_COMMAND, RedisDialect, arg, split_args};
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
 use redis::{
     AsyncConnectionConfig, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
     Value as Reply,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 use ternarygrid_core::admin::{KillMode, Metric, SessionList, TabularData};
@@ -26,7 +27,7 @@ use ternarygrid_core::plan::QueryPlan;
 use ternarygrid_core::value::{ColumnMeta, DataKind};
 use ternarygrid_core::{
     CancelHandle, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions, QueryCursor,
-    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value,
+    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value, trf,
 };
 
 /// Elements read per round trip when paging a reply.
@@ -322,6 +323,134 @@ fn is_write(name: &str) -> bool {
     )
 }
 
+/// Commands that only read (the SQL classifier's Redis read list), the ones
+/// a read-only connection runs.
+fn is_read(name: &str, args: &[Vec<u8>]) -> bool {
+    let sub = args
+        .get(1)
+        .map(|a| String::from_utf8_lossy(a).to_ascii_uppercase())
+        .unwrap_or_default();
+    match name {
+        "CLIENT" => matches!(sub.as_str(), "LIST" | "INFO" | "GETNAME" | "ID"),
+        "CONFIG" => sub == "GET",
+        _ => matches!(
+            name,
+            "GET"
+                | "MGET"
+                | "GETRANGE"
+                | "STRLEN"
+                | "EXISTS"
+                | "TYPE"
+                | "TTL"
+                | "PTTL"
+                | "EXPIRETIME"
+                | "KEYS"
+                | "SCAN"
+                | "HGET"
+                | "HMGET"
+                | "HGETALL"
+                | "HKEYS"
+                | "HVALS"
+                | "HLEN"
+                | "HEXISTS"
+                | "HSCAN"
+                | "HSTRLEN"
+                | "HRANDFIELD"
+                | "LRANGE"
+                | "LINDEX"
+                | "LLEN"
+                | "LPOS"
+                | "SMEMBERS"
+                | "SISMEMBER"
+                | "SMISMEMBER"
+                | "SCARD"
+                | "SSCAN"
+                | "SRANDMEMBER"
+                | "SINTER"
+                | "SUNION"
+                | "SDIFF"
+                | "SINTERCARD"
+                | "ZRANGE"
+                | "ZREVRANGE"
+                | "ZRANGEBYSCORE"
+                | "ZREVRANGEBYSCORE"
+                | "ZRANGEBYLEX"
+                | "ZSCORE"
+                | "ZMSCORE"
+                | "ZRANK"
+                | "ZREVRANK"
+                | "ZCARD"
+                | "ZCOUNT"
+                | "ZLEXCOUNT"
+                | "ZSCAN"
+                | "ZRANDMEMBER"
+                | "XRANGE"
+                | "XREVRANGE"
+                | "XLEN"
+                | "XINFO"
+                | "XREAD"
+                | "XPENDING"
+                | "PFCOUNT"
+                | "BITCOUNT"
+                | "BITPOS"
+                | "GETBIT"
+                | "GEOPOS"
+                | "GEODIST"
+                | "GEOSEARCH"
+                | "JSON.GET"
+                | "JSON.TYPE"
+                | "INFO"
+                | "PING"
+                | "ECHO"
+                | "TIME"
+                | "DBSIZE"
+                | "LASTSAVE"
+                | "RANDOMKEY"
+                | "OBJECT"
+                | "MEMORY"
+                | "SLOWLOG"
+                | "LATENCY"
+                | "COMMAND"
+                | "SELECT"
+                | "DUMP"
+                | "PUBSUB"
+                | "TOUCH"
+        ),
+    }
+}
+
+/// 128-bit fingerprint of a scanned element (de-duplication without keeping
+/// every key).
+fn fingerprint(v: &Value) -> u128 {
+    let text;
+    let bytes: &[u8] = match v {
+        Value::Bytes(b) => b,
+        other => {
+            text = other.to_text();
+            text.as_bytes()
+        }
+    };
+    let half = |salt: u8| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        salt.hash(&mut h);
+        bytes.hash(&mut h);
+        h.finish()
+    };
+    (u128::from(half(0)) << 64) | u128::from(half(1))
+}
+
+/// The stream id right after `id` (`ms-seq`): XRANGE from it continues after
+/// `id` on every Redis version (the exclusive `(id` needs 6.2). `None` after
+/// the last possible id.
+fn next_stream_id(id: &str) -> Option<String> {
+    let (ms, seq) = id.split_once('-')?;
+    let (ms, seq): (u64, u64) = (ms.parse().ok()?, seq.parse().ok()?);
+    match seq.checked_add(1) {
+        Some(seq) => Some(format!("{ms}-{seq}")),
+        None => Some(format!("{}-0", ms.checked_add(1)?)),
+    }
+}
+
 /// How a reply is paged while the grid fetches.
 enum Paging {
     Done,
@@ -331,6 +460,8 @@ enum Paging {
         at: usize,
         pairs: Option<bool>,
         finished: bool,
+        /// Elements returned so far: SCAN may return one more than once.
+        seen: HashSet<u128>,
     },
     /// `LRANGE` / `ZRANGE … [WITHSCORES]` by index.
     Range {
@@ -371,6 +502,7 @@ impl RedisCursor {
                 at,
                 pairs: pair,
                 finished,
+                seen,
             } => {
                 let mut c = redis::Cmd::new();
                 for a in args.iter() {
@@ -385,14 +517,16 @@ impl RedisCursor {
                     .and_then(text_of)
                     .unwrap_or_else(|| "0".into());
                 let items = parts.get(1).cloned().unwrap_or(Reply::Array(Vec::new()));
-                match pair {
-                    Some(score) => self.rows.extend(pairs(&items, *score)),
-                    None => {
-                        if let Reply::Array(a) = &items {
-                            self.rows.extend(a.iter().map(|x| vec![value(x)]));
-                        }
-                    }
-                }
+                let rows = match (pair, &items) {
+                    (Some(score), _) => pairs(&items, *score),
+                    (None, Reply::Array(a)) => a.iter().map(|x| vec![value(x)]).collect(),
+                    (None, _) => Vec::new(),
+                };
+                // Keys (fields, members) once each.
+                self.rows.extend(
+                    rows.into_iter()
+                        .filter(|r| r.first().is_none_or(|k| seen.insert(fingerprint(k)))),
+                );
                 *finished = cursor == "0";
                 args[*at] = cursor.into_bytes();
                 Ok(true)
@@ -460,15 +594,19 @@ impl RedisCursor {
                     .map_err(err)?;
                 let rows = stream_rows(&reply);
                 let n = rows.len();
+                let mut last_id = false;
                 if let Some(last) = rows
                     .last()
                     .and_then(|r| r.first())
                     .map(|v| v.to_text().into_owned())
                 {
-                    *start = format!("({last}");
+                    match next_stream_id(&last) {
+                        Some(next) => *start = next,
+                        None => last_id = true,
+                    }
                 }
                 self.rows.extend(rows);
-                *finished = (n as i64) < PAGE;
+                *finished = (n as i64) < PAGE || last_id;
                 Ok(n > 0)
             }
         }
@@ -503,6 +641,38 @@ impl QueryCursor for RedisCursor {
     }
 }
 
+/// Resolves every name to the local forwarder of an SSH tunnel or proxy, so the
+/// connection URL can carry the real server name for TLS.
+struct ForwarderResolver {
+    host: String,
+}
+
+impl redis::io::AsyncDNSResolver for ForwarderResolver {
+    fn resolve<'a, 'b: 'a>(
+        &'a self,
+        _host: &'b str,
+        port: u16,
+    ) -> redis::RedisFuture<'a, Box<dyn Iterator<Item = std::net::SocketAddr> + Send + 'a>> {
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((self.host.as_str(), port))
+                    .await?
+                    .collect();
+            Ok(Box::new(addrs.into_iter())
+                as Box<dyn Iterator<Item = std::net::SocketAddr> + Send>)
+        })
+    }
+}
+
+/// The resolver for a TLS connection through a local forwarder (`tls_server_name`
+/// set to another name than `host`), `None` for a direct connection.
+fn forwarded_tls(params: &ConnectParams, tls: bool) -> Option<ForwarderResolver> {
+    let real = params.tls_server_name.as_deref()?;
+    (tls && !real.eq_ignore_ascii_case(&params.host)).then(|| ForwarderResolver {
+        host: params.host.clone(),
+    })
+}
+
 pub struct RedisSession {
     base: ConnectionInfo,
     settings: RedisConnectionInfo,
@@ -513,6 +683,8 @@ pub struct RedisSession {
     dialect: Arc<RedisDialect>,
     mode: TransactionMode,
     closed: bool,
+    /// Only commands that read run.
+    read_only: bool,
 }
 
 impl RedisSession {
@@ -521,9 +693,18 @@ impl RedisSession {
             params.ssl.mode,
             SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull
         );
+        // Through an SSH tunnel or proxy `host:port` is the local forwarder and
+        // `tls_server_name` the real server: TLS (SNI and the certificate check)
+        // must use the real name while the socket goes to the forwarder.
+        let forwarded = forwarded_tls(params, tls);
+        if tls {
+            // redis' rustls connector uses the process-wide provider; several
+            // may be compiled in, and rustls refuses to guess between them.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
         let addr = if tls {
             ConnectionAddr::TcpTls {
-                host: params.host.clone(),
+                host: params.tls_host().to_string(),
                 port: params.port,
                 insecure: params.ssl.mode != SslMode::VerifyFull,
                 tls_params: None,
@@ -555,9 +736,12 @@ impl RedisSession {
         {
             settings = settings.set_password(p);
         }
-        let config = AsyncConnectionConfig::new()
+        let mut config = AsyncConnectionConfig::new()
             .set_connection_timeout(Some(params.connect_timeout))
             .set_response_timeout(Some(Duration::from_secs(60)));
+        if let Some(resolver) = forwarded {
+            config = config.set_dns_resolver(resolver);
+        }
         let mut s = RedisSession {
             base,
             settings,
@@ -568,6 +752,7 @@ impl RedisSession {
             dialect: Arc::new(RedisDialect::new()),
             mode: TransactionMode::Auto,
             closed: false,
+            read_only: params.read_only,
         };
         let mut conn = s.conn(db).await?;
         let text: String = redis::cmd("INFO")
@@ -659,78 +844,8 @@ impl RedisSession {
         Ok(out)
     }
 
-    async fn key_type(&mut self, db: i64, key: &str) -> DbResult<String> {
-        let mut conn = self.conn(db).await?;
-        redis::cmd("TYPE")
-            .arg(key)
-            .query_async(&mut conn)
-            .await
-            .map_err(err)
-    }
-
-    async fn info_text(&mut self, section: Option<&str>) -> DbResult<String> {
-        let mut conn = self.conn(self.db).await?;
-        let mut c = redis::cmd("INFO");
-        if let Some(s) = section {
-            c.arg(s);
-        }
-        c.query_async(&mut conn).await.map_err(err)
-    }
-}
-
-#[async_trait]
-impl Session for RedisSession {
-    fn kind(&self) -> DbKind {
-        DbKind::Redis
-    }
-
-    fn dialect(&self) -> Arc<dyn Dialect> {
-        self.dialect.clone()
-    }
-
-    fn server_info(&self) -> &ServerInfo {
-        &self.info
-    }
-
-    fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {
-        None
-    }
-
-    async fn ping(&mut self) -> DbResult<()> {
-        let mut conn = self.conn(self.db).await?;
-        redis::cmd("PING")
-            .query_async::<String>(&mut conn)
-            .await
-            .map(|_| ())
-            .map_err(|e| DbError::connection(e.to_string()))
-    }
-
-    async fn close(&mut self) -> DbResult<()> {
-        self.conns.clear();
-        self.closed = true;
-        Ok(())
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed
-    }
-
-    async fn execute(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-        _opts: &ExecOptions,
-    ) -> DbResult<Box<dyn QueryCursor>> {
-        let mut args = split_args(sql).map_err(DbError::syntax)?;
-        // `?` placeholders take the parameters in order.
-        if !params.is_empty() {
-            let mut p = params.iter();
-            for a in args.iter_mut().filter(|a| a.as_slice() == b"?") {
-                if let Some(v) = p.next() {
-                    *a = v.to_text().into_owned().into_bytes();
-                }
-            }
-        }
+    /// Run one command (already split into arguments).
+    async fn run(&mut self, args: Vec<Vec<u8>>) -> DbResult<Box<dyn QueryCursor>> {
         let Some(first) = args.first() else {
             return Ok(Box::new(RedisCursor {
                 header: None,
@@ -800,6 +915,7 @@ impl Session for RedisSession {
                     at,
                     pairs: pair,
                     finished: false,
+                    seen: HashSet::new(),
                 },
             }));
         }
@@ -932,6 +1048,10 @@ impl Session for RedisSession {
                         a.iter().map(|x| vec![value(x)]).collect(),
                     )
                 }
+                // A string key's value (the column `table_definition` names).
+                other if matches!(name.as_str(), "GET" | "JSON.GET") => {
+                    (vec![text("value")], vec![vec![value(other)]])
+                }
                 other => (vec![text("reply")], vec![vec![value(other)]]),
             },
         };
@@ -941,6 +1061,136 @@ impl Session for RedisSession {
             conn,
             paging: Paging::Done,
         }))
+    }
+
+    /// [`COUNT_COMMAND`]: the number of rows `args` returns, for the data
+    /// tab's row count where no Redis command gives it. The command runs
+    /// again, so only one that reads (`SPOP` would remove more members).
+    async fn count_rows(&mut self, args: Vec<Vec<u8>>) -> DbResult<Box<dyn QueryCursor>> {
+        let name = args
+            .first()
+            .map(|a| String::from_utf8_lossy(a).to_ascii_uppercase())
+            .unwrap_or_default();
+        if !is_read(&name, &args) {
+            return Err(DbError::unsupported(trf(
+                "Counting the rows of {} (only commands that read can be counted)",
+                &[&if name.is_empty() {
+                    "nothing"
+                } else {
+                    name.as_str()
+                }],
+            )));
+        }
+        let mut cursor = self.run(args).await?;
+        let mut n = 0i64;
+        if let Some(ResultHeader::Rows(_)) = cursor.next_result().await? {
+            loop {
+                let rows = cursor.fetch(PAGE as usize).await?;
+                if rows.is_empty() {
+                    break;
+                }
+                n += rows.len() as i64;
+            }
+        }
+        cursor.close().await?;
+        Ok(Box::new(RedisCursor {
+            header: Some(ResultHeader::Rows(vec![ColumnMeta::new(
+                "count",
+                "integer",
+                DataKind::Int,
+            )])),
+            rows: VecDeque::from([vec![Value::Int(n)]]),
+            conn: self.conn(self.db).await?,
+            paging: Paging::Done,
+        }))
+    }
+
+    async fn key_type(&mut self, db: i64, key: &str) -> DbResult<String> {
+        let mut conn = self.conn(db).await?;
+        redis::cmd("TYPE")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(err)
+    }
+
+    async fn info_text(&mut self, section: Option<&str>) -> DbResult<String> {
+        let mut conn = self.conn(self.db).await?;
+        let mut c = redis::cmd("INFO");
+        if let Some(s) = section {
+            c.arg(s);
+        }
+        c.query_async(&mut conn).await.map_err(err)
+    }
+}
+
+#[async_trait]
+impl Session for RedisSession {
+    fn kind(&self) -> DbKind {
+        DbKind::Redis
+    }
+
+    fn dialect(&self) -> Arc<dyn Dialect> {
+        self.dialect.clone()
+    }
+
+    fn server_info(&self) -> &ServerInfo {
+        &self.info
+    }
+
+    fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {
+        None
+    }
+
+    async fn ping(&mut self) -> DbResult<()> {
+        let mut conn = self.conn(self.db).await?;
+        redis::cmd("PING")
+            .query_async::<String>(&mut conn)
+            .await
+            .map(|_| ())
+            .map_err(|e| DbError::connection(e.to_string()))
+    }
+
+    async fn close(&mut self) -> DbResult<()> {
+        self.conns.clear();
+        self.closed = true;
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        _opts: &ExecOptions,
+    ) -> DbResult<Box<dyn QueryCursor>> {
+        let mut args = split_args(sql).map_err(DbError::syntax)?;
+        // `?` placeholders take the parameters in order.
+        if !params.is_empty() {
+            let mut p = params.iter();
+            for a in args.iter_mut().filter(|a| a.as_slice() == b"?") {
+                if let Some(v) = p.next() {
+                    *a = v.to_text().into_owned().into_bytes();
+                }
+            }
+        }
+        let name = args
+            .first()
+            .map(|a| String::from_utf8_lossy(a).to_ascii_uppercase())
+            .unwrap_or_default();
+        if name == COUNT_COMMAND {
+            return self.count_rows(args.split_off(1)).await;
+        }
+        if self.read_only && !name.is_empty() && !is_read(&name, &args) {
+            return Err(DbError::read_only(trf(
+                "The connection is read-only: {} changes data",
+                &[&name],
+            )));
+        }
+        self.run(args).await
     }
 
     fn transaction_mode(&self) -> TransactionMode {
@@ -1345,6 +1595,47 @@ impl Session for RedisSession {
 mod tests {
     use super::*;
 
+    /// Through a tunnel the socket goes to the local forwarder while TLS names
+    /// the real server (SNI, certificate check).
+    #[tokio::test]
+    async fn tls_through_a_forwarder_uses_the_real_server_name() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hello = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            buf.truncate(n);
+            buf
+        });
+        let mut cfg = ternarygrid_core::ConnectionConfig::new(DbKind::Redis, "t");
+        // verify-full: redis-rs sends no SNI when it doesn't verify.
+        cfg.ssl.mode = SslMode::VerifyFull;
+        let mut params = ConnectParams::from_config(&cfg, None);
+        params.host = "127.0.0.1".into();
+        params.port = port;
+        params.tls_server_name = Some("redis.example.invalid".into());
+        params.connect_timeout = Duration::from_secs(2);
+        // The handshake fails (nobody answers it); what matters is where it went.
+        let _ = tokio::time::timeout(Duration::from_secs(5), RedisSession::connect(&params)).await;
+        let hello = hello.await.unwrap();
+        assert!(!hello.is_empty(), "the forwarder got no connection");
+        assert!(
+            hello.windows(21).any(|w| w == b"redis.example.invalid"),
+            "the ClientHello does not name the real server"
+        );
+
+        // Direct connections need no resolver.
+        params.tls_server_name = None;
+        assert!(forwarded_tls(&params, true).is_none());
+        params.tls_server_name = Some("redis.example.invalid".into());
+        assert!(forwarded_tls(&params, false).is_none());
+    }
+
     #[test]
     fn replies_become_rows() {
         let flat = Reply::Array(vec![
@@ -1388,5 +1679,72 @@ mod tests {
         let (cols, rows) = client_rows("id=3 addr=127.0.0.1:5 name= db=0 cmd=client|list\n");
         assert_eq!(cols, ["id", "addr", "name", "db", "cmd"]);
         assert_eq!(rows[0][0], Value::Int(3));
+    }
+
+    #[test]
+    fn read_only_runs_reads_only() {
+        let read = |line: &str| {
+            let args = split_args(line).unwrap();
+            is_read(
+                &String::from_utf8_lossy(&args[0]).to_ascii_uppercase(),
+                &args,
+            )
+        };
+        for r in [
+            "GET k",
+            "HGETALL h",
+            "SCAN 0 MATCH x*",
+            "XRANGE s - +",
+            "INFO",
+            "CLIENT LIST",
+            "client info",
+            "CONFIG GET maxmemory",
+            "SELECT 3",
+            "JSON.GET j",
+        ] {
+            assert!(read(r), "{r}");
+        }
+        for w in [
+            "SET k v",
+            "DEL k",
+            "FLUSHALL",
+            "SPOP s",
+            "EVAL \"return 1\" 0",
+            "SORT l STORE x",
+            "CLIENT KILL ID 3",
+            "CLIENT KILL USER blacklist",
+            "CONFIG SET maxmemory 1",
+            "XREADGROUP GROUP g c STREAMS s >",
+            "TERNARYGRID.COUNT GET k",
+        ] {
+            assert!(!read(w), "{w}");
+        }
+    }
+
+    #[test]
+    fn scan_elements_and_stream_ids() {
+        assert_eq!(
+            fingerprint(&Value::Text("a".into())),
+            fingerprint(&Value::Text("a".into()))
+        );
+        assert_ne!(
+            fingerprint(&Value::Text("a".into())),
+            fingerprint(&Value::Text("b".into()))
+        );
+        assert_ne!(
+            fingerprint(&Value::Bytes(vec![0xff].into())),
+            fingerprint(&Value::Bytes(vec![0xfe].into()))
+        );
+        assert_eq!(next_stream_id("1-0").as_deref(), Some("1-1"));
+        assert_eq!(
+            next_stream_id("1700000000000-41").as_deref(),
+            Some("1700000000000-42")
+        );
+        assert_eq!(
+            next_stream_id(&format!("5-{}", u64::MAX)).as_deref(),
+            Some("6-0")
+        );
+        assert_eq!(next_stream_id(&format!("{0}-{0}", u64::MAX)), None);
+        assert_eq!(next_stream_id("junk"), None);
     }
 }

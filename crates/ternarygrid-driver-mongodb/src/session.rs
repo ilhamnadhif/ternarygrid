@@ -23,7 +23,7 @@ use ternarygrid_core::plan::{PlanNode, QueryPlan};
 use ternarygrid_core::value::{ColumnMeta, DataKind};
 use ternarygrid_core::{
     CancelHandle, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions, QueryCursor,
-    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value,
+    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value, trf,
 };
 
 /// Documents per server batch.
@@ -184,7 +184,8 @@ fn kind_of(b: &Bson) -> (DataKind, &'static str) {
         Bson::DateTime(_) => (DataKind::DateTimeTz, "date"),
         Bson::Binary(_) => (DataKind::Binary, "binData"),
         Bson::Document(_) => (DataKind::Json, "object"),
-        Bson::Array(_) => (DataKind::Array, "array"),
+        // Arrays arrive as JSON text (`Value::Json`), like documents.
+        Bson::Array(_) => (DataKind::Json, "array"),
         Bson::Timestamp(_) => (DataKind::Text, "timestamp"),
         Bson::RegularExpression(_) => (DataKind::Text, "regex"),
         _ => (DataKind::Other, "null"),
@@ -349,6 +350,8 @@ pub struct MongoSession {
     dialect: Arc<MongoDialect>,
     mode: TransactionMode,
     closed: bool,
+    /// Statements that change data are refused.
+    read_only: bool,
 }
 
 fn doc_arg(args: &[Bson], i: usize) -> DbResult<Document> {
@@ -376,6 +379,32 @@ fn str_arg(args: &[Bson], i: usize) -> DbResult<String> {
         Some(Bson::String(s)) => Ok(s.clone()),
         _ => Err(DbError::syntax("expected a string")),
     }
+}
+
+/// The pipeline of `aggregate(…)`: an array of stages, or the stages as
+/// separate arguments (the old shell's form).
+fn pipeline_arg(args: &[Bson]) -> DbResult<Vec<Document>> {
+    match args.first() {
+        Some(Bson::Array(a)) => a
+            .iter()
+            .map(|s| {
+                s.as_document()
+                    .cloned()
+                    .ok_or_else(|| DbError::syntax("a pipeline stage must be a document"))
+            })
+            .collect(),
+        Some(Bson::Document(_)) => Ok(args
+            .iter()
+            .filter_map(|a| a.as_document().cloned())
+            .collect()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// `true` when a chain ends in `.count()` / `.size()` / `.itcount()`.
+fn counted(rest: &[Call]) -> bool {
+    rest.iter()
+        .any(|c| matches!(c.name.as_str(), "count" | "size" | "itcount"))
 }
 
 /// `find` with its chained cursor methods.
@@ -451,6 +480,7 @@ impl MongoSession {
             dialect: Arc::new(MongoDialect::new()),
             mode: TransactionMode::Auto,
             closed: false,
+            read_only: params.read_only,
         })
     }
 
@@ -555,6 +585,15 @@ impl MongoSession {
                     database.drop().await.map_err(err)?;
                     return Ok(Box::new(MongoCursor::update("dropDatabase", None)));
                 }
+                "createView" => {
+                    let (name, source) = (str_arg(&first.args, 0)?, str_arg(&first.args, 1)?);
+                    let pipeline = pipeline_arg(first.args.get(2..).unwrap_or_default())?;
+                    database
+                        .run_command(doc! {"create": name, "viewOn": source, "pipeline": pipeline})
+                        .await
+                        .map_err(err)?;
+                    return Ok(Box::new(MongoCursor::update("createView", None)));
+                }
                 other => {
                     return Err(DbError::unsupported(format!(
                         "db.{other}() is not supported; use db.runCommand({{…}})"
@@ -574,10 +613,7 @@ impl MongoSession {
         Ok(Box::new(match first.name.as_str() {
             "find" | "findOne" => {
                 let (spec, tail) = find_spec(first, rest)?;
-                if tail
-                    .iter()
-                    .any(|t| t == "count" || t == "size" || t == "itcount")
-                {
+                if counted(rest) {
                     let mut c = coll.count_documents(spec.filter);
                     if let Some(l) = spec.limit.filter(|l| *l > 0) {
                         c = c.limit(l as u64);
@@ -619,27 +655,29 @@ impl MongoSession {
                 }
             }
             "aggregate" => {
-                let pipeline: Vec<Document> = match first.args.first() {
-                    Some(Bson::Array(a)) => a
-                        .iter()
-                        .map(|s| {
-                            s.as_document().cloned().ok_or_else(|| {
-                                DbError::syntax("a pipeline stage must be a document")
-                            })
-                        })
-                        .collect::<DbResult<_>>()?,
-                    // Stages as separate arguments (the old shell's form).
-                    Some(Bson::Document(_)) => first
-                        .args
-                        .iter()
-                        .filter_map(|a| a.as_document().cloned())
-                        .collect(),
-                    _ => Vec::new(),
-                };
+                let mut pipeline = pipeline_arg(&first.args)?;
                 if rest.iter().any(|c| c.name == "explain") {
                     let r = database.run_command(doc! {"explain": {"aggregate": &coll_name, "pipeline": pipeline, "cursor": {}}, "verbosity": "queryPlanner"}).await.map_err(err)?;
                     let (cols, rows) = reply_rows(r);
                     MongoCursor::rows(cols, rows)
+                } else if counted(rest) {
+                    // The number of documents the pipeline returns (none: no `$count` document).
+                    pipeline.push(doc! {"$count": "count"});
+                    let n = coll
+                        .aggregate(pipeline)
+                        .await
+                        .map_err(err)?
+                        .try_next()
+                        .await
+                        .map_err(err)?
+                        .and_then(|d| match d.get("count") {
+                            Some(Bson::Int32(n)) => Some(*n as i64),
+                            Some(Bson::Int64(n)) => Some(*n),
+                            Some(Bson::Double(n)) => Some(*n as i64),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    one(n.max(0) as u64, "count")
                 } else {
                     MongoCursor::stream(
                         coll.aggregate(pipeline)
@@ -897,6 +935,14 @@ impl Session for MongoSession {
         _opts: &ExecOptions,
     ) -> DbResult<Box<dyn QueryCursor>> {
         let cmd = shell::parse(sql).map_err(DbError::syntax)?;
+        if self.read_only
+            && let Some(what) = shell::write_reason(&cmd)
+        {
+            return Err(DbError::read_only(trf(
+                "The connection is read-only: {} changes data",
+                &[&what],
+            )));
+        }
         self.run(cmd).await
     }
 
@@ -1108,7 +1154,30 @@ impl Session for MongoSession {
         Ok(t)
     }
 
+    /// `createCollection` with the indexes, or `createView` of a view.
     async fn object_ddl(&mut self, obj: &ObjectRef) -> DbResult<String> {
+        let db = self.db_name(obj.schema.as_deref());
+        let spec: Option<mongodb::results::CollectionSpecification> = self
+            .client
+            .database(&db)
+            .list_collections()
+            .filter(doc! {"name": &obj.name})
+            .await
+            .map_err(err)?
+            .try_next()
+            .await
+            .map_err(err)?;
+        if let Some(s) =
+            spec.filter(|s| s.collection_type == mongodb::results::CollectionType::View)
+        {
+            let pipeline = s.options.pipeline.unwrap_or_default();
+            return Ok(view_ddl(
+                &db,
+                &obj.name,
+                s.options.view_on.as_deref().unwrap_or_default(),
+                &pipeline,
+            ));
+        }
         let t = self.table_definition(obj).await?;
         Ok(self.dialect.ddl().create_table(&t, false).join("\n"))
     }
@@ -1205,7 +1274,7 @@ impl Session for MongoSession {
                 f
             }
             "aggregate" => {
-                doc! {"aggregate": &coll, "pipeline": calls[0].args.first().cloned().unwrap_or(Bson::Array(Vec::new())), "cursor": {}}
+                doc! {"aggregate": &coll, "pipeline": pipeline_arg(&calls[0].args)?, "cursor": {}}
             }
             "countDocuments" | "count" => {
                 doc! {"count": &coll, "query": doc_arg(&calls[0].args, 0)?}
@@ -1367,6 +1436,19 @@ impl Session for MongoSession {
     }
 }
 
+/// `db.getSiblingDB(…).createView(name, source, pipeline)`.
+fn view_ddl(db: &str, name: &str, view_on: &str, pipeline: &[Document]) -> String {
+    let s = |v: &str| to_shell(&Bson::String(v.to_string()));
+    let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    format!(
+        "db.getSiblingDB({}).createView({}, {}, {})",
+        s(db),
+        s(name),
+        s(view_on),
+        to_shell(&Bson::Array(stages))
+    )
+}
+
 fn plan_node(d: &Document) -> PlanNode {
     let mut n = PlanNode::new(d.get_str("stage").unwrap_or("STAGE"));
     n.index = d.get_str("indexName").ok().map(str::to_string);
@@ -1434,7 +1516,15 @@ mod tests {
             cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             ["_id", "name", "tags", "age"]
         );
-        assert_eq!(cols[2].kind, DataKind::Array);
+        // Arrays are JSON values, like documents.
+        assert_eq!(
+            (cols[2].kind, cols[2].type_name.as_str()),
+            (DataKind::Json, "array")
+        );
+        assert_eq!(
+            value(&docs[0].get("tags").cloned().unwrap()),
+            Value::Json("[\"x\"]".into())
+        );
         let r = row(&docs[1], &cols);
         assert_eq!(
             r.to_vec(),
