@@ -46,8 +46,9 @@ struct Page {
     /// In-memory size when loaded.
     bytes: usize,
     last_used: u64,
-    /// Location of the current on-disk copy.
-    disk: Option<(u64, u32)>,
+    /// Location of the current on-disk copy: offset, length, and the size of
+    /// the slot it occupies (an edited page is rewritten into its slot when it fits).
+    disk: Option<(u64, u32, u32)>,
     /// In-memory content differs from the disk copy.
     dirty: bool,
 }
@@ -177,7 +178,7 @@ impl RowStore {
         if self.pages[p].rows.is_some() {
             return true;
         }
-        let Some((offset, len)) = self.pages[p].disk else { return false };
+        let Some((offset, len, _)) = self.pages[p].disk else { return false };
         let Some(spill) = self.spill.as_mut() else { return false };
         let mut buf = vec![0u8; len as usize];
         if let Err(e) = spill.file.seek(SeekFrom::Start(offset)).and_then(|_| spill.file.read_exact(&mut buf)) {
@@ -238,14 +239,21 @@ impl RowStore {
             }
             let buf = encode_page(self.pages[p].rows.as_ref().expect("resident"));
             let spill = self.spill.as_mut().expect("spill file");
-            let offset = spill.end;
+            // A page edited after it was spilled is written over its old copy
+            // when it still fits, so repeated edits don't grow the file.
+            let (offset, slot) = match self.pages[p].disk {
+                Some((old, _, slot)) if buf.len() <= slot as usize => (old, slot),
+                _ => (spill.end, buf.len() as u32),
+            };
             if let Err(e) = spill.file.seek(SeekFrom::Start(offset)).and_then(|_| spill.file.write_all(&buf)) {
                 tracing::warn!("row store: spill write failed, keeping rows in memory: {e}");
                 self.spill_failed = true;
                 return false;
             }
-            spill.end += buf.len() as u64;
-            self.pages[p].disk = Some((offset, buf.len() as u32));
+            if offset == spill.end {
+                spill.end += u64::from(slot);
+            }
+            self.pages[p].disk = Some((offset, buf.len() as u32, slot));
             self.pages[p].dirty = false;
         }
         let bytes = self.pages[p].bytes;
@@ -451,6 +459,26 @@ mod tests {
         });
         assert_eq!(count, 50_000);
         assert_eq!(s.slice(5, 8).len(), 3);
+    }
+
+    #[test]
+    fn edited_spilled_pages_reuse_their_slot() {
+        let mut s = RowStore::new(64 * 1024).with_page_rows(50);
+        for i in 0..5_000 {
+            s.push(row(i));
+        }
+        let end = |s: &RowStore| s.spill.as_ref().map(|f| f.end).unwrap_or(0);
+        // Edit a spilled page, evict it again and repeat: the copy fits its old slot.
+        assert!(s.set_cell(10, 1, Value::text("x")));
+        s.release_memory();
+        let after_first = end(&s);
+        for k in 0..20 {
+            assert!(s.set_cell(10, 1, Value::text(format!("y{k}"))));
+            s.release_memory();
+        }
+        assert_eq!(end(&s), after_first, "the spill file grew");
+        assert_eq!(s.cell(10, 1).unwrap(), &Value::text("y19"));
+        assert_eq!(s.get(4_999).unwrap(), &row(4_999));
     }
 
     #[test]

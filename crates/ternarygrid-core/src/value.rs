@@ -940,10 +940,14 @@ pub fn is_sql_expression(text: &str) -> bool {
     (call || keyword) && balanced(t)
 }
 
-/// Parentheses closed and quotes ended (outside of quotes).
+/// Parentheses closed and quotes ended (outside of quotes), and no statement
+/// separator or comment outside of quotes: the text is inserted verbatim into
+/// `UPDATE … SET c = <text> WHERE …`, where `--`, `/*`, `#` or `;` would cut
+/// off the `WHERE` clause.
 fn balanced(t: &str) -> bool {
     let (mut depth, mut quote) = (0i32, None);
-    for c in t.chars() {
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => {}
@@ -956,6 +960,9 @@ fn balanced(t: &str) -> bool {
                         return false;
                     }
                 }
+                ';' | '#' => return false,
+                '-' if chars.peek() == Some(&'-') => return false,
+                '/' if chars.peek() == Some(&'*') => return false,
                 _ => {}
             },
         }
@@ -1192,6 +1199,14 @@ mod tests {
         }
         for t in ["", "now", "abc", "2025-11-24", "1(2)", "now(", "now())", "f('a)", "{\"a\": 1}", "(1)", "current_timestamps"] {
             assert!(!is_sql_expression(t), "{t}");
+        }
+        // Inserted verbatim before `WHERE`: a comment or a second statement would cut it off.
+        for t in ["abs(1) --", "abs(1) -- x", "now() /* x */", "now(); DELETE FROM t", "now() # x", "CURRENT_DATE --"] {
+            assert!(!is_sql_expression(t), "{t}");
+        }
+        // Inside quotes they are text.
+        for t in ["concat('a--b')", "concat('a;b', \"c/*d\")", "datetime('now', '#')"] {
+            assert!(is_sql_expression(t), "{t}");
         }
     }
 
