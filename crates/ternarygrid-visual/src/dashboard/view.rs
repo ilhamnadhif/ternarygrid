@@ -133,11 +133,7 @@ pub fn show_dashboard_with(
     ui.spacing_mut().item_spacing.y = 0.0;
     parts::toolbar(ui, |ui| {
         if let Some(t) = &layout.title {
-            ui.label(
-                RichText::new(t.as_str())
-                    .font(style::semibold(ui.ctx(), 13.0))
-                    .color(p.text),
-            );
+            kit::semibold_label(ui, t, 13.0, p.text);
             kit::vdivider(ui, 18.0);
         }
         lead(ui);
@@ -204,11 +200,7 @@ pub fn show_dashboard_with(
                         if i > 0 {
                             ui.add_space(10.0);
                         }
-                        ui.label(
-                            RichText::new(group.as_str())
-                                .font(style::semibold(ui.ctx(), 13.0))
-                                .color(p.text),
-                        );
+                        kit::semibold_label(ui, &group, 13.0, p.text);
                         let avail = ui.available_width();
                         let gap = 12.0;
                         let cols = layout
@@ -219,14 +211,17 @@ pub fn show_dashboard_with(
                             )
                             .max(1);
                         let card_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).max(120.0);
-                        for row in metrics.chunks(cols) {
+                        // Rows 12 apart (the spacing and 4), groups 18 (the spacing and 10).
+                        for (r, row) in metrics.chunks(cols).enumerate() {
+                            if r > 0 {
+                                ui.add_space(4.0);
+                            }
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = gap;
                                 for m in row {
                                     metric_card(ui, m, now, window, card_w, layout.chart_height);
                                 }
                             });
-                            ui.add_space(4.0);
                         }
                     }
                 });
@@ -344,13 +339,10 @@ fn metric_card(ui: &mut Ui, m: &MetricHistory, now: f64, window: f64, width: f32
         unit_g,
         p.text_faint,
     );
-    let value_r = painter.text(
-        pos2(inner.right() - unit_w, head_y),
-        Align2::RIGHT_CENTER,
-        value,
-        style::semibold(ui.ctx(), 17.0),
-        p.text,
-    );
+    let value_g = painter.layout_no_wrap(value, style::semibold(ui.ctx(), 17.0), p.text);
+    let value_r =
+        Align2::RIGHT_CENTER.anchor_size(pos2(inner.right() - unit_w, head_y), value_g.size());
+    kit::paint_semibold(&painter, value_r.min, value_g, p.text);
     let label = crate::common::text::truncate_to_width(
         m.label.as_str(),
         (value_r.left() - inner.left() - 8.0).max(20.0),

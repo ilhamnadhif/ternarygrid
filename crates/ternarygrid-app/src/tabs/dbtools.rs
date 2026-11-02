@@ -308,15 +308,19 @@ pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash:
     let current =
         cx.conns.config(value).map(|c| c.name.clone()).unwrap_or_else(|| if value.is_empty() { tr("Choose…").to_string() } else { tr("(missing connection)").to_string() });
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(width).show_ui(ui, |ui| {
-        for c in cx.conns.configs() {
-            let label = format!("{} {}", crate::nav::db_icon(c.kind), c.name);
-            if ui.selectable_label(*value == c.id, label).clicked() && *value != c.id {
-                *value = c.id.clone();
-                changed = true;
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(width).show_ui(
+        ui,
+        |ui| {
+            ternarygrid_ui::kit::menu_look(ui, width);
+            for c in cx.conns.configs() {
+                let label = format!("{} {}", crate::nav::db_icon(c.kind), c.name);
+                if crate::tabs::transfer::wizard::choice(ui, *value == c.id, &label) && *value != c.id {
+                    *value = c.id.clone();
+                    changed = true;
+                }
             }
-        }
-    });
+        },
+    );
     changed
 }
 
@@ -327,13 +331,14 @@ pub(crate) fn schema_field(ui: &mut Ui, cx: &mut AppContext, id: impl std::hash:
         let backend = cx.backend;
         if let Some(live) = cx.conns.live_mut(conn) {
             let r = ui.menu_button(icon::CARET_DOWN, |ui| {
+                ternarygrid_ui::kit::menu_look(ui, 200.0);
                 let main = live.main.clone();
                 live.meta.request_schemas(backend, &main, None);
                 match live.meta.schemas_of(None).get() {
                     Some(list) => {
                         egui::ScrollArea::vertical().id_salt((id, "schemas")).max_height(280.0).show(ui, |ui| {
                             for s in list.iter().filter(|s| !s.is_system) {
-                                if ui.selectable_label(*value == s.name, &s.name).clicked() {
+                                if crate::tabs::transfer::wizard::choice(ui, *value == s.name, &s.name) {
                                     *value = s.name.clone();
                                     changed = true;
                                     ui.close();

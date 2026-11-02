@@ -11,8 +11,9 @@ use ternarygrid_ui::kit::{self, Kind};
 use ternarygrid_ui::parts::{self, Tone};
 use ternarygrid_ui::style;
 
-/// The size of a wizard's window: the design's 940 × 645 (the pop-up adds its header).
-pub(crate) const WINDOW: Vec2 = vec2(940.0, 620.0);
+/// The size of a wizard's window inside its border, as the design's modal (940 × 643, the
+/// header, the steps and the footer included).
+pub(crate) const WINDOW: Vec2 = vec2(940.0, 643.0);
 
 /// Space between the parts of a section.
 pub(crate) const GAP: f32 = 10.0;
@@ -65,7 +66,8 @@ fn bottom_panel_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
         });
 }
 
-/// The scrolling body on the surface colour.
+/// The scrolling body on the surface colour, padded 22 × 18 (4 at the bottom: the design's body
+/// is a fixed 470 high and its longest pages, the export formats, reach 4 above the footer).
 pub(crate) fn body(ui: &mut Ui, id: Id, add: impl FnOnce(&mut Ui)) {
     body_dyn(ui, id, &mut once(add));
 }
@@ -74,7 +76,7 @@ fn body_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
     egui::CentralPanel::default().frame(Frame::new().fill(p.surface)).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
-            Frame::new().inner_margin(Margin { left: 22, right: 22, top: 18, bottom: 18 }).show(ui, |ui| {
+            Frame::new().inner_margin(Margin { left: 22, right: 22, top: 18, bottom: 4 }).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 style::form_spacing(ui);
                 ui.spacing_mut().item_spacing.y = GAP;
@@ -180,19 +182,21 @@ fn section_dyn(ui: &mut Ui, text: &str, h: f32, right: &mut dyn FnMut(&mut Ui)) 
     });
 }
 
-/// The title of a running or finished step ("Exporting…").
+/// The title of a running step ("Exporting…"), 16 above the progress (the body's parts are
+/// 16 apart in the design).
 pub(crate) fn title(ui: &mut Ui, text: &str) {
     let p = style::pal(ui);
-    ui.label(RichText::new(text).font(style::semibold(ui.ctx(), 15.0)).color(p.text));
+    kit::semibold_label(ui, text, 15.0, p.text);
+    ui.add_space(16.0 - GAP);
 }
 
 /// The result of a run: its icon and a large title.
 pub(crate) fn outcome(ui: &mut Ui, tone: Tone, text: &str, extra: Option<&str>) {
     let p = style::pal(ui);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
+    // As high as its 20 pt icon, not as a form control.
+    row_dyn(ui, 20.0, 8.0, &mut |ui| {
         ui.label(RichText::new(tone.icon()).font(style::icon_font(20.0)).color(tone.color(&p)));
-        ui.add(egui::Label::new(RichText::new(text).font(style::semibold(ui.ctx(), 16.0)).color(p.text)).wrap());
+        kit::semibold_label(ui, text, 16.0, p.text);
         if let Some(e) = extra {
             ui.label(RichText::new(e).size(12.0).color(p.text_faint));
         }
@@ -254,19 +258,20 @@ pub(crate) fn fact_grid(ui: &mut Ui, facts: &[(&str, String, Option<Color32>)]) 
 }
 
 /// Read-only form rows in `cols` columns (24 apart): a muted label `label_w` wide, 16 from its
-/// value; rows 22 high and `gap` apart, the label 6 lower than the value (as the design's form
-/// rows whose control is plain text).
+/// value; rows 21.5 high and `gap` apart, as the design's form rows whose control is plain text
+/// (there the text sits on the 16 px line of the page's font: 4 below the row's top, the label 7).
 fn fact_rows(ui: &mut Ui, facts: &[(&str, String, Option<Color32>)], cols: usize, label_w: f32, gap: f32) {
     let p = style::pal(ui);
     let (left, top, w) = (ui.cursor().left(), ui.cursor().top(), ui.available_width());
     let col_w = (w - 24.0 * (cols - 1) as f32) / cols as f32;
-    let pitch = 22.0 + gap;
+    let row_h = 21.5;
+    let pitch = row_h + gap;
     for (i, (label, value, color)) in facts.iter().enumerate() {
         let x = left + (i % cols) as f32 * (col_w + 24.0);
         let y = top + (i / cols) as f32 * pitch;
-        put_left(ui, Rect::from_min_size(pos2(x, y + 6.0), vec2(label_w, 16.0)), egui::Label::new(RichText::new(*label).color(p.text_muted)).truncate());
+        put_left(ui, Rect::from_min_size(pos2(x, y + 7.0), vec2(label_w, 16.0)), egui::Label::new(RichText::new(*label).color(p.text_muted)).truncate());
         let shown = egui::Label::new(RichText::new(value).color(color.unwrap_or(p.text))).truncate();
-        put_left(ui, Rect::from_min_size(pos2(x + label_w + 16.0, y), vec2(col_w - label_w - 16.0, 16.0)), shown);
+        put_left(ui, Rect::from_min_size(pos2(x + label_w + 16.0, y + 4.0), vec2(col_w - label_w - 16.0, 16.0)), shown);
     }
     let h = (facts.len().div_ceil(cols) as f32 * pitch - gap).max(0.0);
     ui.advance_cursor_after_rect(Rect::from_min_size(pos2(left, top), vec2(w, h)));
@@ -311,9 +316,10 @@ pub(crate) fn row_dyn(ui: &mut Ui, h: f32, gap: f32, add: &mut dyn FnMut(&mut Ui
 
 // ------------------------------------------------------------------ controls
 
-/// `edit` exactly `h` high with its text centred and 10 px at the sides (the design's fields).
+/// `edit` exactly `h` high with its text centred, 13 from the left edge as the design's fields
+/// (their 1 px border, 10 px padding and the input's own 2 px) and 10 from the right.
 pub(crate) fn fit(edit: egui::TextEdit<'_>, h: f32) -> egui::TextEdit<'_> {
-    edit.margin(Margin::symmetric(10, 0)).min_size(vec2(0.0, h)).vertical_align(Align::Center)
+    edit.margin(Margin { left: 13, right: 10, top: 0, bottom: 0 }).min_size(vec2(0.0, h)).vertical_align(Align::Center)
 }
 
 /// A single-line text field as tall as the other controls.
@@ -326,19 +332,16 @@ pub(crate) fn mono_line(text: &mut dyn egui::TextBuffer, width: f32) -> egui::Te
     line(text).font(egui::TextStyle::Monospace).desired_width(width)
 }
 
-/// A whole number in a field `width` wide, shown with thousands separators (it can also be
-/// dragged).
-pub(crate) fn number<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range: std::ops::RangeInclusive<T>, width: f32) -> Response {
-    ui.scope(|ui| {
-        ui.spacing_mut().interact_size.x = width;
-        ui.add(
-            egui::DragValue::new(value)
-                .range(range)
-                .custom_formatter(|n, _| super::group(n.max(0.0).round() as u64))
-                .custom_parser(|s| s.replace(',', "").trim().parse::<f64>().ok()),
-        )
-    })
-    .inner
+/// A whole number in a text field `width` wide (left-aligned, as the design's fields), shown
+/// with thousands separators and kept within `range`.
+pub(crate) fn number<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range: std::ops::RangeInclusive<T>, width: f32) {
+    let shown = super::group(value.to_f64().max(0.0).round() as u64);
+    let (lo, hi) = (range.start().to_f64(), range.end().to_f64());
+    super::parsed_edit(ui, shown, "", width, false, |t| {
+        if let Ok(n) = t.replace(',', "").trim().parse::<f64>() {
+            *value = T::from_f64(n.round().clamp(lo, hi));
+        }
+    });
 }
 
 /// A check box of the design (the kit's); without a label it is the smaller check box of a
@@ -348,6 +351,13 @@ pub(crate) fn check(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
         return look::cell_check(ui, on, "");
     }
     kit::checkbox(ui, on, label)
+}
+
+/// An item of a combo box's list in the menu look (call `kit::menu_look` first): a check mark
+/// at the selected one. True when it was clicked.
+pub(crate) fn choice(ui: &mut Ui, selected: bool, label: &str) -> bool {
+    let mut on = selected;
+    kit::menu_check(ui, &mut on, label).clicked()
 }
 
 /// A radio button drawn like the mockups: an accent ring with a dot when selected.
@@ -375,19 +385,6 @@ pub(crate) fn ghost(ui: &mut Ui, glyph: Option<&str>, text: &str) -> Response {
     kit::button_ex(ui, Kind::Ghost, glyph, text, true)
 }
 
-/// A filled red button (confirmations of destructive runs).
-pub(crate) fn danger_solid(ui: &mut Ui, glyph: &str, text: &str) -> Response {
-    let p = style::pal(ui);
-    let fill = if ui.visuals().dark_mode { Color32::from_rgb(0xc4, 0x35, 0x2b) } else { p.err };
-    let font = style::medium(ui.ctx(), style::body_size(ui.ctx()));
-    let button = egui::Button::new(RichText::new(format!("{glyph}  {text}")).font(font).color(Color32::WHITE))
-        .fill(fill)
-        .stroke(Stroke::NONE)
-        .corner_radius(CornerRadius::same(style::RADIUS))
-        .min_size(vec2(0.0, style::CONTROL_H));
-    ui.add(button)
-}
-
 /// A field with a prefix drawn inside it (`WHERE` before a filter) over an optional text.
 pub(crate) fn prefixed_opt_text(ui: &mut Ui, value: &mut Option<String>, prefix: &str, hint: &str, width: f32) -> bool {
     let p = style::pal(ui);
@@ -396,7 +393,7 @@ pub(crate) fn prefixed_opt_text(ui: &mut Ui, value: &mut Option<String>, prefix:
     let mut s = value.clone().unwrap_or_default();
     let mono = egui::FontId::monospace(12.5);
     let edit = fit(egui::TextEdit::singleline(&mut s), 26.0).font(mono.clone()).hint_text(RichText::new(hint).font(mono).color(p.text_faint)).desired_width(width).margin(Margin {
-        left: (10.0 + pg.size().x + 8.0).round() as i8,
+        left: (10.0 + pg.size().x + 8.0 + 2.0).round() as i8,
         right: 10,
         top: 0,
         bottom: 0,
@@ -426,6 +423,9 @@ pub(crate) struct Form<'u> {
     height: f32,
 }
 
+/// The height of `parts::segmented`.
+pub(crate) const SEGMENTED_H: f32 = 28.0;
+
 /// Space between the columns of a form with several rows per line.
 const FORM_COLUMN_GAP: f32 = 28.0;
 
@@ -453,11 +453,13 @@ fn form_dyn(ui: &mut Ui, id: Id, per_row: usize, label_w: f32, gap: f32, add: &m
     });
 }
 
-/// A label of `label_w` (wrapped when longer) and the control(s) `add` draws on its right.
+/// A label of `label_w` (wrapped when longer) and the control(s) `add` draws on its right, as
+/// the design's form rows: the label 6 below the top, the controls centred on a row as high as
+/// the ui's controls (`interact_size.y`).
 pub(crate) fn form_row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
         row_label(ui, label, label_w);
-        add(ui)
+        ui.horizontal(add).inner
     })
     .inner
 }
@@ -477,12 +479,12 @@ fn check_row_dyn(ui: &mut Ui, label: &str, label_w: f32, add: &mut dyn FnMut(&mu
     });
 }
 
-/// The label column of a form row and the gap after it.
+/// The label column of a form row (the label 6 below its top) and the gap after it.
 fn row_label(ui: &mut Ui, label: &str, label_w: f32) {
     let p = style::pal(ui);
-    let h = ui.spacing().interact_size.y;
-    ui.allocate_ui_with_layout(vec2(label_w, h), Layout::left_to_right(Align::Center), |ui| {
+    ui.allocate_ui_with_layout(vec2(label_w, 0.0), Layout::top_down(Align::Min), |ui| {
         ui.set_min_width(label_w);
+        ui.add_space(6.0);
         ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).wrap());
     });
     ui.add_space(16.0 - ui.spacing().item_spacing.x);
@@ -497,6 +499,15 @@ impl Form<'_> {
         let mut child = self.column_ui();
         let r = form_row(&mut child, label, self.label_w, add);
         self.end_column(&child);
+        r
+    }
+
+    /// A row whose only control is a segmented one: 28 high, as in the design.
+    pub fn seg_row<R>(&mut self, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+        let h = self.ui.spacing().interact_size.y;
+        self.ui.spacing_mut().interact_size.y = SEGMENTED_H;
+        let r = self.row(label, add);
+        self.ui.spacing_mut().interact_size.y = h;
         r
     }
 
@@ -594,7 +605,7 @@ fn fold_card_dyn(ui: &mut Ui, id: Id, open: &mut bool, title: &str, summary: Opt
             ui.spacing_mut().interact_size.y = control_h;
             let chevron = if *open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
             ui.label(RichText::new(chevron).font(style::icon_font(12.0)).color(p.text_faint));
-            ui.label(RichText::new(title).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+            kit::semibold_label(ui, title, 13.0, p.text);
             if let Some(s) = summary {
                 ui.add(egui::Label::new(RichText::new(s).size(12.0).color(p.text_faint)).truncate());
             }
@@ -703,7 +714,7 @@ pub(crate) fn table(
 #[allow(clippy::too_many_arguments)]
 fn table_dyn(ui: &mut Ui, id: Id, cols: &[Col], row_h: f32, max_h: Option<f32>, rows: usize, header: &mut dyn FnMut(&mut Ui, usize), cell: &mut dyn FnMut(&mut Ui, usize, usize)) {
     let p = style::pal(ui);
-    let (stripe, line) = (look::stripe(ui), look::line(ui));
+    let (stripe, line) = (p.stripe, p.line);
     // The rows' hairlines are part of their height.
     let pitch = row_h + 1.0;
     let avail = ui.available_width() - 2.0;
@@ -731,12 +742,14 @@ fn table_dyn(ui: &mut Ui, id: Id, cols: &[Col], row_h: f32, max_h: Option<f32>, 
                 let mut x = hr.left();
                 for (i, c) in cols.iter().enumerate() {
                     let r = Rect::from_min_size(pos2(x, hr.top()), vec2(widths[i], hr.height() - 1.0));
-                    let mut child = ui.new_child(UiBuilder::new().id_salt(("h", i)).max_rect(r.shrink2(vec2(10.0, 0.0))).layout(layout_of(c)));
+                    // A data grid's header keeps its name at the left (its type at the right).
+                    let layout = if c.grid { Layout::left_to_right(Align::Center) } else { layout_of(c) };
+                    let mut child = ui.new_child(UiBuilder::new().id_salt(("h", i)).max_rect(r.shrink2(vec2(10.0, 0.0))).layout(layout));
                     child.set_clip_rect(r.intersect(ui.clip_rect()));
                     child.spacing_mut().item_spacing.x = 6.0;
                     if !c.title.is_empty() {
                         let (size, color) = if c.grid { (12.5, p.text) } else { (12.0, p.text_muted) };
-                        child.add(egui::Label::new(RichText::new(c.title).font(style::semibold(child.ctx(), size)).color(color)).truncate());
+                        kit::semibold_label(&mut child, c.title, size, color);
                     }
                     header(&mut child, i);
                     x += widths[i];

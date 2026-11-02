@@ -18,46 +18,14 @@ use ternarygrid_ui::{kit, parts, style};
 /// Padding of a tool window's body (the mockups' `16px 20px`).
 pub(crate) const BODY: Margin = Margin { left: 20, right: 20, top: 16, bottom: 16 };
 
-/// A note on a soft tinted background (an icon, an optional bold title, the text) and
-/// `add` after the text (a button). Like `parts::callout`, but as high as its text.
+/// A note on a soft tinted background (the kit's callout) with `add` under the text (a button).
 pub(crate) fn note_with(ui: &mut Ui, tone: parts::Tone, title: Option<&str>, body: &str, add: impl FnOnce(&mut Ui)) -> Response {
-    let mut add = Some(add);
-    note_dyn(ui, tone, title, body, &mut |ui| {
-        if let Some(a) = add.take() {
-            a(ui)
-        }
-    })
-}
-
-// The frame code is compiled once, not once per caller.
-fn note_dyn(ui: &mut Ui, tone: parts::Tone, title: Option<&str>, body: &str, add: &mut dyn FnMut(&mut Ui)) -> Response {
-    let p = style::pal(ui);
-    let color = tone.color(&p);
-    Frame::new()
-        .fill(tone.fill(ui))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin { left: 12, right: 10, top: 9, bottom: 9 })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(RichText::new(tone.icon()).font(style::icon_font(16.0)).color(color));
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 6.0;
-                    if let Some(t) = title {
-                        ui.label(RichText::new(t).font(style::semibold(ui.ctx(), style::body_size(ui.ctx()))).color(p.text));
-                    }
-                    ui.add(egui::Label::new(RichText::new(body).color(p.text)).wrap().selectable(true));
-                    add(ui);
-                });
-            });
-        })
-        .response
+    parts::callout(ui, tone, title, body, add)
 }
 
 /// [`note_with`] without extra content.
 pub(crate) fn note(ui: &mut Ui, tone: parts::Tone, title: Option<&str>, body: &str) -> Response {
-    note_with(ui, tone, title, body, |_| {})
+    parts::callout(ui, tone, title, body, |_| {})
 }
 
 /// An error note.
@@ -68,29 +36,6 @@ pub(crate) fn error(ui: &mut Ui, text: &str) -> Response {
 /// The mono font of tables, commands and logs.
 pub(crate) fn mono(size: f32) -> FontId {
     FontId::monospace(size)
-}
-
-// The design's table colours that the kit's palette does not have (`line`, `stripe`, `sel`
-// and `modified` of the mockups' palette).
-
-/// The hairline under a table row.
-pub(crate) fn line(ui: &Ui) -> Color32 {
-    if ui.visuals().dark_mode { Color32::from_rgb(0x33, 0x35, 0x3e) } else { Color32::from_rgb(0xed, 0xed, 0xf2) }
-}
-
-/// The fill of every other table row.
-pub(crate) fn stripe(ui: &Ui) -> Color32 {
-    if ui.visuals().dark_mode { Color32::from_rgb(0x26, 0x28, 0x30) } else { Color32::from_rgb(0xfa, 0xfa, 0xfb) }
-}
-
-/// The fill of a selected table row.
-pub(crate) fn selected_row(ui: &Ui) -> Color32 {
-    if ui.visuals().dark_mode { Color32::from_rgb(0x22, 0x44, 0x44) } else { Color32::from_rgb(0xd4, 0xe7, 0xe4) }
-}
-
-/// The fill of the current line (the debugger's).
-pub(crate) fn current_line(ui: &Ui) -> Color32 {
-    if ui.visuals().dark_mode { Color32::from_rgb(0x4b, 0x44, 0x3b) } else { Color32::from_rgb(0xf3, 0xea, 0xd6) }
 }
 
 /// The check box of a table cell: 15 px, radius 4, the accent with a white check when on.
@@ -154,39 +99,6 @@ pub(crate) fn radio_value<T: PartialEq>(ui: &mut Ui, current: &mut T, value: T, 
     false
 }
 
-/// A filled red button: the confirmation of a destructive action (Terminate, Truncate,
-/// Restore, Run on the target).
-pub(crate) fn danger_solid(ui: &mut Ui, glyph: Option<&str>, text: &str) -> Response {
-    let p = style::pal(ui);
-    let dark = ui.visuals().dark_mode;
-    let enabled = ui.is_enabled();
-    let size = style::body_size(ui.ctx());
-    let galley = ui.painter().layout_no_wrap(text.to_string(), style::medium(ui.ctx(), size), Color32::PLACEHOLDER);
-    let icon_g = glyph.map(|i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size + 2.0), Color32::PLACEHOLDER));
-    let gap = if icon_g.is_some() { 6.0 } else { 0.0 };
-    let content = galley.size().x + icon_g.as_ref().map_or(0.0, |g| g.size().x) + gap;
-    let (rect, resp) = ui.allocate_exact_size(vec2(content + 24.0, style::CONTROL_H), Sense::click());
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, text));
-    if ui.is_rect_visible(rect) {
-        let base = if dark { Color32::from_rgb(0xc4, 0x35, 0x2b) } else { p.err };
-        let fill = if enabled && resp.hovered() { crate::theme::darken(base, 0.08) } else { base };
-        let fill = if enabled { fill } else { fill.gamma_multiply(0.5) };
-        let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(style::RADIUS), fill);
-        if resp.has_focus() {
-            painter.rect_stroke(rect.expand(2.0), CornerRadius::same(style::RADIUS + 2), Stroke::new(1.5, p.accent), StrokeKind::Outside);
-        }
-        let mut x = rect.center().x - content / 2.0;
-        if let Some(g) = icon_g {
-            let w = g.size().x;
-            painter.galley(pos2(x, rect.center().y - g.size().y / 2.0), g, Color32::WHITE);
-            x += w + gap;
-        }
-        painter.galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
-    }
-    resp
-}
-
 /// The main action of a tool, a 24 px toolbar button of `kind`.
 pub(crate) fn small(ui: &mut Ui, kind: kit::Kind, glyph: &str, text: &str) -> Response {
     kit::button_ex(ui, kind, Some(glyph), text, true)
@@ -198,9 +110,10 @@ pub(crate) fn small(ui: &mut Ui, kind: kit::Kind, glyph: &str, text: &str) -> Re
 
 /// A label in `color` (counts in a tone, states).
 pub(crate) fn tone(ui: &mut Ui, text: &str, color: Color32, strong: bool) -> Response {
-    let t = RichText::new(text).color(color);
-    let t = if strong { t.font(style::semibold(ui.ctx(), style::body_size(ui.ctx()))) } else { t };
-    ui.add(egui::Label::new(t).selectable(false))
+    if strong {
+        return kit::semibold_label(ui, text, style::body_size(ui.ctx()), color);
+    }
+    ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false))
 }
 
 /// A muted label.
@@ -218,7 +131,7 @@ pub(crate) fn faint(ui: &mut Ui, text: &str) -> Response {
 /// A title in semibold 13 (groups of a tool: "Operation", "Arguments").
 pub(crate) fn title(ui: &mut Ui, text: &str) -> Response {
     let p = style::pal(ui);
-    ui.label(RichText::new(text).font(style::semibold(ui.ctx(), 13.0)).color(p.text))
+    ternarygrid_ui::kit::semibold_label(ui, text, 13.0, p.text)
 }
 
 /// The connection a tool works on: its name in semibold and faint facts (product, version).
@@ -226,7 +139,7 @@ pub(crate) fn conn_title(ui: &mut Ui, name: &str, facts: Option<&str>) {
     let p = style::pal(ui);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(RichText::new(name).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+        ternarygrid_ui::kit::semibold_label(ui, name, 13.0, p.text);
         if let Some(f) = facts.filter(|f| !f.trim().is_empty()) {
             ui.label(RichText::new(f).size(12.0).color(p.text_faint));
         }
@@ -285,6 +198,48 @@ pub(crate) fn command_block(ui: &mut Ui, text: &str) {
     });
 }
 
+/// The options of a read-only code view as the designs show code: `font` points, `line`
+/// points a line, no fold markers, marked words or current line.
+pub(crate) fn code_options(font: f32, line: f32) -> ternarygrid_editor::EditorOptions {
+    let mut o = ternarygrid_editor::EditorOptions::read_only_viewer();
+    o.font_size = font;
+    o.line_height = line / font;
+    o.folding = false;
+    o.mark_occurrences = false;
+    o.highlight_current_line = false;
+    o
+}
+
+/// The design's code block: `text` highlighted in `lang`'s dialect, mono 12.5 on 20 pt lines,
+/// 10 above and below; with `gutter` the line numbers in a 32 pt column 14 from the text,
+/// else 12 at the left.
+pub(crate) fn code_block(ui: &mut Ui, lang: Option<&crate::sqllang::SqlLanguage>, text: &str, gutter: bool) {
+    use ternarygrid_editor::EditorLanguage;
+    let p = style::pal(ui);
+    let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
+    let tokens = lang.map(|l| l.highlight(text)).unwrap_or_default();
+    let mut job = crate::sqllang::highlight_job(text, &tokens, &theme, mono(12.5));
+    for s in &mut job.sections {
+        s.format.line_height = Some(20.0);
+    }
+    let margin = Margin { left: if gutter { 0 } else { 12 }, right: 12, top: 10, bottom: 10 };
+    Frame::new().fill(p.surface).stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).inner_margin(margin).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            if gutter {
+                let numbers = (1..=text.lines().count().max(1)).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+                ui.allocate_ui_with_layout(vec2(32.0, 0.0), Layout::top_down(Align::Max), |ui| {
+                    ui.set_width(32.0);
+                    ui.label(RichText::new(numbers).font(mono(12.5)).line_height(Some(20.0)).color(p.text_faint));
+                });
+                ui.add_space(14.0);
+            }
+            ui.add(egui::Label::new(job).wrap().selectable(true));
+        });
+    });
+}
+
 /// A bordered log box (mono 11.5) of coloured lines, scrolled to the end; `height` is its
 /// height (`None`: the rest of the space).
 pub(crate) fn log_box(ui: &mut Ui, id: impl Hash + std::fmt::Debug, lines: &[(String, Color32)], height: Option<f32>) {
@@ -317,7 +272,7 @@ pub(crate) fn collapsible_card(ui: &mut Ui, open: &mut bool, title: &str, summar
                     ui.spacing_mut().interact_size.y = control_h;
                     let chevron = if *open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
                     ui.label(RichText::new(chevron).font(style::icon_font(12.0)).color(p.text_faint));
-                    ui.label(RichText::new(title).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+                    ternarygrid_ui::kit::semibold_label(ui, title, 13.0, p.text);
                     if let Some(s) = summary {
                         ui.label(RichText::new(s).size(12.0).color(p.text_faint));
                     }
@@ -391,16 +346,24 @@ fn body_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
     });
 }
 
-/// A hairline across `ui` with room above and below.
+/// A hairline across `ui`, as far from the parts above and below as they are from each other
+/// (the design's dividers in a column).
 pub(crate) fn divider(ui: &mut Ui) {
-    ui.add_space(2.0);
     parts::hline(ui);
-    ui.add_space(2.0);
+    ui.add_space(ui.spacing().item_spacing.y);
 }
 
 /// A form row: a muted label in a column `label_w` wide, then the control(s).
 pub(crate) fn row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     parts::form_row(ui, label, label_w, add)
+}
+
+/// [`row`] whose only control is a segmented one: 28 high, as in the design.
+pub(crate) fn seg_row(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui)) {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = crate::tabs::transfer::wizard::SEGMENTED_H;
+        parts::form_row(ui, label, label_w, add)
+    });
 }
 
 /// A form row whose controls are stacked (check boxes): the label at their top.
@@ -416,6 +379,8 @@ pub(crate) fn row_top<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnc
             let at = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(label_w, 16.0));
             // A child ui: the cursor stays after the label column.
             ui.new_child(egui::UiBuilder::new().max_rect(at).layout(Layout::left_to_right(Align::Min))).add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
+            // 16 between the label column and the controls, as `parts::form_row`.
+            ui.add_space((16.0 - ui.spacing().item_spacing.x).max(0.0));
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 add(ui)
@@ -425,6 +390,29 @@ pub(crate) fn row_top<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnc
         .inner;
     ui.spacing_mut().interact_size.y = control_h;
     out
+}
+
+/// A level from 0 to `max` as the design's 6 pt progress bar, `width` wide: a click or a drag
+/// sets it (and `on`), a double click turns it off (the bar then shows faint). True on a change.
+pub(crate) fn level_bar(ui: &mut Ui, label: &str, on: &mut bool, value: &mut u8, max: u8, width: f32) -> bool {
+    let p = style::pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 14.0), Sense::click_and_drag());
+    let mut changed = false;
+    if resp.double_clicked() {
+        *on = false;
+        changed = true;
+    } else if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
+        let v = (((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * max as f32).round() as u8;
+        changed = !*on || v != *value;
+        (*on, *value) = (true, v);
+    }
+    resp.widget_info(|| WidgetInfo::slider(ui.is_enabled(), *value as f64, label));
+    let track = Rect::from_center_size(rect.center(), vec2(width, 6.0));
+    ui.painter().rect_filled(track, CornerRadius::same(3), p.subtle);
+    let fill = Rect::from_min_size(track.min, vec2(width * *value as f32 / max.max(1) as f32, 6.0));
+    let color = if *on && ui.is_enabled() { p.accent } else { p.border_strong };
+    ui.painter().rect_filled(fill, CornerRadius::same(3), color);
+    changed
 }
 
 /// A single-line text field filling `width` (`f32::INFINITY`: the rest of the row).
@@ -504,20 +492,17 @@ fn paint_cell(ui: &mut Ui, c: &Cell, header: bool) {
     if let Some((g, color)) = c.glyph {
         ui.label(RichText::new(g).font(style::icon_font(13.0)).color(color));
     }
+    let first: String = c.text.lines().next().unwrap_or("").chars().take(300).collect();
+    // Headers and strong cells in the design's semibold (clipped by the cell).
     let resp = if let Some(j) = &c.job {
         ui.add(egui::Label::new(j.clone()).truncate().selectable(false))
+    } else if header {
+        kit::semibold_label(ui, &first, 12.0, c.color.unwrap_or(p.text_muted))
+    } else if c.strong {
+        kit::semibold_label(ui, &first, style::body_size(ui.ctx()), c.color.unwrap_or(p.text))
     } else {
-        let first: String = c.text.lines().next().unwrap_or("").chars().take(300).collect();
-        let mut t = RichText::new(first);
-        t = if header {
-            t.font(style::semibold(ui.ctx(), 12.0)).color(c.color.unwrap_or(p.text_muted))
-        } else if c.mono {
-            t.font(mono(12.0)).color(c.color.unwrap_or(p.text))
-        } else if c.strong {
-            t.font(style::semibold(ui.ctx(), style::body_size(ui.ctx()))).color(c.color.unwrap_or(p.text))
-        } else {
-            t.color(c.color.unwrap_or(p.text))
-        };
+        let t = RichText::new(first);
+        let t = if c.mono { t.font(mono(12.0)).color(c.color.unwrap_or(p.text)) } else { t.color(c.color.unwrap_or(p.text)) };
         ui.add(egui::Label::new(t).truncate().selectable(false))
     };
     let long = c.text.lines().nth(1).is_some() || c.text.chars().count() > 300;
@@ -586,18 +571,17 @@ fn spec_widths(widths: &[W], avail: f32) -> Vec<f32> {
 
 fn table_dyn(ui: &mut Ui, id: Id, headers: &[Cell], rows: &[Vec<Cell>], selected: Option<usize>, spec: &[W]) -> TableResponse {
     let mut out = TableResponse::default();
-    let (stripe, line, sel) = (stripe(ui), line(ui), selected_row(ui));
+    let p = style::pal(ui);
+    let (stripe, line, sel) = (p.stripe, p.line, p.sel);
     parts::bordered(ui).show(ui, |ui| {
         ui.scope(|ui| {
-            let p = style::pal(ui);
             // The cells touch (their hairlines join), the column lines show while resizing only.
             ui.spacing_mut().item_spacing = Vec2::ZERO;
-            ui.visuals_mut().faint_bg_color = stripe;
             ui.visuals_mut().selection.bg_fill = sel;
             ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
             let widths = if spec.len() == headers.len() { spec_widths(spec, ui.available_width()) } else { content_widths(ui, headers, rows) };
             let mut tb =
-                TableBuilder::new(ui).id_salt(id).striped(true).resizable(true).sense(Sense::click()).auto_shrink([false, true]).cell_layout(Layout::left_to_right(Align::Center));
+                TableBuilder::new(ui).id_salt(id).striped(false).resizable(true).sense(Sense::click()).auto_shrink([false, true]).cell_layout(Layout::left_to_right(Align::Center));
             for (i, w) in widths.iter().enumerate() {
                 tb = if i + 1 == headers.len() {
                     tb.column(Column::remainder().at_least(w.min(160.0)).clip(true))
@@ -620,9 +604,13 @@ fn table_dyn(ui: &mut Ui, id: Id, headers: &[Cell], rows: &[Vec<Cell>], selected
                     let i = row.index();
                     row.set_selected(selected == Some(i));
                     if let Some(cells) = rows.get(i) {
-                        for c in cells.iter().take(headers.len()) {
+                        let n = cells.len().min(headers.len());
+                        for (k, c) in cells.iter().take(n).enumerate() {
                             row.col(|ui| {
                                 let r = ui.max_rect();
+                                if i % 2 == 1 && selected != Some(i) {
+                                    stripe_cell(ui, r, stripe, i + 1 == rows.len(), k, n);
+                                }
                                 ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, line));
                                 paint_cell(ui, c, false);
                             });
@@ -645,6 +633,13 @@ fn table_dyn(ui: &mut Ui, id: Id, headers: &[Cell], rows: &[Vec<Cell>], selected
     out
 }
 
+/// The stripe of cell `k` of `n` in an odd row, as the design stripes its tables (egui's
+/// stripes start at the first row); the last row's outer cells keep the frame's corners.
+fn stripe_cell(ui: &Ui, r: Rect, stripe: Color32, last: bool, k: usize, n: usize) {
+    let c = |on: bool| if last && on { 7 } else { 0 };
+    ui.painter().rect_filled(r, CornerRadius { nw: 0, ne: 0, sw: c(k == 0), se: c(k + 1 == n) }, stripe);
+}
+
 /// Header cells from names.
 pub(crate) fn headers(names: &[&str]) -> Vec<Cell> {
     names.iter().map(|n| Cell::new(*n)).collect()
@@ -657,16 +652,15 @@ pub(crate) fn widget_table(ui: &mut Ui, id: impl Hash + std::fmt::Debug, names: 
 }
 
 fn widget_table_dyn(ui: &mut Ui, id: Id, names: &[&str], widths: &[f32], rows: usize, row_h: f32, cell: &mut dyn FnMut(&mut Ui, usize, usize)) {
-    let (stripe, line) = (stripe(ui), line(ui));
+    let p = style::pal(ui);
+    let (stripe, line) = (p.stripe, p.line);
     parts::bordered(ui).show(ui, |ui| {
         ui.scope(|ui| {
-            let p = style::pal(ui);
             // As [`table`]: the cells touch, a hairline under the header and every row.
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             ui.spacing_mut().interact_size.y = (row_h - 4.0).min(26.0);
-            ui.visuals_mut().faint_bg_color = stripe;
             ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
-            let mut tb = TableBuilder::new(ui).id_salt(id).striped(true).auto_shrink([false, true]).vscroll(false).cell_layout(Layout::left_to_right(Align::Center));
+            let mut tb = TableBuilder::new(ui).id_salt(id).striped(false).auto_shrink([false, true]).vscroll(false).cell_layout(Layout::left_to_right(Align::Center));
             for (i, w) in widths.iter().enumerate() {
                 tb = if i + 1 == widths.len() { tb.column(Column::remainder().at_least(*w).clip(true)) } else { tb.column(Column::exact(*w).clip(true)) };
             }
@@ -686,6 +680,9 @@ fn widget_table_dyn(ui: &mut Ui, id: Id, names: &[&str], widths: &[f32], rows: u
                         for c in 0..widths.len() {
                             row.col(|ui| {
                                 let rect = ui.max_rect();
+                                if r % 2 == 1 {
+                                    stripe_cell(ui, rect, stripe, r + 1 == rows, c, widths.len());
+                                }
                                 ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, line));
                                 ui.add_space(CELL_PAD);
                                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -697,6 +694,12 @@ fn widget_table_dyn(ui: &mut Ui, id: Id, names: &[&str], widths: &[f32], rows: u
             });
         });
     });
+}
+
+/// A NULL in a table cell as the design draws it: `text` in italics, 12 pt, faint.
+pub(crate) fn null_cell(ui: &Ui, text: String) -> Cell {
+    let format = egui::TextFormat { font_id: FontId::proportional(12.0), color: style::pal(ui).text_faint, italics: true, ..Default::default() };
+    Cell::new(text.clone()).job(LayoutJob::single_section(text, format))
 }
 
 /// A "before → after" text: both semibold, the arrow faint.

@@ -18,7 +18,7 @@ use crate::cx::AppContext;
 use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
 use crate::tabs::dbtools::look::{self, Cell};
-use crate::tabs::transfer::wizard::W;
+use crate::tabs::transfer::wizard::{W, choice};
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use parking_lot::Mutex;
@@ -53,11 +53,15 @@ pub(crate) fn connection_combo_ex(
         .or_else(|| if conn.is_none() { none.map(str::to_string) } else { None })
         .unwrap_or_else(|| tr("Choose a connection…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(if glyph { format!("{} {current}", icon::PLUGS) } else { current }).width(width).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt(id)
+        .icon(ternarygrid_ui::kit::combo_caret)
+        .popup_style(egui::containers::menu::menu_style.into())
+        .selected_text(if glyph { format!("{} {current}", icon::PLUGS) } else { current })
+        .width(width)
+        .show_ui(ui, |ui| {
+            kit::menu_look(ui, width);
             if let Some(n) = none
-                && ui.selectable_label(conn.is_none(), n).clicked()
+                && choice(ui, conn.is_none(), n)
                 && conn.is_some()
             {
                 *conn = None;
@@ -65,13 +69,12 @@ pub(crate) fn connection_combo_ex(
             }
             for (cid, name, connected) in &names {
                 let st = if *connected { icon::PLUGS_CONNECTED } else { icon::PLUGS };
-                if ui.selectable_label(conn.as_deref() == Some(cid), format!("{st} {name}")).clicked() && conn.as_deref() != Some(cid) {
+                if choice(ui, conn.as_deref() == Some(cid), &format!("{st} {name}")) && conn.as_deref() != Some(cid) {
                     *conn = Some(cid.clone());
                     changed = true;
                 }
             }
-        },
-    );
+        });
     if changed
         && let Some(c) = conn.as_ref()
         && !cx.conns.is_connected(c)
@@ -113,18 +116,21 @@ pub(crate) fn schema_combo_ex(ui: &mut Ui, cx: &mut AppContext, id: impl Hash + 
         changed = true;
     }
     let label = schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(if glyph { format!("{} {label}", icon::STACK) } else { label }).width(width).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt(id)
+        .icon(ternarygrid_ui::kit::combo_caret)
+        .popup_style(egui::containers::menu::menu_style.into())
+        .selected_text(if glyph { format!("{} {label}", icon::STACK) } else { label })
+        .width(width)
+        .show_ui(ui, |ui| {
+            kit::menu_look(ui, width);
             for n in &names {
                 let on = schema.as_ref().and_then(|s| s.schema.as_deref()) == Some(n.as_str());
-                if ui.selectable_label(on, n).clicked() && !on {
+                if choice(ui, on, n) && !on {
                     *schema = Some(SchemaRef::new(None, Some(n.clone())));
                     changed = true;
                 }
             }
-        },
-    );
+        });
     if loading {
         ui.spinner();
     }
@@ -166,21 +172,24 @@ pub(crate) fn table_combo_ex(
     let (items, loading) = schema_tables(cx, conn, schema, true);
     let label = table.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| tr("Table…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(if glyph { format!("{} {label}", icon::TABLE) } else { label }).width(width).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt(id)
+        .icon(ternarygrid_ui::kit::combo_caret)
+        .popup_style(egui::containers::menu::menu_style.into())
+        .selected_text(if glyph { format!("{} {label}", icon::TABLE) } else { label })
+        .width(width)
+        .show_ui(ui, |ui| {
+            kit::menu_look(ui, width);
             if items.is_empty() {
-                ui.weak(if loading { tr("Loading…") } else { tr("No tables") });
+                kit::menu_caption(ui, if loading { tr("Loading…") } else { tr("No tables") });
             }
             for o in &items {
                 let on = table.as_ref().is_some_and(|t| t.name == o.name && t.schema == o.schema);
-                if ui.selectable_label(on, format!("{} {}", crate::nav::kind_icon(o.kind), o.name)).clicked() && !on {
+                if choice(ui, on, &format!("{} {}", crate::nav::kind_icon(o.kind), o.name)) && !on {
                     *table = Some(o.clone());
                     changed = true;
                 }
             }
-        },
-    );
+        });
     if loading {
         ui.spinner();
     }
@@ -488,9 +497,11 @@ impl DataCompareTab {
         let side = if target { &mut self.target } else { &mut self.source };
         let before = side.clone();
         let tag = if target { "dst" } else { "src" };
+        // As in the design: the logo 8 from the connection, the schema 6 from it, the table 8.
         ui.spacing_mut().item_spacing.x = 6.0;
         if let Some(kind) = side.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.kind) {
             look::logo(ui, kind, 15.0);
+            ui.add_space(2.0);
         }
         let mut conn = side.conn.clone();
         if connection_combo_ex(ui, cx, ("dc_conn", uid, tag), &mut conn, None, 170.0, false) {
@@ -507,7 +518,7 @@ impl DataCompareTab {
                 }
                 if let Some(s) = side.schema.clone() {
                     let mut table = side.table.clone();
-                    ui.add_space(6.0);
+                    ui.add_space(2.0);
                     if table_combo_ex(ui, cx, ("dc_table", uid, tag), &c, &s, &mut table, 160.0, false) {
                         side.table = table;
                     }
@@ -568,7 +579,7 @@ impl DataCompareTab {
             egui::ScrollArea::vertical().id_salt(("dc_cols_scroll", self.uid)).max_height(220.0).show(ui, |ui| {
                 egui::Grid::new(("dc_cols_grid", self.uid)).num_columns(5).striped(true).spacing([18.0, 4.0]).show(ui, |ui| {
                     for h in [tr("Column"), tr("Type"), tr("Key"), tr("Compare"), tr("In target")] {
-                        ui.label(RichText::new(h).font(ternarygrid_ui::style::semibold(ui.ctx(), 12.0)).color(p.text_muted));
+                        ternarygrid_ui::kit::semibold_label(ui, h, 12.0, p.text_muted);
                     }
                     ui.end_row();
                     for c in &src.columns {
@@ -660,11 +671,19 @@ impl DataCompareTab {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 ui.horizontal(|ui| {
                     look::muted(ui, tr("Row matching"));
-                    egui::ComboBox::from_id_salt(("dc_strategy", uid)).icon(kit::combo_caret).selected_text(strategy_label(o.strategy)).show_ui(ui, |ui| {
-                        for s in [CompareStrategy::Auto, CompareStrategy::MergeJoin, CompareStrategy::HashJoin] {
-                            ui.selectable_value(&mut o.strategy, s, strategy_label(s));
-                        }
-                    });
+                    egui::ComboBox::from_id_salt(("dc_strategy", uid))
+                        .icon(kit::combo_caret)
+                        .popup_style(egui::containers::menu::menu_style.into())
+                        .selected_text(strategy_label(o.strategy))
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            kit::menu_look(ui, 160.0);
+                            for s in [CompareStrategy::Auto, CompareStrategy::MergeJoin, CompareStrategy::HashJoin] {
+                                if choice(ui, o.strategy == s, strategy_label(s)) {
+                                    o.strategy = s;
+                                }
+                            }
+                        });
                 });
                 ui.horizontal(|ui| {
                     look::muted(ui, tr("Differing rows to show"));
@@ -921,7 +940,7 @@ impl DataCompareTab {
                 for (j, name) in o.layout.columns.iter().enumerate() {
                     let src = s.source.as_ref().and_then(|r| r.get(nk + j));
                     let tgt = s.target.as_ref().and_then(|r| r.get(nk + j));
-                    let value = |v: Option<&Value>| if is_null(v) { Cell::new(text_of(v)).color(p.text_faint) } else { Cell::new(text_of(v)) };
+                    let value = |v: Option<&Value>| if is_null(v) { look::null_cell(ui, text_of(v)) } else { Cell::new(text_of(v)) };
                     row.push(match s.kind {
                         RowDiffKind::Different if s.columns.iter().any(|c| c == name) => {
                             let (a, b) = (text_of(src), text_of(tgt));
@@ -938,8 +957,9 @@ impl DataCompareTab {
         look::table_w(ui, ("dc_rows", self.uid), &headers, &cells, None, &widths);
     }
 
-    fn script_ui(&mut self, ui: &mut Ui) {
-        let Some(o) = &self.result else { return };
+    /// The notes above the sync script; false when there is no script to show.
+    fn script_notes(&self, ui: &mut Ui) -> bool {
+        let Some(o) = &self.result else { return false };
         let p = ternarygrid_ui::pal(ui);
         let n = o.diff.sync_statements.len();
         if o.diff.sync_truncated {
@@ -949,11 +969,19 @@ impl DataCompareTab {
             ui.label(RichText::new(tr("Generating the sync script is turned off in the options.")).color(p.text_muted));
         } else if n == 0 {
             ui.label(RichText::new(tr("Nothing to synchronize.")).color(p.text_muted));
-            return;
+            return false;
         }
+        true
+    }
+
+    /// The sync script across the rest of the tab, as the design's editor.
+    fn script_ui(&mut self, ui: &mut Ui) {
+        let Some(o) = &self.result else { return };
         let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-        egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(8).show(ui, |ui| {
-            ternarygrid_editor::CodeView::new(&o.script, &o.lang, &theme).id_salt(("dc_script", self.uid)).show(ui);
+        let options = look::code_options(13.0, 21.0);
+        egui::Frame::new().fill(ternarygrid_ui::pal(ui).surface).show(ui, |ui| {
+            // Without the empty line after the last statement.
+            ternarygrid_editor::CodeView::new(o.script.trim_end_matches('\n'), &o.lang, &theme).options(&options).id_salt(("dc_script", self.uid)).show(ui);
         });
     }
 
@@ -994,7 +1022,7 @@ impl DataCompareTab {
         let question = trf("Run {} statement(s) on {} (\"{}\") in one transaction?", &[&n, &name, &target_conn]);
         let warning = trf("{} is a Production connection: the rows of the live database are changed.", &[&target_conn]);
         let (mut run, mut cancel) = (false, false);
-        let (resp, _) = ternarygrid_ui::parts::Dialog::new(tr("Apply the sync script")).icon(icon::PLAY).width(520.0).show_modal(
+        let (resp, _) = ternarygrid_ui::parts::Dialog::new(tr("Apply the sync script")).icon(icon::PLAY).width(520.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
             ui.ctx(),
             egui::Id::new(("dc_apply", self.uid)),
             |ui| {
@@ -1008,7 +1036,7 @@ impl DataCompareTab {
             },
             |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if look::danger_solid(ui, Some(icon::PLAY), tr("Apply")).clicked() {
+                    if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::PLAY), tr("Apply"), false).clicked() {
                         run = true;
                     }
                     if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -1110,71 +1138,31 @@ impl TabView for DataCompareTab {
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll(cx);
-        let p = ternarygrid_ui::pal(ui);
         ui.spacing_mut().item_spacing.y = 0.0;
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
-            ui.spacing_mut().interact_size.y = 28.0;
-            egui::Grid::new(("dc_sides", self.uid)).num_columns(2).spacing([12.0, 8.0]).min_col_width(70.0).show(ui, |ui| {
-                look::muted(ui, tr("Source"));
-                ui.horizontal(|ui| self.side_ui(ui, cx, false));
-                ui.end_row();
-                look::muted(ui, tr("Target"));
-                ui.horizontal(|ui| self.side_ui(ui, cx, true));
-                ui.end_row();
-            });
-        });
-        self.auto_target_table(cx);
+        // As in the design, the sync script takes the whole tab: the pickers, the cards and the
+        // toolbar are back with the differences.
+        let script_mode = self.view == ResultView::Script && self.result.is_some();
+        if !script_mode {
+            self.sides_ui(ui, cx);
+        }
         let src = Self::def_of(cx, &self.source.clone());
         let dst = Self::def_of(cx, &self.target.clone());
         let errors: Vec<String> = [src.as_ref().err(), dst.as_ref().err()].into_iter().flatten().cloned().collect();
-        let src = src.ok().flatten();
-        let dst = dst.ok().flatten();
-        // Keys and columns, options.
-        egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 10 }).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
-            for e in &errors {
-                look::error(ui, e);
-            }
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                if let Some(s) = &src {
-                    self.init_choice(s);
-                    self.columns_ui(ui, s, dst.as_deref());
-                } else if self.source.table.is_some() {
-                    ternarygrid_ui::parts::spinner_label(ui, tr("Reading the table definition…"));
-                }
-                self.options_ui(ui);
-            });
-        });
+        let (src, dst) = (src.ok().flatten(), dst.ok().flatten());
         let busy = self.run.is_some() || self.apply_job.is_some();
-        ternarygrid_ui::parts::toolbar(ui, |ui| {
+        if !script_mode {
+            self.cards_ui(ui, &errors, src.as_deref(), dst.as_deref());
             let ready = src.is_some() && dst.is_some() && !self.keys.is_empty();
-            if ui.add_enabled_ui(ready && !busy && !self.start_requested, |ui| look::small(ui, kit::Kind::Primary, icon::ARROWS_DOWN_UP, tr("Compare"))).inner.clicked() {
-                self.start_requested = true;
-            }
-            if ui.add_enabled_ui(!busy, |ui| look::small(ui, kit::Kind::Ghost, icon::REPEAT, tr("Swap"))).inner.clicked() {
-                std::mem::swap(&mut self.source, &mut self.target);
-                self.result = None;
-                self.chosen_for = None;
-            }
-            if self.keys.is_empty() && src.is_some() {
-                look::tone(ui, tr("The source table has no primary key: choose the key columns."), p.warn, false);
-            }
-            if self.start_requested {
-                ternarygrid_ui::parts::spinner_label(ui, tr("Opening the sessions…"));
-            }
-            if let Some(o) = &self.result {
-                let facts = Self::facts(o);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(facts).size(12.0).color(p.text_faint));
-                });
-            }
-        });
+            self.toolbar_ui(ui, ready, self.keys.is_empty() && src.is_some(), busy);
+        }
         if self.start_requested {
             self.try_start(cx, src.as_ref(), dst.as_ref());
         }
+        let mut show_script = false;
         egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 10)).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
+            // The summary and the view switch as high as their content (text, a 28 pt switch).
+            ui.spacing_mut().interact_size.y = 0.0;
             self.progress_ui(ui, cx);
             if let Some(e) = &self.error {
                 look::error(ui, e);
@@ -1201,9 +1189,12 @@ impl TabView for DataCompareTab {
             });
             match self.view {
                 ResultView::Rows => self.rows_ui(ui, cx),
-                ResultView::Script => self.script_ui(ui),
+                ResultView::Script => show_script = self.script_notes(ui),
             }
         });
+        if show_script {
+            self.script_ui(ui);
+        }
         self.apply_modal(ui, cx);
         if busy || self.start_requested {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -1216,4 +1207,69 @@ impl TabView for DataCompareTab {
     }
 
     crate::impl_tab_any!();
+}
+
+impl DataCompareTab {
+    /// The source and target pickers.
+    fn sides_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = 28.0;
+            egui::Grid::new(("dc_sides", self.uid)).num_columns(2).spacing([12.0, 8.0]).min_col_width(70.0).show(ui, |ui| {
+                look::muted(ui, tr("Source"));
+                ui.horizontal(|ui| self.side_ui(ui, cx, false));
+                ui.end_row();
+                look::muted(ui, tr("Target"));
+                ui.horizontal(|ui| self.side_ui(ui, cx, true));
+                ui.end_row();
+            });
+        });
+        self.auto_target_table(cx);
+    }
+
+    /// The cards of the keys and columns and of the options.
+    fn cards_ui(&mut self, ui: &mut Ui, errors: &[String], src: Option<&TableDef>, dst: Option<&TableDef>) {
+        egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 10 }).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            for e in errors {
+                look::error(ui, e);
+            }
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                if let Some(s) = src {
+                    self.init_choice(s);
+                    self.columns_ui(ui, s, dst);
+                } else if self.source.table.is_some() {
+                    ternarygrid_ui::parts::spinner_label(ui, tr("Reading the table definition…"));
+                }
+                self.options_ui(ui);
+            });
+        });
+    }
+
+    /// Compare, Swap, the source's key warning and the facts of the last run.
+    fn toolbar_ui(&mut self, ui: &mut Ui, ready: bool, no_key: bool, busy: bool) {
+        let p = ternarygrid_ui::pal(ui);
+        ternarygrid_ui::parts::toolbar(ui, |ui| {
+            if ui.add_enabled_ui(ready && !busy && !self.start_requested, |ui| look::small(ui, kit::Kind::Primary, icon::ARROWS_DOWN_UP, tr("Compare"))).inner.clicked() {
+                self.start_requested = true;
+            }
+            if ui.add_enabled_ui(!busy, |ui| look::small(ui, kit::Kind::Ghost, icon::REPEAT, tr("Swap"))).inner.clicked() {
+                std::mem::swap(&mut self.source, &mut self.target);
+                self.result = None;
+                self.chosen_for = None;
+            }
+            if no_key {
+                look::tone(ui, tr("The source table has no primary key: choose the key columns."), p.warn, false);
+            }
+            if self.start_requested {
+                ternarygrid_ui::parts::spinner_label(ui, tr("Opening the sessions…"));
+            }
+            if let Some(o) = &self.result {
+                let facts = Self::facts(o);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(facts).size(12.0).color(p.text_faint));
+                });
+            }
+        });
+    }
 }

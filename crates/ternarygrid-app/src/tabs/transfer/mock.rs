@@ -4,7 +4,7 @@
 
 use super::wizard::{self, Clicked, W, line};
 use super::{
-    MessageLog, Running, combo_w, connection_name, error_text, next_uid, not_connected, number_edit, on_error_options, opt_number, parsed_edit, progress_ui, reload_table_def,
+    MessageLog, Running, combo, connection_name, error_text, next_uid, not_connected, number_edit, on_error_options, opt_number, parsed_edit, progress_ui, reload_table_def,
     section, table_def_of,
 };
 use crate::command::AppCommand;
@@ -209,21 +209,16 @@ impl MockDataTab {
                 opt_number(ui, &mut c.seed, tr("random"));
                 wizard::faint(ui, tr("same seed, same data"));
             });
-            // The selects fill their column.
+            // The selects as wide as their text, as in the design.
             f.row(tr("Existing rows"), |ui| {
-                let w = ui.available_width();
-                combo_w(
+                combo(
                     ui,
                     ("mock_mode", id),
                     &mut c.mode,
                     &[(MockMode::Append, tr("Keep them and add the new rows").to_string()), (MockMode::TruncateFirst, tr("Delete them first").to_string())],
-                    w,
                 )
             });
-            f.row(tr("On error"), |ui| {
-                let w = ui.available_width();
-                combo_w(ui, ("mock_err", id), &mut c.on_error, &on_error_options(), w)
-            });
+            f.row(tr("On error"), |ui| combo(ui, ("mock_err", id), &mut c.on_error, &on_error_options()));
         });
     }
 
@@ -265,8 +260,11 @@ impl MockDataTab {
                 match k {
                     0 => {
                         let key = def.primary_key.as_ref().is_some_and(|k| k.columns.contains(&col.name));
-                        let font = if key { ternarygrid_ui::style::semibold(ui.ctx(), 13.0) } else { egui::FontId::proportional(13.0) };
-                        ui.add(egui::Label::new(RichText::new(&col.name).font(font)).truncate());
+                        if key {
+                            kit::semibold_label(ui, &col.name, 13.0, ternarygrid_ui::pal(ui).text);
+                        } else {
+                            ui.add(egui::Label::new(RichText::new(&col.name).size(13.0)).truncate());
+                        }
                     }
                     1 => {
                         let mut ty = col.data_type.clone();
@@ -342,7 +340,7 @@ impl MockDataTab {
         }
         let (mut run, mut cancel) = (false, false);
         let text = trf("All rows of {} are deleted before the new rows are generated.", &[&self.table.display_path()]);
-        let (resp, _) = parts::Dialog::new(tr("Delete the existing rows?")).icon(icon::WARNING).width(480.0).show_modal(
+        let (resp, _) = parts::Dialog::new(tr("Delete the existing rows?")).icon(icon::WARNING).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
             ctx,
             egui::Id::new(("mock_confirm", self.uid)),
             |ui| {
@@ -350,7 +348,7 @@ impl MockDataTab {
             },
             |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if wizard::danger_solid(ui, icon::TRASH, tr("Delete and generate")).clicked() {
+                    if kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Delete and generate"), false).clicked() {
                         run = true;
                     }
                     if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -436,14 +434,19 @@ fn text_limit(c: &ColumnDef) -> Option<usize> {
 fn generator_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, col: &ColumnDef, value: &mut GeneratorKind, auto: Option<&GeneratorKind>) {
     let options = choices(col, auto, value);
     let current = options.iter().find(|(g, _)| discriminant(g) == discriminant(value)).map(|(_, l)| l.clone()).unwrap_or_default();
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(ui.available_width()).height(420.0).show_ui(ui, |ui| {
-        for (g, label) in options {
-            let selected = discriminant(&g) == discriminant(value);
-            if ui.selectable_label(selected, label).clicked() && !selected {
-                *value = g;
+    let w = ui.available_width();
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(w).height(420.0).show_ui(
+        ui,
+        |ui| {
+            kit::menu_look(ui, w);
+            for (g, label) in options {
+                let selected = discriminant(&g) == discriminant(value);
+                if wizard::choice(ui, selected, &label) && !selected {
+                    *value = g;
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 fn date_edit(ui: &mut Ui, value: &mut NaiveDate) {
@@ -549,8 +552,8 @@ impl TabView for MockDataTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        // No steps: the design's window is 50 lower than the wizards with steps.
-        Some(wizard::WINDOW - egui::vec2(0.0, 50.0))
+        // No steps: the design's window is 51 lower than the wizards with steps.
+        Some(wizard::WINDOW - egui::vec2(0.0, 51.0))
     }
 
     fn title(&self) -> String {

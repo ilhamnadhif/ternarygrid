@@ -261,7 +261,7 @@ impl BackupForm {
             }
             let whole_server = self.all_databases && flavor == ToolFlavor::Postgres;
             if (pg || sqlite) && !whole_server {
-                look::row(ui, tr("Format"), lw, |ui| {
+                look::seg_row(ui, tr("Format"), lw, |ui| {
                     let items: Vec<(BackupFormat, &str)> = formats(flavor).iter().map(|f| (*f, flavor_format_label(flavor, *f))).collect();
                     let old = self.format;
                     if parts::segmented(ui, &mut self.format, &items) {
@@ -314,13 +314,14 @@ impl BackupForm {
                     changed |= look::checkbox(ui, &mut self.routines, tr("Include routines and events")).changed();
                 }
                 if pg && self.format != BackupFormat::Tar && !whole_server {
+                    // As in the design: the label, a level bar (drag or click; a double click
+                    // goes back to the tool's default) and the level.
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
-                        changed |= look::checkbox(ui, &mut self.compress, tr("Compression level")).changed();
-                        ui.add_enabled_ui(self.compress, |ui| {
-                            ui.spacing_mut().slider_width = 180.0;
-                            changed |= ui.add(egui::Slider::new(&mut self.compression, 0..=9)).changed();
-                        });
+                        look::muted(ui, tr("Compression level"));
+                        changed |= look::level_bar(ui, tr("Compression level"), &mut self.compress, &mut self.compression, 9, 182.0);
+                        let shown = if self.compress { self.compression.to_string() } else { tr("default").to_string() };
+                        ui.label(RichText::new(shown).size(12.5));
                     });
                 }
             });
@@ -459,7 +460,7 @@ impl RestoreForm {
                 changed |= picked;
             });
             if pg || sqlite {
-                look::row(ui, tr("Format"), lw, |ui| {
+                look::seg_row(ui, tr("Format"), lw, |ui| {
                     let items: Vec<(BackupFormat, &str)> = formats(flavor).iter().map(|f| (*f, flavor_format_label(flavor, *f))).collect();
                     changed |= parts::segmented(ui, &mut self.format, &items);
                 });
@@ -893,7 +894,7 @@ impl BackupTab {
     /// Start (backup), Cancel and Save as task… (the restore has them in its footer).
     fn run_buttons(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let running = self.is_running();
-        let (glyph, label) = if self.restore { (icon::ARROW_COUNTER_CLOCKWISE, tr("Start restore")) } else { (icon::PLAY, tr("Start backup")) };
+        let (glyph, label) = if self.restore { (icon::REPEAT, tr("Start restore")) } else { (icon::PLAY, tr("Start backup")) };
         let ready = cx.conns.is_connected(&self.conn) && matches!(self.preview.as_ref().map(|p| &p.result), Some(Ok(_)));
         if ui.add_enabled_ui(!running && ready, |ui| kit::primary_icon(ui, glyph, label)).inner.clicked() {
             if self.restore {
@@ -1008,7 +1009,7 @@ impl BackupTab {
             let file = std::path::Path::new(self.restore_form.input.trim()).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| self.restore_form.input.clone());
             let question = trf("Restore {} into \"{}\" / {}?", &[&file, &target, &db]);
             let (mut run, mut cancel) = (false, false);
-            let (resp, _) = parts::Dialog::new(tr("Restore the backup")).icon(icon::ARROW_COUNTER_CLOCKWISE).width(480.0).show_modal(
+            let (resp, _) = parts::Dialog::new(tr("Restore the backup")).icon(icon::REPEAT).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
                 ui.ctx(),
                 egui::Id::new(("confirm_restore", &self.conn)),
                 |ui| {
@@ -1019,7 +1020,7 @@ impl BackupTab {
                 },
                 |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if look::danger_solid(ui, Some(icon::ARROW_COUNTER_CLOCKWISE), tr("Restore")).clicked() {
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::REPEAT), tr("Restore"), false).clicked() {
                             run = true;
                         }
                         if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -1038,7 +1039,7 @@ impl BackupTab {
         if let Some((mut name, mut folder)) = self.save_prompt.take() {
             let (mut save, mut cancel) = (false, false);
             let can_save = !name.trim().is_empty();
-            let (resp, _) = parts::Dialog::new(tr("Save as task")).icon(icon::FLOPPY_DISK).width(460.0).show_modal(
+            let (resp, _) = parts::Dialog::new(tr("Save as task")).icon(icon::FLOPPY_DISK).width(460.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
                 ui.ctx(),
                 egui::Id::new(("save_backup_task", &self.conn)),
                 |ui| {
@@ -1087,14 +1088,15 @@ impl TabView for BackupTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(if self.restore { egui::vec2(860.0, 640.0) } else { egui::vec2(900.0, 703.0) })
+        // The design's windows inside their border.
+        Some(if self.restore { egui::vec2(860.0, 439.5) } else { egui::vec2(900.0, 729.5) })
     }
 
     fn title(&self) -> String {
         if self.restore { tr("Restore").to_string() } else { tr("Backup").to_string() }
     }
     fn icon(&self) -> &'static str {
-        if self.restore { icon::ARROW_COUNTER_CLOCKWISE } else { icon::ARCHIVE }
+        if self.restore { icon::REPEAT } else { icon::CUBE }
     }
     fn connection_id(&self) -> Option<&str> {
         Some(&self.conn)
@@ -1113,6 +1115,8 @@ impl TabView for BackupTab {
             });
         }
         look::body(ui, ("backup_body", &conn, self.restore), |ui| {
+            // The design's parts are 14 apart.
+            ui.spacing_mut().item_spacing.y = 14.0;
             self.header(ui, cx);
             look::divider(ui);
             ui.add_enabled_ui(!running, |ui| {

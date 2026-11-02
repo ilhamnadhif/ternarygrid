@@ -186,7 +186,8 @@ impl FdwConfigTab {
 
 impl TabView for FdwConfigTab {
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(860.0, 680.0))
+        // The design's window inside its border.
+        Some(egui::vec2(860.0, 628.0))
     }
 
     fn title(&self) -> String {
@@ -222,6 +223,8 @@ impl TabView for FdwConfigTab {
             let sources: Vec<ConnectionConfig> = cx.conns.configs().iter().filter(|c| c.id != self.conn && wrapper_of(c.kind).is_some()).cloned().collect();
             let current = self.source.as_ref().and_then(|id| sources.iter().find(|c| &c.id == id)).cloned();
             let lw = 150.0;
+            // The design's select box is 30 high, as the fields (the logo centred on it).
+            ui.spacing_mut().interact_size.y = ternarygrid_ui::style::CONTROL_H;
             look::row(ui, tr("Source connection"), lw, |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if let Some(c) = &current {
@@ -229,11 +232,13 @@ impl TabView for FdwConfigTab {
                 }
                 egui::ComboBox::from_id_salt(("fdw_source", &self.conn))
                     .icon(ternarygrid_ui::kit::combo_caret)
+                    .popup_style(egui::containers::menu::menu_style.into())
                     .selected_text(current.as_ref().map(|c| format!("{} ({})", c.name, c.kind.display_name())).unwrap_or_else(|| tr("(choose)").to_string()))
                     .width(260.0)
                     .show_ui(ui, |ui| {
+                        ternarygrid_ui::kit::menu_look(ui, 260.0);
                         for c in &sources {
-                            if ui.selectable_label(self.source.as_deref() == Some(&c.id), format!("{} ({})", c.name, c.kind.display_name())).clicked() {
+                            if crate::tabs::transfer::wizard::choice(ui, self.source.as_deref() == Some(&c.id), &format!("{} ({})", c.name, c.kind.display_name())) {
                                 self.set_source(c);
                             }
                         }
@@ -248,6 +253,8 @@ impl TabView for FdwConfigTab {
             });
             look::row(ui, tr("Tables"), lw, |ui| look::field(ui, &mut self.tables, tr("comma separated; empty = all"), f32::INFINITY, false));
             ui.add_space(4.0);
+            // The buttons' row as high as they are (26).
+            ui.spacing_mut().interact_size.y = ternarygrid_ui::style::SMALL_H;
             match self.script() {
                 Ok(script) => {
                     ui.horizontal(|ui| {
@@ -259,12 +266,14 @@ impl TabView for FdwConfigTab {
                             ui.ctx().copy_text(script.clone());
                         }
                     });
-                    let h = (ui.available_height() - 18.0).max(160.0);
+                    // 250 high as in the design (more when the window is made taller).
+                    let h = (ui.available_height() - 18.0).max(250.0);
                     egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(8).show(ui, |ui| {
                         ui.allocate_ui(egui::vec2(ui.available_width(), h - 2.0), |ui| match &self.lang {
                             Some(lang) => {
                                 let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-                                ternarygrid_editor::CodeView::new(&script, lang, &theme).id_salt(("fdw_script", &conn)).show(ui);
+                                let options = look::code_options(13.0, 21.0);
+                                ternarygrid_editor::CodeView::new(&script, lang, &theme).options(&options).id_salt(("fdw_script", &conn)).show(ui);
                             }
                             None => {
                                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| crate::tabs::code(ui, cx, &conn, ("fdw_script", &conn), &script));

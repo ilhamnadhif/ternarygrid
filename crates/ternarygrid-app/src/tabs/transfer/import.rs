@@ -738,7 +738,11 @@ impl ImportTab {
         for (i, c) in p.columns.iter().enumerate() {
             let head = text_w(ui, &c.name) + text_w(ui, &type_of(&c.type_name)) * 0.85 + 34.0;
             let widest = rows.iter().filter_map(|r| r.get(i)).map(|v| text_w(ui, preview_text(v).lines().next().unwrap_or(""))).fold(0.0, f32::max) + 24.0;
-            cols.push(col(&c.name, W::Px(head.max(widest).clamp(80.0, 280.0))).grid());
+            // Numbers at the right, as in the design's grid.
+            let mut values = rows.iter().filter_map(|r| r.get(i)).filter(|v| !v.is_null()).peekable();
+            let number = values.peek().is_some() && values.all(|v| preview_text(v).trim().parse::<f64>().is_ok());
+            let column = col(&c.name, W::Px(head.max(widest).clamp(80.0, 280.0))).grid();
+            cols.push(if number { column.right() } else { column });
         }
         // 180 high as in the design; the rows scroll under the header.
         wizard::table(
@@ -843,25 +847,31 @@ impl ImportTab {
         let Some(schema) = self.schema.clone().or_else(|| current_schema(cx, &conn)) else { return };
         let tables = schema_tables(cx, &conn, &schema, false);
         let label = self.table.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| tr("Choose…").to_string());
-        egui::ComboBox::from_id_salt(("imp_table", self.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(200.0).height(360.0).show_ui(
-            ui,
-            |ui| match &tables {
-                None => {
-                    parts::spinner_label(ui, tr("Loading…"));
-                }
-                Some(Err(e)) => {
-                    ui.label(e.full_text());
-                }
-                Some(Ok(list)) => {
-                    for o in list.iter().filter(|o| !o.is_system) {
-                        let selected = self.table.as_ref() == Some(&o.obj);
-                        if ui.selectable_label(selected, &o.obj.name).clicked() && !selected {
-                            self.table = Some(o.obj.clone());
+        egui::ComboBox::from_id_salt(("imp_table", self.uid))
+            .icon(kit::combo_caret)
+            .popup_style(egui::containers::menu::menu_style.into())
+            .selected_text(label)
+            .width(200.0)
+            .height(360.0)
+            .show_ui(ui, |ui| {
+                kit::menu_look(ui, 200.0);
+                match &tables {
+                    None => {
+                        parts::spinner_label(ui, tr("Loading…"));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(e.full_text());
+                    }
+                    Some(Ok(list)) => {
+                        for o in list.iter().filter(|o| !o.is_system) {
+                            let selected = self.table.as_ref() == Some(&o.obj);
+                            if wizard::choice(ui, selected, &o.obj.name) && !selected {
+                                self.table = Some(o.obj.clone());
+                            }
                         }
                     }
                 }
-            },
-        );
+            });
     }
 
     fn sample_values(&self, index: usize) -> String {
@@ -939,11 +949,12 @@ impl ImportTab {
                             edited = true;
                         }
                         if let Some(d) = &dialect {
-                            let r = wizard::icon_button(ui, icon::CARET_DOWN, tr("Types"), 22.0);
+                            let r = kit::icon_button_sized(ui, icon::CARET_DOWN, tr("Types"), false, 22.0, 11.0);
                             egui::Popup::menu(&r).show(|ui| {
+                                kit::menu_look(ui, 260.0);
                                 for kind in COMMON_KINDS {
                                     let t = d.ddl().default_type_for(kind);
-                                    if ui.button(format!("{t}  ({})", kind_label(kind))).clicked() {
+                                    if kit::menu_item(ui, None, &t, kind_label(kind)).clicked() {
                                         c.target_type = t;
                                         c.target_kind = Some(kind);
                                         edited = true;
@@ -1019,15 +1030,20 @@ impl ImportTab {
                     }
                     1 => {
                         let label = if c.skip { tr("(not imported)").to_string() } else { c.target_name.clone() };
-                        egui::ComboBox::from_id_salt(("imp_map_col", id, i)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(ui.available_width()).show_ui(
-                            ui,
-                            |ui| {
-                                if ui.selectable_label(c.skip, tr("(not imported)")).clicked() {
+                        let w = ui.available_width();
+                        egui::ComboBox::from_id_salt(("imp_map_col", id, i))
+                            .icon(kit::combo_caret)
+                            .popup_style(egui::containers::menu::menu_style.into())
+                            .selected_text(label)
+                            .width(w)
+                            .show_ui(ui, |ui| {
+                                kit::menu_look(ui, w);
+                                if wizard::choice(ui, c.skip, tr("(not imported)")) {
                                     c.skip = true;
                                 }
                                 for col in &def.columns {
                                     let selected = !c.skip && c.target_name == col.name;
-                                    if ui.selectable_label(selected, &col.name).clicked() {
+                                    if wizard::choice(ui, selected, &col.name) {
                                         c.skip = col.generated.is_some();
                                         c.target_name = col.name.clone();
                                         c.target_type = col.data_type.clone();
@@ -1035,8 +1051,7 @@ impl ImportTab {
                                         c.nullable = col.nullable;
                                     }
                                 }
-                            },
-                        );
+                            });
                     }
                     2 => {
                         wizard::faint(ui, if c.skip { "" } else { &c.target_type });
@@ -1118,10 +1133,13 @@ impl ImportTab {
                 f.row(tr("Decimal separator"), |ui| char_edit(ui, &mut c.decimal_separator));
                 f.row(tr("Thousands separator"), |ui| opt_char_edit(ui, &mut c.thousands_separator, ""));
                 f.row(tr("NULL markers"), |ui| lines_edit(ui, &mut c.null_values, tr("one per line, e.g. NULL or \\N"), f32::INFINITY));
+                // Wrapped when the column is narrow (the window keeps the design's width).
                 f.check_row(tr("Text"), |ui| {
-                    ui.spacing_mut().item_spacing.x = 16.0;
-                    wizard::check(ui, &mut c.trim_text, tr("Trim spaces"));
-                    wizard::check(ui, &mut c.empty_text_as_null, tr("Empty text is NULL"));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(16.0, 8.0);
+                        wizard::check(ui, &mut c.trim_text, tr("Trim spaces"));
+                        wizard::check(ui, &mut c.empty_text_as_null, tr("Empty text is NULL"));
+                    });
                 });
                 f.row(tr("Time zone of timestamps"), |ui| {
                     opt_number(ui, &mut c.default_offset_minutes, tr("local"));
@@ -1357,10 +1375,12 @@ fn table_name_from(stem: &str) -> String {
 
 // ------------------------------------------------------------ reader options
 
-fn encoding_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut String) {
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(value.clone()).width(160.0).show_ui(ui, |ui| {
-        for e in ENCODINGS {
-            if ui.selectable_label(value.eq_ignore_ascii_case(e), e).clicked() {
+/// A choice of text encodings (export and import), 160 wide.
+pub(crate) fn encoding_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut String, options: &[&str]) {
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(value.clone()).width(160.0).show_ui(ui, |ui| {
+        kit::menu_look(ui, 160.0);
+        for e in options {
+            if wizard::choice(ui, value.eq_ignore_ascii_case(e), e) {
                 *value = e.to_string();
             }
         }
@@ -1380,13 +1400,14 @@ fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, tsv: bool, m
         });
         f.row(tr("Comment lines"), |ui| opt_char_edit(ui, &mut o.comment_char, tr("none")));
         f.check_row(tr("Spaces"), |ui| wizard::check(ui, &mut o.trim, tr("Trim spaces around values")));
+        // Any other delimiter (the common ones are chosen above, as in the design).
+        if !tsv {
+            f.row(tr("Other delimiter"), |ui| ui.add(wizard::mono_line(&mut o.delimiter, 60.0)));
+        }
         return;
     }
     if !tsv {
-        f.row(tr("Delimiter"), |ui| {
-            ui.add(wizard::mono_line(&mut o.delimiter, 60.0));
-            delimiter_choice(ui, &mut o.delimiter);
-        });
+        f.seg_row(tr("Delimiter"), |ui| delimiter_choice(ui, &mut o.delimiter));
     }
     f.row(tr("Header"), |ui| {
         let w = ui.available_width();
@@ -1405,7 +1426,7 @@ fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, tsv: bool, m
     f.row(tr("Skip rows"), |ui| wizard::number(ui, &mut o.skip_rows, 0..=1_000_000, 70.0));
     f.row(tr("Quote character"), |ui| opt_char_edit(ui, &mut o.quote_char, tr("none")));
     f.row(tr("NULL text"), |ui| ui.add(line(&mut o.null_string).hint_text(tr("empty")).desired_width(140.0)));
-    f.row(tr("Encoding"), |ui| encoding_combo(ui, ("csv_rd_enc", id), &mut o.encoding));
+    f.row(tr("Encoding"), |ui| encoding_combo(ui, ("csv_rd_enc", id), &mut o.encoding, &ENCODINGS));
 }
 
 fn xlsx_reader_ui(f: &mut Form<'_>, id: u64, o: &mut XlsxReadOptions, sheets: &[String]) {
@@ -1414,16 +1435,22 @@ fn xlsx_reader_ui(f: &mut Form<'_>, id: u64, o: &mut XlsxReadOptions, sheets: &[
             SheetSelector::Name(n) => n.clone(),
             SheetSelector::Index(i) => sheets.get(*i).cloned().unwrap_or_else(|| trf("Sheet {}", &[&(i + 1)])),
         };
-        egui::ComboBox::from_id_salt(("xlsx_sheet", id)).icon(ternarygrid_ui::kit::combo_caret).selected_text(current.clone()).width(180.0).show_ui(ui, |ui| {
-            if sheets.is_empty() {
-                ui.weak(tr("Loading…"));
-            }
-            for s in sheets {
-                if ui.selectable_label(*s == current, s).clicked() {
-                    o.sheet = SheetSelector::Name(s.clone());
+        egui::ComboBox::from_id_salt(("xlsx_sheet", id))
+            .icon(kit::combo_caret)
+            .popup_style(egui::containers::menu::menu_style.into())
+            .selected_text(current.clone())
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                kit::menu_look(ui, 180.0);
+                if sheets.is_empty() {
+                    kit::menu_caption(ui, tr("Loading…"));
                 }
-            }
-        });
+                for s in sheets {
+                    if wizard::choice(ui, *s == current, s) {
+                        o.sheet = SheetSelector::Name(s.clone());
+                    }
+                }
+            });
     });
     f.check_row(tr("Header"), |ui| wizard::check(ui, &mut o.header, tr("The first row holds the column names")));
     f.row(tr("Skip rows"), |ui| wizard::number(ui, &mut o.skip_rows, 0..=1_000_000, 70.0));
@@ -1434,7 +1461,7 @@ fn xml_reader_ui(f: &mut Form<'_>, id: u64, o: &mut XmlReadOptions) {
     f.row(tr("Row element"), |ui| opt_text(ui, &mut o.record_element, tr("every child of the root element"), 220.0));
     f.check_row(tr("Attributes"), |ui| wizard::check(ui, &mut o.attributes_as_columns, tr("Attributes of the row element are columns")));
     f.check_row(tr("Empty elements"), |ui| wizard::check(ui, &mut o.empty_as_null, tr("Read as NULL")));
-    f.row(tr("Encoding"), |ui| encoding_combo(ui, ("xml_rd_enc", id), &mut o.encoding));
+    f.row(tr("Encoding"), |ui| encoding_combo(ui, ("xml_rd_enc", id), &mut o.encoding, &ENCODINGS));
 }
 
 fn json_reader_ui(f: &mut Form<'_>, id: u64, o: &mut JsonReadOptions) {
@@ -1450,7 +1477,7 @@ fn json_reader_ui(f: &mut Form<'_>, id: u64, o: &mut JsonReadOptions) {
             ],
         )
     });
-    f.row(tr("Encoding"), |ui| encoding_combo(ui, ("json_rd_enc", id), &mut o.encoding));
+    f.row(tr("Encoding"), |ui| encoding_combo(ui, ("json_rd_enc", id), &mut o.encoding, &ENCODINGS));
 }
 
 impl TabView for ImportTab {

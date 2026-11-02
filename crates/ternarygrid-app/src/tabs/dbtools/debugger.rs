@@ -559,7 +559,7 @@ impl DebuggerTab {
             // The signature as in the design: "public.recalc_order_total(bigint)".
             let types: Vec<&str> = self.args.iter().filter(|a| !a.mode.eq_ignore_ascii_case("OUT")).map(|a| a.data_type.as_str()).collect();
             let title = if types.is_empty() { self.routine.display_path() } else { format!("{}({})", self.routine.display_path(), types.join(", ")) };
-            ui.label(RichText::new(title).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(p.text));
+            ternarygrid_ui::kit::semibold_label(ui, &title, 13.0, p.text);
             if let Loadable::Loaded(d) = &self.def
                 && let Some(l) = &d.language
             {
@@ -704,7 +704,7 @@ impl DebuggerTab {
         let gutter_w = 18.0 + 18.0 + number_w;
         let width = gutter_w + self.max_cols as f32 * char_w + 24.0;
         let current = self.state.as_ref().filter(|s| !s.finished).and_then(|s| s.line);
-        let current_bg = look::current_line(ui);
+        let current_bg = ternarygrid_ui::pal(ui).modified;
         let bp_color = egui::Color32::from_rgb(0xf2, 0x66, 0x5a);
         let can_toggle = self.lines_ok;
         let mut toggled = None;
@@ -842,7 +842,7 @@ impl DebuggerTab {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.add_space(16.0);
-                ui.label(RichText::new(tr("Messages")).font(ternarygrid_ui::style::semibold(ui.ctx(), 12.5)).color(p.text));
+                ternarygrid_ui::kit::semibold_label(ui, tr("Messages"), 12.5, p.text);
             });
             egui::ScrollArea::both().id_salt(("dbg_msgs", &self.conn)).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;
@@ -864,7 +864,7 @@ impl DebuggerTab {
             ui.add_space(10.0);
             egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 8 }).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
-                ui.label(RichText::new(tr("Result")).font(ternarygrid_ui::style::semibold(ui.ctx(), 12.5)).color(p.text));
+                ternarygrid_ui::kit::semibold_label(ui, tr("Result"), 12.5, p.text);
                 match &self.result {
                     Some(data) if !data.columns.is_empty() => {
                         let fmt = cx.settings.results.format.clone();
@@ -957,7 +957,8 @@ impl TabView for DebuggerTab {
             .size_range(80.0..=f32::INFINITY)
             .frame(egui::Frame::new().fill(p.canvas))
             .show(ui, |ui| self.output_ui(ui, cx));
-        egui::Panel::right(base.with("frame")).resizable(true).default_size(320.0).frame(egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin::symmetric(14, 12))).show(
+        // The design's 320 wide content with its 14 × 12 padding (348 with the padding).
+        egui::Panel::right(base.with("frame")).resizable(true).default_size(347.0).frame(egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin::symmetric(14, 12))).show(
             ui,
             |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
