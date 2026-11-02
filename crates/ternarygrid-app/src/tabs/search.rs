@@ -414,6 +414,9 @@ impl SearchTab {
                     ui.add(egui::Spinner::new().size(14.0).color(pal.accent_text));
                 }
             });
+            // A line as tall as its 26 point fields (its first row starts at that height, so
+            // the check boxes are centred on them).
+            ui.spacing_mut().interact_size.y = 26.0;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 look::checkbox(ui, &mut self.case_sensitive, tr("Case sensitive"));
@@ -423,36 +426,50 @@ impl SearchTab {
                 divider(ui);
                 ui.horizontal(|ui| self.schema_filter_ui(ui, cx));
             });
-            ui.horizontal_wrapped(|ui| {
+            // When the kinds do not fit on the line, the longest label wraps (as a flex row
+            // shrinks it) before the line breaks; the row is then as tall as that label and the
+            // others are centred on it.
+            let font = egui::FontId::proportional(13.0);
+            let label = ui.painter().layout_no_wrap(tr("Kinds").to_string(), egui::FontId::proportional(12.5), egui::Color32::PLACEHOLDER).size().x;
+            let widths: Vec<f32> =
+                KINDS.iter().map(|k| ui.painter().layout_no_wrap(tr(k.plural_label()).to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x + 26.0).collect();
+            let need = label + widths.iter().sum::<f32>() + 12.0 * KINDS.len() as f32;
+            let over = need - ui.available_width();
+            let longest = widths.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+            // Squeezing the longest label to 55 % at most; past that the line breaks.
+            let fits = over <= widths[longest] * 0.45;
+            let squeezed = (over > 0.0 && fits).then(|| widths[longest] - over);
+            let row_h = squeezed.map_or(17.0, |w| {
+                let text = tr(KINDS[longest].plural_label()).to_string();
+                ui.painter().layout(text, font.clone(), egui::Color32::PLACEHOLDER, w - 26.0).size().y.max(17.0)
+            });
+            let kinds = &mut self.kinds;
+            let mut kinds_row = |ui: &mut Ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 ui.label(RichText::new(tr("Kinds")).size(12.5).color(pal.text_muted));
-                // When the kinds do not fit on the line, the longest label wraps (as a flex row
-                // shrinks it) before the line breaks.
-                let font = egui::FontId::proportional(13.0);
-                let widths: Vec<f32> =
-                    KINDS.iter().map(|k| ui.painter().layout_no_wrap(tr(k.plural_label()).to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x + 26.0).collect();
-                let need = widths.iter().sum::<f32>() + 12.0 * (KINDS.len() - 1) as f32;
-                // The rest of this line (a wrapping layout's `available_width` is not).
-                let over = need - (ui.max_rect().right() - ui.cursor().min.x);
-                let longest = widths.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
                 for (i, k) in KINDS.iter().enumerate() {
-                    let mut on = self.kinds.contains(k);
-                    let squeeze = (i == longest && over > 0.0).then(|| (widths[i] - over).max(widths[i] * 0.55));
-                    let r = match squeeze {
+                    let mut on = kinds.contains(k);
+                    let r = match squeezed.filter(|_| i == longest) {
                         Some(w) => {
-                            ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| look::checkbox(ui, &mut on, tr(k.plural_label()))).inner
+                            ui.allocate_ui_with_layout(egui::vec2(w, row_h), egui::Layout::top_down(egui::Align::Min), |ui| look::checkbox(ui, &mut on, tr(k.plural_label()))).inner
                         }
                         None => look::checkbox(ui, &mut on, tr(k.plural_label())),
                     };
                     if r.changed() {
                         if on {
-                            self.kinds.insert(*k);
+                            kinds.insert(*k);
                         } else {
-                            self.kinds.remove(k);
+                            kinds.remove(k);
                         }
                     }
                 }
-            });
+            };
+            if fits {
+                // One line as tall as its tallest label, the others centred on it.
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), row_h), egui::Layout::left_to_right(egui::Align::Center), |ui| kinds_row(ui));
+            } else {
+                ui.horizontal_wrapped(|ui| kinds_row(ui));
+            }
         });
         if go {
             self.start_metadata(cx);

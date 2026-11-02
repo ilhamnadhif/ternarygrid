@@ -1736,6 +1736,7 @@ impl TableDesignerTab {
                     .hint_text(RichText::new(hint).color(p.text_faint))
                     .code_editor()
                     // The design's one-line code block (lines of 20, 8 above and below).
+                    .font(egui::FontId::monospace(12.5))
                     .desired_rows(1)
                     .min_size(vec2(0.0, 38.0))
                     .desired_width(f32::INFINITY)

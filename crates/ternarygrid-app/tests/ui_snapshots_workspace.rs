@@ -482,6 +482,7 @@ fn shots(s: &mut Shots) {
         st.results.global_memory_limit_mb = 2048;
         st.results.max_text_length = 1_000_000;
         st.results.format.null_text = "NULL".into();
+        st.results.format.bool_style = ternarygrid_core::value::BoolStyle::TrueFalse;
         st.history.max_entries = 100_000;
         st.ai.enabled = true;
         st.ai.max_tokens = 8192;
