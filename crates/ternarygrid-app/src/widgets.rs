@@ -81,26 +81,40 @@ pub fn styled_table(
     selected: Option<usize>,
     styles: &[CellStyle],
 ) -> TableResponse {
+    styled_table_widths(ui, id_salt, headers, rows, selected, styles, &[])
+}
+
+/// [`styled_table`] with the mockups' column widths: a share of the width left by the fixed
+/// ones (positive, the CSS `fr`), or points (negative: -40 is 40 points). Empty: as wide as
+/// their text.
+pub fn styled_table_widths(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    headers: &[&str],
+    rows: &[Vec<String>],
+    selected: Option<usize>,
+    styles: &[CellStyle],
+    widths: &[f32],
+) -> TableResponse {
     // In its own ui: the column lines end at the last row, not at the bottom of the panel.
     let id = egui::Id::new(&id_salt);
-    ternarygrid_ui::parts::bordered(ui).inner_margin(egui::Margin::ZERO).show(ui, |ui| ui.scope(|ui| table_in(ui, id, headers, rows, selected, styles)).inner).inner
+    ternarygrid_ui::parts::bordered(ui).inner_margin(egui::Margin::ZERO).show(ui, |ui| ui.scope(|ui| table_in(ui, id, headers, rows, selected, styles, widths)).inner).inner
 }
 
 /// The colours of a [`CellStyle::Chip`]: keys warn, checks and dependants in the accent.
-fn chip_colors(text: &str, pal: &ternarygrid_ui::style::Palette, dark: bool) -> (egui::Color32, egui::Color32) {
+fn chip_colors(text: &str, pal: &ternarygrid_ui::style::Palette) -> (egui::Color32, egui::Color32) {
     match text {
-        "PRIMARY" | "PRIMARY KEY" => (pal.warn, if dark { egui::Color32::from_rgb(0x4b, 0x44, 0x3b) } else { egui::Color32::from_rgb(0xf3, 0xea, 0xd6) }),
+        "PRIMARY" | "PRIMARY KEY" => (pal.warn, pal.modified),
         "CHECK" => (pal.accent_text, pal.accent_soft),
         t if t == tr("used by") => (pal.accent_text, pal.accent_soft),
         _ => (pal.text_muted, pal.subtle),
     }
 }
 
-fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], selected: Option<usize>, styles: &[CellStyle]) -> TableResponse {
+fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], selected: Option<usize>, styles: &[CellStyle], widths: &[f32]) -> TableResponse {
     let mut out = TableResponse::default();
     let row_h = 31.0;
     let pal = ternarygrid_ui::pal(ui);
-    let dark = ui.visuals().dark_mode;
     let style_of = |i: usize| styles.get(i).copied().unwrap_or_default();
     let chip_font = ternarygrid_ui::style::semibold(ui.ctx(), 11.0);
     let body_font = egui::TextStyle::Body.resolve(ui.style());
@@ -122,12 +136,18 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
             widest + 2.0 * CELL_PAD
         })
         .collect();
+    // The mockups' widths: points, and shares of what is left.
+    let fixed: f32 = widths.iter().filter(|w| **w < 0.0).map(|w| -w).sum();
+    let shares: f32 = widths.iter().filter(|w| **w > 0.0).sum();
+    let unit = (ui.available_width() - fixed).max(0.0) / shares.max(1e-3);
+    let given = |i: usize| widths.get(i).map(|w| if *w < 0.0 { -w } else { w * unit });
     // Rows edge to edge, no lines between the columns (their borders show when hovered).
     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
     ui.visuals_mut().widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
     let mut tb = TableBuilder::new(ui)
         .id_salt(id)
-        .striped(true)
+        // Striped by hand: the mockups' second row is the first tinted one.
+        .striped(false)
         .resizable(true)
         .sense(egui::Sense::click())
         // As tall as its rows: the column lines end at the last row.
@@ -137,7 +157,8 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
         tb = if i + 1 == headers.len() {
             tb.column(Column::remainder().at_least(w.max(60.0)).clip(true))
         } else {
-            tb.column(Column::initial(content_w[i].clamp(w.max(40.0), 480.0)).at_least(w.max(40.0)).clip(true).resizable(true))
+            let initial = given(i).unwrap_or_else(|| content_w[i].clamp(w.max(40.0), 480.0));
+            tb.column(Column::initial(initial).at_least(w.max(40.0)).clip(true).resizable(true))
         };
     }
     tb.header(33.0, |mut header| {
@@ -148,7 +169,7 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
                 ui.painter().rect_filled(r, 0.0, pal.header);
                 ui.painter().hline(r.x_range(), r.bottom() - 0.5, egui::Stroke::new(1.0, pal.border));
                 ui.add_space(CELL_PAD);
-                ui.label(RichText::new(*h).font(header_font.clone()).color(pal.text_muted));
+                ternarygrid_ui::kit::semibold_label(ui, h, 12.0, pal.text_muted);
             });
         }
     })
@@ -160,13 +181,16 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
                 for (ci, c) in cells.iter().take(headers.len()).enumerate() {
                     let st = style_of(ci);
                     row.col(|ui| {
+                        if i % 2 == 1 && selected != Some(i) {
+                            ui.painter().rect_filled(ui.max_rect().expand2(egui::vec2(4.0, 0.0)), 0.0, pal.stripe);
+                        }
                         ui.spacing_mut().item_spacing.x = 6.0;
                         ui.add_space(CELL_PAD);
                         let short: String = c.chars().take(300).collect();
                         let first_line = short.lines().next().unwrap_or("");
                         if st == CellStyle::Chip {
                             if !first_line.is_empty() {
-                                let (fg, bg) = chip_colors(first_line, &pal, dark);
+                                let (fg, bg) = chip_colors(first_line, &pal);
                                 let g = ui.painter().layout_no_wrap(first_line.to_string(), font_of(st), fg);
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(g.size().x + 14.0, 18.0), egui::Sense::hover());
                                 ui.painter().rect_filled(r, 9, bg);
@@ -174,12 +198,15 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
                             }
                             return;
                         }
-                        // A leading icon (e.g. the key of primary key columns) in its colour.
+                        // A leading icon in its colour: the key of primary key columns (whose name
+                        // is in the medium weight) in the warning colour, as in the mockups.
                         let mut chars = first_line.chars();
-                        let icon = chars.next().map(String::from).and_then(|g| ternarygrid_icons::color(&g).map(|c| (g, c)));
+                        let lead = chars.next().map(String::from);
+                        let key = lead.as_deref() == Some(icon::KEY);
+                        let icon = lead.and_then(|g| if key { Some((g, pal.warn)) } else { ternarygrid_icons::color(&g).map(|c| (g, c)) });
                         let text = match icon {
                             Some((g, color)) => {
-                                ui.label(RichText::new(g).size(12.0).color(color));
+                                ui.label(RichText::new(g).font(ternarygrid_ui::style::icon_font(12.0)).color(color));
                                 chars.as_str().trim_start()
                             }
                             None => first_line,
@@ -190,7 +217,8 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
                             CellStyle::Ok => pal.ok,
                             _ => pal.text,
                         };
-                        let resp = ui.add(egui::Label::new(RichText::new(text).font(font_of(st)).color(color)).truncate().selectable(false));
+                        let font = if key { ternarygrid_ui::style::medium(ui.ctx(), body_font.size) } else { font_of(st) };
+                        let resp = ui.add(egui::Label::new(RichText::new(text).font(font).color(color)).truncate().selectable(false));
                         if c.len() > first_line.len() {
                             resp.on_hover_text(c.chars().take(4000).collect::<String>());
                         }
@@ -213,9 +241,9 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
 }
 
 /// Name/value list, grouped when properties carry a group: each group's title (12, faint,
-/// semibold), then its rows in a bordered, striped list (the name muted in 180, 7 / 14 around).
-pub fn property_grid(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug + Copy, props: &[Property]) {
-    let _ = id;
+/// semibold), then its rows in a bordered, striped list (the name muted in `label_w`, 12 from
+/// the value, 7 / 14 around; the mockups' pages use 180 to 220).
+pub fn property_grid(ui: &mut Ui, label_w: f32, props: &[Property]) {
     let mut groups: Vec<Option<&str>> = Vec::new();
     for p in props {
         let g = p.group.as_deref();
@@ -224,7 +252,7 @@ pub fn property_grid(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug + C
         }
     }
     let pal = ternarygrid_ui::pal(ui);
-    let stripe = if ui.visuals().dark_mode { egui::Color32::from_rgb(0x26, 0x28, 0x30) } else { egui::Color32::from_rgb(0xfa, 0xfa, 0xfb) };
+    let stripe = pal.stripe;
     for (gi, g) in groups.into_iter().enumerate() {
         if let Some(name) = g {
             if gi > 0 {
@@ -242,7 +270,7 @@ pub fn property_grid(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug + C
                     ui.set_width(ui.available_width());
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        ui.add_sized([180.0, 16.0], egui::Label::new(RichText::new(&p.name).color(pal.text_muted)).truncate());
+                        ui.add_sized([label_w, 16.0], egui::Label::new(RichText::new(&p.name).color(pal.text_muted)).truncate());
                         ui.add(egui::Label::new(RichText::new(&p.value).color(if p.value == "NULL" { pal.text_faint } else { pal.text })).wrap());
                     });
                 });
@@ -285,6 +313,41 @@ pub fn code_view(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, text: 
     egui::ScrollArea::both().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
         let mut t = text;
         ui.add(egui::TextEdit::multiline(&mut t).code_editor().desired_width(f32::INFINITY).interactive(true).layouter(&mut layouter));
+    });
+}
+
+/// Read-only code as the mockups' editor area (the DDL page): on the surface, 10 above and
+/// below, line numbers ending 44 points in (16 from the text), monospace 13 on lines of 21,
+/// coloured by `tokens`; selectable, not wrapped, it scrolls both ways.
+pub fn code_lines(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, text: &str, tokens: &[(std::ops::Range<usize>, ternarygrid_editor::TokenStyle)]) {
+    let pal = ternarygrid_ui::pal(ui);
+    let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
+    let font = egui::FontId::monospace(13.0);
+    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+        let mut job = crate::sqllang::highlight_job(buf.as_str(), tokens, &theme, font.clone());
+        for s in &mut job.sections {
+            s.format.line_height = Some(21.0);
+        }
+        job.wrap.max_width = f32::INFINITY;
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    let lines = text.lines().count().max(1);
+    egui::Frame::new().fill(pal.surface).inner_margin(egui::Margin::symmetric(0, 10)).show(ui, |ui| {
+        ui.set_min_size(ui.available_size());
+        egui::ScrollArea::both().id_salt(egui::Id::new(id)).auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let (gutter, _) = ui.allocate_exact_size(egui::vec2(60.0, lines as f32 * 21.0), egui::Sense::hover());
+                for i in 0..lines {
+                    // Laid out as the code's rows (21 high), so the numbers sit on their lines.
+                    let format = egui::TextFormat { font_id: font.clone(), color: pal.text_faint, line_height: Some(21.0), ..Default::default() };
+                    let g = ui.painter().layout_job(egui::text::LayoutJob::single_section((i + 1).to_string(), format));
+                    ui.painter().galley(egui::pos2(gutter.left() + 44.0 - g.size().x, gutter.top() + i as f32 * 21.0), g, pal.text_faint);
+                }
+                let mut t = text;
+                ui.add(egui::TextEdit::multiline(&mut t).frame(egui::Frame::NONE).margin(egui::Margin::ZERO).desired_width(f32::INFINITY).layouter(&mut layouter));
+            });
+        });
     });
 }
 
