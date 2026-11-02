@@ -1,12 +1,13 @@
 //! ClickHouse [`Session`] over the HTTP interface.
 
 use crate::catalog;
-use crate::cursor::{self, ActiveQuery, Job};
+use crate::cursor::{self, ActiveQuery, ChannelCursor, Job};
 use crate::dialect::{ClickHouseDialect, ident};
+use crate::error::error_code;
 use crate::http::{QueryRequest, Transport, sql_string, tls_plan};
 use crate::plan;
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ternarygrid_core::admin::*;
@@ -16,18 +17,23 @@ use ternarygrid_core::dialect::Dialect;
 use ternarygrid_core::driver::{ServerInfo, parse_version_number};
 use ternarygrid_core::meta::*;
 use ternarygrid_core::plan::QueryPlan;
-use ternarygrid_core::{CancelHandle, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions, QueryCursor, ResultHeader, Row, Session, TransactionMode, Value};
+use ternarygrid_core::{
+    CancelHandle, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions, QueryCursor, ResultHeader, Row, ServerMessage, Session, TransactionMode, Value,
+};
 use tokio::sync::Semaphore;
+
+/// The driver's own settings, sent before the connection's.
+const BASE_SETTINGS: [(&str, &str); 3] = [
+    ("output_format_json_quote_denormals", "1"),
+    ("date_time_output_format", "simple"),
+    // Allow a client to pause reading (grid paging) without the server
+    // aborting the stream.
+    ("http_send_timeout", "3600"),
+];
 
 /// Settings sent with every query unless the user is `readonly = 1`.
 fn default_settings(params: &ConnectParams) -> Vec<(String, String)> {
-    let mut s = vec![
-        ("output_format_json_quote_denormals".to_string(), "1".to_string()),
-        ("date_time_output_format".to_string(), "simple".to_string()),
-        // Allow a client to pause reading (grid paging) without the server
-        // aborting the stream.
-        ("http_send_timeout".to_string(), "3600".to_string()),
-    ];
+    let mut s: Vec<(String, String)> = BASE_SETTINGS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
     if params.read_only {
         s.push(("readonly".into(), "2".into()));
     }
@@ -38,6 +44,8 @@ fn default_settings(params: &ConnectParams) -> Vec<(String, String)> {
         if let Some(name) = k.strip_prefix("setting.")
             && !name.is_empty()
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            // the last value sent wins: `setting.readonly = 0` would undo the read-only option
+            && !(params.read_only && name.eq_ignore_ascii_case("readonly"))
         {
             s.push((name.to_string(), v.clone()));
         }
@@ -73,10 +81,18 @@ pub struct ClickHouseSession {
     cursor_open: Arc<AtomicU64>,
     cancel: Arc<ClickHouseCancelHandle>,
     closed: bool,
-    /// `readonly = 1` user: no settings may be sent.
+    /// A closed cursor's statement did not end (the server kept its response open):
+    /// the session cannot run anything else.
+    broken: Arc<AtomicBool>,
+    /// How long closing a cursor waits for its statement to end.
+    close_wait: Duration,
+    /// The server rejected the connection settings (`readonly = 1` user, unknown
+    /// setting): the session runs with fewer or none of them.
     pub(crate) minimal: bool,
     /// Server time zone (`X-ClickHouse-Timezone`).
     pub(crate) timezone: Option<String>,
+    /// Warnings from connecting, delivered with the first executed statement.
+    notices: Vec<ServerMessage>,
 }
 
 /// First keyword of a statement (upper case), skipping comments and `(`.
@@ -180,26 +196,47 @@ impl ClickHouseSession {
             transport.set_settings(settings);
             timezone = Some(tz.to_string());
         }
+        let mut session = Self::assemble(transport, info, Some(probe.database), probe.minimal, timezone);
+        if let Some(reason) = &probe.rejected {
+            let mut dropped = probe.dropped;
+            if params.property("time_zone").is_some_and(|z| !z.is_empty()) {
+                dropped.push("session_timezone (time_zone property)".into());
+            }
+            let text = format!("The server rejected the connection settings ({reason}); the session runs without: {}", dropped.join(", "));
+            tracing::warn!("ClickHouse {}: {text}", session.transport.display_url);
+            // Shown when a setting of the connection is lost (read-only, properties); only the
+            // driver's own (any `readonly = 1` user) is not worth a warning on every connection.
+            if dropped.iter().any(|d| !BASE_SETTINGS.iter().any(|(n, _)| n == d)) {
+                session.notices.push(ServerMessage::new("WARNING", text));
+            }
+        }
+        Ok(session)
+    }
+
+    fn assemble(transport: Transport, info: ServerInfo, database: Option<String>, minimal: bool, timezone: Option<String>) -> ClickHouseSession {
         let transport = Arc::new(transport);
         let active = Arc::new(ActiveQuery::default());
         let cancel = Arc::new(ClickHouseCancelHandle { transport: transport.clone(), active: active.clone() });
-        Ok(ClickHouseSession {
+        ClickHouseSession {
             transport,
             dialect: Arc::new(ClickHouseDialect::new()),
             info,
-            database: Arc::new(Mutex::new(Some(probe.database))),
+            database: Arc::new(Mutex::new(database)),
             active,
             gate: Arc::new(Semaphore::new(1)),
             cursor_open: Arc::new(AtomicU64::new(0)),
             cancel,
             closed: false,
-            minimal: probe.minimal,
+            broken: Arc::new(AtomicBool::new(false)),
+            close_wait: cursor::CLOSE_WAIT,
+            minimal,
             timezone,
-        })
+            notices: Vec::new(),
+        }
     }
 
-    /// The user may not change settings (`readonly = 1`): the driver sends
-    /// no per-query settings in this mode.
+    /// The server rejected the connection settings (`readonly = 1` user, unknown
+    /// setting): the driver sends fewer or no per-query settings in this mode.
     pub fn is_minimal_mode(&self) -> bool {
         self.minimal
     }
@@ -215,25 +252,40 @@ impl ClickHouseSession {
     }
 
     /// Start a statement and return its cursor.
-    async fn start(&mut self, sql: String, timeout: Option<Duration>, use_session: bool) -> DbResult<Box<dyn QueryCursor>> {
+    async fn start(&mut self, sql: String, timeout: Option<Duration>, use_session: bool) -> DbResult<ChannelCursor> {
         if self.closed {
             return Err(DbError::connection("The session is closed"));
+        }
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(DbError::connection("The session is unusable: a cancelled statement did not end on the server. Reconnect to continue"));
         }
         if self.cursor_open.load(Ordering::SeqCst) != 0 {
             return Err(DbError::internal("A result set is still open on this session; close it before running another statement"));
         }
-        let permit = tokio::time::timeout(Duration::from_secs(60), self.gate.clone().acquire_owned())
-            .await
-            .map_err(|_| DbError::timeout("The previous statement on this session did not finish"))?
-            .map_err(|_| DbError::internal("session gate closed"))?;
+        let permit = match tokio::time::timeout(Duration::from_secs(60), self.gate.clone().acquire_owned()).await {
+            Ok(p) => p.map_err(|_| DbError::internal("session gate closed"))?,
+            // A dropped cursor's statement still holds the session after being killed.
+            Err(_) => {
+                self.broken.store(true, Ordering::SeqCst);
+                return Err(DbError::connection("The previous statement on this session did not finish after it was cancelled; the session was closed, reconnect to continue"));
+            }
+        };
         let keyword = first_keyword(&sql);
         let use_database = use_target(&sql);
-        let request =
-            QueryRequest { sql, query_id: uuid::Uuid::new_v4().to_string(), database: self.current_db(), use_session, extra_settings: Vec::new(), skip_default_settings: false };
-        let job =
-            Job { transport: self.transport.clone(), request, keyword, use_database, database: self.database.clone(), active: self.active.clone(), timeout, permit: Some(permit) };
-        let c = cursor::start(job, self.cursor_open.clone())?;
-        Ok(Box::new(c))
+        let request = QueryRequest { sql, query_id: uuid::Uuid::new_v4().to_string(), database: self.current_db(), use_session, ..Default::default() };
+        let job = Job {
+            transport: self.transport.clone(),
+            request,
+            keyword,
+            use_database,
+            database: self.database.clone(),
+            active: self.active.clone(),
+            timeout,
+            permit: Some(permit),
+            close_wait: self.close_wait,
+            broken: self.broken.clone(),
+        };
+        cursor::start(job, self.cursor_open.clone())
     }
 
     /// Run an internal query and collect all rows of its first result.
@@ -316,23 +368,35 @@ struct ProbeResult {
     database: String,
     timezone: Option<String>,
     minimal: bool,
+    /// The server's reason for rejecting the connection settings.
+    rejected: Option<String>,
+    /// Names of the settings the session runs without.
+    dropped: Vec<String>,
+}
+
+/// The server reports `getSetting('readonly')` as `value`: is the session read-only?
+fn read_only_enforced(value: &str) -> bool {
+    value.trim().parse::<u64>().is_ok_and(|v| v > 0)
 }
 
 fn probe(transport: &Transport, params: &ConnectParams) -> DbResult<ProbeResult> {
-    transport.set_settings(default_settings(params));
+    let full = default_settings(params);
+    // Settings tried in turn while the server rejects them (a `readonly = 1` user may
+    // change none, an older server lacks some): all, then only the read-only
+    // enforcement of a read-only connection, then none.
+    let mut stages = vec![full.clone()];
+    if params.read_only {
+        stages.push(vec![("readonly".to_string(), "2".to_string())]);
+    }
+    stages.push(Vec::new());
+    let mut stage = 0;
+    let mut rejected: Option<DbError> = None;
+    transport.set_settings(stages[0].clone());
     let sql = "SELECT version(), currentDatabase(), timezone(), getSetting('readonly')";
-    let mut minimal = false;
     let mut tries = 0;
     loop {
         tries += 1;
-        let req = QueryRequest {
-            sql: sql.to_string(),
-            query_id: uuid::Uuid::new_v4().to_string(),
-            database: params.database.clone(),
-            use_session: true,
-            extra_settings: Vec::new(),
-            skip_default_settings: minimal,
-        };
+        let req = QueryRequest { sql: sql.to_string(), query_id: uuid::Uuid::new_v4().to_string(), database: params.database.clone(), use_session: true, ..Default::default() };
         match transport.send_text(&req, 1 << 20) {
             Ok((head, text)) => {
                 let mut lines = text.lines().filter(|l| !l.trim().is_empty());
@@ -341,31 +405,48 @@ fn probe(transport: &Transport, params: &ConnectParams) -> DbResult<ProbeResult>
                 let row = lines.next().ok_or_else(|| DbError::connection("Unexpected response from the ClickHouse server"))?;
                 let cells = crate::json::parse_row(row.as_bytes()).map_err(|e| DbError::connection(format!("Unexpected response from the ClickHouse server: {e}")))?;
                 let text_at = |i: usize| cells.get(i).and_then(|c| c.scalar_text()).unwrap_or("").to_string();
-                if minimal {
-                    transport.set_settings(Vec::new());
+                let minimal = stage > 0;
+                // Without the `readonly` setting the server must already make the user read-only.
+                if minimal && params.read_only && !read_only_enforced(&text_at(3)) {
+                    let reason = rejected.map(|e| e.message).unwrap_or_default();
+                    return Err(DbError::config(format!("The server rejected the connection settings ({reason}), and without them the read-only option cannot be enforced"))
+                        .with_hint("Remove the setting.* properties the server does not accept, or turn off the read-only option"));
                 }
-                return Ok(ProbeResult { version: text_at(0), database: text_at(1), timezone: head.timezone.or_else(|| Some(text_at(2)).filter(|t| !t.is_empty())), minimal });
+                let kept = &stages[stage];
+                let dropped = full.iter().filter(|(k, _)| !kept.iter().any(|(n, _)| n == k)).map(|(k, _)| k.clone()).collect();
+                return Ok(ProbeResult {
+                    version: text_at(0),
+                    database: text_at(1),
+                    timezone: head.timezone.or_else(|| Some(text_at(2)).filter(|t| !t.is_empty())),
+                    minimal,
+                    rejected: rejected.map(|e| e.message),
+                    dropped,
+                });
             }
-            Err(e) if tries < 4 => {
-                let code = e.code.as_deref().unwrap_or("");
-                if code.starts_with("164") || code.starts_with("115") {
+            Err(e) if tries < 6 => {
+                match error_code(&e) {
                     // readonly = 1 user or an old server without some setting
-                    minimal = true;
-                    continue;
-                }
-                if code.starts_with("374") {
-                    // "Session timeout 'N' is larger than max_session_timeout: M"
-                    if let Some(max) = e
-                        .message
-                        .rsplit("max_session_timeout:")
-                        .next()
-                        .and_then(|t| t.trim().trim_end_matches('.').split(|c: char| !c.is_ascii_digit()).next())
-                        .and_then(|d| d.parse::<u32>().ok())
-                        .filter(|m| *m > 0)
-                    {
-                        transport.session_timeout.store(max, Ordering::Relaxed);
+                    Some(164 | 115) if stage + 1 < stages.len() => {
+                        stage += 1;
+                        transport.set_settings(stages[stage].clone());
+                        rejected.get_or_insert(e);
                         continue;
                     }
+                    // "Session timeout 'N' is larger than max_session_timeout: M"
+                    Some(374) => {
+                        if let Some(max) = e
+                            .message
+                            .rsplit("max_session_timeout:")
+                            .next()
+                            .and_then(|t| t.trim().trim_end_matches('.').split(|c: char| !c.is_ascii_digit()).next())
+                            .and_then(|d| d.parse::<u32>().ok())
+                            .filter(|m| *m > 0)
+                        {
+                            transport.session_timeout.store(max, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                    _ => {}
                 }
                 return Err(e);
             }
@@ -403,12 +484,14 @@ impl Session for ClickHouseSession {
     }
 
     fn is_closed(&self) -> bool {
-        self.closed
+        self.closed || self.broken.load(Ordering::SeqCst)
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value], opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
         let sql = crate::params::bind(sql, params, self.dialect.as_ref())?;
-        self.start(sql, opts.timeout, true).await
+        let mut c = self.start(sql, opts.timeout, true).await?;
+        c.add_messages(std::mem::take(&mut self.notices));
+        Ok(Box::new(c))
     }
 
     fn transaction_mode(&self) -> TransactionMode {
@@ -542,7 +625,7 @@ impl Session for ClickHouseSession {
         let rows = match self.rows(sql).await {
             Ok(r) => r,
             // queryID() is missing on old servers (UNKNOWN_FUNCTION)
-            Err(e) if e.code.as_deref().is_some_and(|c| c.starts_with("46 ")) => self.rows(&sql.replace(" WHERE query_id != queryID()", "")).await?,
+            Err(e) if error_code(&e) == Some(46) => self.rows(&sql.replace(" WHERE query_id != queryID()", "")).await?,
             Err(e) => return Err(e),
         };
         Ok(SessionList {
@@ -599,5 +682,62 @@ mod tests {
         assert!(s.contains(&("readonly".to_string(), "2".to_string())));
         assert!(s.contains(&("max_threads".to_string(), "4".to_string())));
         assert!(!s.iter().any(|(k, _)| k.contains(' ')));
+    }
+
+    #[test]
+    fn a_user_setting_cannot_undo_read_only() {
+        let mut cfg = ternarygrid_core::ConnectionConfig::new(DbKind::ClickHouse, "x");
+        cfg.read_only = true;
+        cfg.properties.insert("setting.readonly".into(), "0".into());
+        let s = default_settings(&ConnectParams::from_config(&cfg, None));
+        assert_eq!(s.iter().filter(|(k, _)| k == "readonly").collect::<Vec<_>>(), vec![&("readonly".to_string(), "2".to_string())]);
+        // Without the read-only option the user's value is sent.
+        cfg.read_only = false;
+        let s = default_settings(&ConnectParams::from_config(&cfg, None));
+        assert!(s.contains(&("readonly".to_string(), "0".to_string())));
+    }
+
+    #[test]
+    fn read_only_values() {
+        assert!(read_only_enforced("1"));
+        assert!(read_only_enforced(" 2 "));
+        assert!(!read_only_enforced("0"));
+        assert!(!read_only_enforced(""));
+        assert!(!read_only_enforced("x"));
+    }
+
+    /// A server that accepts connections and never answers (a hung connection, a
+    /// KILL that does not end the response).
+    fn silent_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for c in listener.incoming().flatten() {
+                held.push(c);
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn closing_a_cursor_on_a_hung_server_does_not_block_the_session() {
+        let mut cfg = ternarygrid_core::ConnectionConfig::new(DbKind::ClickHouse, "x");
+        cfg.host = "127.0.0.1".into();
+        cfg.port = Some(silent_server());
+        let p = ConnectParams::from_config(&cfg, None);
+        let transport = Transport::new(&p, false, false, "s".into()).unwrap();
+        let mut s = ClickHouseSession::assemble(transport, ServerInfo::default(), None, false, None);
+        s.close_wait = Duration::from_millis(200);
+        let mut c = s.execute("SELECT sleep(3)", &[], &ExecOptions::default()).await.unwrap();
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), c.close()).await.expect("close must be bounded").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Connection);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The stuck statement still holds the session: it reports itself closed and
+        // refuses work at once instead of waiting for the session.
+        assert!(s.is_closed());
+        let err = s.execute("SELECT 1", &[], &ExecOptions::default()).await.err().expect("broken session");
+        assert_eq!(err.kind, ErrorKind::Connection);
     }
 }

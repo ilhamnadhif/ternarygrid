@@ -931,7 +931,9 @@ pub async fn view_definition(s: &mut SqlServerSession, view: &ObjectRef) -> DbRe
         v.options.insert("encrypted".into(), "true".into());
     }
     let scope = Scope { db: dbp(view.database.as_deref()), schema, table: Some(view.name.clone()), object_types: "'V'" };
-    if let Some((cols, _)) = load_columns(s, &scope, None).await?.into_values().next() {
+    // Columns with the database's collation carry none (as for tables).
+    let collation = database_collation(s, view.database.as_deref()).await;
+    if let Some((cols, _)) = load_columns(s, &scope, collation.as_deref()).await?.into_values().next() {
         v.columns = cols;
     }
     Ok(v)
@@ -1550,7 +1552,8 @@ pub async fn schema_snapshot(s: &mut SqlServerSession, schema: &SchemaRef, opts:
         let mods = modules(s, db, &sc, None, &[ObjectKind::View]).await?;
         let mut cols = if opts.columns {
             let scope = Scope { db: dbp(db), schema: sc.clone(), table: None, object_types: "'V'" };
-            load_columns(s, &scope, None).await?
+            let collation = database_collation(s, db).await;
+            load_columns(s, &scope, collation.as_deref()).await?
         } else {
             BTreeMap::new()
         };

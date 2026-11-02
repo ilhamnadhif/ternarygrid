@@ -264,6 +264,13 @@ async fn transactions() {
     s.rollback().await.unwrap();
     assert!(!s.in_transaction());
     assert_eq!(scalar(s.as_mut(), "SELECT COUNT(*) FROM dbo.t").await.as_i64(), Some(2));
+    // the server ends the explicit transaction on an error (XACT_ABORT): no longer reported open
+    exec(s.as_mut(), "SET XACT_ABORT ON").await;
+    exec(s.as_mut(), "BEGIN TRANSACTION").await;
+    assert!(s.in_transaction());
+    assert!(execute_update(s.as_mut(), "INSERT INTO dbo.t VALUES (2, N'dup')", &[]).await.is_err());
+    assert!(!s.in_transaction());
+    exec(s.as_mut(), "SET XACT_ABORT OFF").await;
     drop(other);
     db.drop(s.as_mut()).await;
 }
@@ -398,7 +405,7 @@ EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Unit price
 GO
 CREATE TRIGGER sales.trg_orders ON sales.orders AFTER INSERT, UPDATE AS BEGIN SET NOCOUNT ON; END
 GO
-CREATE VIEW sales.v_orders WITH SCHEMABINDING AS SELECT o.id, o.total FROM sales.orders o
+CREATE VIEW sales.v_orders WITH SCHEMABINDING AS SELECT o.id, o.total, o.note FROM sales.orders o
 GO
 CREATE PROCEDURE sales.get_orders @customer int, @n int = 10 OUTPUT AS SELECT TOP (@n) * FROM sales.orders WHERE customer_id = @customer
 GO
@@ -470,7 +477,9 @@ CREATE SYNONYM sales.o FOR sales.orders
     let vref = ObjectRef::new(ObjectKind::View, Some("sales".into()), "v_orders").with_database(Some(dbn.clone()));
     let v = s.view_definition(&vref).await.unwrap();
     assert!(v.definition.starts_with("SELECT o.id"), "{v:?}");
-    assert_eq!(v.columns.len(), 2);
+    assert_eq!(v.columns.len(), 3);
+    // a character column in the database's collation carries none (as in tables)
+    assert_eq!(v.columns[2].collation, None, "{v:?}");
     let r = s.routine_definition(&ObjectRef::new(ObjectKind::Procedure, Some("sales".into()), "get_orders").with_database(Some(dbn.clone()))).await.unwrap();
     assert_eq!(r.arguments, "@customer int, @n int OUTPUT");
     let f = s.routine_definition(&ObjectRef::new(ObjectKind::Function, Some("sales".into()), "order_total").with_database(Some(dbn.clone()))).await.unwrap();
@@ -487,6 +496,7 @@ CREATE SYNONYM sales.o FOR sales.orders
     let snap = s.schema_snapshot(&sch, &SnapshotOptions::full()).await.unwrap();
     assert_eq!(snap.tables.len(), 2);
     assert_eq!(snap.views.len(), 1);
+    assert_eq!(snap.views[0].columns[2].collation, None, "{:?}", snap.views[0]);
     assert_eq!(snap.routines.len(), 2);
     assert_eq!(snap.sequences.len(), 1);
     assert_eq!(snap.types.len(), 1);

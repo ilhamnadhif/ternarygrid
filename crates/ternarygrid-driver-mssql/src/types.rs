@@ -202,7 +202,12 @@ fn convert_raw(data: ColumnData<'static>, ct: ColumnType) -> Value {
         ColumnData::F32(v) => v.map(|x| Value::Float(f64::from(x))).unwrap_or(Value::Null),
         ColumnData::F64(v) => match v {
             None => Value::Null,
-            // tiberius decodes money as f64: render it with its fixed scale
+            // tiberius 0.13 decodes money as `scaled_i64 as f64 / 1e4` and does not expose the
+            // integer, so it cannot be decoded exactly here. Rounding to the fixed scale gives
+            // the exact value for smallmoney and for |money| < 2^39 (549 755 813 888, 16 digits);
+            // above that two neighbouring values can share one f64 and the last digit may be
+            // off (the integer itself is rounded above 2^53 / 10^4). For exact values beyond
+            // that range: CAST(col AS decimal(19,4)).
             Some(x) if matches!(ct, ColumnType::Money | ColumnType::Money4) => Value::decimal(format!("{x:.4}")),
             Some(x) => Value::Float(x),
         },
@@ -446,6 +451,39 @@ mod tests {
         assert_eq!(convert(ColumnData::Numeric(Some(Numeric::new_with_scale(1050, 2))), ColumnType::Decimaln), Value::decimal("10.50"));
         assert_eq!(convert(ColumnData::Binary(Some(Cow::Owned(vec![1, 2]))), ColumnType::BigVarBin), Value::bytes(vec![1u8, 2]));
         assert_eq!(convert(ColumnData::String(None), ColumnType::NVarchar), Value::Null);
+    }
+
+    /// The f64 tiberius 0.13 produces for a money value scaled by 10^4 (`money::decode`).
+    fn tiberius_money(scaled: i64) -> f64 {
+        let high = (scaled >> 32) as i32 as i64;
+        let low = scaled as u32 as f64;
+        ((high << 32) as f64 + low) / 1e4
+    }
+
+    fn exact_money(scaled: i64) -> String {
+        let sign = if scaled < 0 { "-" } else { "" };
+        let a = scaled.unsigned_abs();
+        format!("{sign}{}.{:04}", a / 10_000, a % 10_000)
+    }
+
+    #[test]
+    fn money_is_exact_where_the_f64_allows() {
+        // smallmoney: every value (an i32 scaled by 10^4)
+        for s in [i32::MIN, i32::MIN + 1, -1, 0, 1, 12_345, i32::MAX - 1, i32::MAX] {
+            assert_eq!(convert(ColumnData::F64(Some(f64::from(s) / 1e4)), ColumnType::Money4), Value::decimal(exact_money(i64::from(s))));
+        }
+        // money: exact below 2^39 (16 significant digits)
+        let limit: i64 = (1i64 << 39) * 10_000 - 1;
+        let mut samples = vec![1, -1, 9_999, 10_001, 123_456_789_012_345, limit, -limit, limit - 1, -(limit - 1)];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let s = (x >> 11) as i64 % limit;
+            samples.push(if x & 1 == 0 { s } else { -s });
+        }
+        for s in samples {
+            assert_eq!(convert(ColumnData::F64(Some(tiberius_money(s))), ColumnType::Money), Value::decimal(exact_money(s)), "{s}");
+        }
     }
 
     #[test]

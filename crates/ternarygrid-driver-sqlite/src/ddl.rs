@@ -20,10 +20,21 @@
 //! ALTER TABLE "t" RENAME COLUMN ...    -- native renames, so SQLite rewrites
 //! ALTER TABLE "t" RENAME TO ...        -- views, triggers and foreign keys
 //! CREATE INDEX / CREATE TRIGGER ...    -- new or modified indexes and triggers
-//! PRAGMA foreign_key_check('t')        -- reports violations as rows
+//! CREATE TEMP TABLE "_ternarygrid_fk_check" (violations ... CHECK (violations = 0))
+//! INSERT INTO temp."_ternarygrid_fk_check"     -- fails when the change broke
+//!   SELECT count(*) FROM pragma_foreign_key_check('t')  -- foreign keys
+//! DROP TABLE temp."_ternarygrid_fk_check"
 //! COMMIT
 //! PRAGMA foreign_keys = ON
 //! ```
+//!
+//! (The foreign key steps only when the connection enforces foreign keys.)
+//! The rebuild must run outside a transaction (`PRAGMA foreign_keys` has no
+//! effect inside one, and `DROP TABLE` with enforcement on would run the
+//! `ON DELETE` actions of referencing tables), so its `BEGIN` fails inside an
+//! open transaction. A failed rebuild is rolled back; the session's rollback
+//! restores `foreign_keys` and `legacy_alter_table`. Native changes are wrapped
+//! in a savepoint, which also works inside an open transaction.
 //!
 //! Rowids of tables without an `INTEGER PRIMARY KEY` are preserved, as is the
 //! `AUTOINCREMENT` counter.
@@ -38,6 +49,7 @@ use crate::schema_sql::{
     rewrite_create, squash_ws,
 };
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use ternarygrid_core::config::DbKind;
 use ternarygrid_core::ddl::*;
 use ternarygrid_core::dialect::ansi;
@@ -69,6 +81,17 @@ use options::*;
 
 /// Prefix of the temporary table used by table rebuilds.
 const REBUILD_PREFIX: &str = "_ternarygrid_new_";
+
+/// Savepoint wrapping a multi-statement native `ALTER`.
+const NATIVE_SAVEPOINT: &str = "ternarygrid_alter";
+
+/// Temporary table whose CHECK constraint fails a rebuild that broke foreign keys.
+const FK_GUARD: &str = "_ternarygrid_fk_check";
+
+/// Name of the guard's CHECK constraint: SQLite reports it in the error
+/// ("CHECK constraint failed: ...").
+const FK_GUARD_MESSAGE: &str =
+    "the change violates foreign key constraints (PRAGMA foreign_key_check lists the rows)";
 
 fn eq_ci(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
@@ -1068,9 +1091,12 @@ impl<'a> Plan<'a> {
                 out.extend(create_trigger_in(s, &self.to.name, tt));
             }
         }
+        // A savepoint, not BEGIN: it also works inside an open transaction (manual
+        // commit mode opens one for every statement, a SELECT included), where the
+        // changes join that transaction instead of failing.
         if out.len() > 1 {
-            out.insert(0, "BEGIN".to_string());
-            out.push("COMMIT".to_string());
+            out.insert(0, format!("SAVEPOINT {NATIVE_SAVEPOINT}"));
+            out.push(format!("RELEASE {NATIVE_SAVEPOINT}"));
         }
         out
     }
@@ -1197,7 +1223,9 @@ impl<'a> Plan<'a> {
         (mid, post_renames)
     }
 
-    fn rebuild(&self) -> Vec<String> {
+    /// The 12 step rebuild. `foreign_keys`: the connection enforces foreign keys,
+    /// so the script fails when the change breaks them and switches them back on.
+    fn rebuild(&self, foreign_keys: bool) -> Vec<String> {
         let s = self.schema();
         let old_t = qualified(s, &self.from.name);
         let (mid, post_renames) = self.rebuild_definition();
@@ -1292,25 +1320,46 @@ impl<'a> Plan<'a> {
             }
         }
 
-        let pragma = match s {
-            Some(s) => format!("PRAGMA {}.foreign_key_check", quote_ident(s)),
-            None => "PRAGMA foreign_key_check".to_string(),
-        };
-        let mut checked: Vec<String> = vec![self.to.name.clone()];
-        out.push(format!("{pragma}({})", string_literal(&self.to.name)));
-        for fk in &self.from.referenced_by {
-            let child = if eq_ci(&fk.table, &self.from.name) {
-                self.to.name.clone()
-            } else {
-                fk.table.clone()
-            };
-            if !child.is_empty() && !contains_ci(&checked, &child) {
-                out.push(format!("{pragma}({})", string_literal(&child)));
-                checked.push(child);
+        // Foreign keys broken by the change (the table's own or those of tables
+        // referencing it) fail the script before COMMIT: the rows of a plain
+        // `PRAGMA foreign_key_check` would go unnoticed and the violations be committed.
+        if foreign_keys {
+            let guard = format!("temp.{}", quote_ident(FK_GUARD));
+            out.push(format!(
+                "CREATE TEMP TABLE IF NOT EXISTS {} (violations INTEGER CONSTRAINT {} CHECK (violations = 0))",
+                quote_ident(FK_GUARD),
+                quote_ident(FK_GUARD_MESSAGE)
+            ));
+            let schema_arg = s
+                .map(|s| format!(", {}", string_literal(s)))
+                .unwrap_or_default();
+            let mut checked: Vec<String> = vec![self.to.name.clone()];
+            out.push(format!(
+                "INSERT INTO {guard} SELECT count(*) FROM pragma_foreign_key_check({}{schema_arg})",
+                string_literal(&self.to.name)
+            ));
+            for fk in &self.from.referenced_by {
+                let child = if eq_ci(&fk.table, &self.from.name) {
+                    self.to.name.clone()
+                } else {
+                    fk.table.clone()
+                };
+                if !child.is_empty() && !contains_ci(&checked, &child) {
+                    out.push(format!(
+                        "INSERT INTO {guard} SELECT count(*) FROM pragma_foreign_key_check({}{schema_arg})",
+                        string_literal(&child)
+                    ));
+                    checked.push(child);
+                }
             }
+            out.push(format!("DROP TABLE {guard}"));
         }
         out.push("COMMIT".to_string());
-        out.push("PRAGMA foreign_keys = ON".to_string());
+        // Without enforcement on the connection the rebuild leaves it off (as it was).
+        out.push(format!(
+            "PRAGMA foreign_keys = {}",
+            if foreign_keys { "ON" } else { "OFF" }
+        ));
         out
     }
 }
@@ -1335,11 +1384,26 @@ fn without_column(table: &TableDef, column: &str) -> TableDef {
     t
 }
 
+/// Main database of the connection a generator belongs to: where
+/// [`DdlGenerator::create_schema`] puts the new database file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum MainDatabase {
+    /// Not known (generator without a connection): files relative to the
+    /// process working directory.
+    #[default]
+    Unknown,
+    /// In memory: new schemas are in-memory databases too.
+    Memory,
+    /// A file in this directory: new schemas are files next to it.
+    Dir(PathBuf),
+}
+
 /// SQLite DDL generator.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SqliteDdl {
     /// The connection enforces foreign keys: a table rebuild switches them back on.
     foreign_keys: bool,
+    main: MainDatabase,
 }
 
 impl Default for SqliteDdl {
@@ -1351,12 +1415,25 @@ impl Default for SqliteDdl {
 impl SqliteDdl {
     /// Create the generator.
     pub fn new() -> Self {
-        SqliteDdl { foreign_keys: true }
+        Self::with_foreign_keys(true)
     }
 
     /// The generator for a connection with (or without) foreign key enforcement.
     pub fn with_foreign_keys(foreign_keys: bool) -> Self {
-        SqliteDdl { foreign_keys }
+        SqliteDdl {
+            foreign_keys,
+            main: MainDatabase::Unknown,
+        }
+    }
+
+    /// The generator of a connection whose main database is `main_file`
+    /// (`None` or empty: in memory).
+    pub fn for_connection(foreign_keys: bool, main_file: Option<&Path>) -> Self {
+        let main = match main_file.filter(|f| !f.as_os_str().is_empty()) {
+            None => MainDatabase::Memory,
+            Some(f) => MainDatabase::Dir(f.parent().map(Path::to_path_buf).unwrap_or_default()),
+        };
+        SqliteDdl { foreign_keys, main }
     }
 
     fn script(&self, from: &TableDef, to: &TableDef) -> String {
@@ -1426,16 +1503,7 @@ impl DdlGenerator for SqliteDdl {
         }
         let plan = Plan::new(from, to, renamed_columns);
         if plan.needs_rebuild() {
-            let mut out = plan.rebuild();
-            // Without enforcement on the connection the rebuild leaves it off (as it was).
-            if !self.foreign_keys
-                && let Some(last) = out
-                    .last_mut()
-                    .filter(|s| s.as_str() == "PRAGMA foreign_keys = ON")
-            {
-                *last = "PRAGMA foreign_keys = OFF".to_string();
-            }
-            out
+            plan.rebuild(self.foreign_keys)
         } else {
             plan.native()
         }
@@ -1617,10 +1685,21 @@ impl DdlGenerator for SqliteDdl {
         format!("-- SQLite has no stored routines ({})", routine.name)
     }
 
+    /// `ATTACH` of a new database file `<name>.db` next to the main database
+    /// (SQLite resolves a relative name against the process working directory,
+    /// not the main database); an in-memory database for an in-memory main database.
     fn create_schema(&self, name: &str) -> String {
+        let file = match &self.main {
+            MainDatabase::Unknown => format!("{name}.db"),
+            MainDatabase::Memory => ":memory:".to_string(),
+            MainDatabase::Dir(dir) => dir
+                .join(format!("{name}.db"))
+                .to_string_lossy()
+                .into_owned(),
+        };
         format!(
             "ATTACH DATABASE {} AS {}",
-            string_literal(&format!("{name}.db")),
+            string_literal(&file),
             quote_ident(name)
         )
     }
@@ -1819,11 +1898,11 @@ mod tests {
         assert_eq!(
             sql,
             vec![
-                "BEGIN",
+                "SAVEPOINT ternarygrid_alter",
                 "ALTER TABLE main.users RENAME COLUMN email TO mail",
                 "ALTER TABLE main.users RENAME TO people",
                 "ALTER TABLE main.people ADD COLUMN nick TEXT DEFAULT 'x'",
-                "COMMIT",
+                "RELEASE ternarygrid_alter",
             ]
         );
         // dropping a column whose check is removed too needs a rebuild
@@ -1847,21 +1926,28 @@ mod tests {
         assert_eq!(
             sql,
             vec![
-                "BEGIN",
+                "SAVEPOINT ternarygrid_alter",
                 "DROP INDEX main.ix_note",
                 "ALTER TABLE main.users DROP COLUMN note",
-                "COMMIT"
+                "RELEASE ternarygrid_alter"
             ]
         );
         assert_eq!(
             SqliteDdl::new().drop_column(&from2, "note"),
-            "BEGIN;\nDROP INDEX main.ix_note;\nALTER TABLE main.users DROP COLUMN note;\nCOMMIT"
+            "SAVEPOINT ternarygrid_alter;\nDROP INDEX main.ix_note;\nALTER TABLE main.users DROP COLUMN note;\nRELEASE ternarygrid_alter"
         );
     }
 
     #[test]
     fn rebuild_alter() {
-        let from = users();
+        let mut from = users();
+        from.referenced_by.push(ForeignKeyDef {
+            table: "orders".into(),
+            columns: vec!["user_id".into()],
+            ref_table: "users".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        });
         let mut to = from.clone();
         to.columns[2].data_type = "BIGINT".into();
         let sql = SqliteDdl::new().alter_table(&from, &to, &[]);
@@ -1885,9 +1971,37 @@ mod tests {
             sql.contains(&"ALTER TABLE main._ternarygrid_new_users RENAME TO users".to_string())
         );
         assert!(sql.contains(&"CREATE INDEX main.ix_age ON users (age) WHERE age > 0".to_string()));
-        assert!(sql.contains(&"PRAGMA main.foreign_key_check('users')".to_string()));
+        // broken foreign keys fail the script before COMMIT
+        let n = sql.len();
+        assert_eq!(
+            sql[n - 6],
+            "CREATE TEMP TABLE IF NOT EXISTS _ternarygrid_fk_check (violations INTEGER CONSTRAINT \"the change violates foreign key constraints (PRAGMA foreign_key_check lists the rows)\" CHECK (violations = 0))"
+        );
+        assert_eq!(
+            sql[n - 5],
+            "INSERT INTO temp._ternarygrid_fk_check SELECT count(*) FROM pragma_foreign_key_check('users', 'main')"
+        );
+        assert_eq!(
+            sql[n - 4],
+            "INSERT INTO temp._ternarygrid_fk_check SELECT count(*) FROM pragma_foreign_key_check('orders', 'main')"
+        );
+        assert_eq!(sql[n - 3], "DROP TABLE temp._ternarygrid_fk_check");
+        assert_eq!(sql[n - 2], "COMMIT");
+        assert_eq!(sql[n - 1], "PRAGMA foreign_keys = ON");
+        assert!(
+            !sql.iter()
+                .any(|s| s.starts_with("PRAGMA main.foreign_key_check"))
+        );
+
+        // without enforcement on the connection: no check, and it stays off
+        let sql = SqliteDdl::with_foreign_keys(false).alter_table(&from, &to, &[]);
+        assert_eq!(sql[0], "PRAGMA foreign_keys = OFF");
+        assert!(
+            !sql.iter().any(|s| s.contains("foreign_key_check")),
+            "{sql:?}"
+        );
         assert_eq!(sql[sql.len() - 2], "COMMIT");
-        assert_eq!(sql[sql.len() - 1], "PRAGMA foreign_keys = ON");
+        assert_eq!(sql[sql.len() - 1], "PRAGMA foreign_keys = OFF");
     }
 
     #[test]
@@ -1991,6 +2105,17 @@ mod tests {
         );
         assert_eq!(d.drop_schema("aux", true), "DETACH DATABASE aux");
         assert_eq!(d.create_schema("aux"), "ATTACH DATABASE 'aux.db' AS aux");
+        // next to the main database, not in the process working directory
+        let d = SqliteDdl::for_connection(true, Some(Path::new("/data/shop/main.db")));
+        assert_eq!(
+            d.create_schema("aux"),
+            format!(
+                "ATTACH DATABASE '{}' AS aux",
+                Path::new("/data/shop").join("aux.db").display()
+            )
+        );
+        let d = SqliteDdl::for_connection(true, None);
+        assert_eq!(d.create_schema("aux"), "ATTACH DATABASE ':memory:' AS aux");
         assert_eq!(d.drop_table(Some("main"), "t", true), "DROP TABLE main.t");
         let t = users();
         assert_eq!(

@@ -222,11 +222,14 @@ impl Session for SqliteSession {
 
     async fn rollback(&mut self) -> DbResult<()> {
         self.call(|w| {
-            if w.conn.is_autocommit() {
-                Ok(())
-            } else {
-                w.exec_batch("ROLLBACK")
+            // Already ended: SQLite rolls back by itself after some errors (an
+            // interrupted INSERT, a full disk ...).
+            if !w.conn.is_autocommit() {
+                w.exec_batch("ROLLBACK")?;
             }
+            // A failed table rebuild leaves foreign keys off outside its transaction.
+            w.restore_pragmas();
+            Ok(())
         })
         .await
     }

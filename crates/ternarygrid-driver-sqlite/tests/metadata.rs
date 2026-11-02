@@ -98,14 +98,17 @@ async fn lists_schemas_and_objects() {
             "tags"
         ]
     );
-    // Sizes from dbstat: every table takes at least one page (a virtual
-    // table's rows are in its shadow tables).
+    // No sizes in the listing (`dbstat` reads the whole file); the definition
+    // has them: every table takes at least one page (a virtual table's rows are
+    // in its shadow tables).
     for t in &tables {
+        assert_eq!(t.size_bytes, None, "{t:?}");
         let is_virtual = t
             .detail
             .as_deref()
             .is_some_and(|d| d.starts_with("virtual"));
-        assert_eq!(t.size_bytes.is_some_and(|b| b > 0), !is_virtual, "{t:?}");
+        let size = s.table_definition(&t.obj).await.unwrap().size_bytes;
+        assert_eq!(size.is_some_and(|b| b > 0), !is_virtual, "{t:?}");
     }
     let by_name = |n: &str| tables.iter().find(|t| t.obj.name == n).unwrap().clone();
     assert_eq!(by_name("customers").row_estimate, Some(2));

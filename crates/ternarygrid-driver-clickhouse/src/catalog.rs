@@ -46,9 +46,14 @@ fn obj_schema(s: &ClickHouseSession, obj: &ObjectRef) -> String {
 async fn rows_or(s: &mut ClickHouseSession, primary: &str, fallback: &str) -> DbResult<Vec<Row>> {
     match s.rows(primary).await {
         Ok(r) => Ok(r),
-        Err(e) if e.kind == ErrorKind::Query && e.code.as_deref().is_some_and(|c| c.starts_with("47") || c.starts_with("16")) => s.rows(fallback).await,
+        Err(e) if is_unknown_column(&e) => s.rows(fallback).await,
         Err(e) => Err(e),
     }
+}
+
+/// UNKNOWN_IDENTIFIER (47) or NO_SUCH_COLUMN_IN_TABLE (16), not e.g. 160 TOO_SLOW or 473.
+fn is_unknown_column(e: &DbError) -> bool {
+    e.kind == ErrorKind::Query && matches!(crate::error::error_code(e), Some(47 | 16))
 }
 
 // ------------------------------------------------------------ parsing helpers

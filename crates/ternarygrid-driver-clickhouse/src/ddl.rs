@@ -57,9 +57,11 @@ fn expr_mentions(expr: &str, column: &str) -> bool {
     expr.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '`')).any(|w| w.trim_matches('`') == column)
 }
 
+/// The `nullable` flag decides (a `Nullable(…)` type with the flag cleared becomes NOT NULL);
+/// key columns are never nullable.
 fn column_type(c: &ColumnDef, key: bool) -> String {
-    let (inner, was_nullable) = strip_nullable(&c.data_type);
-    if (c.nullable || (was_nullable && c.nullable)) && !key { make_nullable(&inner) } else { inner }
+    let (inner, _) = strip_nullable(&c.data_type);
+    if c.nullable && !key { make_nullable(&inner) } else { inner }
 }
 
 /// Column definition as used in `CREATE TABLE` / `ADD COLUMN` / `MODIFY COLUMN`.
@@ -609,6 +611,18 @@ mod tests {
         bad.columns.push(ColumnDef::new("note", "String"));
         bad.primary_key = Some(KeyDef { name: None, columns: vec!["name".into()] });
         assert!(d.alter_table(&from, &bad, &[])[0].starts_with("SELECT throwIf"));
+    }
+
+    #[test]
+    fn column_type_follows_the_nullable_flag() {
+        let mut c = ColumnDef::new("a", "Nullable(String)");
+        assert_eq!(column_type(&c, false), "Nullable(String)");
+        assert_eq!(column_type(&c, true), "String");
+        c.nullable = false;
+        assert_eq!(column_type(&c, false), "String");
+        let c = ColumnDef::new("b", "LowCardinality(String)");
+        assert_eq!(column_type(&c, false), "LowCardinality(Nullable(String))");
+        assert_eq!(column_type(&c.not_null(), false), "LowCardinality(String)");
     }
 
     fn sample() -> TableDef {

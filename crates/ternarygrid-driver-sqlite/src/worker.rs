@@ -39,8 +39,10 @@ pub(crate) struct Shared {
     pub interrupt: rusqlite::InterruptHandle,
     /// Set by [`Shared::cancel`]; checked by the busy and progress handlers.
     pub cancel_requested: AtomicBool,
-    /// Counts cancels: a request remembers it when sent, so that a cancel that
-    /// came before its statement started is not lost (`begin_command` resets the flag).
+    /// Counts cancels: a request remembers it when sent, and every statement and
+    /// fetch of the request compares it before running, so that a cancel arriving
+    /// while no statement runs (`sqlite3_interrupt` is then a no-op, and
+    /// `begin_command` resets the flag) is not lost.
     pub cancel_seq: AtomicU64,
     /// `!sqlite3_get_autocommit()`, refreshed after every command.
     pub in_transaction: AtomicBool,
@@ -51,8 +53,10 @@ pub(crate) struct Shared {
 impl Shared {
     /// Interrupt the running statement (`sqlite3_interrupt`) and abort lock waits.
     pub fn cancel(&self) {
-        self.cancel_requested.store(true, Ordering::SeqCst);
+        // The count first: a statement that starts after `begin_command` reset the
+        // flag either sees the new count or still gets the flag set below.
         self.cancel_seq.fetch_add(1, Ordering::SeqCst);
+        self.cancel_requested.store(true, Ordering::SeqCst);
         self.interrupt.interrupt();
     }
 }
@@ -365,10 +369,12 @@ impl Drop for AliveGuard {
 }
 
 /// Entry point of the connection thread.
+/// `ready` receives the shared state, the server info and the main database
+/// file (empty when in memory).
 pub(crate) fn run(
     cfg: OpenConfig,
     rx: Receiver<Command>,
-    ready: oneshot::Sender<DbResult<(Arc<Shared>, ServerInfo)>>,
+    ready: oneshot::Sender<DbResult<(Arc<Shared>, ServerInfo, String)>>,
 ) {
     BUSY_TIMEOUT_MS.set(u64::try_from(cfg.busy_timeout.as_millis()).unwrap_or(u64::MAX));
     let conn = match open_connection(&cfg) {
@@ -407,6 +413,24 @@ pub(crate) fn run(
         version,
         session_id: None,
     };
+    let main_file = if cfg.is_memory() {
+        String::new()
+    } else {
+        conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    };
+    let pragma_on = |name: &str| {
+        conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))
+            .is_ok_and(|v| v != 0)
+    };
+    let foreign_keys = pragma_on("foreign_keys");
+    let legacy_alter_table = pragma_on("legacy_alter_table");
     let mut worker = Worker {
         conn,
         shared: Arc::clone(&shared),
@@ -414,9 +438,14 @@ pub(crate) fn run(
         read_only: cfg.read_only,
         busy_timeout: cfg.busy_timeout,
         show_system_objects: cfg.show_system_objects,
+        foreign_keys,
+        legacy_alter_table,
     };
     worker.sync_state();
-    if ready.send(Ok((Arc::clone(&shared), info))).is_err() {
+    if ready
+        .send(Ok((Arc::clone(&shared), info, main_file)))
+        .is_err()
+    {
         return;
     }
     let shutdown = worker.serve(&rx);
@@ -475,6 +504,10 @@ pub(crate) struct Worker {
     pub read_only: bool,
     pub busy_timeout: Duration,
     pub show_system_objects: bool,
+    /// `PRAGMA foreign_keys` as configured for the connection.
+    pub foreign_keys: bool,
+    /// `PRAGMA legacy_alter_table` as configured for the connection.
+    pub legacy_alter_table: bool,
 }
 
 impl Worker {
@@ -544,8 +577,42 @@ impl Worker {
         DEADLINE.set(timeout.filter(|t| !t.is_zero()).map(|t| Instant::now() + t));
     }
 
+    /// [`begin_command`](Self::begin_command) for a statement or fetch of a request
+    /// sent when the cancel count was `seq`; true when it was cancelled since
+    /// (the flag is reset first, so a cancel racing with this check still
+    /// interrupts the statement through the flag).
+    fn begin_request_step(&self, timeout: Option<Duration>, seq: u64) -> bool {
+        self.begin_command(timeout);
+        self.shared.cancel_seq.load(Ordering::SeqCst) != seq
+    }
+
     pub fn end_command(&self) {
         DEADLINE.set(None);
+    }
+
+    /// After a rollback: switch `foreign_keys` and `legacy_alter_table` back to the
+    /// connection's configuration. A table rebuild turns them off / on outside its
+    /// transaction, so a rebuild that failed and was rolled back would leave the
+    /// session without foreign key enforcement. No effect inside a transaction.
+    pub fn restore_pragmas(&self) {
+        if !self.conn.is_autocommit() {
+            return;
+        }
+        for (name, configured) in [
+            ("foreign_keys", self.foreign_keys),
+            ("legacy_alter_table", self.legacy_alter_table),
+        ] {
+            let current = self
+                .conn
+                .query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))
+                .map(|v| v != 0);
+            if current.is_ok_and(|on| on != configured) {
+                let value = if configured { "ON" } else { "OFF" };
+                if let Err(e) = self.conn.execute_batch(&format!("PRAGMA {name} = {value}")) {
+                    tracing::warn!("Cannot restore PRAGMA {name} = {value}: {e}");
+                }
+            }
+        }
     }
 
     /// Error context for the current command.
@@ -798,16 +865,10 @@ impl Worker {
             cancel_seq,
             reply,
         } = req;
-        // Cancelled while it waited for the connection thread.
-        if self.shared.cancel_seq.load(Ordering::SeqCst) != cancel_seq {
-            let _ = reply.send(Err(DbError::cancelled()));
-            return None;
-        }
         let statements = lexer::split_statements(&sql);
         let single = statements.len() == 1;
         let mut param_pos = 0usize;
         let mut header_reply = reply;
-        self.begin_command(opts.timeout);
         for span in &statements {
             let kind = lexer::classify(span.text);
             let fail = |w: &Worker, e: DbError, reply: Reply<Option<ResultHeader>>| {
@@ -815,6 +876,12 @@ impl Worker {
                 w.sync_state();
                 let _ = reply.send(Err(e));
             };
+            // Cancelled while it waited for the connection thread, or between two
+            // statements of the batch (while the client had not asked for the next).
+            if self.begin_request_step(opts.timeout, cancel_seq) {
+                fail(self, DbError::cancelled(), header_reply);
+                return self.finish_cursor(id, rx);
+            }
             let mut stmt = match self.conn.prepare(span.text) {
                 Ok(s) => s,
                 Err(e) => {
@@ -823,6 +890,23 @@ impl Worker {
                     return self.finish_cursor(id, rx);
                 }
             };
+            if kind == StatementKind::Begin && !self.conn.is_autocommit() {
+                drop(stmt);
+                let why = if self.mode == TransactionMode::Manual {
+                    " (in manual commit mode every statement, a SELECT too, opens one)"
+                } else {
+                    ""
+                };
+                fail(
+                    self,
+                    DbError::query(format!(
+                        "Cannot start a transaction within a transaction: one is already open{why}. \
+                         Commit or roll it back first."
+                    )),
+                    header_reply,
+                );
+                return self.finish_cursor(id, rx);
+            }
             if self.read_only && !stmt.readonly() && !kind.runs_outside_transaction() {
                 drop(stmt);
                 fail(
@@ -884,6 +968,9 @@ impl Worker {
                 match result {
                     Ok(_) => {
                         let header = self.update_header(&kind);
+                        if kind == StatementKind::Rollback {
+                            self.restore_pragmas();
+                        }
                         self.sync_state();
                         self.end_command();
                         let _ = header_reply.send(Ok(Some(header)));
@@ -897,7 +984,6 @@ impl Worker {
                 match self.wait_without_rows(id, rx) {
                     Ok(next) => {
                         header_reply = next;
-                        self.begin_command(opts.timeout);
                         continue;
                     }
                     Err(next) => return next,
@@ -934,15 +1020,30 @@ impl Worker {
             self.sync_state();
             self.end_command();
             let _ = header_reply.send(Ok(Some(ResultHeader::Rows(columns))));
+            // A step error after some rows were returned, reported by the next fetch
+            // (or `next_result`).
             let mut pending_error: Option<DbError> = None;
+            // An error was reported by a fetch: like an error of the first step, it
+            // ends the batch (the following statements do not run).
+            let mut failed = false;
             let next_reply = loop {
                 match self.recv_cursor(id, rx) {
                     CursorCmd::Fetch(max_rows, reply) => {
                         if let Some(e) = pending_error.take() {
+                            failed = true;
                             let _ = reply.send(Err(e));
                             continue;
                         }
-                        self.begin_command(opts.timeout);
+                        // Cancelled between two fetches: the statement may be idle
+                        // (its interrupt is then lost), so check the count too.
+                        if self.begin_request_step(opts.timeout, cancel_seq) && !done {
+                            self.end_command();
+                            done = true;
+                            buffered = None;
+                            failed = true;
+                            let _ = reply.send(Err(DbError::cancelled()));
+                            continue;
+                        }
                         let max = max_rows.max(1);
                         let mut out: Vec<Row> = Vec::with_capacity(max.min(4096));
                         let mut bytes = 0usize;
@@ -972,6 +1073,7 @@ impl Worker {
                         if out.is_empty()
                             && let Some(e) = pending_error.take()
                         {
+                            failed = true;
                             let _ = reply.send(Err(e));
                             continue;
                         }
@@ -980,6 +1082,15 @@ impl Worker {
                             rows: out,
                             done: exhausted,
                         }));
+                    }
+                    CursorCmd::Next(reply) if failed || pending_error.is_some() => {
+                        // The error not reported yet goes to `next_result`; either
+                        // way the batch ends here.
+                        drop(rows);
+                        drop(stmt);
+                        self.sync_state();
+                        let _ = reply.send(pending_error.take().map_or(Ok(None), Err));
+                        return self.finish_cursor(id, rx);
                     }
                     CursorCmd::Next(reply) => break reply,
                     CursorCmd::Close(reply) => {
@@ -997,7 +1108,6 @@ impl Worker {
             drop(stmt);
             self.sync_state();
             header_reply = next_reply;
-            self.begin_command(opts.timeout);
         }
         let _ = header_reply.send(Ok(None));
         self.end_command();

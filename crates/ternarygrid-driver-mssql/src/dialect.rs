@@ -161,7 +161,12 @@ impl Dialect for MsSqlDialect {
                 // integral values print without an exponent
                 if f.fract() == 0.0 && f.abs() < 1e15 { format!("{f}") } else { s }
             }
-            Value::Float(f) => format!("CAST({} AS float)", nstring(&f.to_string())),
+            // SQL Server float has no infinity or NaN (a parameter is refused, see
+            // `param_decl`). No literal can stand for one and a substitute (NULL, the
+            // largest float) would silently change the data: the statement fails when run,
+            // with this text in the server's message ("Conversion failed when converting
+            // the nvarchar value '…' to data type int").
+            Value::Float(f) => format!("CAST({} AS int)", nstring(&format!("{f}: SQL Server float cannot store infinity or NaN"))),
             Value::Decimal(s) => {
                 if is_decimal_text(s) && s.chars().all(|c| c.is_ascii_digit() || "+-.eE".contains(c)) {
                     s.to_string()
@@ -531,6 +536,11 @@ mod tests {
         assert_eq!(d.literal(&Value::text("x"), Some("nvarchar(10)")), "N'x'");
         assert_eq!(d.literal(&Value::Float(2.0), None), "2");
         assert_eq!(d.literal(&Value::Float(0.1), None), "1e-1");
+        // no infinity / NaN in SQL Server: never NULL or a number, but a statement that
+        // fails explaining why (not the old `CAST(N'inf' AS float)`, a bare conversion error)
+        for (f, text) in [(f64::INFINITY, "inf"), (f64::NEG_INFINITY, "-inf"), (f64::NAN, "NaN")] {
+            assert_eq!(d.literal(&Value::Float(f), None), format!("CAST(N'{text}: SQL Server float cannot store infinity or NaN' AS int)"));
+        }
         let dt = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap().and_hms_nano_opt(3, 4, 5, 3_333_333).unwrap();
         assert_eq!(d.literal(&Value::DateTime(dt), Some("datetime")), "'2024-01-02T03:04:05.003'");
         assert!(d.inline_value("datetime") && d.inline_value("[smalldatetime]") && !d.inline_value("datetime2(3)"));

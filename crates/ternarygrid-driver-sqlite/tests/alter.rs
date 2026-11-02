@@ -341,7 +341,10 @@ async fn native_changes_avoid_a_rebuild() {
         .ddl()
         .alter_table(&from, &to, &[("note".into(), "remark".into())]);
     assert!(!is_rebuild(&stmts), "{stmts:#?}");
-    assert_eq!(stmts.first().map(String::as_str), Some("BEGIN"));
+    assert_eq!(
+        stmts.first().map(String::as_str),
+        Some("SAVEPOINT ternarygrid_alter")
+    );
     apply(&mut s, &stmts).await;
     let after = def(&mut s, "main", "goods").await;
     assert_eq!(shape(&after), shape(&to));
@@ -493,7 +496,8 @@ async fn foreign_key_checks_and_failed_rebuilds() {
     let mut s = memory().await;
     exec(&mut s, "CREATE TABLE p (id INTEGER PRIMARY KEY); CREATE TABLE c (pid INT, v TEXT); INSERT INTO p VALUES (1); INSERT INTO c VALUES (1, 'ok'), (2, NULL)").await;
     let from = def(&mut s, "main", "c").await;
-    // adding a foreign key violated by existing rows: reported by foreign_key_check
+    // adding a foreign key violated by existing rows fails the script before
+    // COMMIT (its rows used to be returned and the violation committed)
     let mut to = from.clone();
     to.foreign_keys.push(ForeignKeyDef {
         columns: vec!["pid".into()],
@@ -501,32 +505,161 @@ async fn foreign_key_checks_and_failed_rebuilds() {
         ref_columns: vec!["id".into()],
         ..Default::default()
     });
-    let violations = apply(&mut s, &ddl().ddl().alter_table(&from, &to, &[])).await;
-    assert_eq!(violations.len(), 1, "{violations:?}");
-    assert_eq!(violations[0][0], Value::text("c"));
+    let stmts = ddl().ddl().alter_table(&from, &to, &[]);
+    let err = run_until_error(&mut s, &stmts)
+        .await
+        .expect("the script fails");
+    assert!(err.message.contains("violates foreign key"), "{err:?}");
+    assert!(s.in_transaction());
+    // the session's rollback restores foreign key enforcement
+    s.rollback().await.unwrap();
+    assert!(!s.in_transaction());
+    assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 1);
+    assert!(def(&mut s, "main", "c").await.foreign_keys.is_empty());
+    assert_eq!(int(&mut s, "SELECT count(*) FROM c").await, 2);
+    // without violations the same change applies
+    exec(&mut s, "DELETE FROM c WHERE pid = 2").await;
+    let violations = apply(&mut s, &stmts).await;
+    assert!(violations.is_empty(), "{violations:?}");
     assert_eq!(def(&mut s, "main", "c").await.foreign_keys.len(), 1);
+    assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 1);
+    // ... and a violation in a table referencing the rebuilt one too
+    exec(
+        &mut s,
+        "PRAGMA foreign_keys = OFF; DELETE FROM p; PRAGMA foreign_keys = ON",
+    )
+    .await;
+    let from = def(&mut s, "main", "p").await;
+    let mut to = from.clone();
+    to.columns.push(
+        ColumnDef::new("code", "TEXT")
+            .not_null()
+            .default_value("'x'"),
+    );
+    to.columns.rotate_right(1);
+    let stmts = ddl().ddl().alter_table(&from, &to, &[]);
+    assert!(is_rebuild(&stmts), "{stmts:#?}");
+    let err = run_until_error(&mut s, &stmts)
+        .await
+        .expect("the script fails");
+    assert!(err.message.contains("violates foreign key"), "{err:?}");
+    s.rollback().await.unwrap();
+    assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 1);
+    exec(
+        &mut s,
+        "PRAGMA foreign_keys = OFF; DELETE FROM c; PRAGMA foreign_keys = ON",
+    )
+    .await;
 
     // a NOT NULL that existing rows violate fails inside the transaction
+    exec(
+        &mut s,
+        "INSERT INTO p VALUES (1); INSERT INTO c VALUES (1, 'ok'), (1, NULL)",
+    )
+    .await;
     let from = def(&mut s, "main", "c").await;
     let mut to = from.clone();
     to.columns[1].nullable = false;
     let stmts = ddl().ddl().alter_table(&from, &to, &[]);
-    let mut failed = false;
-    for stmt in &stmts {
-        if execute_update(&mut s, stmt, &[]).await.is_err() {
-            failed = true;
-            break;
-        }
-    }
-    assert!(failed);
+    assert!(run_until_error(&mut s, &stmts).await.is_some());
     assert!(s.in_transaction());
-    exec(&mut s, "ROLLBACK; PRAGMA foreign_keys = ON").await;
+    // a typed ROLLBACK restores the connection's pragmas as well
+    exec(&mut s, "ROLLBACK").await;
+    assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 1);
+    assert_eq!(int(&mut s, "PRAGMA legacy_alter_table").await, 0);
     assert_eq!(
         int(&mut s, "SELECT count(*) FROM c").await,
         2,
         "the original table is intact"
     );
     assert!(def(&mut s, "main", "c").await.columns[1].nullable);
+    // a rollback after a failure inside the legacy rename window as well
+    exec(
+        &mut s,
+        "PRAGMA foreign_keys = OFF; BEGIN; PRAGMA legacy_alter_table = ON",
+    )
+    .await;
+    s.rollback().await.unwrap();
+    assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 1);
+    assert_eq!(int(&mut s, "PRAGMA legacy_alter_table").await, 0);
+}
+
+/// Execute statements one by one until one fails; returns its error.
+async fn run_until_error(
+    s: &mut SqliteSession,
+    stmts: &[String],
+) -> Option<ternarygrid_core::DbError> {
+    for stmt in stmts {
+        if let Err(e) = execute_update(s, stmt, &[]).await {
+            return Some(e);
+        }
+    }
+    None
+}
+
+/// Manual commit mode opens a transaction for a SELECT: the generated scripts
+/// are run the way the table designer does (statements joining the open
+/// transaction inside a savepoint, then a commit).
+#[tokio::test]
+async fn scripts_in_manual_commit_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = file_in(dir.path(), "manual.db");
+    let mut p = params(&path, &[]);
+    p.auto_commit = false;
+    let mut s = ternarygrid_driver_sqlite::SqliteDriver::new()
+        .connect_sqlite(&p)
+        .await
+        .unwrap();
+    exec(&mut s, "CREATE TABLE p (id INTEGER PRIMARY KEY); CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT REFERENCES p (id) ON DELETE CASCADE, v TEXT); INSERT INTO p VALUES (1); INSERT INTO c VALUES (1, 1, 'a')").await;
+    s.commit().await.unwrap();
+    // a SELECT opens the transaction
+    assert_eq!(int(&mut s, "SELECT count(*) FROM c").await, 1);
+    assert!(s.in_transaction());
+
+    // a native change joins it (it used to fail at its BEGIN)
+    let from = def(&mut s, "main", "c").await;
+    let mut to = from.clone();
+    to.columns.push(ColumnDef::new("note", "TEXT"));
+    to.indexes.push(IndexDef {
+        name: "ix_c_v".into(),
+        columns: vec![IndexColumn::column("v")],
+        ..Default::default()
+    });
+    let stmts = ddl().ddl().alter_table(&from, &to, &[]);
+    assert!(!is_rebuild(&stmts), "{stmts:#?}");
+    exec(&mut s, "SAVEPOINT ternarygrid_save").await;
+    apply(&mut s, &stmts).await;
+    exec(&mut s, "RELEASE SAVEPOINT ternarygrid_save").await;
+    assert!(s.in_transaction());
+    s.commit().await.unwrap();
+    assert_eq!(shape(&def(&mut s, "main", "c").await), shape(&to));
+
+    // a rebuild cannot run inside the open transaction (PRAGMA foreign_keys has
+    // no effect there; DROP TABLE p would cascade to c): it fails at its BEGIN,
+    // before changing anything, with an explanation
+    assert_eq!(int(&mut s, "SELECT count(*) FROM c").await, 1);
+    let from = def(&mut s, "main", "p").await;
+    let mut to = from.clone();
+    to.columns[0].data_type = "INT".into();
+    let stmts = ddl().ddl().alter_table(&from, &to, &[]);
+    assert!(is_rebuild(&stmts), "{stmts:#?}");
+    exec(&mut s, "SAVEPOINT ternarygrid_save").await;
+    let err = run_until_error(&mut s, &stmts).await.expect("BEGIN fails");
+    assert!(err.message.contains("manual commit mode"), "{err:?}");
+    exec(
+        &mut s,
+        "ROLLBACK TO SAVEPOINT ternarygrid_save; RELEASE SAVEPOINT ternarygrid_save",
+    )
+    .await;
+    assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 1);
+    assert_eq!(int(&mut s, "SELECT count(*) FROM c").await, 1);
+    // outside a transaction it runs, and keeps the referencing rows
+    s.rollback().await.unwrap();
+    let violations = apply(&mut s, &stmts).await;
+    assert!(violations.is_empty(), "{violations:?}");
+    s.commit().await.unwrap();
+    assert_eq!(int(&mut s, "SELECT count(*) FROM c").await, 1);
+    assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 1);
 }
 
 #[tokio::test]

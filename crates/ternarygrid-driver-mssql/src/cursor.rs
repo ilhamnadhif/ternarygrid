@@ -115,6 +115,8 @@ pub(crate) struct Statement {
     pub resolve_sources: bool,
     /// Re-read `@@TRANCOUNT` / `DB_NAME()` afterwards.
     pub refresh_state: bool,
+    /// ... and after an error or interruption (it may have ended the transaction on the server).
+    pub refresh_on_error: bool,
     /// Command tag for row-less results (first keyword).
     pub tag: Option<String>,
     /// Message delivered before the results (e.g. a reconnect warning).
@@ -242,20 +244,25 @@ async fn run(mut client: MsClient, stmt: &Statement, shared: &Shared, tx: &mpsc:
         let _ = tx.send(Event::Message(n)).await;
     }
     let mut described = None;
+    let mut outcome = Step::Done;
     if stmt.resolve_sources {
-        match describe(&mut client, stmt).await {
-            Ok(d) => described = Some(d),
-            Err(e) if is_fatal_db(&e) => {
-                let _ = tx.send(Event::Error(e)).await;
-                return None;
-            }
-            Err(e) => tracing::debug!("describe_first_result_set failed: {e}"),
+        // The catalog lookup waits for schema locks like the statement: interruptible too.
+        match interruptible(describe(&mut client, stmt), cancel, abandon, &mut clock).await {
+            Ok(Ok(d)) => described = Some(d),
+            Ok(Err(e)) if is_fatal_db(&e) => outcome = Step::Broken(e),
+            Ok(Err(e)) => tracing::debug!("describe_first_result_set failed: {e}"),
+            Err(step) => outcome = step,
         }
     }
 
-    let batches: Vec<(String, u32)> = if stmt.mode == ExecMode::Batch && stmt.params.is_empty() { sqltext::split_batches(&stmt.sql) } else { vec![(stmt.sql.clone(), 1)] };
+    let batches: Vec<(String, u32)> = if !matches!(outcome, Step::Done) {
+        Vec::new() // ended before the statement ran
+    } else if stmt.mode == ExecMode::Batch && stmt.params.is_empty() {
+        sqltext::split_batches(&stmt.sql)
+    } else {
+        vec![(stmt.sql.clone(), 1)]
+    };
     let mut emitted = false;
-    let mut outcome = Step::Done;
     // Error positions are reported within the batch: shifted to the script (after a GO).
     let mut search_from = 0usize;
     'outer: for (batch, repeat) in &batches {
@@ -280,21 +287,27 @@ async fn run(mut client: MsClient, stmt: &Statement, shared: &Shared, tx: &mpsc:
     }
 
     let mut client = Some(client);
+    // Delivered after the state refresh below: the session's transaction state is read as
+    // soon as the statement's last result (or its error) arrives.
+    let mut last: Option<Event> = None;
+    let mut failed = false;
     match outcome {
         Step::Done => {
             if !emitted {
-                let _ = tx.send(Event::Header(ResultHeader::Update { rows_affected: None, last_insert_id: None, tag: stmt.tag.clone() })).await;
+                last = Some(Event::Header(ResultHeader::Update { rows_affected: None, last_insert_id: None, tag: stmt.tag.clone() }));
             }
         }
         Step::AbandonedClean => {}
         Step::Failed(e) => {
-            let _ = tx.send(Event::Error(e)).await;
+            failed = true;
+            last = Some(Event::Error(e));
         }
         Step::Broken(e) => {
             let _ = tx.send(Event::Error(e)).await;
             client = None;
         }
         Step::Interrupted(reason) => {
+            failed = true;
             let mut c = client.take();
             let mut lost = false;
             if let Some(cl) = c.as_mut() {
@@ -330,7 +343,9 @@ async fn run(mut client: MsClient, stmt: &Statement, shared: &Shared, tx: &mpsc:
         }
     }
 
-    if stmt.refresh_state
+    // An error can end the transaction on the server (deadlock victim, XACT_ABORT, a
+    // trigger's ROLLBACK): the state is read again after one too.
+    if (stmt.refresh_state || (failed && stmt.refresh_on_error))
         && let Some(cl) = client.as_mut()
     {
         match tokio::time::timeout(Duration::from_secs(15), refresh_state(cl)).await {
@@ -347,11 +362,44 @@ async fn run(mut client: MsClient, stmt: &Statement, shared: &Shared, tx: &mpsc:
             Err(_) => client = None,
         }
     }
+    if let Some(ev) = last {
+        let _ = tx.send(ev).await;
+    }
     client
 }
 
 fn is_fatal_db(e: &DbError) -> bool {
     e.kind == ErrorKind::Connection
+}
+
+/// Run `work` (a round trip on the connection before the statement) the way the
+/// statement runs: cancel and timeout interrupt it; when the cursor is abandoned it
+/// gets [`DRAIN_BUDGET`] to finish (the connection stays in sync), else it is
+/// interrupted. `Err`: how the statement ends instead of running.
+async fn interruptible<T>(
+    work: impl std::future::Future<Output = DbResult<T>>,
+    cancel: &CancellationToken,
+    abandon: &CancellationToken,
+    clock: &mut ServerClock,
+) -> Result<DbResult<T>, Step> {
+    tokio::pin!(work);
+    let waited = Instant::now();
+    let done = tokio::select! {
+        biased;
+        _ = abandon.cancelled() => None,
+        _ = cancel.cancelled() => return Err(Step::Interrupted(Interrupt::Cancelled)),
+        _ = clock.expired() => return Err(Step::Interrupted(Interrupt::TimedOut)),
+        r = &mut work => Some(r),
+    };
+    clock.consume(waited);
+    match done {
+        Some(r) => Ok(r),
+        None => match tokio::time::timeout(DRAIN_BUDGET, &mut work).await {
+            Ok(Err(e)) if is_fatal_db(&e) => Err(Step::Broken(e)),
+            Ok(_) => Err(Step::AbandonedClean),
+            Err(_) => Err(Step::Interrupted(Interrupt::Abandoned)),
+        },
+    }
 }
 
 /// `@@TRANCOUNT` and `DB_NAME()`.
@@ -801,6 +849,41 @@ mod tests {
         assert!(matches!(c.next_result().await.unwrap(), Some(ResultHeader::Update { rows_affected: Some(3), .. })));
         assert_eq!(c.next_result().await.unwrap_err().message, "late");
         assert!(c.next_result().await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_before_the_statement_is_interruptible() {
+        let never = || futures::future::pending::<DbResult<()>>();
+        let idle = CancellationToken::new();
+        // cancelled while waiting (e.g. for a schema lock)
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            c.cancel();
+        });
+        let r = interruptible(never(), &cancel, &idle, &mut ServerClock::new(None)).await;
+        assert!(matches!(r, Err(Step::Interrupted(Interrupt::Cancelled))));
+        // statement timeout
+        let r = interruptible(never(), &idle, &idle, &mut ServerClock::new(Some(Duration::from_secs(2)))).await;
+        assert!(matches!(r, Err(Step::Interrupted(Interrupt::TimedOut))));
+        // abandoned: given the drain budget to finish (connection in sync), else interrupted
+        let gone = CancellationToken::new();
+        gone.cancel();
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok::<_, DbError>(())
+        };
+        assert!(matches!(interruptible(slow, &idle, &gone, &mut ServerClock::new(None)).await, Err(Step::AbandonedClean)));
+        assert!(matches!(interruptible(never(), &idle, &gone, &mut ServerClock::new(None)).await, Err(Step::Interrupted(Interrupt::Abandoned))));
+        // finished: the result passes through and its time counts against the timeout
+        let mut clock = ServerClock::new(Some(Duration::from_secs(10)));
+        let quick = async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok::<_, DbError>(7)
+        };
+        assert!(matches!(interruptible(quick, &idle, &idle, &mut clock).await, Ok(Ok(7))));
+        assert_eq!(clock.remaining, Some(Duration::from_secs(7)));
     }
 
     #[test]
