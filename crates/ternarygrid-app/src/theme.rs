@@ -107,6 +107,8 @@ pub fn apply_theme(ctx: &Context, choice: ThemeChoice, high_contrast: bool) {
             style.spacing.item_spacing = egui::vec2(6.0, 4.0);
             style.spacing.button_padding = egui::vec2(6.0, 2.0);
             style.spacing.interact_size.y = 20.0;
+            // Menus as in the design: 5 points around the items.
+            style.spacing.menu_margin = egui::Margin::same(5);
             style.interaction.tooltip_delay = 0.4;
             // Scroll bars stay visible (egui shows them only on hover), wider when used.
             style.spacing.scroll = egui::style::ScrollStyle {
@@ -161,7 +163,7 @@ pub fn visuals(theme: Theme) -> Visuals {
     v.window_stroke = Stroke::new(1.0, p.border);
     v.extreme_bg_color = p.surface;
     v.text_edit_bg_color = Some(p.surface);
-    v.faint_bg_color = if dark { hex(0x272930) } else { hex(0xf7f7f9) };
+    v.faint_bg_color = p.stripe;
     v.code_bg_color = p.subtle;
     v.hyperlink_color = p.accent_text;
     v.warn_fg_color = p.warn;
@@ -173,9 +175,16 @@ pub fn visuals(theme: Theme) -> Visuals {
     // A blinking caret would repaint twice a second (idle CPU stays at 0 %).
     v.text_cursor.blink = false;
     v.window_corner_radius = CornerRadius::same(ternarygrid_ui::style::RADIUS_LG);
-    v.menu_corner_radius = CornerRadius::same(8);
-    v.window_shadow = Shadow { offset: [0, 10], blur: 30, spread: 0, color: Color32::from_black_alpha(if dark { 120 } else { 38 }) };
-    v.popup_shadow = Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(if dark { 100 } else { 28 }) };
+    v.menu_corner_radius = CornerRadius::same(9);
+    // Dialogs and menus float on a soft shadow (as soft as in the rendered design: its CSS
+    // 0 24 60 at 45 % reads much lighter than the same numbers in egui).
+    let (window, popup) = if dark {
+        (Color32::from_black_alpha(90), Color32::from_black_alpha(64))
+    } else {
+        (Color32::from_rgba_unmultiplied(20, 20, 40, 34), Color32::from_rgba_unmultiplied(20, 20, 40, 26))
+    };
+    v.window_shadow = Shadow { offset: [0, 16], blur: 44, spread: 0, color: window };
+    v.popup_shadow = Shadow { offset: [0, 10], blur: 28, spread: 0, color: popup };
     v.collapsing_header_frame = false;
     v.indent_has_left_vline = true;
     v.striped = false;
@@ -190,17 +199,17 @@ pub fn visuals(theme: Theme) -> Visuals {
     w.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
     w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
     w.noninteractive.corner_radius = radius;
-    // Buttons, inputs, check boxes at rest: an outlined surface (text fields
-    // must stand out in dialogs too).
+    // Inputs and select boxes at rest: the surface with a hairline, as in the design
+    // (outlined buttons are drawn by the kit, with the stronger border).
     w.inactive.bg_fill = p.subtle;
     w.inactive.weak_bg_fill = p.surface;
-    w.inactive.bg_stroke = Stroke::new(1.0, p.border_strong);
+    w.inactive.bg_stroke = Stroke::new(1.0, p.border);
     w.inactive.fg_stroke = Stroke::new(1.0, p.text);
     w.inactive.corner_radius = radius;
     w.inactive.expansion = 0.0;
     w.hovered.bg_fill = p.subtle;
     w.hovered.weak_bg_fill = p.hover;
-    w.hovered.bg_stroke = Stroke::new(1.0, if dark { p.border_strong } else { hex(0xbebec8) });
+    w.hovered.bg_stroke = Stroke::new(1.0, p.border_strong);
     w.hovered.fg_stroke = Stroke::new(1.0, p.text);
     w.hovered.corner_radius = radius;
     w.hovered.expansion = 0.0;
@@ -237,10 +246,17 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     let mut s = egui_dock::Style::from_egui(style);
     let v = &style.visuals;
     let p = ternarygrid_ui::palette(v.dark_mode);
-    let top = CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+    let top = CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
+    // The design's tab bar: 38 points with the hairline under it (painted by the viewer, 1
+    // point thick), the tabs 8 points from its ends and 2 apart; the active tab reaches up
+    // to the top bar's hairline and opens onto the content.
     s.tab_bar.bg_fill = p.chrome;
-    s.tab_bar.hline_color = p.border;
-    s.tab_bar.height = s.tab_bar.height.max(30.0);
+    s.tab_bar.hline_color = Color32::TRANSPARENT;
+    s.tab_bar.height = crate::tabs::TAB_BAR_H;
+    s.tab_bar.inner_margin = egui::Margin { left: 8, right: 8, top: -1, bottom: 0 };
+    s.tab.spacing = 2.0;
+    s.tab.minimum_width = None;
+    s.tab.hline_below_active_tab_name = false;
     for t in [&mut s.tab.active, &mut s.tab.focused, &mut s.tab.active_with_kb_focus, &mut s.tab.focused_with_kb_focus] {
         t.bg_fill = p.canvas;
         t.outline_color = p.border;
@@ -249,16 +265,19 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     }
     for t in [&mut s.tab.inactive, &mut s.tab.inactive_with_kb_focus] {
         t.bg_fill = p.chrome;
-        t.outline_color = p.chrome;
+        t.outline_color = Color32::TRANSPARENT;
         t.text_color = p.text_muted;
         t.corner_radius = top;
     }
-    s.tab.hovered.bg_fill = p.hover;
-    s.tab.hovered.outline_color = p.hover;
+    s.tab.hovered.bg_fill = p.chrome;
+    s.tab.hovered.outline_color = Color32::TRANSPARENT;
     s.tab.hovered.text_color = p.text;
     s.tab.hovered.corner_radius = top;
+    // The content reaches the edges (no frame, no padding: each view has the design's own).
     s.tab.tab_body.bg_fill = p.canvas;
-    s.tab.tab_body.stroke = Stroke::new(1.0, p.border);
+    s.tab.tab_body.stroke = Stroke::NONE;
+    s.tab.tab_body.inner_margin = egui::Margin::ZERO;
+    s.dock_area_padding = None;
     s.separator.width = 1.0;
     s.separator.color_idle = p.border;
     s.separator.color_hovered = p.border_strong;
@@ -282,6 +301,23 @@ pub fn rgb(c: [u8; 3]) -> Color32 {
 /// become transparent so development connections are not highlighted.
 pub fn connection_marker(c: [u8; 3]) -> Option<Color32> {
     if c == [255, 255, 255] { None } else { Some(rgb(c)) }
+}
+
+/// The colour of a connection type's marker as the design draws it (navigator stripe, tab
+/// line, PRODUCTION pill): the built-in production colour is the theme's error red, other
+/// colours are the user's; white is no marker.
+pub fn marker(c: [u8; 3], dark_mode: bool) -> Option<Color32> {
+    if c == ternarygrid_core::config::ConnectionType::production().color {
+        return Some(ternarygrid_ui::palette(dark_mode).err);
+    }
+    connection_marker(c)
+}
+
+/// The pill of a connection type ("PRODUCTION"): the production red on its soft tint, other
+/// colours on their own tint.
+pub fn marker_pill(ui: &mut egui::Ui, name: &str, c: Color32) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    if c == p.err { ternarygrid_ui::kit::pill_colors(ui, name, p.err, p.prod_soft) } else { ternarygrid_ui::kit::pill(ui, name, c) }
 }
 
 /// Softened version of a marker colour for backgrounds (tab strips, status bar).

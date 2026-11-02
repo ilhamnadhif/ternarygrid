@@ -91,30 +91,29 @@ impl<'a> Dialog<'a> {
         ui.spacing_mut().item_spacing.y = 0.0;
         let mut close = false;
         // Header.
-        Frame::new().inner_margin(Margin { left: 20, right: 12, top: 14, bottom: 12 }).show(ui, |ui| {
+        Frame::new().inner_margin(Margin { left: 20, right: 16, top: 16, bottom: 14 }).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 if let Some(icon) = self.icon {
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
                     ui.painter().rect_filled(r, CornerRadius::same(RADIUS_LG), p.accent_soft);
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, icon, style::icon_font(19.0), p.accent_text);
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, icon, style::icon_font(16.5), p.accent_text);
                 }
-                let title = RichText::new(self.title).font(style::semibold(ui.ctx(), 15.0)).color(p.text);
                 match self.subtitle {
                     // Title over subtitle; a lone title stays centred on the row.
                     Some(s) => {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(title);
+                            kit::semibold_label(ui, self.title, 15.0, p.text);
                             ui.label(RichText::new(s).size(12.5).color(p.text_muted));
                         });
                     }
                     None => {
-                        ui.label(title);
+                        kit::semibold_label(ui, self.title, 15.0, p.text);
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if kit::icon_button(ui, egui_phosphor::regular::X, crate_close_label()).clicked() {
+                    if kit::icon_button_sized(ui, egui_phosphor::regular::X, crate_close_label(), false, 28.0, 12.0).clicked() {
                         close = true;
                     }
                 });
@@ -308,13 +307,16 @@ impl Tone {
         }
     }
 
-    /// The soft fill behind a callout of this tone.
+    /// The soft fill behind a callout of this tone (the design's note colours).
     pub fn fill(self, ui: &Ui) -> Color32 {
         let p = style::pal(ui);
         let dark = ui.visuals().dark_mode;
+        let rgb = |c: u32| Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
         match self {
             Tone::Info => p.accent_soft,
-            _ => blend(p.surface, self.color(&p), if dark { 0.16 } else { 0.10 }),
+            Tone::Warning => rgb(if dark { 0x3f3826 } else { 0xfbf3df }),
+            Tone::Error => p.prod_soft,
+            Tone::Success => rgb(if dark { 0x253b2b } else { 0xe3f4e7 }),
         }
     }
 }
@@ -341,18 +343,18 @@ fn callout_dyn(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: &m
     Frame::new()
         .fill(tone.fill(ui))
         .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin { left: 12, right: 10, top: 9, bottom: 9 })
+        .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(RichText::new(tone.icon()).font(style::icon_font(16.0)).color(color));
+                ui.label(RichText::new(tone.icon()).font(style::icon_font(14.0)).color(color));
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     if let Some(t) = title {
-                        ui.label(RichText::new(t).font(style::semibold(ui.ctx(), style::body_size(ui.ctx()))).color(p.text));
+                        kit::semibold_label(ui, t, 13.0, p.text);
                     }
-                    ui.add(egui::Label::new(RichText::new(body).color(p.text)).wrap().selectable(true));
+                    ui.add(egui::Label::new(RichText::new(body).size(12.5).color(p.text)).wrap().selectable(true));
                     // Extra content (buttons) under the text at the right; nothing when empty
                     // (a right-to-left layout beside the text would take the panel's height).
                     ui.scope(|ui| {
@@ -423,7 +425,14 @@ fn segmented_idx(ui: &mut Ui, sel: Option<usize>, labels: &[&str], small: bool) 
     let p = style::pal(ui);
     let h = if small { 24.0 } else { 28.0 };
     let fs = 12.5;
-    let galleys: Vec<_> = labels.iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), egui::FontId::proportional(fs), Color32::PLACEHOLDER)).collect();
+    let galleys: Vec<_> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let font = if sel == Some(i) { style::medium(ui.ctx(), fs) } else { egui::FontId::proportional(fs) };
+            ui.painter().layout_no_wrap(l.to_string(), font, Color32::PLACEHOLDER)
+        })
+        .collect();
     let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + 20.0).collect();
     let total = widths.iter().sum::<f32>() + 4.0 + (labels.len().saturating_sub(1)) as f32 * 2.0;
     let (rect, _) = ui.allocate_exact_size(vec2(total, h), Sense::hover());
@@ -436,8 +445,7 @@ fn segmented_idx(ui: &mut Ui, sel: Option<usize>, labels: &[&str], small: bool) 
         let on = sel == Some(i);
         resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, on, *label));
         if on {
-            ui.painter().rect_filled(r, CornerRadius::same(5), p.surface);
-            ui.painter().rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, p.border), StrokeKind::Inside);
+            kit::raised(ui.painter(), r, CornerRadius::same(5), p.surface);
         } else if resp.hovered() {
             ui.painter().rect_filled(r, CornerRadius::same(5), p.hover);
         }
@@ -546,7 +554,7 @@ fn group_dyn(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, add: &mut dyn 
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
                 if let Some(t) = title {
-                    ui.label(RichText::new(t).font(style::semibold(ui.ctx(), 13.5)).color(p.text));
+                    kit::semibold_label(ui, t, 13.5, p.text);
                 }
                 if let Some(s) = sub {
                     ui.add(egui::Label::new(RichText::new(s).size(12.5).color(p.text_muted)).wrap());
@@ -561,7 +569,7 @@ fn group_dyn(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, add: &mut dyn 
 pub fn section_header(ui: &mut Ui, title: &str, right: impl FnOnce(&mut Ui)) {
     let p = style::pal(ui);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+        kit::semibold_label(ui, title, 13.0, p.text);
         ui.with_layout(Layout::right_to_left(Align::Center), right);
     });
 }
@@ -639,20 +647,22 @@ pub fn page_header(ui: &mut Ui, icon: &str, place: &[&str], title: &str, facts: 
 
 fn page_header_dyn(ui: &mut Ui, icon: &str, place: &[&str], title: &str, facts: Option<&str>, right: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        ui.add_space(4.0);
-        ui.label(RichText::new(icon).font(style::icon_font(17.0)).color(p.text_muted));
-        for part in place {
-            ui.label(RichText::new(*part).color(p.text_muted));
-            ui.label(RichText::new(egui_phosphor::regular::CARET_RIGHT).size(11.0).color(p.text_faint));
-        }
-        ui.label(RichText::new(title).font(style::semibold(ui.ctx(), 15.0)).color(p.text));
-        if let Some(f) = facts {
-            ui.label(RichText::new(f).color(p.text_faint));
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), right);
+    Frame::new().inner_margin(Margin { left: 16, right: 16, top: 12, bottom: 6 }).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.set_min_height(28.0);
+            ui.label(RichText::new(icon).font(style::icon_font(15.5)).color(p.text_muted));
+            for part in place {
+                ui.label(RichText::new(*part).size(13.0).color(p.text_muted));
+                ui.label(RichText::new("›").size(13.0).color(p.text_faint));
+            }
+            kit::semibold_label(ui, title, 15.0, p.text);
+            if let Some(f) = facts {
+                ui.add_space(4.0);
+                ui.label(RichText::new(f).size(12.5).color(p.text_faint));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), right);
+        });
     });
 }
 
@@ -665,10 +675,10 @@ pub fn toolbar<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 }
 
 fn toolbar_dyn(ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)) {
-    Frame::new().inner_margin(Margin { left: 12, right: 12, top: 6, bottom: 6 }).show(ui, |ui| {
+    Frame::new().inner_margin(Margin::symmetric(16, 8)).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.set_min_height(28.0);
+            ui.set_min_height(30.0);
             add(ui);
         });
     });

@@ -41,6 +41,16 @@ pub struct Palette {
     pub warn: Color32,
     pub err: Color32,
     pub info: Color32,
+    /// Lines between the rows and cells of tables and the grid.
+    pub line: Color32,
+    /// The selected cell of the grid.
+    pub sel: Color32,
+    /// A changed (not yet saved) cell, the pending changes bar.
+    pub modified: Color32,
+    /// Behind production markers (pills, error callouts).
+    pub prod_soft: Color32,
+    /// Every other row of tables and the grid.
+    pub stripe: Color32,
 }
 
 const fn rgb(c: u32) -> Color32 {
@@ -53,7 +63,7 @@ pub const LIGHT: Palette = Palette {
     surface: rgb(0xffffff),
     hover: rgb(0xefeff3),
     subtle: rgb(0xe8e8ee),
-    header: rgb(0xf3f3f6),
+    header: rgb(0xf6f6f8),
     border: rgb(0xe3e3e9),
     border_strong: rgb(0xcfcfd8),
     text: rgb(0x1a1a20),
@@ -68,6 +78,11 @@ pub const LIGHT: Palette = Palette {
     warn: rgb(0x9a6700),
     err: rgb(0xb42318),
     info: rgb(0x2563dc),
+    line: rgb(0xededf2),
+    sel: rgb(0xd4e7e4),
+    modified: rgb(0xf3ead6),
+    prod_soft: rgb(0xfbe9e7),
+    stripe: rgb(0xfafafb),
 };
 
 pub const DARK: Palette = Palette {
@@ -93,6 +108,11 @@ pub const DARK: Palette = Palette {
     warn: rgb(0xe8b45e),
     err: rgb(0xf88a84),
     info: rgb(0x7aa7ff),
+    line: rgb(0x33353e),
+    sel: rgb(0x224444),
+    modified: rgb(0x4b443b),
+    prod_soft: rgb(0x4a3a40),
+    stripe: rgb(0x262830),
 };
 
 impl Palette {
@@ -177,8 +197,10 @@ pub const RADIUS: u8 = 6;
 pub const RADIUS_LG: u8 = 10;
 /// Width of the label column in forms.
 pub const LABEL_W: f32 = 128.0;
-/// Height of a form control (text field, button, menu) in dialogs.
-pub const CONTROL_H: f32 = 28.0;
+/// Height of a form control (text field, select box, button) in dialogs.
+pub const CONTROL_H: f32 = 30.0;
+/// Height of a small button (toolbars, footers).
+pub const SMALL_H: f32 = 26.0;
 
 /// Roomier spacing for the content of a dialog or form.
 pub fn form_spacing(ui: &mut Ui) {

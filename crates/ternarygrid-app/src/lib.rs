@@ -210,8 +210,9 @@ pub fn run() -> ExitCode {
         #[cfg(target_os = "macos")]
         {
             app.app_menu = macmenu::AppMenu::install(&cc.egui_ctx);
+            app.native_menu_bar = app.app_menu.is_some();
             // Room for the close / minimise / zoom buttons in the merged title bar.
-            app.titlebar_inset = 78.0;
+            app.titlebar_inset = app::MAC_TITLEBAR_INSET;
         }
         match std::env::var("TERNARYGRID_BENCH_SCENARIO").as_deref() {
             Ok("workload") => app.start_bench_workload(),

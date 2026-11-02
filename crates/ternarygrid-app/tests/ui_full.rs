@@ -281,7 +281,7 @@ fn sweep_menu(h: &mut H, name: &str, open: &dyn Fn(&mut H), skip: &[&str]) -> us
         frames(h, 3);
         // A sub-menu: new items appeared and the menu is still open.
         let sub: Vec<String> = labels(h).into_iter().filter(|l| !before.contains(l) && !l.trim().is_empty()).collect();
-        let is_submenu = item.contains('⏵');
+        let is_submenu = item.contains('⏵') || item.contains(egui_phosphor::regular::CARET_RIGHT);
         if is_submenu && !sub.is_empty() {
             h.key_press(Key::Escape);
             frames(h, 2);
@@ -977,6 +977,9 @@ fn wait_file(h: &mut H, dir: &std::path::Path, what: &str, pred: impl Fn(&str) -
     found.unwrap()
 }
 
+/// The label of the navigator menu's Tools submenu (its text and the chevron after it).
+const TOOLS: &str = concat!("Tools ", "\u{E13A}");
+
 fn nav_menu(h: &mut H, row: &str, items: &[&str]) {
     pause(h);
     nav_row(h, row).unwrap_or_else(|| panic!("no navigator row {row:?}")).click_secondary();
@@ -1032,7 +1035,7 @@ fn tool_tabs_run() {
 
     // Backup of the SQLite database (with the sqlite3 tool, which Windows lacks).
     if std::process::Command::new("sqlite3").arg("-version").output().is_ok() {
-        nav_menu(&mut h, "ternarygrid-sample.db", &["Tools ⏵", "Backup"]);
+        nav_menu(&mut h, "ternarygrid-sample.db", &[TOOLS, "Backup"]);
         click(&mut h, "Start backup");
         let backup = wait_file(&mut h, &dir.0, "backup file", |n| n.starts_with("ternarygrid-sample") && n.ends_with(".sql"));
         let dump = std::fs::read_to_string(&backup).unwrap();
@@ -1059,7 +1062,7 @@ fn tool_tabs_run() {
     settle(&mut h, "mock data");
 
     // Metadata search.
-    nav_menu(&mut h, "ternarygrid-sample.db", &["Tools ⏵", "Search metadata"]);
+    nav_menu(&mut h, "ternarygrid-sample.db", &[TOOLS, "Search metadata"]);
     field_with_hint(&mut h, "Name or pattern", "cust*");
     click(&mut h, "Search");
     wait(&mut h, "search results", |h| h.query_all_by_label_contains("customer").count() > 2);

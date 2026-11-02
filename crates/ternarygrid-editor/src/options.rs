@@ -17,6 +17,9 @@ pub struct EditorOptions {
     pub font_family: FontFamily,
     /// Extra vertical space between rows, in points.
     pub line_spacing: f32,
+    /// The least height of a row as a multiple of the font size (0: the font's row height
+    /// and `line_spacing`).
+    pub line_height: f32,
     /// Width of an indentation level in columns.
     pub tab_size: usize,
     /// Insert spaces instead of `\t` when pressing Tab.
@@ -81,6 +84,7 @@ impl Default for EditorOptions {
             font_size: 13.0,
             font_family: FontFamily::Monospace,
             line_spacing: 3.0,
+            line_height: 0.0,
             tab_size: 4,
             insert_spaces: true,
             line_numbers: true,
