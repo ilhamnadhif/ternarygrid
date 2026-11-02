@@ -407,7 +407,14 @@ impl Navigator {
     fn build_connection(&self, cx: &mut AppContext, rows: &mut Vec<Row>, cfg: &ConnectionConfig, depth: usize) {
         let node = NavNode::Connection(cfg.id.clone());
         let status = cx.conns.status(&cfg.id);
-        let expanded = self.expanded.contains(&node) && matches!(status, ConnStatus::Connected | ConnStatus::Lost);
+        let unfolded = self.expanded.contains(&node);
+        let expanded = unfolded && matches!(status, ConnStatus::Connected | ConnStatus::Lost);
+        // Unfolded while connecting or after a failure: the state shows under the row.
+        let pending = match &status {
+            ConnStatus::Connecting if unfolded => Some(RowKind::Loading),
+            ConnStatus::Failed(e) if unfolded => Some(RowKind::Error(e.clone())),
+            _ => None,
+        };
         let filter_hit = self.filter_matches(&cfg.name);
         let dark = self.dark;
         let color = match &status {
@@ -430,12 +437,14 @@ impl Navigator {
             tint: marker,
             size: None,
             expandable: true,
-            expanded,
+            expanded: expanded || pending.is_some(),
             kind: RowKind::Node,
         });
         if !expanded {
             if !filter_hit {
                 rows.truncate(start);
+            } else if let Some(kind) = pending {
+                rows.push(placeholder(depth + 1, kind));
             }
             return;
         }
@@ -738,6 +747,7 @@ impl Navigator {
             let node = NavNode::KindFolder { conn: conn.to_string(), schema: schema.clone(), kind };
             let expanded = self.expanded.contains(&node) || (!self.filter.trim().is_empty() && matches!(kind, ObjectKind::Table | ObjectKind::View));
             let count = live.meta.objects.get(&(schema.clone(), kind)).and_then(|l| l.get()).map(|v| v.len());
+            let folder_row = rows.len();
             rows.push(Row {
                 node,
                 depth,
@@ -761,6 +771,12 @@ impl Navigator {
                 let leaf = live.config.kind == DbKind::Redis;
                 let has_children = !leaf && (kind.is_table_like() || matches!(kind, ObjectKind::View | ObjectKind::MaterializedView));
                 self.push_objects(live, rows, conn, schema, kind, depth + 1, has_children);
+                if !self.filter.trim().is_empty()
+                    && let Some(total) = count
+                {
+                    let shown = rows[folder_row + 1..].iter().filter(|r| r.depth == depth + 1 && r.kind == RowKind::Node).count();
+                    rows[folder_row].detail = Some(ternarygrid_core::trf("{} of {}", &[&shown, &total]));
+                }
                 // expanded objects get their child folders
                 let objs: Vec<ObjectInfo> = live.meta.objects.get(&(schema.clone(), kind)).and_then(|l| l.get()).cloned().unwrap_or_default();
                 let _ = objs;
@@ -1021,31 +1037,47 @@ impl Navigator {
     }
 
     fn properties_ui(&self, ui: &mut Ui, cx: &AppContext) {
+        let p = ternarygrid_ui::pal(ui);
         ui.horizontal(|ui| {
-            ui.strong(format!("{} {}", icon::INFO, tr("Properties")));
+            ui.set_min_height(34.0);
+            ui.add_space(8.0);
+            ui.label(RichText::new(icon::INFO).font(ternarygrid_ui::style::icon_font(14.0)).color(p.text_muted));
+            ui.label(RichText::new(tr("Properties")).font(ternarygrid_ui::style::semibold(ui.ctx(), 12.5)).color(p.text));
         });
         // only a node of the tree (not one removed since it was selected)
         let in_tree = self.selected.as_ref().is_some_and(|sel| self.rows.iter().any(|r| &r.node == sel));
         let props = if in_tree { self.selected_properties(cx) } else { Vec::new() };
         if props.is_empty() {
-            ui.weak(tr("Select an object in the navigator."));
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new(tr("Select an object in the navigator.")).size(12.5).color(p.text_muted));
+            });
             return;
         }
         egui::ScrollArea::vertical().id_salt("nav_properties_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("nav_properties_grid").num_columns(2).striped(true).spacing([10.0, 3.0]).show(ui, |ui| {
-                for (k, v) in &props {
-                    ui.label(RichText::new(k).weak());
-                    let first = v.lines().next().unwrap_or("");
-                    let resp = ui.add(egui::Label::new(first).truncate());
-                    resp.context_menu(|ui| {
-                        if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).clicked() {
-                            ui.ctx().copy_text(v.clone());
-                            ui.close();
-                        }
-                    });
-                    ui.end_row();
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let stripe = ui.visuals().faint_bg_color;
+            for (i, (k, v)) in props.iter().enumerate() {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
+                if i % 2 == 1 {
+                    ui.painter().rect_filled(rect, 0.0, stripe);
                 }
-            });
+                let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                row.spacing_mut().item_spacing.x = 8.0;
+                row.allocate_ui_with_layout(egui::vec2(110.0, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_width(110.0);
+                    ui.add(egui::Label::new(RichText::new(k).size(12.5).color(p.text_muted)).truncate());
+                });
+                let first = v.lines().next().unwrap_or("");
+                let resp = row.add(egui::Label::new(RichText::new(first).size(12.5).color(p.text)).truncate());
+                resp.context_menu(|ui| {
+                    if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).clicked() {
+                        ui.ctx().copy_text(v.clone());
+                        ui.close();
+                    }
+                });
+            }
+            ui.add_space(6.0);
         });
     }
 
@@ -1056,10 +1088,10 @@ impl Navigator {
     /// DBeaver, next to the Database / Project switch), the rest in "⋯". New
     /// connection and New SQL editor are in the main toolbar.
     pub fn toolbar_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        use ternarygrid_ui::kit::icon_button_ex;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
-            let flat = |text: egui::RichText| egui::Button::new(text).frame_when_inactive(false).min_size(egui::vec2(22.0, 22.0));
-            let more = ui.add(flat(egui::RichText::new(icon::DOTS_THREE))).on_hover_text(tr("More"));
+            let more = icon_button_ex(ui, icon::DOTS_THREE, tr("More"), false, 22.0);
             egui::Popup::menu(&more).show(|ui| {
                 // A new folder inside the selected folder, else at the top level.
                 if ui.button((ternarygrid_icons::ic(icon::FOLDER_PLUS), tr("New folder…"))).clicked() {
@@ -1082,16 +1114,17 @@ impl Navigator {
                     cx.push(AppCommand::SettingsChanged);
                 }
             });
-            if ui.add(flat(ternarygrid_icons::ic(icon::ARROWS_IN_SIMPLE))).on_hover_text(tr("Collapse all")).clicked() {
+            if icon_button_ex(ui, icon::ARROWS_IN_SIMPLE, tr("Collapse all"), false, 22.0).clicked() {
                 self.collapse_all();
             }
             let sel_conn = self.selected.as_ref().and_then(|n| n.connection()).map(str::to_string);
             let connected = sel_conn.as_deref().is_some_and(|c| cx.conns.is_connected(c));
-            if ui.add_enabled(connected, flat(ternarygrid_icons::ic(icon::ARROW_CLOCKWISE))).on_hover_text(tr("Refresh")).clicked() {
+            if ui.add_enabled_ui(connected, |ui| icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 22.0)).inner.clicked() {
                 self.refresh_selected(cx);
             }
-            let plug = ternarygrid_icons::ic(if connected { icon::PLUGS } else { icon::PLUGS_CONNECTED });
-            if ui.add_enabled(sel_conn.is_some(), flat(plug)).on_hover_text(if connected { tr("Disconnect") } else { tr("Connect") }).clicked()
+            let plug = if connected { icon::PLUGS } else { icon::PLUGS_CONNECTED };
+            let label = if connected { tr("Disconnect") } else { tr("Connect") };
+            if ui.add_enabled_ui(sel_conn.is_some(), |ui| icon_button_ex(ui, plug, label, false, 22.0)).inner.clicked()
                 && let Some(c) = sel_conn
             {
                 cx.push(if connected { AppCommand::Disconnect(c) } else { AppCommand::Connect(c) });
@@ -1104,14 +1137,16 @@ impl Navigator {
         if self.prefs != cx.settings.navigator {
             self.prefs = cx.settings.navigator.clone();
         }
-        let search = ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text(format!("{} {}", icon::MAGNIFYING_GLASS, tr("Filter objects"))).desired_width(f32::INFINITY));
+        ui.add_space(4.0);
+        let search = ternarygrid_ui::kit::search_field(ui, egui::Id::new("nav_filter"), &mut self.filter, tr("Filter objects"), ui.available_width());
         if search.changed() {
             // keep selection visible
             self.scroll_to_selected = true;
         }
-        ui.separator();
+        ui.add_space(4.0);
         if cx.settings.navigator.show_properties && !cx.conns.configs().is_empty() {
-            egui::Panel::bottom("nav_properties").resizable(true).default_size(170.0).size_range(60.0..=600.0).show(ui, |ui| self.properties_ui(ui, cx));
+            let frame = egui::Frame::new().fill(ternarygrid_ui::pal(ui).canvas).inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 6 });
+            egui::Panel::bottom("nav_properties").resizable(true).default_size(200.0).size_range(60.0..=600.0).frame(frame).show(ui, |ui| self.properties_ui(ui, cx));
         }
 
         self.request_child_loads(cx);
@@ -1137,8 +1172,8 @@ impl Navigator {
             return;
         }
 
-        // Compact rows (no gap between them): more of the tree fits in the sidebar.
-        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 5.0;
+        // Rows of 26 points with no gap between them, inset by 6 points (their rounded fill).
+        let row_h = 26.0;
         let rows = std::mem::take(&mut self.rows);
         let mut clicked: Option<(usize, bool)> = None; // (row, double)
         let mut toggled: Option<usize> = None;
@@ -1154,9 +1189,13 @@ impl Navigator {
         if let Some(i) = scroll_target {
             sa = sa.vertical_scroll_offset((i as f32 * row_h - 80.0).max(0.0));
         }
-        let dark = ui.visuals().dark_mode;
+        let p = ternarygrid_ui::pal(ui);
         let item_gap = std::mem::replace(&mut ui.spacing_mut().item_spacing.y, 0.0);
-        sa.show_rows(ui, row_h, rows.len(), |ui, range| {
+        // The rows reach the panel's edges (their own inset is the mockup's 6 points).
+        let full = ui.available_rect_before_wrap().expand2(egui::vec2(6.0, 0.0));
+        let mut area = ui.new_child(egui::UiBuilder::new().max_rect(full).layout(egui::Layout::top_down(egui::Align::Min)));
+        area.spacing_mut().item_spacing.y = 0.0;
+        sa.show_rows(&mut area, row_h, rows.len(), |ui, range| {
             for i in range {
                 let r = &rows[i];
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(200.0), row_h), Sense::click());
@@ -1167,61 +1206,60 @@ impl Navigator {
                     RowKind::Error(e) => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, e),
                     RowKind::Empty => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, tr("(empty)")),
                 });
+                let inner = rect.shrink2(egui::vec2(6.0, 0.0));
+                let is_node = r.kind == RowKind::Node;
                 let fill = if selected {
-                    Some(ui.visuals().selection.bg_fill)
-                } else if resp.hovered() {
-                    Some(ui.visuals().widgets.hovered.weak_bg_fill)
+                    Some(p.accent_soft)
+                } else if is_node && resp.hovered() {
+                    Some(p.hover)
                 } else {
                     None
                 };
                 if let Some(fill) = fill {
-                    ui.painter().rect_filled(rect, 4.0, fill);
+                    ui.painter().rect_filled(inner, ternarygrid_ui::style::RADIUS, fill);
                 }
                 // A marked connection type (Production): a stripe on the row's left edge.
                 if let Some(t) = r.tint {
-                    let stripe = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + 3.0), egui::pos2(rect.left() + 3.0, rect.bottom() - 3.0));
-                    ui.painter().rect_filled(stripe, 1.5, t);
+                    let stripe = egui::Rect::from_min_max(egui::pos2(inner.left(), inner.top() + 4.0), egui::pos2(inner.left() + 3.0, inner.bottom() - 4.0));
+                    ui.painter().rect_filled(stripe, 2.0, t);
                 }
-                let row_bg = fill.map_or(ui.visuals().panel_fill, |f| crate::theme::over(f, ui.visuals().panel_fill));
-                let mut x = rect.left() + 4.0 + r.depth as f32 * 14.0;
-                let y = rect.center().y;
-                let text_color = if selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
-                let font = egui::TextStyle::Body.resolve(ui.style());
+                let row_bg = fill.unwrap_or(p.canvas);
+                let mut x = inner.left() + 8.0 + r.depth as f32 * 14.0;
+                let y = inner.center().y;
+                let text_color = if selected { p.accent_text } else { p.text };
+                let size = ternarygrid_ui::style::body_size(ui.ctx());
                 if r.expandable {
                     let arrow = if r.expanded { icon::CARET_DOWN } else { icon::CARET_RIGHT };
-                    let arrow_rect = egui::Rect::from_center_size(egui::pos2(x + 6.0, y), egui::vec2(14.0, row_h));
-                    ui.painter().text(arrow_rect.center(), egui::Align2::CENTER_CENTER, arrow, font.clone(), ui.visuals().weak_text_color());
-                    if resp.clicked() && resp.interact_pointer_pos().is_some_and(|p| arrow_rect.contains(p)) {
+                    let arrow_rect = egui::Rect::from_center_size(egui::pos2(x + 6.0, y), egui::vec2(16.0, row_h));
+                    ui.painter().text(arrow_rect.center(), egui::Align2::CENTER_CENTER, arrow, ternarygrid_ui::style::icon_font(11.0), p.text_faint);
+                    if resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| arrow_rect.contains(q)) {
                         toggled = Some(i);
                     }
                 }
-                x += 16.0;
+                x += 18.0;
+                let small = egui::FontId::proportional(12.5);
                 match &r.kind {
                     RowKind::Loading => {
-                        ui.painter().text(
-                            egui::pos2(x, y),
-                            egui::Align2::LEFT_CENTER,
-                            format!("{} {}", icon::HOURGLASS, tr("Loading…")),
-                            font.clone(),
-                            ui.visuals().weak_text_color(),
-                        );
+                        ui.painter().text(egui::pos2(x + 6.5, y), egui::Align2::CENTER_CENTER, icon::HOURGLASS, ternarygrid_ui::style::icon_font(13.0), p.text_faint);
+                        ui.painter().text(egui::pos2(x + 19.0, y), egui::Align2::LEFT_CENTER, tr("Loading…"), small, p.text_faint);
                         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                         continue;
                     }
                     RowKind::Error(e) => {
                         let resp = resp.on_hover_text(e.clone());
-                        ui.painter().text(
-                            egui::pos2(x, y),
-                            egui::Align2::LEFT_CENTER,
-                            format!("{} {}", icon::WARNING, e.lines().next().unwrap_or("")),
-                            font.clone(),
-                            crate::theme::error_color(dark),
+                        ui.painter().text(egui::pos2(x + 6.5, y), egui::Align2::CENTER_CENTER, icon::WARNING, ternarygrid_ui::style::icon_font(13.0), p.err);
+                        let g = egui::WidgetText::from(RichText::new(e.lines().next().unwrap_or("")).font(small).color(p.err)).into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Truncate),
+                            (inner.right() - x - 25.0).max(30.0),
+                            egui::TextStyle::Body,
                         );
+                        ui.painter().galley(egui::pos2(x + 19.0, y - g.size().y / 2.0), g, p.err);
                         let _ = resp;
                         continue;
                     }
                     RowKind::Empty => {
-                        ui.painter().text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, tr("(empty)"), font.clone(), ui.visuals().weak_text_color());
+                        ui.painter().text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, tr("(empty)"), small, p.text_faint);
                         continue;
                     }
                     RowKind::Node => {}
@@ -1232,45 +1270,51 @@ impl Navigator {
                     }
                     _ => resp,
                 };
-                let icol = r.icon_color.or_else(|| ternarygrid_icons::color(r.icon)).unwrap_or_else(|| ui.visuals().weak_text_color());
+                let icol = if selected { p.accent_text } else { r.icon_color.or_else(|| ternarygrid_icons::color(r.icon)).unwrap_or(p.text_muted) };
                 // A connection: its database's logo (the icon when there is none).
-                let logo_rect = egui::Rect::from_center_size(egui::pos2(x + 8.0, y), egui::vec2(font.size + 5.0, font.size + 5.0));
-                let icon_rect = match r.logo {
-                    Some(kind) if crate::dblogo::paint(ui, kind, logo_rect, crate::theme::legible_on(icol, row_bg)) => logo_rect,
-                    _ => ui.painter().text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, r.icon, egui::FontId::proportional(font.size), icol),
-                };
-                if let Some(badge) = r.badge {
-                    let at = icon_rect.right_bottom() + egui::vec2(-1.0, -2.0);
-                    let bg = if selected { ui.visuals().selection.bg_fill } else { ui.visuals().panel_fill };
-                    ui.painter().circle(at, 3.5, badge, egui::Stroke::new(1.5, bg));
+                let logo_rect = egui::Rect::from_center_size(egui::pos2(x + 7.5, y), egui::vec2(15.0, 15.0));
+                let drawn = r.logo.is_some_and(|kind| crate::dblogo::paint(ui, kind, logo_rect, crate::theme::legible_on(icol, row_bg)));
+                if !drawn {
+                    ui.painter().text(egui::pos2(x + 7.5, y), egui::Align2::CENTER_CENTER, r.icon, ternarygrid_ui::style::icon_font(15.0), icol);
                 }
-                x += 20.0;
+                x += 21.0;
                 // Name and detail cut with "…" at the panel's edge (or the size).
-                let mut right = rect.right() - 6.0;
-                let fit = |ui: &Ui, text: egui::RichText, width: f32, style: egui::TextStyle| {
-                    egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), width, style)
-                };
-                let resp = match &r.size {
-                    Some((short, tip)) if right - x > 120.0 => {
-                        // Faint, right-aligned: there when wanted, not a box on every row.
-                        let faint = ternarygrid_ui::pal(ui).text_faint;
-                        let g = fit(ui, RichText::new(short).small().color(faint), 60.0, egui::TextStyle::Small);
+                let mut right = inner.right() - 10.0;
+                let fit =
+                    |ui: &Ui, text: egui::RichText, width: f32| egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), width, egui::TextStyle::Body);
+                let is_conn = matches!(r.node, NavNode::Connection(_));
+                // At the right: the size of a table, the count of a folder, an object's detail.
+                let right_text = r.size.as_ref().map(|(short, _)| short.clone()).or_else(|| r.detail.clone().filter(|_| !is_conn));
+                let resp = match right_text {
+                    Some(text) if right - x > 110.0 => {
+                        let g = fit(ui, RichText::new(text).size(11.5).color(p.text_faint), 90.0);
                         let left = right - g.size().x;
-                        ui.painter().galley(egui::pos2(left, y - g.size().y / 2.0), g, faint);
+                        ui.painter().galley(egui::pos2(left, y - g.size().y / 2.0), g, p.text_faint);
                         right = left - 8.0;
-                        resp.on_hover_text(tip)
+                        match &r.size {
+                            Some((_, tip)) => resp.on_hover_text(tip),
+                            None => resp,
+                        }
                     }
                     _ => resp,
                 };
-                let galley = fit(ui, RichText::new(&r.label).color(text_color), (right - x).max(30.0), egui::TextStyle::Body);
+                let font = if selected || r.depth == 0 { ternarygrid_ui::style::medium(ui.ctx(), size) } else { egui::FontId::proportional(size) };
+                let room = (right - x - if r.badge.is_some() { 14.0 } else { 0.0 }).max(30.0);
+                let galley = fit(ui, RichText::new(&r.label).font(font).color(text_color), room);
                 let w = galley.size().x;
                 ui.painter().galley(egui::pos2(x, y - galley.size().y / 2.0), galley, text_color);
-                if let Some(d) = &r.detail
-                    && right - (x + w + 8.0) > 24.0
+                let mut after = x + w;
+                // The connection's state: a dot after its name.
+                if let Some(badge) = r.badge {
+                    ui.painter().circle_filled(egui::pos2(after + 9.5, y), 3.5, badge);
+                    after += 16.0;
+                }
+                if is_conn
+                    && let Some(d) = &r.detail
+                    && right - (after + 8.0) > 24.0
                 {
-                    let weak = ui.visuals().weak_text_color();
-                    let g = fit(ui, RichText::new(d).small().color(weak), right - (x + w + 8.0), egui::TextStyle::Small);
-                    ui.painter().galley(egui::pos2(x + w + 8.0, y - g.size().y / 2.0), g, weak);
+                    let g = fit(ui, RichText::new(d).size(11.5).color(p.text_faint), right - (after + 8.0));
+                    ui.painter().galley(egui::pos2(after + 8.0, y - g.size().y / 2.0), g, p.text_faint);
                 }
                 if resp.double_clicked() {
                     clicked = Some((i, true));
