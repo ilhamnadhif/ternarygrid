@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use ternarygrid_config::ImportResult;
 use ternarygrid_config::import::{DuplicatePolicy, merge_into_store};
 use ternarygrid_core::{DbResult, tr, trf};
-use ternarygrid_ui::kit;
+use ternarygrid_ui::kit::{self, Kind};
 use ternarygrid_ui::parts::{self, Dialog};
 use ternarygrid_ui::style;
 
@@ -182,8 +182,12 @@ impl ImportDialog {
                         ui.allocate_ui_with_layout(egui::vec2(w, ternarygrid_ui::style::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let combo = egui::ComboBox::from_id_salt("dbeaver_ws").icon(kit::combo_caret).selected_text(current).width(w).truncate();
                             combo.show_ui(ui, |ui| {
-                                for w in &self.workspaces {
-                                    ui.selectable_value(&mut self.workspace, Some(w.clone()), home_relative(w));
+                                kit::menu_look(ui, w);
+                                for ws in &self.workspaces {
+                                    let mut on = self.workspace.as_ref() == Some(ws);
+                                    if kit::menu_check(ui, &mut on, &home_relative(ws)).clicked() {
+                                        self.workspace = Some(ws.clone());
+                                    }
                                 }
                             });
                         });
@@ -234,23 +238,29 @@ impl ImportDialog {
         }
         let Some(r) = &self.result else { return };
         parts::hline(ui);
+        // The divider is a row of its own in the design, the gap after it too.
+        ui.add_space(ui.spacing().item_spacing.y);
         if r.connections.is_empty() {
             muted(ui, tr("No connections found."));
             return;
         }
+        // As tall as its small buttons (26), not a form row.
+        let control_h = ui.spacing().interact_size.y;
+        ui.spacing_mut().interact_size.y = 0.0;
         ui.horizontal(|ui| {
             let n = r.connections.len();
             let found = if n == 1 { tr("1 connection found").to_string() } else { trf("{} connections found", &[&n]) };
-            ui.label(RichText::new(found).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
-            if kit::ghost(ui, None, tr("Select all")).clicked() {
+            kit::semibold_label(ui, &found, 13.0, p.text);
+            if kit::button_ex(ui, Kind::Ghost, None, tr("Select all"), true).clicked() {
                 self.selected.iter_mut().for_each(|s| *s = true);
             }
-            if kit::ghost(ui, None, tr("Select none")).clicked() {
+            if kit::button_ex(ui, Kind::Ghost, None, tr("Select none"), true).clicked() {
                 self.selected.iter_mut().for_each(|s| *s = false);
             }
         });
+        ui.spacing_mut().interact_size.y = control_h;
         let cols = [
-            Column::new("", W::Px(32.0)),
+            Column::new("", W::Px(32.0)).center(),
             Column::new(tr("Connection"), W::Fr(1.3)),
             Column::new(tr("Host"), W::Fr(1.6)),
             Column::new(tr("Folder"), W::Fr(1.0)),
@@ -286,13 +296,14 @@ impl ImportDialog {
                 }
                 3 => {
                     if let Some(f) = &c.folder {
-                        ui.label(RichText::new(icon::FOLDER).size(13.0).color(p.text_faint));
+                        ui.label(RichText::new(icon::FOLDER).font(style::icon_font(13.0)).color(p.text_faint));
                         ui.label(RichText::new(f).size(12.5).color(p.text_muted));
                     }
                 }
                 _ => {
                     if c.init.shell_before_connect.is_some() || c.init.shell_after_disconnect.is_some() {
-                        ui.label(RichText::new(icon::TERMINAL_WINDOW).size(14.0).color(p.warn)).on_hover_text(tr("Runs a shell command when connecting or disconnecting."));
+                        ui.label(RichText::new(icon::TERMINAL_WINDOW).font(style::icon_font(14.0)).color(p.warn))
+                            .on_hover_text(tr("Runs a shell command when connecting or disconnecting."));
                     }
                 }
             }

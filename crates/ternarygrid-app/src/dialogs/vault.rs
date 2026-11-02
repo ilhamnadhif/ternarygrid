@@ -63,7 +63,7 @@ impl VaultDialog {
         let skip = Cell::new(false);
         let title = if create { tr("Create the password vault") } else { tr("Unlock saved passwords") };
         let error = self.error.clone();
-        let (resp, _) = Dialog::new(title).icon(icon::LOCK).width(if create { 460.0 } else { 440.0 }).body_padding(super::BODY).show_modal(
+        let (resp, _) = Dialog::new(title).icon(icon::LOCK_SIMPLE).width(if create { 460.0 } else { 440.0 }).body_padding(super::BODY).show_modal(
             ctx,
             Id::new("vault_unlock"),
             |ui| {
@@ -105,7 +105,7 @@ impl VaultDialog {
                 }
                 super::right(ui, |ui| {
                     let label = if create { tr("Create") } else { tr("Unlock") };
-                    if kit::primary_icon(ui, icon::LOCK, label).clicked() {
+                    if kit::primary_icon(ui, icon::LOCK_SIMPLE, label).clicked() {
                         submit.set(true);
                     }
                 });

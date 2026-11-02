@@ -394,7 +394,7 @@ impl TernaryGridApp {
             |ui| dialogs::body_text(ui, &text),
             |ui| {
                 dialogs::right(ui, |ui| {
-                    if dialogs::danger_button(ui, None, button).clicked() {
+                    if kit::button_ex(ui, kit::Kind::DangerFilled, None, button, false).clicked() {
                         answer.set(Some(true));
                     }
                     if dialogs::cancel_button(ui).clicked() {
@@ -467,7 +467,7 @@ impl TernaryGridApp {
                     }
                     dialogs::right(ui, |ui| {
                         let label = if reconnect { tr("Roll back and reconnect") } else { tr("Roll back and disconnect") };
-                        if dialogs::danger_button(ui, None, label).clicked() {
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, None, label, false).clicked() {
                             answer.set(Some(true));
                         }
                         if dialogs::cancel_button(ui).clicked() {
@@ -1702,7 +1702,7 @@ impl eframe::App for TernaryGridApp {
                         reviewed.set(true);
                     }
                     dialogs::right(ui, |ui| {
-                        if dialogs::danger_button(ui, None, tr("Quit without saving")).clicked() {
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, None, tr("Quit without saving"), false).clicked() {
                             answer.set(Some(true));
                         }
                         if dialogs::cancel_button(ui).clicked() {

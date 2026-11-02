@@ -399,14 +399,13 @@ impl ConnectionDialog {
         let w = ui.available_width();
         ui.spacing_mut().item_spacing.y = 0.0;
         kit::search_field(ui, Id::new(("conn_kind_filter", &self.cfg.id)), &mut self.kind_filter, tr("Filter databases"), w);
-        ui.add_space(10.0);
         let needle = self.kind_filter.trim().to_lowercase();
         let matches = |name: &str| needle.is_empty() || name.to_lowercase().contains(&needle);
         egui::ScrollArea::vertical().id_salt("conn_kinds_scroll").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             let kinds: Vec<DbKind> = DbKind::ALL.into_iter().filter(|k| cx.conns.registry.get(*k).is_some() && matches(k.display_name())).collect();
             if !kinds.is_empty() {
-                list_caption(ui, tr("Database"), 4.0);
+                list_caption(ui, tr("Database"), 24.5);
             }
             for kind in kinds {
                 let sel = self.cfg.kind == kind && self.preset.is_none();
@@ -414,9 +413,12 @@ impl ConnectionDialog {
                     self.choose(ConnectionConfig::new(kind, ""), None);
                 }
             }
-            let presets: Vec<_> = PRESETS.iter().filter(|p| cx.conns.registry.get(p.kind).is_some() && matches(p.name)).collect();
+            let mut presets: Vec<_> = PRESETS.iter().filter(|p| cx.conns.registry.get(p.kind).is_some() && matches(p.name)).collect();
+            // The design's five first, the others after them.
+            const FIRST: [&str; 5] = ["supabase", "neon", "timescaledb", "planetscale", "atlas"];
+            presets.sort_by_key(|p| FIRST.iter().position(|f| *f == p.id).unwrap_or(FIRST.len()));
             if !presets.is_empty() {
-                list_caption(ui, tr("Compatible"), 10.0);
+                list_caption(ui, tr("Compatible"), 24.0);
             }
             for preset in presets {
                 let sel = self.preset == Some(preset.id);
@@ -432,8 +434,9 @@ impl ConnectionDialog {
     fn page_tabs(&mut self, ui: &mut Ui) {
         let p = style::pal(ui);
         let row = ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.add_space(10.0);
+            // The design's tabs: 16 apart, 16 in from the edge.
+            ui.spacing_mut().item_spacing.x = 16.0;
+            ui.add_space(16.0);
             for (page, label) in [
                 (Page::Main, tr("Main")),
                 (Page::Ssh, tr("SSH")),
@@ -551,6 +554,7 @@ impl ConnectionDialog {
             });
             form_row(ui, tr("Authentication"), |ui| {
                 egui::ComboBox::from_id_salt("auth_method").icon(kit::combo_caret).width(200.0).selected_text(auth_label(&self.cfg.auth)).show_ui(ui, |ui| {
+                    kit::menu_look(ui, 200.0);
                     let mut options = vec![AuthMethod::Password, AuthMethod::Prompt];
                     if kind.is_postgres_family() {
                         options.push(AuthMethod::Pgpass);
@@ -558,9 +562,8 @@ impl ConnectionDialog {
                     options.push(AuthMethod::Command { command: String::new() });
                     options.push(AuthMethod::None);
                     for o in options {
-                        let label = auth_label(&o);
-                        let same = std::mem::discriminant(&o) == std::mem::discriminant(&self.cfg.auth);
-                        if ui.selectable_label(same, label).clicked() && !same {
+                        let mut same = std::mem::discriminant(&o) == std::mem::discriminant(&self.cfg.auth);
+                        if kit::menu_check(ui, &mut same, auth_label(&o)).clicked() && same {
                             self.cfg.auth = o;
                         }
                     }
@@ -597,12 +600,17 @@ impl ConnectionDialog {
             let types = cx.conns.connection_types();
             let current = types.iter().find(|t| t.id == self.cfg.connection_type).map(|t| t.name.clone()).unwrap_or_default();
             egui::ComboBox::from_id_salt("conn_type").icon(kit::combo_caret).width(180.0).selected_text(tr(&current)).show_ui(ui, |ui| {
+                kit::menu_look(ui, 180.0);
                 for t in &types {
-                    let marker = crate::theme::connection_marker(t.color).map(|c| RichText::new("■ ").color(c)).unwrap_or_else(|| RichText::new("□ "));
-                    ui.horizontal(|ui| {
-                        ui.label(marker);
-                        ui.selectable_value(&mut self.cfg.connection_type, t.id.clone(), tr(&t.name));
-                    });
+                    let mut on = self.cfg.connection_type == t.id;
+                    let r = kit::menu_check(ui, &mut on, tr(&t.name));
+                    // The type's colour at the right, as its marker in the navigator.
+                    if let Some(c) = crate::theme::connection_marker(t.color) {
+                        ui.painter().circle_filled(egui::pos2(r.rect.right() - 14.0, r.rect.center().y), 4.0, c);
+                    }
+                    if r.clicked() {
+                        self.cfg.connection_type = t.id.clone();
+                    }
                 }
             });
             ternarygrid_ui::kit::checkbox(ui, &mut self.cfg.read_only, tr("Read-only"));
@@ -677,9 +685,13 @@ impl ConnectionDialog {
                 .map(|(_, n)| n.clone())
                 .unwrap_or_else(|| tr("(none — settings below)").to_string());
             egui::ComboBox::from_id_salt("net_profile").icon(kit::combo_caret).width(280.0).selected_text(current).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.cfg.network_profile, None, tr("(none — settings below)"));
-                for (id, name) in &profiles {
-                    ui.selectable_value(&mut self.cfg.network_profile, Some(id.clone()), name);
+                kit::menu_look(ui, 280.0);
+                let none = tr("(none — settings below)");
+                for (id, name) in std::iter::once((None, none)).chain(profiles.iter().map(|(id, n)| (Some(id), n.as_str()))) {
+                    let mut on = self.cfg.network_profile.as_ref() == id;
+                    if kit::menu_check(ui, &mut on, name).clicked() {
+                        self.cfg.network_profile = id.cloned();
+                    }
                 }
             });
         });
@@ -866,12 +878,12 @@ impl ConnectionDialog {
                 let control_h = ui.spacing().interact_size.y;
                 ui.spacing_mut().interact_size.y = 19.0;
                 ui.horizontal(|ui| {
-                    let title = ui.painter().layout_no_wrap(label.to_string(), style::semibold(ui.ctx(), 13.0), p.text);
+                    let title = ui.painter().layout_no_wrap(label.to_string(), style::medium(ui.ctx(), 13.0), p.text);
                     let (r, resp) = ui.allocate_exact_size(vec2(title.size().x + 20.0, 19.0), Sense::click());
                     resp.widget_info(|| WidgetInfo::selected(WidgetType::CollapsingHeader, true, open, label));
                     let caret = if open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
                     ui.painter().text(egui::pos2(r.left() + 6.0, r.center().y), Align2::CENTER_CENTER, caret, style::icon_font(12.0), p.text_faint);
-                    ui.painter().galley(egui::pos2(r.left() + 20.0, r.center().y - title.size().y / 2.0), title, p.text);
+                    kit::paint_semibold(ui.painter(), egui::pos2(r.left() + 20.0, r.center().y - title.size().y / 2.0), title, p.text);
                     if resp.clicked() {
                         open = !open;
                         ui.data_mut(|d| d.insert_temp(open_id, open));
@@ -926,8 +938,10 @@ impl ConnectionDialog {
                 self.cfg.folder = if folder.trim().is_empty() { None } else { Some(folder.trim().trim_matches('/').to_string()) };
             }
             egui::ComboBox::from_id_salt("folders").icon(kit::combo_caret).selected_text("").width(44.0).show_ui(ui, |ui| {
+                kit::menu_look(ui, 220.0);
                 for f in cx.conns.folders() {
-                    if ui.selectable_label(self.cfg.folder.as_deref() == Some(f), f).clicked() {
+                    let mut on = self.cfg.folder.as_deref() == Some(f);
+                    if kit::menu_check(ui, &mut on, f).clicked() {
                         self.cfg.folder = Some(f.clone());
                     }
                 }
@@ -947,11 +961,11 @@ impl ConnectionDialog {
         });
         form_row(ui, tr("Colour"), |ui| {
             let mut use_color = self.cfg.color.is_some();
-            super::row_lead(ui, &mut |ui| {
-                if ternarygrid_ui::kit::checkbox(ui, &mut use_color, tr("Custom colour")).changed() {
-                    self.cfg.color = if use_color { Some([120, 160, 220]) } else { None };
-                }
-            });
+            // The check box centred on the swatch.
+            ui.set_min_height(28.0);
+            if ternarygrid_ui::kit::checkbox(ui, &mut use_color, tr("Custom colour")).changed() {
+                self.cfg.color = if use_color { Some([120, 160, 220]) } else { None };
+            }
             if let Some(c) = &mut self.cfg.color {
                 ui.spacing_mut().interact_size = vec2(28.0, 28.0);
                 ui.color_edit_button_srgb(c);
@@ -969,18 +983,22 @@ fn split_patterns(s: &str) -> Vec<String> {
     s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
 }
 
-/// A caption of the database list.
-fn list_caption(ui: &mut Ui, text: &str, top: f32) {
+/// The height of an entry of the database list: the design's 30 as its page renders them,
+/// squeezed to fit the list (CSS `flex-shrink`), 1 apart.
+const KIND_ROW_H: f32 = 23.5;
+
+/// A caption of the database list, `h` high, its capitals 7.5 above the row under it.
+fn list_caption(ui: &mut Ui, text: &str, h: f32) {
     let p = style::pal(ui);
-    let g = ui.painter().layout_no_wrap(text.to_uppercase(), style::semibold(ui.ctx(), 11.0), p.text_faint);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), top + g.size().y + 4.0), Sense::hover());
-    ui.painter().galley(egui::pos2(rect.left() + 10.0, rect.top() + top), g, p.text_faint);
+    let g = ui.painter().layout_no_wrap(text.to_uppercase(), style::medium(ui.ctx(), 11.0), p.text_faint);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    kit::paint_semibold(ui.painter(), egui::pos2(rect.left() + 10.0, rect.bottom() - 17.5), g, p.text_faint);
 }
 
 /// One entry of the database list: logo and name, the chosen one on a soft accent.
 fn kind_row(ui: &mut Ui, kind: DbKind, name: &str, selected: bool) -> egui::Response {
     let p = style::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), KIND_ROW_H), Sense::click());
     resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, name));
     if ui.is_rect_visible(rect) {
         let radius = CornerRadius::same(style::RADIUS);
@@ -1113,8 +1131,12 @@ pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut Strin
         form_row(ui, tr("Keep-alive (s)"), |ui| number_field(ui, (id, "keepalive"), &mut ssh.keepalive_secs, 0..=3600, 90.0));
         form_row(ui, tr("Host key check"), |ui| {
             egui::ComboBox::from_id_salt((id, "hostkey")).icon(kit::combo_caret).width(240.0).selected_text(host_key_label(ssh.host_key_policy)).show_ui(ui, |ui| {
+                kit::menu_look(ui, 240.0);
                 for p in [HostKeyPolicy::AcceptNew, HostKeyPolicy::Strict, HostKeyPolicy::AcceptAll] {
-                    ui.selectable_value(&mut ssh.host_key_policy, p, host_key_label(p));
+                    let mut on = ssh.host_key_policy == p;
+                    if kit::menu_check(ui, &mut on, host_key_label(p)).clicked() {
+                        ssh.host_key_policy = p;
+                    }
                 }
             });
         });
