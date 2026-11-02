@@ -191,7 +191,7 @@ mod tests {
         let date = Value::Date(NaiveDate::from_ymd_opt(2024, 3, 9).unwrap());
         assert_eq!(format_value(&date, &o, Some(&d)), "09.03.2024");
         assert_eq!(format_value(&date, &o, None), "2024-03-09");
-        assert_eq!(format_value(&Value::Null, &o, Some(&c)), "[NULL]");
+        assert_eq!(format_value(&Value::Null, &o, Some(&c)), "NULL");
         assert_eq!(format_value(&Value::text("x"), &o, Some(&c)), "x");
         assert!(ColumnFormat::default().is_empty());
     }

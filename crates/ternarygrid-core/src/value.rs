@@ -211,7 +211,7 @@ pub struct FormatOptions {
 impl Default for FormatOptions {
     fn default() -> Self {
         FormatOptions {
-            null_text: "[NULL]".into(),
+            null_text: "NULL".into(),
             date_format: "%Y-%m-%d".into(),
             time_format: "%H:%M:%S".into(),
             datetime_format: "%Y-%m-%d %H:%M:%S".into(),
@@ -1216,7 +1216,7 @@ mod tests {
         assert_eq!(Value::Int(1234567).display(&o), "1,234,567");
         assert_eq!(Value::Int(-1234).display(&o), "-1,234");
         assert_eq!(Value::decimal("1234.50").display(&o), "1,234.50");
-        assert_eq!(Value::Null.display(&o), "[NULL]");
+        assert_eq!(Value::Null.display(&o), "NULL");
         assert_eq!(Value::text("a\nb").display(&o), "a¶b");
     }
 

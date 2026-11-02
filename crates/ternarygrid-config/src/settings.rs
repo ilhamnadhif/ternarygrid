@@ -19,7 +19,7 @@ use ternarygrid_core::config::NavigatorView;
 use ternarygrid_core::value::FormatOptions;
 
 /// Current schema version written to `settings.json`.
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 2;
 
 /// Deserializes a value, falling back to its default when it is invalid
 /// (e.g. an enum variant written by a newer version).
@@ -799,6 +799,7 @@ pub fn load_with_warnings(paths: &AppPaths) -> (AppSettings, Vec<String>) {
             }
         },
     };
+    migrate(&mut settings);
     let (keymap, kw) = keymap::load_config(paths);
     settings.keymap = keymap;
     warnings.extend(kw);
@@ -806,6 +807,14 @@ pub fn load_with_warnings(paths: &AppPaths) -> (AppSettings, Vec<String>) {
         tracing::warn!("{w}");
     }
     (settings, warnings)
+}
+
+/// Brings settings written by an older version up to date.
+fn migrate(settings: &mut AppSettings) {
+    // Version 1 shipped "[NULL]" as the default NULL text; it is "NULL" now.
+    if settings.version < 2 && settings.results.format.null_text == "[NULL]" {
+        settings.results.format.null_text = "NULL".into();
+    }
 }
 
 /// Typed parse with per-section fallback.
@@ -965,6 +974,32 @@ mod tests {
         std::fs::remove_file(p.settings_file()).unwrap();
         save(&p, &s).unwrap();
         assert_eq!(load(&p), s);
+    }
+
+    #[test]
+    fn the_old_default_null_text_follows_the_new_default() {
+        let (_d, p) = paths();
+        std::fs::create_dir_all(p.config_dir()).unwrap();
+        let file = |version: u32, text: &str| {
+            format!(
+                r#"{{"version": {version}, "results": {{"format": {{"null_text": "{text}"}}}}}}"#
+            )
+        };
+        std::fs::write(p.settings_file(), file(1, "[NULL]")).unwrap();
+        assert_eq!(load(&p).results.format.null_text, "NULL");
+        std::fs::write(p.settings_file(), file(1, "(null)")).unwrap();
+        assert_eq!(
+            load(&p).results.format.null_text,
+            "(null)",
+            "a chosen text stays"
+        );
+        std::fs::write(p.settings_file(), file(2, "[NULL]")).unwrap();
+        assert_eq!(
+            load(&p).results.format.null_text,
+            "[NULL]",
+            "chosen after the change"
+        );
+        assert_eq!(AppSettings::default().results.format.null_text, "NULL");
     }
 
     #[test]
