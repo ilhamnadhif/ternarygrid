@@ -6,7 +6,7 @@ use crate::grid::{DataGridState, GridAction, GridOptions, ListChoice, ResultView
 use crate::model::{CellRef, ResultModel, RowAnchor, RowState};
 use crate::theme::GridTheme;
 use egui::text::{CCursor, CCursorRange};
-use egui::{Button, Key, RichText, ScrollArea, TextEdit, Ui};
+use egui::{Key, RichText, ScrollArea, TextEdit, Ui};
 use egui_phosphor::regular as icon;
 use ternarygrid_core::value::single_line;
 use ternarygrid_core::{Value, tr, trf};
@@ -493,7 +493,7 @@ fn rows_table(
         let mut w = measure(ui, trf("Row #{}", &[&(r + 1)]), body.clone());
         for (i, &c) in columns.iter().enumerate() {
             if let Some((v, is_default, modified)) = values.get(j).and_then(|vs| vs.get(i)) {
-                let fmt = PreparedFormat::new(&options.format, grid.column_format(c));
+                let fmt = PreparedFormat::new(&options.format, crate::format::cell_format(model, c, grid.column_format(c)));
                 let rt = value_text(v, *is_default, *modified, &fmt, options, &theme);
                 let g = egui::WidgetText::from(rt).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
                 w = w.max(g.size().x);
@@ -501,9 +501,9 @@ fn rows_table(
         }
         w + 20.0
     };
-    // A little higher than the grid's rows (Settings › Results › Row height): 34 at 13 points
+    // A little higher than the grid's rows (Settings › Results › Row height): 35 at 13 points
     // (32 side by side); the header 32.
-    let row_h = options.row_height_for(egui::TextStyle::Body.resolve(ui.style()).size) + if single { 5.0 } else { 3.0 };
+    let row_h = options.row_height_for(egui::TextStyle::Body.resolve(ui.style()).size) + if single { 6.0 } else { 3.0 };
     let head_h = 32.0;
     let pal = ternarygrid_ui::pal(ui);
     let head_font = ternarygrid_ui::style::semibold(ui.ctx(), 12.0);
@@ -688,7 +688,7 @@ fn rows_table(
                                 }
                                 let inner = rect.shrink2(egui::vec2(12.0, 0.0));
                                 let Some((v, is_default, modified)) = values.get(j).and_then(|vs| vs.get(i)) else { continue };
-                                let fmt = PreparedFormat::new(&options.format, grid.column_format(c));
+                                let fmt = PreparedFormat::new(&options.format, crate::format::cell_format(model, c, grid.column_format(c)));
                                 let rt = value_text(v, *is_default, *modified, &fmt, options, &theme);
                                 let mut text_rect = inner;
                                 let fk = model.foreign_key_for_column(c).filter(|_| !v.is_null() && !*is_default && inner.width() > 40.0);
@@ -941,12 +941,11 @@ fn rows_table(
 /// The record view's own copy items, at the top of the grid's menu: `copy`
 /// becomes `Some(with column names)` (laid out as shown, a line per column).
 fn copy_menu(ui: &mut Ui, copy: &mut Option<bool>) {
-    let shortcut = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::C));
-    if ui.add(Button::new(format!("{}  {}", icon::COPY, tr("Copy"))).shortcut_text(shortcut)).clicked() {
+    if ternarygrid_ui::kit::menu_item(ui, Some(icon::COPY), tr("Copy"), crate::toolbar::keys("⌘C", "Ctrl+C")).clicked() {
         *copy = Some(false);
         ui.close();
     }
-    if ui.button(format!("{}  {}", icon::COPY_SIMPLE, tr("Copy with column names"))).clicked() {
+    if ternarygrid_ui::kit::menu_item(ui, Some(icon::COPY_SIMPLE), tr("Copy with column names"), "").clicked() {
         *copy = Some(true);
         ui.close();
     }

@@ -700,12 +700,20 @@ pub fn toolbar<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 }
 
 fn toolbar_dyn(ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)) {
-    Frame::new().inner_margin(Margin::symmetric(16, 8)).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.set_min_height(30.0);
-            add(ui);
-        });
-    });
-    hline(ui);
+    let bottom = Frame::new()
+        .inner_margin(Margin::symmetric(16, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.set_min_height(30.0);
+                add(ui);
+            });
+        })
+        .response
+        .rect
+        .bottom();
+    // The hairline right under the bar (not after the item spacing), and the content after it.
+    let p = style::pal(ui);
+    ui.painter().hline(ui.max_rect().x_range(), bottom + 0.5, Stroke::new(1.0, p.border));
+    ui.add_space(bottom + 1.0 - ui.cursor().top());
 }

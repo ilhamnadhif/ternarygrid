@@ -200,9 +200,9 @@ impl<'a> ValuePanel<'a> {
         // 12 between the header, the modes, the value and its actions.
         ui.spacing_mut().item_spacing.y = 12.0;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(model.column_name(col)).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
+            ternarygrid_ui::kit::semibold_label(ui, model.column_name(col), 13.0, pal.text);
             if let Some(m) = model.column_meta(col) {
-                ui.label(RichText::new(&m.type_name).color(pal.text_faint));
+                ui.label(RichText::new(m.type_name.to_lowercase()).color(pal.text_faint));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(trf("row {}", &[&(row + 1)])).color(pal.text_faint));

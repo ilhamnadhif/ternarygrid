@@ -154,7 +154,7 @@ impl TabView for CatalogObjectTab {
                             .collect();
                         ui.scope(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            crate::widgets::property_grid(ui, ("catalog_props", self.folder_id), &props);
+                            crate::widgets::property_grid(ui, 200.0, &props);
                         });
                     }
                     Loadable::Loaded(None) => {
