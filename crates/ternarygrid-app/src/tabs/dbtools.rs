@@ -7,6 +7,7 @@
 mod backup;
 mod debugger;
 mod fdw;
+pub(crate) mod look;
 mod maintenance;
 mod password;
 
@@ -114,25 +115,23 @@ impl ToolSession {
         match self.state(cx, conn, label) {
             SessionState::Ready(s) => Some(s),
             SessionState::Opening => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak(tr("Opening a session…"));
-                });
+                ui.add_space(8.0);
+                ternarygrid_ui::parts::spinner_label(ui, tr("Opening a session…"));
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
                 None
             }
             SessionState::Closed => {
-                ui.horizontal(|ui| {
-                    ui.label(tr("The connection is closed."));
-                    if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
+                ui.add_space(8.0);
+                look::note_with(ui, ternarygrid_ui::parts::Tone::Info, None, tr("The connection is closed."), |ui| {
+                    if ternarygrid_ui::kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Connect")).clicked() {
                         cx.push(AppCommand::Connect(conn.to_string()));
                     }
                 });
                 None
             }
             SessionState::Failed(e) => {
-                crate::widgets::error_box(ui, &e);
-                if ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Retry"))).clicked() {
+                look::error(ui, &e);
+                if ternarygrid_ui::kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked() {
                     self.session = Loadable::NotLoaded;
                 }
                 None

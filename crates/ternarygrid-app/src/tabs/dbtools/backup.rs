@@ -11,6 +11,7 @@ use crate::command::AppCommand;
 use crate::cx::AppContext;
 use crate::ops::{OpHandle, OpState};
 use crate::tabs::TabView;
+use crate::tabs::dbtools::look;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use parking_lot::Mutex;
@@ -22,6 +23,7 @@ use ternarygrid_core::admin::{BackupFormat, BackupOptions, CommandSpec, RestoreO
 use ternarygrid_core::error::ErrorKind;
 use ternarygrid_core::meta::SchemaRef;
 use ternarygrid_core::{DbError, DbResult, tr, trf};
+use ternarygrid_ui::{kit, parts};
 
 /// Log lines kept for a run.
 const MAX_LOG_LINES: usize = 20_000;
@@ -77,11 +79,18 @@ fn retarget_extension_for(flavor: ToolFlavor, path: &str, from: BackupFormat, to
     if new.is_empty() { stem.to_string() } else { format!("{stem}.{new}") }
 }
 
+/// Label column of the backup form (the restore form's is a little wider, as designed).
+const BACKUP_LABEL_W: f32 = 140.0;
+const RESTORE_LABEL_W: f32 = 150.0;
+
+/// A path field filling the row and Browse… after it.
 fn browse_row(ui: &mut Ui, value: &mut String, hint: &str, pick: impl FnOnce(&str) -> Option<PathBuf>) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        changed |= ui.add(egui::TextEdit::singleline(value).desired_width(340.0).hint_text(hint)).changed();
-        if ui.button((ternarygrid_icons::ic(icon::FOLDER_OPEN), tr("Browse…"))).clicked()
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let bw = kit::button_width(ui, Some(icon::FOLDER_OPEN), tr("Browse…"), false);
+        changed |= look::field(ui, value, hint, (ui.available_width() - bw - 8.0).max(120.0), true).changed();
+        if kit::secondary(ui, Some(icon::FOLDER_OPEN), tr("Browse…")).clicked()
             && let Some(p) = pick(value.as_str())
         {
             *value = p.display().to_string();
@@ -91,14 +100,11 @@ fn browse_row(ui: &mut Ui, value: &mut String, hint: &str, pick: impl FnOnce(&st
     changed
 }
 
-fn tool_row(ui: &mut Ui, tool_path: &mut String, extra_args: &mut String) -> bool {
+/// Tool path and extra arguments.
+fn tool_row(ui: &mut Ui, label_w: f32, tool_path: &mut String, extra_args: &mut String) -> bool {
     let mut changed = false;
-    ui.label(tr("Tool path"));
-    changed |= browse_row(ui, tool_path, tr("empty = search PATH"), |cur| dialog_near(cur).pick_file());
-    ui.end_row();
-    ui.label(tr("Extra arguments"));
-    changed |= ui.add(egui::TextEdit::singleline(extra_args).desired_width(340.0).hint_text(tr("passed to the tool as they are"))).changed();
-    ui.end_row();
+    look::row(ui, tr("Tool path"), label_w, |ui| changed |= browse_row(ui, tool_path, tr("empty = search PATH"), |cur| dialog_near(cur).pick_file()));
+    look::row(ui, tr("Extra arguments"), label_w, |ui| changed |= look::field(ui, extra_args, tr("passed to the tool as they are"), f32::INFINITY, true).changed());
     changed
 }
 
@@ -209,23 +215,25 @@ impl BackupForm {
         let sqlite = flavor == ToolFlavor::Sqlite;
         let pg = matches!(flavor, ToolFlavor::Postgres | ToolFlavor::Other);
         let my = matches!(flavor, ToolFlavor::MySql | ToolFlavor::Other);
-        egui::Grid::new((id, "backup_form")).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Output file"));
+        let lw = BACKUP_LABEL_W;
+        ui.push_id((id, "backup_form"), |ui| {
+            ui.spacing_mut().item_spacing.y = 12.0;
             let directory = self.format == BackupFormat::Directory;
-            changed |= browse_row(ui, &mut self.output, tr("File to write"), |cur| if directory { dialog_near(cur).pick_folder() } else { dialog_near(cur).save_file() });
-            ui.end_row();
+            look::row(ui, tr("Output file"), lw, |ui| {
+                changed |= browse_row(ui, &mut self.output, tr("File to write"), |cur| if directory { dialog_near(cur).pick_folder() } else { dialog_near(cur).save_file() });
+            });
             if flavor == ToolFlavor::Postgres {
-                ui.label(tr("Scope"));
-                ui.horizontal(|ui| {
+                look::row(ui, tr("Scope"), lw, |ui| {
+                    ui.spacing_mut().item_spacing.x = 16.0;
                     let mut mode = match (self.all_databases, self.globals_only) {
                         (false, _) => 0,
                         (true, false) => 1,
                         (true, true) => 2,
                     };
                     let before = mode;
-                    ui.radio_value(&mut mode, 0, tr("This database"));
-                    ui.radio_value(&mut mode, 1, tr("All databases (pg_dumpall)"));
-                    ui.radio_value(&mut mode, 2, tr("Only roles and tablespaces"));
+                    look::radio_value(ui, &mut mode, 0, tr("This database"));
+                    look::radio_value(ui, &mut mode, 1, tr("All databases (pg_dumpall)"));
+                    look::radio_value(ui, &mut mode, 2, tr("Only roles and tablespaces"));
                     if mode != before {
                         self.all_databases = mode > 0;
                         self.globals_only = mode == 2;
@@ -236,45 +244,33 @@ impl BackupForm {
                         changed = true;
                     }
                 });
-                ui.end_row();
             }
             let whole_server = self.all_databases && flavor == ToolFlavor::Postgres;
             if (pg || sqlite) && !whole_server {
-                ui.label(tr("Format"));
-                egui::ComboBox::from_id_salt((id, "format")).icon(ternarygrid_ui::kit::combo_caret).selected_text(flavor_format_label(flavor, self.format)).width(200.0).show_ui(
-                    ui,
-                    |ui| {
-                        for &f in formats(flavor) {
-                            let old = self.format;
-                            if ui.selectable_value(&mut self.format, f, flavor_format_label(flavor, f)).changed() {
-                                self.output = retarget_extension_for(flavor, &self.output, old, f);
-                                changed = true;
-                            }
-                        }
-                    },
-                );
-                ui.end_row();
+                look::row(ui, tr("Format"), lw, |ui| {
+                    let items: Vec<(BackupFormat, &str)> = formats(flavor).iter().map(|f| (*f, flavor_format_label(flavor, *f))).collect();
+                    let old = self.format;
+                    if parts::segmented(ui, &mut self.format, &items) {
+                        self.output = retarget_extension_for(flavor, &self.output, old, self.format);
+                        changed = true;
+                    }
+                });
             }
             // pg_dumpall has no database, schema or table selection.
             if !whole_server {
-                ui.label(tr("Database"));
-                changed |= ui.add(egui::TextEdit::singleline(&mut self.database).desired_width(220.0).hint_text(tr("(connection database)"))).changed();
-                ui.end_row();
+                look::row(ui, tr("Database"), lw, |ui| changed |= look::field(ui, &mut self.database, tr("(connection database)"), 260.0, false).changed());
                 if !sqlite {
-                    ui.label(if flavor == ToolFlavor::MySql { tr("Databases") } else { tr("Schemas") });
-                    changed |= ui.add(egui::TextEdit::singleline(&mut self.schemas).desired_width(340.0).hint_text(tr("comma separated; empty = all"))).changed();
-                    ui.end_row();
+                    let label = if flavor == ToolFlavor::MySql { tr("Databases") } else { tr("Schemas") };
+                    look::row(ui, label, lw, |ui| changed |= look::field(ui, &mut self.schemas, tr("comma separated; empty = all"), f32::INFINITY, false).changed());
                 }
-                ui.label(tr("Tables"));
-                changed |= ui.add(egui::TextEdit::singleline(&mut self.tables).desired_width(340.0).hint_text(tr("comma separated; empty = all"))).changed();
-                ui.end_row();
+                look::row(ui, tr("Tables"), lw, |ui| changed |= look::field(ui, &mut self.tables, tr("comma separated; empty = all"), f32::INFINITY, false).changed());
             }
             if whole_server && self.globals_only {
-                changed |= tool_row(ui, &mut self.tool_path, &mut self.extra_args);
+                changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
                 return;
             }
-            ui.label(tr("Content"));
-            ui.horizontal(|ui| {
+            look::row(ui, tr("Content"), lw, |ui| {
+                ui.spacing_mut().item_spacing.x = 16.0;
                 let mut mode = if self.schema_only {
                     1
                 } else if self.data_only {
@@ -283,48 +279,47 @@ impl BackupForm {
                     0
                 };
                 let before = mode;
-                ui.radio_value(&mut mode, 0, tr("Schema and data"));
-                ui.radio_value(&mut mode, 1, tr("Schema only"));
-                ui.radio_value(&mut mode, 2, tr("Data only"));
+                look::radio_value(ui, &mut mode, 0, tr("Schema and data"));
+                look::radio_value(ui, &mut mode, 1, tr("Schema only"));
+                look::radio_value(ui, &mut mode, 2, tr("Data only"));
                 if mode != before {
                     self.schema_only = mode == 1;
                     self.data_only = mode == 2;
                     changed = true;
                 }
             });
-            ui.end_row();
             if sqlite {
                 // sqlite3 has no further dump options.
-                changed |= tool_row(ui, &mut self.tool_path, &mut self.extra_args);
+                changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
                 return;
             }
-            ui.label(tr("Options"));
-            ui.vertical(|ui| {
-                changed |= ui.checkbox(&mut self.clean, tr("Drop objects before creating them")).changed();
+            look::row_top(ui, tr("Options"), lw, |ui| {
+                changed |= look::checkbox(ui, &mut self.clean, tr("Drop objects before creating them")).changed();
                 if !whole_server {
-                    changed |= ui.checkbox(&mut self.create_database, tr("Include CREATE DATABASE")).changed();
+                    changed |= look::checkbox(ui, &mut self.create_database, tr("Include CREATE DATABASE")).changed();
                 }
                 if pg {
-                    changed |= ui.checkbox(&mut self.no_owner, tr("Do not restore object owners")).changed();
-                    changed |= ui.checkbox(&mut self.no_privileges, tr("Do not dump privileges (GRANT / REVOKE)")).changed();
+                    changed |= look::checkbox(ui, &mut self.no_owner, tr("Do not restore object owners")).changed();
+                    changed |= look::checkbox(ui, &mut self.no_privileges, tr("Do not dump privileges (GRANT / REVOKE)")).changed();
                 }
                 let inserts = if flavor == ToolFlavor::MySql { tr("One INSERT statement per row") } else { tr("INSERT statements instead of COPY") };
-                changed |= ui.checkbox(&mut self.inserts, inserts).changed();
+                changed |= look::checkbox(ui, &mut self.inserts, inserts).changed();
                 if my {
-                    changed |= ui.checkbox(&mut self.single_transaction, tr("Single transaction (consistent snapshot)")).changed();
-                    changed |= ui.checkbox(&mut self.routines, tr("Include routines and events")).changed();
+                    changed |= look::checkbox(ui, &mut self.single_transaction, tr("Single transaction (consistent snapshot)")).changed();
+                    changed |= look::checkbox(ui, &mut self.routines, tr("Include routines and events")).changed();
                 }
                 if pg && self.format != BackupFormat::Tar && !whole_server {
                     ui.horizontal(|ui| {
-                        changed |= ui.checkbox(&mut self.compress, tr("Compression level")).changed();
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        changed |= look::checkbox(ui, &mut self.compress, tr("Compression level")).changed();
                         ui.add_enabled_ui(self.compress, |ui| {
+                            ui.spacing_mut().slider_width = 180.0;
                             changed |= ui.add(egui::Slider::new(&mut self.compression, 0..=9)).changed();
                         });
                     });
                 }
             });
-            ui.end_row();
-            changed |= tool_row(ui, &mut self.tool_path, &mut self.extra_args);
+            changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
         });
         changed
     }
@@ -417,49 +412,41 @@ impl RestoreForm {
         let mut changed = false;
         let sqlite = flavor == ToolFlavor::Sqlite;
         let pg = matches!(flavor, ToolFlavor::Postgres | ToolFlavor::Other);
-        egui::Grid::new((id, "restore_form")).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Backup file"));
+        let lw = RESTORE_LABEL_W;
+        ui.push_id((id, "restore_form"), |ui| {
+            ui.spacing_mut().item_spacing.y = 12.0;
             let directory = self.format == BackupFormat::Directory;
-            let picked = browse_row(ui, &mut self.input, tr("File to restore"), |cur| if directory { dialog_near(cur).pick_folder() } else { dialog_near(cur).pick_file() });
-            if picked && pg {
-                self.detect_format();
-            }
-            changed |= picked;
-            ui.end_row();
+            look::row(ui, tr("Backup file"), lw, |ui| {
+                let picked = browse_row(ui, &mut self.input, tr("File to restore"), |cur| if directory { dialog_near(cur).pick_folder() } else { dialog_near(cur).pick_file() });
+                if picked && pg {
+                    self.detect_format();
+                }
+                changed |= picked;
+            });
             if pg || sqlite {
-                ui.label(tr("Format"));
-                egui::ComboBox::from_id_salt((id, "rformat")).icon(ternarygrid_ui::kit::combo_caret).selected_text(flavor_format_label(flavor, self.format)).width(200.0).show_ui(
-                    ui,
-                    |ui| {
-                        for &f in formats(flavor) {
-                            changed |= ui.selectable_value(&mut self.format, f, flavor_format_label(flavor, f)).changed();
-                        }
-                    },
-                );
-                ui.end_row();
+                look::row(ui, tr("Format"), lw, |ui| {
+                    let items: Vec<(BackupFormat, &str)> = formats(flavor).iter().map(|f| (*f, flavor_format_label(flavor, *f))).collect();
+                    changed |= parts::segmented(ui, &mut self.format, &items);
+                });
             }
-            ui.label(tr("Target database"));
-            changed |= ui.add(egui::TextEdit::singleline(&mut self.database).desired_width(220.0).hint_text(tr("(connection database)"))).changed();
-            ui.end_row();
+            look::row(ui, tr("Target database"), lw, |ui| changed |= look::field(ui, &mut self.database, tr("(connection database)"), f32::INFINITY, false).changed());
             if sqlite {
-                changed |= tool_row(ui, &mut self.tool_path, &mut self.extra_args);
+                changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
                 return;
             }
-            ui.label(tr("Options"));
-            ui.vertical(|ui| {
+            look::row_top(ui, tr("Options"), lw, |ui| {
                 if pg {
-                    changed |= ui.checkbox(&mut self.clean, tr("Drop objects before recreating them")).changed();
+                    changed |= look::checkbox(ui, &mut self.clean, tr("Drop objects before recreating them")).changed();
                 }
                 let create = if pg { tr("Create the database first") } else { tr("The script creates the database (no target database)") };
-                changed |= ui.checkbox(&mut self.create_database, create).changed();
+                changed |= look::checkbox(ui, &mut self.create_database, create).changed();
                 if pg {
-                    changed |= ui.checkbox(&mut self.no_owner, tr("Do not restore object owners")).changed();
-                    changed |= ui.checkbox(&mut self.single_transaction, tr("Restore in a single transaction")).changed();
+                    changed |= look::checkbox(ui, &mut self.no_owner, tr("Do not restore object owners")).changed();
+                    changed |= look::checkbox(ui, &mut self.single_transaction, tr("Restore in a single transaction")).changed();
                 }
-                changed |= ui.checkbox(&mut self.exit_on_error, tr("Stop at the first error")).changed();
+                changed |= look::checkbox(ui, &mut self.exit_on_error, tr("Stop at the first error")).changed();
             });
-            ui.end_row();
-            changed |= tool_row(ui, &mut self.tool_path, &mut self.extra_args);
+            changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
         });
         changed
     }
@@ -800,20 +787,14 @@ impl BackupTab {
 
     fn header(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let name = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_else(|| self.conn.clone());
-        ui.horizontal(|ui| {
-            if !cx.popup {
-                ui.heading(if self.restore { tr("Restore") } else { tr("Backup") });
-            }
-            ui.label(RichText::new(name).strong());
-            if let Some(live) = cx.conns.live(&self.conn) {
-                ui.weak(format!("{} {}", live.server.product, live.server.version.split_whitespace().next().unwrap_or("")));
-            }
-        });
+        if !cx.popup {
+            look::title(ui, if self.restore { tr("Restore") } else { tr("Backup") });
+        }
+        let facts = cx.conns.live(&self.conn).map(|live| format!("{} {}", live.server.product, live.server.version.split_whitespace().next().unwrap_or("")));
+        look::conn_title(ui, &name, facts.as_deref());
         if !cx.conns.is_connected(&self.conn) {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(icon::INFO).color(crate::theme::warning_color(ui.visuals().dark_mode)));
-                ui.label(tr("Connect to build the command: the tools use the connection's host, user and password."));
-                if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
+            look::note_with(ui, parts::Tone::Info, None, tr("Connect to build the command: the tools use the connection's host, user and password."), |ui| {
+                if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUGS_CONNECTED), tr("Connect"), true).clicked() {
                     cx.push(AppCommand::Connect(self.conn.clone()));
                 }
             });
@@ -821,98 +802,116 @@ impl BackupTab {
             let caps = &live.driver.info().capabilities;
             let supported = if self.restore { caps.restore } else { caps.backup };
             if !supported {
-                crate::widgets::error_box(ui, if self.restore { tr("Restore is not supported for this database.") } else { tr("Backup is not supported for this database.") });
+                look::error(ui, if self.restore { tr("Restore is not supported for this database.") } else { tr("Backup is not supported for this database.") });
             }
         }
     }
 
     fn command_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.refresh_preview(cx);
-        ui.strong(tr("Command"));
-        match self.preview.as_ref().map(|p| p.result.clone()) {
-            Some(Ok((_, display))) => {
+        let p = ternarygrid_ui::pal(ui);
+        let preview = self.preview.as_ref().map(|p| p.result.clone());
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            parts::section_header(ui, tr("Command"), |ui| {
+                if let Some(Ok((_, display))) = &preview
+                    && kit::icon_button_ex(ui, icon::COPY, tr("Copy"), false, 24.0).clicked()
+                {
+                    ui.ctx().copy_text(display.clone());
+                }
+            });
+            match &preview {
+                Some(Ok((_, display))) => {
+                    look::command_block(ui, display);
+                    look::faint(ui, tr("The password is passed through the environment and is not part of the command line."));
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(e).color(p.err));
+                }
+                None => {}
+            }
+            if let Some((tool, line, warning)) = self.tool_status(cx) {
                 ui.horizontal(|ui| {
-                    if ui.small_button(ternarygrid_icons::ic(icon::COPY)).on_hover_text(tr("Copy")).clicked() {
-                        ui.ctx().copy_text(display.clone());
-                    }
-                    ui.add(egui::Label::new(RichText::new(&display).monospace()).wrap().selectable(true));
-                });
-                ui.weak(tr("The password is passed through the environment and is not part of the command line."));
-            }
-            Some(Err(e)) => {
-                ui.label(RichText::new(e).color(crate::theme::error_color(ui.visuals().dark_mode)));
-            }
-            None => {}
-        }
-        if let Some((tool, line, warning)) = self.tool_status(cx) {
-            ui.horizontal(|ui| {
-                ui.weak(tr("Tool:"));
-                match &line {
-                    Some(l) => ui.weak(l.as_str()),
-                    None => {
-                        if self.versions.values().any(|v| matches!(v, ToolVersion::Loading(_))) {
-                            ui.spinner();
-                            ui.ctx().request_repaint_after(Duration::from_millis(200));
-                            ui.weak(tool.as_str())
-                        } else {
-                            ui.label(
-                                RichText::new(trf("{} was not found. Install the client tools or set the tool path.", &[&tool]))
-                                    .color(crate::theme::error_color(ui.visuals().dark_mode)),
-                            )
+                    look::muted(ui, tr("Tool:"));
+                    match &line {
+                        Some(l) => {
+                            ui.label(RichText::new(l.as_str()).font(look::mono(12.0)).color(p.text_muted));
+                        }
+                        None => {
+                            if self.versions.values().any(|v| matches!(v, ToolVersion::Loading(_))) {
+                                ui.spinner();
+                                ui.ctx().request_repaint_after(Duration::from_millis(200));
+                                ui.label(RichText::new(tool.as_str()).font(look::mono(12.0)).color(p.text_muted));
+                            } else {
+                                ui.label(RichText::new(trf("{} was not found. Install the client tools or set the tool path.", &[&tool])).color(p.err));
+                            }
                         }
                     }
-                };
-            });
-            if let Some(w) = warning {
-                warning_box(ui, &w);
+                });
+                if let Some(w) = warning {
+                    look::note(ui, parts::Tone::Warning, None, &w);
+                }
             }
+        });
+    }
+
+    /// Start (backup), Cancel and Save as task… (the restore has them in its footer).
+    fn run_buttons(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let running = self.is_running();
+        let (glyph, label) = if self.restore { (icon::ARROW_COUNTER_CLOCKWISE, tr("Start restore")) } else { (icon::PLAY, tr("Start backup")) };
+        let ready = cx.conns.is_connected(&self.conn) && matches!(self.preview.as_ref().map(|p| &p.result), Some(Ok(_)));
+        if ui.add_enabled_ui(!running && ready, |ui| kit::primary_icon(ui, glyph, label)).inner.clicked() {
+            if self.restore {
+                self.confirm = true;
+            } else {
+                self.start(cx);
+            }
+        }
+        if running && kit::secondary(ui, Some(icon::STOP), tr("Cancel")).clicked() {
+            self.cancel();
         }
     }
 
-    fn run_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+    fn save_buttons(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let running = self.is_running();
-        ui.horizontal(|ui| {
-            let (glyph, label) = if self.restore { (icon::ARROW_COUNTER_CLOCKWISE, tr("Start restore")) } else { (icon::PLAY, tr("Start backup")) };
-            let ready = cx.conns.is_connected(&self.conn) && matches!(self.preview.as_ref().map(|p| &p.result), Some(Ok(_)));
-            if ui.add_enabled(!running && ready, crate::widgets::primary_button(ui, glyph, label)).clicked() {
-                if self.restore {
-                    self.confirm = true;
-                } else {
-                    self.start(cx);
+        if ui.add_enabled_ui(!running, |ui| kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FLOPPY_DISK), tr("Save as task…"), false)).inner.clicked() {
+            let name = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default();
+            let default = if self.restore { trf("Restore into {}", &[&name]) } else { trf("Backup of {}", &[&name]) };
+            self.save_prompt = Some((default, String::new()));
+        }
+        if self.saved_task.is_some() && ui.link(tr("Open tasks")).clicked() {
+            cx.push(AppCommand::OpenTasks);
+        }
+    }
+
+    /// How the last run ended and Open folder.
+    fn status_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let Some(run) = self.run.as_ref() else { return };
+        let p = ternarygrid_ui::pal(ui);
+        let elapsed = crate::widgets::format_duration(run.ended.unwrap_or_else(Instant::now).duration_since(run.started));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if let (Some(ToolOutcome::Succeeded | ToolOutcome::Warnings { .. }), Some(path)) = (&run.outcome, &run.output) {
+                let dir = if path.is_dir() { Some(path.clone()) } else { path.parent().map(|d| d.to_path_buf()) };
+                if let Some(dir) = dir
+                    && kit::ghost(ui, Some(icon::FOLDER_OPEN), tr("Open folder")).clicked()
+                {
+                    cx.backend.spawn_detached(async move {
+                        let _ = open::that_detached(dir);
+                    });
                 }
             }
-            if running && ui.button((ternarygrid_icons::ic(icon::STOP), tr("Cancel"))).clicked() {
-                self.cancel();
-            }
-            if ui.add_enabled(!running, egui::Button::new((ternarygrid_icons::ic(icon::FLOPPY_DISK), tr("Save as task…")))).clicked() {
-                let name = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default();
-                let default = if self.restore { trf("Restore into {}", &[&name]) } else { trf("Backup of {}", &[&name]) };
-                self.save_prompt = Some((default, String::new()));
-            }
-            if self.saved_task.is_some() && ui.link(tr("Open tasks")).clicked() {
-                cx.push(AppCommand::OpenTasks);
-            }
-        });
-        if let Some(e) = &self.form_error {
-            crate::widgets::error_box(ui, e);
-        }
-        let Some(run) = self.run.as_ref() else { return };
-        let dark = ui.visuals().dark_mode;
-        let elapsed = run.ended.unwrap_or_else(Instant::now).duration_since(run.started);
-        ui.horizontal(|ui| {
-            match &run.outcome {
+            let (glyph, color, text) = match &run.outcome {
                 None => {
-                    ui.spinner();
-                    ui.label(trf("Running… {}", &[&crate::widgets::format_duration(elapsed)]));
                     ui.ctx().request_repaint_after(Duration::from_millis(500));
+                    (None, p.text_muted, trf("Running… {}", &[&elapsed]))
                 }
                 Some(ToolOutcome::Succeeded) => {
                     let text = match &run.output {
-                        Some(p) => trf("Backup written to {}", &[&p.display()]),
+                        Some(path) => trf("Backup written to {}", &[&path.display()]),
                         None => tr("Restore completed").to_string(),
                     };
-                    ui.label(RichText::new(format!("{} {text}", icon::CHECK_CIRCLE)).color(crate::theme::success_color(dark)));
-                    ui.weak(crate::widgets::format_duration(elapsed));
+                    (Some(icon::CHECK_CIRCLE), p.ok, format!("{text} · {elapsed}"))
                 }
                 Some(ToolOutcome::Warnings { errors, only_settings }) => {
                     let text = if *only_settings {
@@ -920,90 +919,112 @@ impl BackupTab {
                     } else {
                         trf("Completed, but the tool reported {} error(s).", &[&errors.len()])
                     };
-                    ui.label(RichText::new(format!("{} {text}", icon::WARNING)).color(crate::theme::warning_color(dark)));
+                    (Some(icon::WARNING), p.warn, text)
                 }
-                Some(ToolOutcome::Failed(_)) => {
-                    ui.label(RichText::new(format!("{} {}", icon::X_CIRCLE, tr("The tool failed"))).color(crate::theme::error_color(dark)));
+                Some(ToolOutcome::Failed(_)) => (Some(icon::X_CIRCLE), p.err, tr("The tool failed").to_string()),
+                Some(ToolOutcome::Cancelled) => (Some(icon::PROHIBIT), p.warn, tr("Cancelled").to_string()),
+            };
+            ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).truncate());
+            match glyph {
+                Some(g) => {
+                    ui.label(RichText::new(g).font(ternarygrid_ui::style::icon_font(15.0)).color(color));
                 }
-                Some(ToolOutcome::Cancelled) => {
-                    ui.label(RichText::new(format!("{} {}", icon::PROHIBIT, tr("Cancelled"))).color(crate::theme::warning_color(dark)));
+                None => {
+                    ui.spinner();
                 }
-            }
-            if let (Some(ToolOutcome::Succeeded | ToolOutcome::Warnings { .. }), Some(p)) = (&run.outcome, &run.output) {
-                let dir = if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) };
-                if let Some(dir) = dir
-                    && ui.button((ternarygrid_icons::ic(icon::FOLDER_OPEN), tr("Open folder"))).clicked()
-                {
-                    cx.backend.spawn_detached(async move {
-                        let _ = open::that_detached(dir);
-                    });
-                }
-            }
-        });
-        if let Some(ToolOutcome::Failed(e)) = &run.outcome {
-            crate::widgets::error_box(ui, e);
-        }
-        let lines = run.log.lock().clone();
-        egui::ScrollArea::both().id_salt(("backup_log", &self.conn)).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-            for l in &lines {
-                let lower = l.to_ascii_lowercase();
-                let mut t = RichText::new(l).monospace();
-                if lower.contains("error") && !lower.contains("errors ignored") {
-                    t = t.color(if is_unknown_setting_error(l) { crate::theme::warning_color(dark) } else { crate::theme::error_color(dark) });
-                } else if lower.contains("warning") {
-                    t = t.color(crate::theme::warning_color(dark));
-                }
-                ui.add(egui::Label::new(t).extend());
             }
         });
     }
 
+    /// The errors and the log of the last run.
+    fn log_ui(&mut self, ui: &mut Ui) {
+        if let Some(e) = &self.form_error {
+            look::error(ui, e);
+        }
+        let Some(run) = self.run.as_ref() else { return };
+        if let Some(ToolOutcome::Failed(e)) = &run.outcome {
+            look::error(ui, e);
+        }
+        let p = ternarygrid_ui::pal(ui);
+        let lines: Vec<(String, egui::Color32)> = run
+            .log
+            .lock()
+            .iter()
+            .map(|l| {
+                let lower = l.to_ascii_lowercase();
+                let color = if lower.contains("error") && !lower.contains("errors ignored") {
+                    if is_unknown_setting_error(l) { p.warn } else { p.err }
+                } else if lower.contains("warning") {
+                    p.warn
+                } else {
+                    p.text_muted
+                };
+                (l.clone(), color)
+            })
+            .collect();
+        let h = (lines.len() as f32 * 18.0 + 4.0).clamp(54.0, 220.0);
+        look::log_box(ui, ("backup_log", &self.conn, self.restore), &lines, Some(h));
+    }
+
     fn dialogs(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if self.confirm {
-            let mut close = false;
             let target = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default();
             let db = Some(self.restore_form.database.trim().to_string()).filter(|d| !d.is_empty()).unwrap_or_else(|| tr("(connection database)").to_string());
-            let modal = egui::Modal::new(egui::Id::new(("confirm_restore", &self.conn))).show(ui.ctx(), |ui| {
-                ui.heading(tr("Restore the backup"));
-                ui.label(trf("Restore {} into \"{}\" / {}?", &[&self.restore_form.input, &target, &db]));
-                ui.label(tr("Existing objects can be dropped or overwritten."));
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Restore")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        self.start(cx);
-                        close = true;
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        close = true;
-                    }
-                });
-            });
-            if close || modal.should_close() {
+            let file = std::path::Path::new(self.restore_form.input.trim()).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| self.restore_form.input.clone());
+            let question = trf("Restore {} into \"{}\" / {}?", &[&file, &target, &db]);
+            let (mut run, mut cancel) = (false, false);
+            let (resp, _) = parts::Dialog::new(tr("Restore the backup")).icon(icon::ARROW_COUNTER_CLOCKWISE).width(480.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("confirm_restore", &self.conn)),
+                |ui| {
+                    let p = ternarygrid_ui::pal(ui);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.add(egui::Label::new(RichText::new(&question).size(13.5)).wrap()).on_hover_text(self.restore_form.input.as_str());
+                    ui.label(RichText::new(tr("Existing objects can be dropped or overwritten.")).color(p.text_muted));
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if look::danger_solid(ui, Some(icon::ARROW_COUNTER_CLOCKWISE), tr("Restore")).clicked() {
+                            run = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
+            if run {
+                self.start(cx);
+            }
+            if run || cancel || resp.close {
                 self.confirm = false;
             }
         }
         if let Some((mut name, mut folder)) = self.save_prompt.take() {
-            let mut keep = true;
-            let modal = egui::Modal::new(egui::Id::new(("save_backup_task", &self.conn))).show(ui.ctx(), |ui| {
-                ui.heading(tr("Save as task"));
-                egui::Grid::new("save_task_grid").num_columns(2).show(ui, |ui| {
-                    ui.label(tr("Name"));
-                    ui.add(egui::TextEdit::singleline(&mut name).desired_width(260.0));
-                    ui.end_row();
-                    ui.label(tr("Folder"));
-                    ui.add(egui::TextEdit::singleline(&mut folder).desired_width(260.0).hint_text(tr("(top level)")));
-                    ui.end_row();
-                });
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!name.trim().is_empty(), egui::Button::new(tr("Save"))).clicked() {
-                        self.save_as_task(cx, name.trim().to_string(), folder.trim().to_string());
-                        keep = false;
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        keep = false;
-                    }
-                });
-            });
-            if keep && !modal.should_close() {
+            let (mut save, mut cancel) = (false, false);
+            let can_save = !name.trim().is_empty();
+            let (resp, _) = parts::Dialog::new(tr("Save as task")).icon(icon::FLOPPY_DISK).width(460.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("save_backup_task", &self.conn)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    look::row(ui, tr("Name"), 80.0, |ui| look::field(ui, &mut name, "", f32::INFINITY, false));
+                    look::row(ui, tr("Folder"), 80.0, |ui| look::field(ui, &mut folder, tr("(top level)"), f32::INFINITY, false));
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled_ui(can_save, |ui| kit::primary(ui, tr("Save"))).inner.clicked() {
+                            save = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
+            if save && !name.trim().is_empty() {
+                self.save_as_task(cx, name.trim().to_string(), folder.trim().to_string());
+            } else if !cancel && !resp.close {
                 self.save_prompt = Some((name, folder));
             }
         }
@@ -1025,23 +1046,13 @@ impl BackupTab {
     }
 }
 
-fn warning_box(ui: &mut Ui, text: &str) {
-    let color = crate::theme::warning_color(ui.visuals().dark_mode);
-    egui::Frame::group(ui.style()).stroke(egui::Stroke::new(1.0, color)).show(ui, |ui| {
-        ui.horizontal_top(|ui| {
-            ui.label(RichText::new(icon::WARNING).color(color));
-            ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
-        });
-    });
-}
-
 impl TabView for BackupTab {
     fn take_done(&mut self) -> bool {
         std::mem::take(&mut self.done)
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(760.0, 600.0))
+        Some(if self.restore { egui::vec2(860.0, 640.0) } else { egui::vec2(900.0, 760.0) })
     }
 
     fn title(&self) -> String {
@@ -1057,30 +1068,38 @@ impl TabView for BackupTab {
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.init_defaults(cx);
         self.poll(cx);
-        self.header(ui, cx);
-        ui.separator();
         let flavor = self.flavor(cx);
         let running = self.is_running();
-        egui::Panel::bottom(egui::Id::new(("backup_run", &self.conn, self.restore)))
-            .resizable(true)
-            .default_size(ui.available_height() * 0.4)
-            .size_range(120.0..=f32::INFINITY)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                self.command_ui(ui, cx);
-                ui.add_space(4.0);
-                self.run_ui(ui, cx);
+        let conn = self.conn.clone();
+        if self.restore {
+            look::footer(ui, ("restore_footer", &conn), |ui| {
+                self.save_buttons(ui, cx);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.run_buttons(ui, cx));
             });
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt(("backup_form_scroll", &self.conn)).auto_shrink([false, false]).show(ui, |ui| {
-                ui.add_enabled_ui(!running, |ui| {
-                    if self.restore {
-                        self.restore_form.ui(ui, flavor, "restore_tab");
-                    } else {
-                        self.backup.ui(ui, flavor, "backup_tab");
-                    }
+        }
+        look::body(ui, ("backup_body", &conn, self.restore), |ui| {
+            self.header(ui, cx);
+            look::divider(ui);
+            ui.add_enabled_ui(!running, |ui| {
+                if self.restore {
+                    self.restore_form.ui(ui, flavor, "restore_tab");
+                } else {
+                    self.backup.ui(ui, flavor, "backup_tab");
+                }
+            });
+            look::divider(ui);
+            self.command_ui(ui, cx);
+            if !self.restore {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    self.run_buttons(ui, cx);
+                    self.save_buttons(ui, cx);
+                    self.status_ui(ui, cx);
                 });
-            });
+            } else if self.run.is_some() {
+                ui.horizontal(|ui| self.status_ui(ui, cx));
+            }
+            self.log_ui(ui);
         });
         self.dialogs(ui, cx);
         if self.save_job.is_some() {

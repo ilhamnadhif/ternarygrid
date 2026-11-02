@@ -6,11 +6,14 @@
 
 use crate::command::AppCommand;
 use crate::cx::AppContext;
+use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
-use egui::{RichText, Ui};
+use crate::tabs::dbtools::look;
+use egui::Ui;
 use egui_phosphor::regular as icon;
 use ternarygrid_core::config::ConnectionConfig;
 use ternarygrid_core::{DbKind, SchemaRef, tr, trf};
+use ternarygrid_ui::kit;
 
 /// The source of the foreign tables.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -160,11 +163,13 @@ pub struct FdwConfigTab {
     source: Option<String>,
     spec: FdwSpec,
     tables: String,
+    /// Highlighting of the script (the connection's dialect).
+    lang: Option<SqlLanguage>,
 }
 
 impl FdwConfigTab {
     pub fn new(conn: String) -> Self {
-        FdwConfigTab { conn, source: None, spec: FdwSpec::default(), tables: String::new() }
+        FdwConfigTab { conn, source: None, spec: FdwSpec::default(), tables: String::new(), lang: None }
     }
 
     /// Choose the source connection (fills the defaults).
@@ -181,7 +186,7 @@ impl FdwConfigTab {
 
 impl TabView for FdwConfigTab {
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(720.0, 560.0))
+        Some(egui::vec2(860.0, 680.0))
     }
 
     fn title(&self) -> String {
@@ -201,61 +206,77 @@ impl TabView for FdwConfigTab {
     }
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        if !cx.popup {
-            crate::widgets::icon_heading(ui, icon::PLUGS_CONNECTED, tr("Foreign data wrapper"));
+        let conn = self.conn.clone();
+        let p = ternarygrid_ui::pal(ui);
+        if self.lang.is_none() {
+            let dialect =
+                cx.conns.live(&self.conn).map(|l| l.dialect.clone()).or_else(|| cx.conns.config(&self.conn).and_then(|c| cx.conns.registry.get(c.kind)).map(|d| d.dialect()));
+            self.lang = dialect.map(SqlLanguage::new);
         }
-        ui.weak(tr("Make the tables of another connection available in this database as foreign tables."));
-        ui.add_space(6.0);
-        let sources: Vec<ConnectionConfig> = cx.conns.configs().iter().filter(|c| c.id != self.conn && wrapper_of(c.kind).is_some()).cloned().collect();
-        let selected = self.source.as_ref().and_then(|id| sources.iter().find(|c| &c.id == id)).map(|c| format!("{} ({})", c.name, c.kind.display_name()));
-        egui::Grid::new(("fdw_form", &self.conn)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Source connection"));
-            egui::ComboBox::from_id_salt(("fdw_source", &self.conn))
-                .icon(ternarygrid_ui::kit::combo_caret)
-                .selected_text(selected.unwrap_or_else(|| tr("(choose)").to_string()))
-                .width(260.0)
-                .show_ui(ui, |ui| {
-                    for c in &sources {
-                        if ui.selectable_label(self.source.as_deref() == Some(&c.id), format!("{} ({})", c.name, c.kind.display_name())).clicked() {
-                            self.set_source(c);
+        egui::Frame::new().inner_margin(look::BODY).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 12.0;
+            if !cx.popup {
+                look::title(ui, tr("Foreign data wrapper"));
+            }
+            look::muted(ui, tr("Make the tables of another connection available in this database as foreign tables."));
+            let sources: Vec<ConnectionConfig> = cx.conns.configs().iter().filter(|c| c.id != self.conn && wrapper_of(c.kind).is_some()).cloned().collect();
+            let current = self.source.as_ref().and_then(|id| sources.iter().find(|c| &c.id == id)).cloned();
+            let lw = 150.0;
+            look::row(ui, tr("Source connection"), lw, |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if let Some(c) = &current {
+                    look::logo(ui, c.kind, 15.0);
+                }
+                egui::ComboBox::from_id_salt(("fdw_source", &self.conn))
+                    .icon(ternarygrid_ui::kit::combo_caret)
+                    .selected_text(current.as_ref().map(|c| format!("{} ({})", c.name, c.kind.display_name())).unwrap_or_else(|| tr("(choose)").to_string()))
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for c in &sources {
+                            if ui.selectable_label(self.source.as_deref() == Some(&c.id), format!("{} ({})", c.name, c.kind.display_name())).clicked() {
+                                self.set_source(c);
+                            }
                         }
-                    }
-                });
-            ui.end_row();
-            ui.label(tr("Server name"));
-            ui.add(egui::TextEdit::singleline(&mut self.spec.server).desired_width(260.0));
-            ui.end_row();
-            ui.label(tr("Remote schema"));
-            ui.add(egui::TextEdit::singleline(&mut self.spec.remote_schema).desired_width(260.0));
-            ui.end_row();
-            ui.label(tr("Local schema"));
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.spec.local_schema).desired_width(260.0));
-                ui.checkbox(&mut self.spec.create_local_schema, tr("Create it"));
+                    });
             });
-            ui.end_row();
-            ui.label(tr("Tables"));
-            ui.add(egui::TextEdit::singleline(&mut self.tables).desired_width(340.0).hint_text(tr("comma separated; empty = all")));
-            ui.end_row();
+            look::row(ui, tr("Server name"), lw, |ui| look::field(ui, &mut self.spec.server, "", 260.0, false));
+            look::row(ui, tr("Remote schema"), lw, |ui| look::field(ui, &mut self.spec.remote_schema, "", 200.0, false));
+            look::row(ui, tr("Local schema"), lw, |ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                look::field(ui, &mut self.spec.local_schema, "", 200.0, false);
+                look::checkbox(ui, &mut self.spec.create_local_schema, tr("Create it"));
+            });
+            look::row(ui, tr("Tables"), lw, |ui| look::field(ui, &mut self.tables, tr("comma separated; empty = all"), f32::INFINITY, false));
+            ui.add_space(4.0);
+            match self.script() {
+                Ok(script) => {
+                    ui.horizontal(|ui| {
+                        if look::small(ui, kit::Kind::Secondary, icon::FILE_SQL, tr("Open in SQL editor")).clicked() {
+                            let schema = cx.conns.config(&self.conn).and_then(|c| c.database.clone()).map(|d| SchemaRef { database: Some(d), schema: None });
+                            cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema, text: Some(script.clone()) });
+                        }
+                        if look::small(ui, kit::Kind::Ghost, icon::COPY, tr("Copy")).clicked() {
+                            ui.ctx().copy_text(script.clone());
+                        }
+                    });
+                    let h = (ui.available_height() - 18.0).max(160.0);
+                    egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(8).show(ui, |ui| {
+                        ui.allocate_ui(egui::vec2(ui.available_width(), h - 2.0), |ui| match &self.lang {
+                            Some(lang) => {
+                                let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
+                                ternarygrid_editor::CodeView::new(&script, lang, &theme).id_salt(("fdw_script", &conn)).show(ui);
+                            }
+                            None => {
+                                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| crate::tabs::code(ui, cx, &conn, ("fdw_script", &conn), &script));
+                            }
+                        });
+                    });
+                }
+                Err(e) => {
+                    look::muted(ui, &e);
+                }
+            }
         });
-        ui.add_space(8.0);
-        match self.script() {
-            Ok(script) => {
-                ui.horizontal(|ui| {
-                    if ui.button((ternarygrid_icons::ic(icon::FILE_SQL), tr("Open in SQL editor"))).clicked() {
-                        let schema = cx.conns.config(&self.conn).and_then(|c| c.database.clone()).map(|d| SchemaRef { database: Some(d), schema: None });
-                        cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema, text: Some(script.clone()) });
-                    }
-                    if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).clicked() {
-                        ui.ctx().copy_text(script.clone());
-                    }
-                });
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| crate::tabs::code(ui, cx, &self.conn.clone(), ("fdw_script", &self.conn), &script));
-            }
-            Err(e) => {
-                ui.label(RichText::new(e).weak());
-            }
-        }
     }
 
     crate::impl_tab_any!();
