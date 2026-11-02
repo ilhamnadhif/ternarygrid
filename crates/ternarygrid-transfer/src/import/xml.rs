@@ -62,6 +62,9 @@ struct XmlParser {
     record_text: String,
     field: Option<FieldState>,
     done: bool,
+    /// Values read from child elements / from attributes of records.
+    element_values: u64,
+    attribute_values: u64,
 }
 
 fn local_name(e: &BytesStart<'_>) -> String {
@@ -153,6 +156,7 @@ impl XmlParser {
                                     let value =
                                         a.normalized_value(XmlVersion::Implicit1_0).map(|v| v.into_owned()).map_err(|err| parse_error("XML", format!("attribute {qname}"), err))?;
                                     self.record.push((key, Some(value)));
+                                    self.attribute_values += 1;
                                 }
                             }
                         }
@@ -176,6 +180,7 @@ impl XmlParser {
                                     Some(f.text)
                                 };
                                 self.record.push((f.name, value));
+                                self.element_values += 1;
                             }
                         } else if self.depth == rd {
                             self.record_depth = None;
@@ -252,6 +257,8 @@ pub struct XmlSource {
     index: HashMap<String, usize>,
     pending: VecDeque<Row>,
     unknown: Vec<String>,
+    /// Binary values are base64 rather than hexadecimal ([`RowSource::binary_is_base64`]).
+    base64_binary: bool,
 }
 
 impl XmlSource {
@@ -287,6 +294,8 @@ impl XmlSource {
             record_text: String::new(),
             field: None,
             done: false,
+            element_values: 0,
+            attribute_values: 0,
         };
         let mut sample = Vec::new();
         while sample.len() < options.sample_rows.max(1) {
@@ -306,7 +315,11 @@ impl XmlSource {
             }
         }
         let columns = names.into_iter().map(|n| ColumnMeta::new(n, "", DataKind::Text)).collect();
-        let mut src = XmlSource { parser, columns, index, pending: VecDeque::new(), unknown: Vec::new() };
+        // Element values come from the XML export, which writes binary values as
+        // configured (hexadecimal by default); attribute-only records are DbUnit
+        // flat XML, whose binary values are base64.
+        let base64_binary = parser.attribute_values > 0 && parser.element_values == 0;
+        let mut src = XmlSource { parser, columns, index, pending: VecDeque::new(), unknown: Vec::new(), base64_binary };
         let rows: Vec<Row> = sample.into_iter().map(|r| src.make_row(r)).collect();
         src.pending.extend(rows);
         Ok(src)
@@ -336,7 +349,7 @@ impl XmlSource {
 #[async_trait]
 impl RowSource for XmlSource {
     fn binary_is_base64(&self) -> bool {
-        true
+        self.base64_binary
     }
 
     fn columns(&self) -> &[ColumnMeta] {
@@ -445,6 +458,16 @@ c</name>
         let mut s = XmlSource::from_reader(std::io::Cursor::new(bytes), XmlReadOptions::default()).unwrap();
         assert_eq!(s.next_batch(10).await.unwrap(), vec![vec![Value::text("café")]]);
         assert_eq!(declared_encoding(b"<?xml version='1.0' encoding='ISO-8859-2' ?>"), Some("ISO-8859-2".into()));
+    }
+
+    #[test]
+    fn binary_encoding_follows_the_document_style() {
+        let open = |xml: &str| XmlSource::from_reader(std::io::Cursor::new(xml.as_bytes().to_vec()), XmlReadOptions::default()).unwrap();
+        // The XML export (child elements) writes hexadecimal by default.
+        assert!(!open("<export><DATA_RECORD><b>abcd</b></DATA_RECORD></export>").binary_is_base64());
+        assert!(!open(r#"<orders><order id="7"><b>abcd</b></order></orders>"#).binary_is_base64());
+        // DbUnit flat XML (attributes only) writes base64.
+        assert!(open(r#"<dataset><t id="1" b="AAEC"/><t id="2"/></dataset>"#).binary_is_base64());
     }
 
     #[tokio::test]

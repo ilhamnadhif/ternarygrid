@@ -9,6 +9,17 @@
 //! [`DataCompareOptions::max_hash_bytes`], above which the comparison stops
 //! with a clear error.
 //!
+//! With [`CompareStrategy::Auto`] the key kinds are read from a one-row probe
+//! of each side first, so that the rows are only sorted when a merge join
+//! will use the order.
+//!
+//! Both joins refuse duplicate keys (on either side): a sync script built on
+//! them would `DELETE` / `UPDATE` every row sharing the key, including the
+//! matched one. The hash join detects a duplicate target key when the key
+//! matched a source row (it remembers the matched keys, bounded by the source
+//! size); target-only keys appearing twice are reported once per row, and
+//! their `DELETE` removes rows that are not in the source anyway.
+//!
 //! The merge join keeps two cursors open at the same time, so the source and
 //! target providers must use different sessions. The hash join reads the
 //! source completely and closes its cursor before querying the target, so
@@ -22,7 +33,7 @@ mod tests;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use ternarygrid_core::driver::{ExecOptions, QueryCursor, ResultHeader, Session};
 use ternarygrid_core::{ColumnMeta, DbError, DbKind, DbResult, Dialect, ObjectRef, Row, Value, tr, trf};
 use tokio_util::sync::CancellationToken;
@@ -292,7 +303,7 @@ fn find_column(meta: &[ColumnMeta], name: &str) -> Option<usize> {
     meta.iter().position(|c| c.name == name).or_else(|| meta.iter().position(|c| c.name.eq_ignore_ascii_case(name)))
 }
 
-fn select_sql(spec: &TableSpec, d: &dyn Dialect, order: bool) -> String {
+fn select_sql(spec: &TableSpec, d: &dyn Dialect, order: bool, limit: Option<u64>) -> String {
     let cols: Option<Vec<String>> = if spec.columns.is_empty() {
         None
     } else {
@@ -301,7 +312,16 @@ fn select_sql(spec: &TableSpec, d: &dyn Dialect, order: bool) -> String {
         Some(c)
     };
     let order_by = if order { Some(spec.key_columns.iter().map(|k| d.quote_ident(k)).collect::<Vec<_>>().join(", ")) } else { None };
-    d.select_table(&spec.obj, cols.as_deref(), spec.where_clause.as_deref(), order_by.as_deref(), None)
+    d.select_table(&spec.obj, cols.as_deref(), spec.where_clause.as_deref(), order_by.as_deref(), limit)
+}
+
+/// Whether the key columns of `spec` (read by a one-row probe) have kinds that
+/// sort the same in every database. `None` when the probe fails.
+async fn probe_orderable(p: &mut dyn RowProvider, spec: &TableSpec, keys: &[String], d: &dyn Dialect, uuid_ok: bool) -> Option<bool> {
+    let mut s = Stream::open(p, &select_sql(spec, d, false, Some(1)), 1).await.ok()?;
+    let r = key_positions(&s.meta, keys, "").ok().map(|idx| idx.iter().all(|&i| orderable_kind(s.meta[i].kind, uuid_ok)));
+    s.close().await;
+    r
 }
 
 /// Positions of key and compared columns in both results.
@@ -559,7 +579,18 @@ pub async fn run_data_compare(
     }
     let o = &job.options;
     let uuid_ok = src_dialect.kind() != DbKind::SqlServer && dst_dialect.kind() != DbKind::SqlServer;
-    let mut src = Stream::open(source, &select_sql(&job.source, src_dialect, o.strategy != CompareStrategy::HashJoin), o.fetch_size).await?;
+    // Auto: probe both sides first so that the source is only sorted for a merge
+    // join (when a probe fails the decision is taken on the sorted source query).
+    let sorted = match o.strategy {
+        CompareStrategy::MergeJoin => true,
+        CompareStrategy::HashJoin => false,
+        CompareStrategy::Auto => match probe_orderable(source, &job.source, &job.source.key_columns, src_dialect, uuid_ok).await {
+            Some(true) => probe_orderable(target, &job.target, &target_keys(job), dst_dialect, uuid_ok).await.unwrap_or(true),
+            Some(false) => false,
+            None => true,
+        },
+    };
+    let mut src = Stream::open(source, &select_sql(&job.source, src_dialect, sorted, None), o.fetch_size).await?;
     let src_key_idx = match key_positions(&src.meta, &job.source.key_columns, "source") {
         Ok(k) => k,
         Err(e) => {
@@ -571,10 +602,10 @@ pub async fn run_data_compare(
     let merge = match o.strategy {
         CompareStrategy::MergeJoin => true,
         CompareStrategy::HashJoin => false,
-        CompareStrategy::Auto => orderable(&src.meta, &src_key_idx),
+        CompareStrategy::Auto => sorted && orderable(&src.meta, &src_key_idx),
     };
     let result = if merge {
-        let mut tgt = match Stream::open(target, &select_sql(&job.target, dst_dialect, true), o.fetch_size).await {
+        let mut tgt = match Stream::open(target, &select_sql(&job.target, dst_dialect, true, None), o.fetch_size).await {
             Ok(t) => t,
             Err(e) => {
                 src.close().await;
@@ -715,6 +746,10 @@ async fn probe_target(
     let tgt_keys = lay.tgt_keys.clone();
     let mut e = Engine { job, dst, lay, tgt_meta: tgt.meta.clone(), src_names, diff, deletes: Vec::new(), updates: Vec::new(), inserts: Vec::new() };
     let mut processed = 0u64;
+    // Target keys that matched a source row (at most one per source row). A
+    // second target row with such a key is a duplicate: reporting it "only in
+    // the target" would make the sync script DELETE the matched row too.
+    let mut matched: HashSet<String> = HashSet::new();
     while let Some(row) = tgt.next(cancel).await? {
         let Some(key) = key_of(&row, &tgt_keys) else {
             skipped += 1;
@@ -722,6 +757,9 @@ async fn probe_target(
         };
         // Exactly the same key, else a text key of one side spelling the other's number / UUID.
         let repr = key_repr(&key, &job.options);
+        if matched.contains(&repr) {
+            return Err(DbError::query(trf("Duplicate key in the {} table: {}", &[&"target", &key_text(&key)])));
+        }
         let found = map.remove(&repr).or_else(|| {
             let alt = cross_key_repr(&key, &job.options);
             if alt != repr
@@ -732,7 +770,10 @@ async fn probe_target(
             cross.get(&repr).cloned().flatten().and_then(|r| map.remove(&r))
         });
         match found {
-            Some((sk, sr)) => e.compare(sk, &sr, &row),
+            Some((sk, sr)) => {
+                matched.insert(repr);
+                e.compare(sk, &sr, &row);
+            }
             None => e.only_target(key, &row),
         }
         processed += 1;
@@ -782,7 +823,7 @@ async fn hash_join(
     let map = loaded?;
     let meta = src.meta.clone();
     let src_rows = src.rows;
-    let mut tgt = Stream::open(target, &select_sql(&job.target, dst, false), job.options.fetch_size).await?;
+    let mut tgt = Stream::open(target, &select_sql(&job.target, dst, false, None), job.options.fetch_size).await?;
     let r = probe_target(job, map, &meta, &mut tgt, dst, progress, cancel, skipped, src_rows).await;
     tgt.close().await;
     r

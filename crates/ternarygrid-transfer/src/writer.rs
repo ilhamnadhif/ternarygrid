@@ -124,6 +124,10 @@ pub(crate) struct BatchWriter<'a> {
     /// MySQL BIT and geometry, SQL Server datetime).
     inline: Vec<bool>,
     item: String,
+    /// Why the writer refuses to start (checked by [`BatchWriter::begin`]).
+    refused: Option<String>,
+    /// Rows known to be committed (see [`BatchWriter::committed_rows`]).
+    committed: u64,
     pub(crate) written: u64,
     pub(crate) failed: u64,
     pub(crate) errors: Vec<RowError>,
@@ -159,6 +163,25 @@ impl<'a> BatchWriter<'a> {
             warnings.push(format!("{} has no savepoints: rows are committed statement by statement so failing rows can be skipped", dialect.kind().display_name()));
             scope = TransactionScope::None;
         }
+        // Replace without a native upsert deletes the existing rows of the keys
+        // before inserting the new ones: without a transaction a failed insert
+        // would lose them. Such writes always run in transactions, and are
+        // refused where there are none.
+        let mut refused = None;
+        if upsert_sql.is_none() && !target.key_index.is_empty() && scope == TransactionScope::None {
+            if savepoints.is_some() {
+                warnings.push(
+                    "Rows replaced by key are deleted and inserted again: they are written in one transaction per batch so that a failed insert cannot lose the deleted rows"
+                        .into(),
+                );
+                scope = TransactionScope::PerBatch;
+            } else {
+                refused = Some(format!(
+                    "{} has neither an upsert statement nor transactions: replacing rows by key would delete them before inserting the new ones, and a failed insert would lose them. Append the rows or empty the table first instead",
+                    dialect.kind().display_name()
+                ));
+            }
+        }
         BatchWriter {
             session,
             dialect,
@@ -174,6 +197,8 @@ impl<'a> BatchWriter<'a> {
             overriding: false,
             inline,
             item: item.into(),
+            refused,
+            committed: 0,
             written: 0,
             failed: 0,
             errors: Vec::new(),
@@ -185,6 +210,9 @@ impl<'a> BatchWriter<'a> {
 
     /// Switch the session into the transaction mode of the scope.
     pub(crate) async fn begin(&mut self) -> DbResult<()> {
+        if let Some(why) = &self.refused {
+            return Err(DbError::unsupported(why.clone()));
+        }
         let mode = self.session.transaction_mode();
         if mode == TransactionMode::Manual && self.session.in_transaction() {
             return Err(DbError::config("The session has an open transaction; commit or roll it back before writing data"));
@@ -231,6 +259,12 @@ impl<'a> BatchWriter<'a> {
 
     fn transactional(&self) -> bool {
         self.scope != TransactionScope::None
+    }
+
+    /// Rows known to be committed: those of committed batches, or every
+    /// written row when statements auto-commit.
+    pub(crate) fn committed_rows(&self) -> u64 {
+        if self.transactional() { self.committed } else { self.written }
     }
 
     async fn exec(&mut self, sql: &str, params: &[Value]) -> DbResult<Option<u64>> {
@@ -540,6 +574,7 @@ impl<'a> BatchWriter<'a> {
     pub(crate) async fn end_batch(&mut self) -> DbResult<()> {
         if self.scope == TransactionScope::PerBatch {
             self.session.commit().await?;
+            self.committed = self.written;
         }
         Ok(())
     }
@@ -552,6 +587,7 @@ impl<'a> BatchWriter<'a> {
             self.abort().await;
             return Err(e);
         }
+        self.committed = self.written;
         self.identity_insert_off().await;
         self.restore_mode().await
     }
@@ -587,7 +623,30 @@ impl<'a> BatchWriter<'a> {
     }
 }
 
-/// Keep the last row of every key (later rows replace earlier ones).
+/// After a failed job: drop `table`, which the job created, when it holds no
+/// row, so that the target is left as it was found (and the job can simply be
+/// run again). Best effort; returns whether the table was dropped.
+pub(crate) async fn drop_created_table(session: &mut dyn Session, table: &ObjectRef) -> bool {
+    let dialect = session.dialect();
+    let count = format!("SELECT COUNT(*) FROM {}", dialect.qualified_ref(table));
+    let empty = match ternarygrid_core::driver::query_all(&mut *session, &count, &[]).await {
+        Ok((_, rows)) => rows.first().and_then(|r| r.first()).and_then(|v| v.as_i64()) == Some(0),
+        Err(_) => false,
+    };
+    if !empty {
+        return false;
+    }
+    let drop = dialect.ddl().drop_table(table.schema.as_deref(), &table.name, false);
+    if let Err(e) = execute_update(&mut *session, &drop, &[]).await {
+        tracing::debug!("dropping the created table failed: {e}");
+        return false;
+    }
+    if session.transaction_mode() == TransactionMode::Manual && session.in_transaction() {
+        let _ = session.commit().await;
+    }
+    true
+}
+
 /// `[a]]b]` → `a]b`: a quoted T-SQL name as stored in the catalog.
 fn unquote_tsql(name: &str) -> String {
     let n = name.trim();
@@ -600,6 +659,7 @@ fn unquote_tsql(name: &str) -> String {
     }
 }
 
+/// Keep the last row of every key (later rows replace earlier ones).
 fn dedupe_by_key(rows: Vec<(u64, Row)>, keys: &[usize]) -> Vec<(u64, Row)> {
     if rows.len() < 2 {
         return rows;

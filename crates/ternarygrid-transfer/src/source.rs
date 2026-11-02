@@ -34,8 +34,8 @@ pub trait RowSource: Send {
         Vec::new()
     }
 
-    /// Binary values of this format are usually base64 (JSON, XML: what the
-    /// export writes there), so "detect" tries base64 before hex.
+    /// Binary values of this input are usually base64 (what the export writes
+    /// there: JSON, DbUnit flat XML), so "detect" tries base64 before hex.
     fn binary_is_base64(&self) -> bool {
         false
     }

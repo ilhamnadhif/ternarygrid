@@ -399,13 +399,17 @@ impl MigrationPlan {
     }
 }
 
-/// Statements opening and committing a transaction in `kind`.
+/// Statements opening and committing a transaction in `kind`; `None` when a
+/// script cannot be wrapped in one.
 pub(crate) fn transaction_statements(kind: DbKind) -> Option<(&'static str, &'static str)> {
     match kind {
+        DbKind::Postgres | DbKind::CockroachDb | DbKind::Sqlite | DbKind::Generic => Some(("BEGIN", "COMMIT")),
         DbKind::MySql | DbKind::MariaDb => Some(("START TRANSACTION", "COMMIT")),
         DbKind::SqlServer => Some(("BEGIN TRANSACTION", "COMMIT TRANSACTION")),
-        DbKind::ClickHouse => None,
-        _ => Some(("BEGIN", "COMMIT")),
+        // Oracle opens transactions implicitly (a bare `BEGIN` starts a PL/SQL
+        // block and is a syntax error) and commits every DDL statement;
+        // ClickHouse, Cassandra and the NoSQL products have no transactional scripts.
+        _ => None,
     }
 }
 
@@ -586,6 +590,9 @@ pub fn migration_plan(diff: &SchemaDiff, source: &SchemaSnapshot, target: &Schem
     if opts.wrap_in_transaction && !p.steps.is_empty() {
         match transaction_statements(target_dialect.kind()) {
             Some((b, c)) => transaction = Some((b.to_string(), c.to_string())),
+            None if target_dialect.kind() == DbKind::Oracle => {
+                p.warnings.push(ternarygrid_core::tr("Oracle commits DDL statements implicitly; the script is not wrapped in a transaction").to_string())
+            }
             None => p.warnings.push(ternarygrid_core::tr("The target database does not support transactions; the script is not wrapped").to_string()),
         }
         if target_dialect.kind().is_mysql_family() {

@@ -29,10 +29,13 @@ pub enum ImportMode {
     /// Insert the rows.
     #[default]
     Append,
-    /// Delete all rows first, then insert.
+    /// Delete all rows first, then insert. Only with [`TransactionScope::Whole`]
+    /// is the deletion undone when the import fails; otherwise it is committed
+    /// before the rows are written.
     TruncateFirst,
     /// Insert or replace rows by key ([`ImportMapping::key_columns`]) via
-    /// [`Dialect::upsert`]; dialects without upsert get `DELETE` + `INSERT`.
+    /// [`Dialect::upsert`]; dialects without upsert get `DELETE` + `INSERT`,
+    /// always inside a transaction (refused on databases without transactions).
     Replace,
 }
 
@@ -91,7 +94,9 @@ pub struct ImportMapping {
     pub transaction: TransactionScope,
     /// Error handling.
     pub on_error: OnError,
-    /// Stop after this many failed rows (with `SkipRow` / `LogAndContinue`).
+    /// Stop once this many rows have failed (with `SkipRow` / `LogAndContinue`;
+    /// 0 counts as 1): the import ends with an error and, as with
+    /// [`OnError::Abort`], the batch in progress is rolled back.
     pub max_errors: Option<u64>,
     /// Parsing of text values (date formats, decimal separator, NULL markers ...).
     pub convert: ConvertOptions,
@@ -277,6 +282,21 @@ async fn import_rows(source: &mut dyn RowSource, session: &mut dyn Session, mapp
         progress.add_total_rows(total);
     }
 
+    let key_index: Vec<usize> = if mapping.mode == ImportMode::Replace {
+        if mapping.key_columns.is_empty() {
+            return Err(DbError::config("Replace mode needs key columns"));
+        }
+        mapping
+            .key_columns
+            .iter()
+            .map(|k| {
+                active.iter().position(|c| c.target_name.eq_ignore_ascii_case(k)).ok_or_else(|| DbError::config(format!("Key column '{k}' is not among the imported columns")))
+            })
+            .collect::<DbResult<_>>()?
+    } else {
+        Vec::new()
+    };
+
     let mut summary = ImportSummary::default();
     if mapping.create_table {
         let mut def = TableDef::new(mapping.target.schema.clone(), mapping.target.name.clone());
@@ -302,20 +322,6 @@ async fn import_rows(source: &mut dyn RowSource, session: &mut dyn Session, mapp
         progress.info(Some(&item), "Table created");
     }
 
-    let key_index: Vec<usize> = if mapping.mode == ImportMode::Replace {
-        if mapping.key_columns.is_empty() {
-            return Err(DbError::config("Replace mode needs key columns"));
-        }
-        mapping
-            .key_columns
-            .iter()
-            .map(|k| {
-                active.iter().position(|c| c.target_name.eq_ignore_ascii_case(k)).ok_or_else(|| DbError::config(format!("Key column '{k}' is not among the imported columns")))
-            })
-            .collect::<DbResult<_>>()?
-    } else {
-        Vec::new()
-    };
     let target = TableTarget {
         table_sql: dialect.qualified_ref(&mapping.target),
         columns: active.iter().map(|c| dialect.quote_ident(&c.target_name)).collect(),
@@ -323,9 +329,11 @@ async fn import_rows(source: &mut dyn RowSource, session: &mut dyn Session, mapp
         key_index,
     };
     let handle = session.cancel_handle();
-    let mut writer = BatchWriter::new(session, target, mapping.transaction, mapping.on_error, mapping.rows_per_statement, item.clone());
-    writer.begin().await?;
+    let mut writer = BatchWriter::new(&mut *session, target, mapping.transaction, mapping.on_error, mapping.rows_per_statement, item.clone());
+    let begun = writer.begin().await;
+    let begun_failed = begun.is_err();
     let outcome = async {
+        begun?;
         if mapping.mode == ImportMode::TruncateFirst {
             writer.clear_table(&mapping.target).await?;
         }
@@ -368,13 +376,14 @@ async fn import_rows(source: &mut dyn RowSource, session: &mut dyn Session, mapp
                 }
             }
             writer.write(converted, progress).await?;
+            // Checked before the batch is committed: reaching the limit stops the import like an abort.
+            if let Some(max) = mapping.max_errors
+                && writer.failed >= max.max(1)
+            {
+                return Err(DbError::config(format!("Import stopped after {} failed row(s)", writer.failed)));
+            }
             writer.end_batch().await?;
             progress.add_rows(n);
-            if let Some(max) = mapping.max_errors
-                && writer.failed > max
-            {
-                return Err(DbError::config(format!("Import stopped after {} failed rows", writer.failed)));
-            }
             if cancel.is_cancelled() {
                 return Err(DbError::cancelled());
             }
@@ -382,17 +391,28 @@ async fn import_rows(source: &mut dyn RowSource, session: &mut dyn Session, mapp
         Ok(())
     }
     .await;
-    match outcome {
-        Ok(()) => writer.finish().await?,
+    let done = match outcome {
+        Ok(()) => writer.finish().await,
+        // A failed `begin` left the session as it was (it may hold the user's open transaction).
+        Err(e) if begun_failed => Err(e),
         Err(e) => {
             writer.abort().await;
-            if e.kind == ErrorKind::Cancelled
-                && let Some(h) = handle
-            {
-                let _ = h.cancel().await;
-            }
-            return Err(crate::error::with_item(e, &item));
+            Err(e)
         }
+    };
+    if let Err(e) = done {
+        let persisted = writer.committed_rows();
+        drop(writer);
+        if e.kind == ErrorKind::Cancelled
+            && let Some(h) = handle
+        {
+            let _ = h.cancel().await;
+        }
+        // A table created by this import that received no row is dropped again.
+        if summary.created_table && persisted == 0 && crate::writer::drop_created_table(session, &mapping.target).await {
+            progress.info(Some(&item), "The table created by the failed import was dropped");
+        }
+        return Err(crate::error::with_item(e, &item));
     }
     summary.rows_written = writer.written;
     summary.rows_failed = writer.failed;

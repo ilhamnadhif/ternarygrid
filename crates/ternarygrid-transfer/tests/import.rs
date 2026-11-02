@@ -238,7 +238,95 @@ async fn import_abort_and_transactions() {
     m.batch_size = 2;
     let mut src = csv(CUSTOMERS, CsvReadOptions::default());
     let err = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
-    assert!(err.message.contains("stopped after 2 failed rows"), "{}", err.message);
+    // "Stop after 1 failed row": the first batch (row 1 fails, row 2 is fine) reaches
+    // the limit and is rolled back like an abort.
+    assert!(err.message.contains("stopped after 1 failed row"), "{}", err.message);
+    assert_eq!(select(&session.conn, "SELECT count(*) FROM customers"), vec![vec![Value::Int(1)]]);
+    // 0 counts as 1.
+    let mut session = SqliteSession::memory(sqlite_dialect());
+    customers(&session);
+    m.max_errors = Some(0);
+    let mut src = csv(CUSTOMERS, CsvReadOptions::default());
+    let err = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(err.message.contains("stopped after 1 failed row"), "{}", err.message);
+    // Below the limit the import completes.
+    let mut session = SqliteSession::memory(sqlite_dialect());
+    customers(&session);
+    m.max_errors = Some(5);
+    let mut src = csv(CUSTOMERS, CsvReadOptions::default());
+    let s = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap();
+    assert_eq!(s.rows_failed, 4);
+}
+
+#[tokio::test]
+async fn replace_without_upsert_never_loses_rows() {
+    // DELETE + INSERT (the generic dialect has no upsert) with auto-commit
+    // requested: a failing INSERT must not leave the old row deleted.
+    let mut session = SqliteSession::memory(generic());
+    customers(&session);
+    let mut m = customer_mapping(ImportMode::Replace);
+    m.transaction = TransactionScope::None;
+    let mut src = csv(b"id,name,age,joined\n1,,5,\n", CsvReadOptions::default());
+    let err = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(err.full_text().contains("NOT NULL"), "{}", err.full_text());
+    assert!(session.log.lock().iter().any(|s| s.starts_with("DELETE FROM customers")), "the DELETE ran (and was rolled back)");
+    assert_eq!(select(&session.conn, "SELECT name FROM customers WHERE id = 1"), vec![vec![Value::text("old")]]);
+
+    // Skipping failing rows: every failed replacement is undone on its own.
+    let mut session = SqliteSession::memory(generic());
+    customers(&session);
+    session.exec_batch("INSERT INTO customers VALUES (2, 'two', 2, NULL)");
+    m.on_error = OnError::SkipRow;
+    let mut src = csv(b"id,name,age,joined\n1,,5,\n2,Bob,40,\n", CsvReadOptions::default());
+    let s = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap();
+    assert_eq!((s.rows_written, s.rows_failed), (1, 1), "{:?}", s.errors);
+    assert!(s.warnings.iter().any(|w| w.contains("one transaction per batch")), "{:?}", s.warnings);
+    assert_eq!(select(&session.conn, "SELECT id, name FROM customers ORDER BY id"), vec![vec![Value::Int(1), Value::text("old")], vec![Value::Int(2), Value::text("Bob")]]);
+
+    // A database without transactions (and without upsert) refuses before deleting anything.
+    let mut session = SqliteSession::memory(dialect_of_kind(ternarygrid_core::DbKind::ClickHouse));
+    customers(&session);
+    let m = customer_mapping(ImportMode::Replace);
+    let mut src = csv(b"id,name,age,joined\n1,Ann,5,\n", CsvReadOptions::default());
+    let err = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Unsupported, "{}", err.full_text());
+    assert!(!session.log.lock().iter().any(|s| s.starts_with("DELETE")));
+    assert_eq!(select(&session.conn, "SELECT name FROM customers WHERE id = 1"), vec![vec![Value::text("old")]]);
+}
+
+#[tokio::test]
+async fn failed_import_drops_the_table_it_created() {
+    let exists = |session: &SqliteSession| !select(&session.conn, "SELECT name FROM sqlite_master WHERE name = 'fresh'").is_empty();
+    let mut m = customer_mapping(ImportMode::Append);
+    m.target = ObjectRef::table(None, "fresh");
+    m.create_table = true;
+    m.batch_size = 1;
+    let data: &[u8] = b"id,name,age,joined\n1,Ann,1,\n2,Bob,x,\n";
+    // Nothing written: the table is dropped again (so the import can simply be run again).
+    let mut session = SqliteSession::memory(sqlite_dialect());
+    let mut src = csv(b"id,name,age,joined\n1,Ann,x,\n", CsvReadOptions::default());
+    let err = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(err.message.contains("Row 1, column age"), "{}", err.full_text());
+    assert!(!exists(&session));
+    // One transaction: the rows written before the failure are rolled back, the table dropped.
+    m.transaction = TransactionScope::Whole;
+    let mut src = csv(data, CsvReadOptions::default());
+    run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(!exists(&session));
+    // Committed batches stay, and so does the table holding them.
+    m.transaction = TransactionScope::PerBatch;
+    let mut src = csv(data, CsvReadOptions::default());
+    run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(exists(&session));
+    assert_eq!(select(&session.conn, "SELECT name FROM fresh"), vec![vec![Value::text("Ann")]]);
+    // An invalid key is reported before the table is created.
+    let mut session = SqliteSession::memory(sqlite_dialect());
+    m.mode = ImportMode::Replace;
+    m.key_columns = vec!["nope".into()];
+    let mut src = csv(data, CsvReadOptions::default());
+    let err = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(err.message.contains("Key column 'nope'"), "{}", err.message);
+    assert!(!exists(&session));
 }
 
 trait InTxn {

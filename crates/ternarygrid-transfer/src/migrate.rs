@@ -28,7 +28,8 @@ pub enum MigrationMode {
     /// Add rows to the target table (created when missing and `create_tables` is set).
     #[default]
     Append,
-    /// Empty the target table first.
+    /// Empty the target table first (undone on failure only with
+    /// [`MigrationJob::transaction_per_table`]).
     Truncate,
     /// Insert or replace rows by primary key.
     Replace,
@@ -67,13 +68,14 @@ pub struct MigrationJob {
     pub tables: Vec<ObjectRef>,
     /// Schema of the target tables; `None` uses the target session's current schema.
     pub target_schema: Option<String>,
-    /// Target table name by source table name.
+    /// Target table name by source table name: `schema.table` (tables of the
+    /// same name in two schemas) or the plain table name.
     pub table_names: BTreeMap<String, String>,
-    /// Target column names: source table name → (source column → target column).
+    /// Target column names: source table name (as in `table_names`) → (source column → target column).
     pub column_names: BTreeMap<String, BTreeMap<String, String>>,
     /// Case conversion for names without an explicit mapping.
     pub name_case: NameCase,
-    /// Explicit target types by `table.column` (source names).
+    /// Explicit target types by `schema.table.column` or `table.column` (source names).
     pub column_types: BTreeMap<String, String>,
     /// Create target tables that do not exist.
     pub create_tables: bool,
@@ -166,29 +168,45 @@ struct Plan {
     indexes: Vec<IndexDef>,
 }
 
+/// The entry of `map` for a source table: by `schema.table` first, then by the plain name.
+fn by_table<'a, T>(map: &'a BTreeMap<String, T>, schema: Option<&str>, table: &str) -> Option<&'a T> {
+    schema.filter(|s| !s.is_empty()).and_then(|s| map.get(&format!("{s}.{table}"))).or_else(|| map.get(table))
+}
+
 impl MigrationJob {
-    fn table_name(&self, source: &str) -> String {
-        self.table_names.get(source).cloned().unwrap_or_else(|| self.name_case.apply(source))
+    fn table_name(&self, schema: Option<&str>, source: &str) -> String {
+        by_table(&self.table_names, schema, source).cloned().unwrap_or_else(|| self.name_case.apply(source))
     }
 
-    fn column_name(&self, table: &str, column: &str) -> String {
-        self.column_names.get(table).and_then(|m| m.get(column)).cloned().unwrap_or_else(|| self.name_case.apply(column))
+    fn column_name(&self, schema: Option<&str>, table: &str, column: &str) -> String {
+        by_table(&self.column_names, schema, table).and_then(|m| m.get(column)).cloned().unwrap_or_else(|| self.name_case.apply(column))
     }
 
-    fn map_columns(&self, table: &str, cols: &[String]) -> Vec<String> {
-        cols.iter().map(|c| self.column_name(table, c)).collect()
+    /// Explicit target type of a source column.
+    fn column_type(&self, schema: Option<&str>, table: &str, column: &str) -> Option<&String> {
+        by_table(&self.column_types, schema, &format!("{table}.{column}"))
+    }
+
+    fn map_columns(&self, schema: Option<&str>, table: &str, cols: &[String]) -> Vec<String> {
+        cols.iter().map(|c| self.column_name(schema, table, c)).collect()
     }
 }
 
 /// Map a source definition into the target dialect.
 fn plan_table(job: &MigrationJob, source: &ObjectRef, def: TableDef, src_kind: DbKind, dst: &dyn Dialect, warnings: &mut Vec<String>) -> Plan {
     let same = src_kind == dst.kind() && src_kind != DbKind::Generic;
-    let tname = job.table_name(&def.name);
+    let schema = source.schema.as_deref();
+    let tname = job.table_name(schema, &def.name);
     let mut t = TableDef::new(job.target_schema.clone(), tname.clone());
     let mut copy = Vec::new();
+    // Target names of the columns given an explicit type.
+    let mut explicit_types: Vec<String> = Vec::new();
     for c in &def.columns {
-        let name = job.column_name(&def.name, &c.name);
-        let explicit = job.column_types.get(&format!("{}.{}", def.name, c.name)).cloned();
+        let name = job.column_name(schema, &def.name, &c.name);
+        let explicit = job.column_type(schema, &def.name, &c.name).cloned();
+        if explicit.is_some() {
+            explicit_types.push(name.clone());
+        }
         let data_type = explicit.unwrap_or_else(|| if same { c.data_type.clone() } else { dst.ddl().map_type(src_kind, &c.data_type, c.kind) });
         let mut col = c.clone();
         col.name = name.clone();
@@ -210,7 +228,7 @@ fn plan_table(job: &MigrationJob, source: &ObjectRef, def: TableDef, src_kind: D
         }
         t.columns.push(col);
     }
-    let key = |k: &KeyDef| KeyDef { name: if same { k.name.clone() } else { None }, columns: job.map_columns(&def.name, &k.columns) };
+    let key = |k: &KeyDef| KeyDef { name: if same { k.name.clone() } else { None }, columns: job.map_columns(schema, &def.name, &k.columns) };
     t.primary_key = def.primary_key.as_ref().filter(|k| !k.columns.is_empty()).map(key);
     t.unique_keys = def.unique_keys.iter().map(key).collect();
     if same {
@@ -234,7 +252,7 @@ fn plan_table(job: &MigrationJob, source: &ObjectRef, def: TableDef, src_kind: D
             }
             for c in &mut idx.columns {
                 if !c.is_expression {
-                    c.name = job.column_name(&def.name, &c.name);
+                    c.name = job.column_name(schema, &def.name, &c.name);
                 }
             }
             idx
@@ -251,7 +269,8 @@ fn plan_table(job: &MigrationJob, source: &ObjectRef, def: TableDef, src_kind: D
             .chain(indexes.iter().flat_map(|i| i.columns.iter().filter(|c| !c.is_expression).map(|c| c.name.clone())))
             .collect();
         for col in t.columns.iter_mut().filter(|c| keyed.contains(&c.name)) {
-            let explicit = job.column_types.contains_key(&format!("{}.{}", def.name, col.name));
+            // `col.name` is the target name: the explicit types were recorded by it.
+            let explicit = explicit_types.contains(&col.name);
             if let Some(bounded) = bounded_key_type(dst.kind(), &col.data_type).filter(|_| !explicit) {
                 warnings.push(format!("{}.{}: {} cannot be a key or index column, {bounded} is used", def.name, col.name, col.data_type));
                 col.data_type = bounded.to_string();
@@ -431,7 +450,17 @@ async fn migrate(
                 continue;
             }
             for fk in &plan.source_def.foreign_keys {
-                let Some(parent) = plans.iter().find(|p| p.source_def.name == fk.ref_table && (fk.ref_schema.is_none() || fk.ref_schema == p.source.schema)) else {
+                // Catalogs may spell the referenced table differently from the table itself.
+                let refers = |p: &&Plan, exact: bool| {
+                    let same = |a: &str, b: &str| if exact { a == b } else { a.eq_ignore_ascii_case(b) };
+                    same(&p.source_def.name, &fk.ref_table)
+                        && match (&fk.ref_schema, &p.source.schema) {
+                            (None, _) => true,
+                            (Some(r), Some(s)) => same(r, s),
+                            (Some(_), None) => false,
+                        }
+                };
+                let Some(parent) = plans.iter().find(|p| refers(p, true)).or_else(|| plans.iter().find(|p| refers(p, false))) else {
                     summary.warnings.push(format!("{}: foreign key to {} not copied (table not migrated)", plan.target_ref.display_path(), fk.ref_table));
                     continue;
                 };
@@ -439,10 +468,10 @@ async fn migrate(
                     name: fk.name.clone(),
                     schema: plan.target_ref.schema.clone(),
                     table: plan.target_ref.name.clone(),
-                    columns: job.map_columns(&plan.source_def.name, &fk.columns),
+                    columns: job.map_columns(plan.source.schema.as_deref(), &plan.source_def.name, &fk.columns),
                     ref_schema: parent.target_ref.schema.clone(),
                     ref_table: parent.target_ref.name.clone(),
-                    ref_columns: job.map_columns(&parent.source_def.name, &fk.ref_columns),
+                    ref_columns: job.map_columns(parent.source.schema.as_deref(), &parent.source_def.name, &fk.ref_columns),
                     on_update: fk.on_update,
                     on_delete: fk.on_delete,
                     deferrable: fk.deferrable,
@@ -482,15 +511,23 @@ async fn migrate_table(
     ts: &mut TableMigrationSummary,
 ) -> DbResult<()> {
     let dst_handle = dst.cancel_handle();
-    let src_handle = src.cancel_handle();
     let exists = match job.mode {
         MigrationMode::DropAndCreate => false,
         _ => table_exists(dst, &plan.target_ref).await,
     };
+    if !exists && !job.create_tables && job.mode != MigrationMode::DropAndCreate {
+        return Err(DbError::config(format!("Target table {} does not exist", plan.target_ref.display_path())));
+    }
+    let key_index: Vec<usize> = if job.mode == MigrationMode::Replace && !plan.copy.is_empty() {
+        let key = plan.target.row_key().ok_or_else(|| DbError::config(format!("{} has no primary or unique key for replace mode", plan.target_ref.display_path())))?;
+        key.columns
+            .iter()
+            .map(|k| plan.copy.iter().position(|(_, t, _)| t == k).ok_or_else(|| DbError::config(format!("Key column {k} is not copied"))))
+            .collect::<DbResult<_>>()?
+    } else {
+        Vec::new()
+    };
     if !exists {
-        if !job.create_tables && job.mode != MigrationMode::DropAndCreate {
-            return Err(DbError::config(format!("Target table {} does not exist", plan.target_ref.display_path())));
-        }
         let mut def = plan.target.clone();
         def.indexes.clear();
         def.foreign_keys.clear();
@@ -502,15 +539,34 @@ async fn migrate_table(
     if plan.copy.is_empty() {
         return Ok(());
     }
-    let key_index: Vec<usize> = if job.mode == MigrationMode::Replace {
-        let key = plan.target.row_key().ok_or_else(|| DbError::config(format!("{} has no primary or unique key for replace mode", plan.target_ref.display_path())))?;
-        key.columns
-            .iter()
-            .map(|k| plan.copy.iter().position(|(_, t, _)| t == k).ok_or_else(|| DbError::config(format!("Key column {k} is not copied"))))
-            .collect::<DbResult<_>>()?
-    } else {
-        Vec::new()
-    };
+    let mut persisted = 0u64;
+    let copied = copy_rows(job, plan, src, dst, dst_dialect, src_dialect, key_index, progress, cancel, ts, &mut persisted).await;
+    // A table this migration created (not one replacing a dropped table) that
+    // received no row is dropped again: the target is left as it was found.
+    if copied.is_err() && ts.created && job.mode != MigrationMode::DropAndCreate && persisted == 0 && crate::writer::drop_created_table(dst, &plan.target_ref).await {
+        ts.created = false;
+        progress.info(Some(&plan.target_ref.display_path()), "The table created by the failed migration was dropped");
+    }
+    copied
+}
+
+/// Stream the rows of `plan` from `src` into the (existing) target table.
+/// `persisted` receives the number of rows committed in the target.
+#[allow(clippy::too_many_arguments)]
+async fn copy_rows(
+    job: &MigrationJob,
+    plan: &Plan,
+    src: &mut dyn Session,
+    dst: &mut dyn Session,
+    dst_dialect: &Arc<dyn Dialect>,
+    src_dialect: &Arc<dyn Dialect>,
+    key_index: Vec<usize>,
+    progress: &Progress,
+    cancel: &CancellationToken,
+    ts: &mut TableMigrationSummary,
+    persisted: &mut u64,
+) -> DbResult<()> {
+    let src_handle = src.cancel_handle();
     let target = TableTarget {
         table_sql: dst_dialect.qualified_ref(&plan.target_ref),
         columns: plan.copy.iter().map(|(_, t, _)| dst_dialect.quote_ident(t)).collect(),
@@ -536,96 +592,107 @@ async fn migrate_table(
     }
     let utc = ConvertOptions { default_offset_minutes: Some(0), ..ConvertOptions::default() };
     let in_utc: Vec<bool> = timestamps.iter().map(|t| *t && read_utc).collect();
-    let cursor = cancellable(src.execute(&sql, &[], &ternarygrid_core::ExecOptions::default()), cancel, src_handle.clone()).await?;
-    let mut rows = cancellable(CursorSource::new(cursor), cancel, src_handle.clone()).await?;
-    let name = plan.target_ref.display_path();
-    // The source's ids are copied into the target's identity / serial columns.
-    let identity: Vec<String> = plan.copy.iter().filter(|(_, t, _)| plan.target.columns.iter().any(|c| &c.name == t && c.auto_increment)).map(|(_, t, _)| t.clone()).collect();
-    let table_sql = dst_dialect.qualified_ref(&plan.target_ref);
-    let mut writer = BatchWriter::new(dst, target, scope, job.on_error, job.batch_size.min(500), name.clone());
-    writer.begin().await?;
-    let outcome = async {
-        if job.mode == MigrationMode::Truncate {
-            writer.clear_table(&plan.target_ref).await?;
+    let copied = async {
+        let cursor = cancellable(src.execute(&sql, &[], &ternarygrid_core::ExecOptions::default()), cancel, src_handle.clone()).await?;
+        let mut rows = cancellable(CursorSource::new(cursor), cancel, src_handle.clone()).await?;
+        let name = plan.target_ref.display_path();
+        // The source's ids are copied into the target's identity / serial columns.
+        let identity: Vec<String> = plan.copy.iter().filter(|(_, t, _)| plan.target.columns.iter().any(|c| &c.name == t && c.auto_increment)).map(|(_, t, _)| t.clone()).collect();
+        let table_sql = dst_dialect.qualified_ref(&plan.target_ref);
+        let mut writer = BatchWriter::new(dst, target, scope, job.on_error, job.batch_size.min(500), name.clone());
+        if let Err(e) = writer.begin().await {
+            let _ = rows.close().await;
+            return Err(e);
         }
-        let mut row_no = 0u64;
-        loop {
-            let batch = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(DbError::cancelled()),
-                b = rows.next_batch(job.batch_size.max(1)) => b?,
-            };
-            if batch.is_empty() {
-                break;
+        let outcome = async {
+            if job.mode == MigrationMode::Truncate {
+                writer.clear_table(&plan.target_ref).await?;
             }
-            let n = batch.len() as u64;
-            ts.rows_read += n;
-            let mut converted = Vec::with_capacity(batch.len());
-            for row in batch {
-                row_no += 1;
-                let out: ternarygrid_core::Row = kinds
-                    .iter()
-                    .enumerate()
-                    .map(|(i, kind)| {
-                        let v = row.get(i).unwrap_or(&crate::sink::NULL_VALUE);
-                        // Values that do not convert are passed on unchanged; the database decides.
-                        convert_value(v, *kind, if in_utc[i] { &utc } else { &convert }).unwrap_or_else(|_| v.clone())
-                    })
-                    .collect();
-                converted.push((row_no, out));
+            let mut row_no = 0u64;
+            loop {
+                let batch = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(DbError::cancelled()),
+                    b = rows.next_batch(job.batch_size.max(1)) => b?,
+                };
+                if batch.is_empty() {
+                    break;
+                }
+                let n = batch.len() as u64;
+                ts.rows_read += n;
+                let mut converted = Vec::with_capacity(batch.len());
+                for row in batch {
+                    row_no += 1;
+                    let out: ternarygrid_core::Row = kinds
+                        .iter()
+                        .enumerate()
+                        .map(|(i, kind)| {
+                            let v = row.get(i).unwrap_or(&crate::sink::NULL_VALUE);
+                            // Values that do not convert are passed on unchanged; the database decides.
+                            convert_value(v, *kind, if in_utc[i] { &utc } else { &convert }).unwrap_or_else(|_| v.clone())
+                        })
+                        .collect();
+                    converted.push((row_no, out));
+                }
+                writer.write(converted, progress).await?;
+                writer.end_batch().await?;
+                progress.add_rows(n);
             }
-            writer.write(converted, progress).await?;
-            writer.end_batch().await?;
-            progress.add_rows(n);
+            Ok(())
         }
+        .await;
+        let _ = rows.close().await;
+        match outcome {
+            Ok(()) => {
+                let finished = writer.finish().await;
+                *persisted = writer.committed_rows();
+                finished?;
+                // The sequence continues after the copied ids (else the next insert collides).
+                if dst_dialect.kind() == DbKind::Postgres {
+                    for col in &identity {
+                        let sql = format!(
+                            "SELECT setval(pg_get_serial_sequence({}, {}), MAX({})) FROM {table_sql}",
+                            dst_dialect.string_literal(&table_sql),
+                            dst_dialect.string_literal(col),
+                            dst_dialect.quote_ident(col)
+                        );
+                        if let Err(e) = writer.execute(&sql).await {
+                            writer.errors.push(RowError { row: 0, column: Some(col.clone()), message: format!("Cannot advance the sequence: {}", e.message) });
+                        }
+                    }
+                }
+                // Oracle: the identity restarts after the largest value in the column.
+                if dst_dialect.kind() == DbKind::Oracle {
+                    for col in &identity {
+                        let sql = format!("ALTER TABLE {table_sql} MODIFY ({} GENERATED BY DEFAULT ON NULL AS IDENTITY (START WITH LIMIT VALUE))", dst_dialect.quote_ident(col));
+                        if let Err(e) = writer.execute(&sql).await {
+                            writer.errors.push(RowError { row: 0, column: Some(col.clone()), message: format!("Cannot advance the identity: {}", e.message) });
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                writer.abort().await;
+                *persisted = writer.committed_rows();
+                if e.kind == ErrorKind::Cancelled
+                    && let Some(h) = &src_handle
+                {
+                    let _ = h.cancel().await;
+                }
+                return Err(e);
+            }
+        }
+        ts.rows_written = writer.written;
+        ts.rows_failed = writer.failed;
+        ts.errors = std::mem::take(&mut writer.errors);
         Ok(())
     }
     .await;
-    let _ = rows.close().await;
+    // The source session is shared by the following tables: restored on every path.
     if read_utc {
         let _ = execute_update(src, "SET time_zone = @ternarygrid_time_zone", &[]).await;
     }
-    match outcome {
-        Ok(()) => {
-            writer.finish().await?;
-            // The sequence continues after the copied ids (else the next insert collides).
-            if dst_dialect.kind() == DbKind::Postgres {
-                for col in &identity {
-                    let sql = format!(
-                        "SELECT setval(pg_get_serial_sequence({}, {}), MAX({})) FROM {table_sql}",
-                        dst_dialect.string_literal(&table_sql),
-                        dst_dialect.string_literal(col),
-                        dst_dialect.quote_ident(col)
-                    );
-                    if let Err(e) = writer.execute(&sql).await {
-                        writer.errors.push(RowError { row: 0, column: Some(col.clone()), message: format!("Cannot advance the sequence: {}", e.message) });
-                    }
-                }
-            }
-            // Oracle: the identity restarts after the largest value in the column.
-            if dst_dialect.kind() == DbKind::Oracle {
-                for col in &identity {
-                    let sql = format!("ALTER TABLE {table_sql} MODIFY ({} GENERATED BY DEFAULT ON NULL AS IDENTITY (START WITH LIMIT VALUE))", dst_dialect.quote_ident(col));
-                    if let Err(e) = writer.execute(&sql).await {
-                        writer.errors.push(RowError { row: 0, column: Some(col.clone()), message: format!("Cannot advance the identity: {}", e.message) });
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            writer.abort().await;
-            if e.kind == ErrorKind::Cancelled
-                && let Some(h) = &src_handle
-            {
-                let _ = h.cancel().await;
-            }
-            return Err(e);
-        }
-    }
-    ts.rows_written = writer.written;
-    ts.rows_failed = writer.failed;
-    ts.errors = std::mem::take(&mut writer.errors);
-    Ok(())
+    copied
 }
 
 #[cfg(test)]
@@ -662,5 +729,64 @@ mod tests {
         assert_eq!(plan.copy.len(), 3);
         assert_eq!(plan.indexes.len(), 1);
         assert_eq!(plan.indexes[0].columns[0].name, "name");
+    }
+
+    /// Tables of the same name in two schemas keep their own target names,
+    /// columns and types (keys `schema.table`), and plain names still work.
+    #[test]
+    fn same_table_names_in_two_schemas() {
+        let def = |schema: &str| {
+            let mut d = TableDef::new(Some(schema.into()), "t");
+            d.columns.push(ColumnDef::new("c", "integer"));
+            d.primary_key = Some(KeyDef { name: None, columns: vec!["c".into()] });
+            d
+        };
+        let mut job = MigrationJob::default();
+        job.table_names.insert("a.t".into(), "t_a".into());
+        job.table_names.insert("b.t".into(), "t_b".into());
+        job.column_names.insert("a.t".into(), BTreeMap::from([("c".to_string(), "ca".to_string())]));
+        job.column_names.insert("b.t".into(), BTreeMap::from([("c".to_string(), "cb".to_string())]));
+        job.column_types.insert("a.t.c".into(), "bigint".into());
+        job.column_types.insert("b.t.c".into(), "smallint".into());
+        let plan =
+            |schema: &str, job: &MigrationJob| plan_table(job, &ObjectRef::table(Some(schema.into()), "t"), def(schema), DbKind::Postgres, &GenericDialect::new(), &mut Vec::new());
+        let a = plan("a", &job);
+        let b = plan("b", &job);
+        assert_eq!((a.target.name.as_str(), a.target.columns[0].name.as_str(), a.target.columns[0].data_type.as_str()), ("t_a", "ca", "bigint"));
+        assert_eq!((b.target.name.as_str(), b.target.columns[0].name.as_str(), b.target.columns[0].data_type.as_str()), ("t_b", "cb", "smallint"));
+        assert_eq!(a.target.primary_key.unwrap().columns, vec!["ca".to_string()]);
+        // Saved tasks of earlier versions: plain table names.
+        let job = MigrationJob { table_names: BTreeMap::from([("t".to_string(), "plain".to_string())]), ..Default::default() };
+        assert_eq!(plan("a", &job).target.name, "plain");
+    }
+
+    /// A renamed key column with an explicit type keeps that type: only key
+    /// columns without one get a bounded type (MySQL cannot index `longtext`).
+    #[test]
+    fn explicit_types_of_renamed_key_columns_are_kept() {
+        struct MySqlLike(GenericDialect);
+        impl Dialect for MySqlLike {
+            fn kind(&self) -> DbKind {
+                DbKind::MySql
+            }
+            fn syntax(&self) -> &ternarygrid_core::SqlSyntax {
+                self.0.syntax()
+            }
+            fn ddl(&self) -> &dyn ternarygrid_core::ddl::DdlGenerator {
+                self.0.ddl()
+            }
+        }
+        let mut d = TableDef::new(None, "t");
+        d.columns.push(ColumnDef::new("k", "text"));
+        d.columns.push(ColumnDef::new("j", "text"));
+        d.primary_key = Some(KeyDef { name: None, columns: vec!["k".into(), "j".into()] });
+        let mut job = MigrationJob::default();
+        job.column_names.insert("t".into(), BTreeMap::from([("k".to_string(), "key".to_string())]));
+        job.column_types.insert("t.k".into(), "longtext".into());
+        let mut warnings = Vec::new();
+        let plan = plan_table(&job, &ObjectRef::table(None, "t"), d, DbKind::Postgres, &MySqlLike(GenericDialect::new()), &mut warnings);
+        assert_eq!(plan.target.columns[0].name, "key");
+        assert_eq!(plan.target.columns[0].data_type, "longtext", "the explicit type is kept");
+        assert_eq!(plan.target.columns[1].data_type, "varchar(255)", "{warnings:?}");
     }
 }
