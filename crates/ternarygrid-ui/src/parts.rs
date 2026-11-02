@@ -97,7 +97,7 @@ impl<'a> Dialog<'a> {
                 if let Some(icon) = self.icon {
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
                     ui.painter().rect_filled(r, CornerRadius::same(RADIUS_LG), p.accent_soft);
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, icon, style::icon_font(16.5), p.accent_text);
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, icon, style::icon_font(19.0), p.accent_text);
                 }
                 match self.subtitle {
                     // Title over subtitle; a lone title stays centred on the row.
@@ -113,7 +113,7 @@ impl<'a> Dialog<'a> {
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if kit::icon_button_sized(ui, egui_phosphor::regular::X, crate_close_label(), false, 28.0, 12.0).clicked() {
+                    if kit::icon_button_sized(ui, egui_phosphor::regular::X, crate_close_label(), false, 28.0, 14.0).clicked() {
                         close = true;
                     }
                 });
@@ -136,8 +136,10 @@ impl<'a> Dialog<'a> {
             ui.painter().rect_filled(rect.shrink(1.0), r, p.chrome);
             ui.painter().hline(rect.x_range(), top + 0.5, Stroke::new(1.0, p.border));
             Frame::new().inner_margin(Margin { left: 20, right: 16, top: 12, bottom: 12 }).show(ui, |ui| {
-                ui.set_min_height(30.0);
-                ui.horizontal(|ui| {
+                // The row is the buttons' height from its first widget on, so a leading label or
+                // check box sits centred on them.
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), style::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_height(style::CONTROL_H);
                     ui.spacing_mut().item_spacing.x = 8.0;
                     footer(ui);
                 });
@@ -348,7 +350,7 @@ fn callout_dyn(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: &m
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(RichText::new(tone.icon()).font(style::icon_font(14.0)).color(color));
+                ui.label(RichText::new(tone.icon()).font(style::icon_font(16.0)).color(color));
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     if let Some(t) = title {
@@ -496,14 +498,20 @@ pub fn switch(ui: &mut Ui, on: &mut bool, label: &str, sub: Option<&str>) -> Res
 
 /// A thin progress bar `width` wide (`f32::INFINITY`: the rest of the row).
 pub fn progress(ui: &mut Ui, fraction: f32, width: f32) -> Response {
+    progress_h(ui, fraction, width, 6.0)
+}
+
+/// [`progress`] `height` points high (the design's update progress: 8).
+pub fn progress_h(ui: &mut Ui, fraction: f32, width: f32, height: f32) -> Response {
     let p = style::pal(ui);
     let w = if width.is_finite() { width } else { ui.available_width() };
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 6.0), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(3), p.subtle);
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, height), Sense::hover());
+    let radius = CornerRadius::same((height / 2.0).round() as u8);
+    ui.painter().rect_filled(rect, radius, p.subtle);
     let f = fraction.clamp(0.0, 1.0);
     if f > 0.0 {
-        let r = Rect::from_min_size(rect.min, vec2((rect.width() * f).max(6.0), rect.height()));
-        ui.painter().rect_filled(r, CornerRadius::same(3), p.accent);
+        let r = Rect::from_min_size(rect.min, vec2((rect.width() * f).max(height), rect.height()));
+        ui.painter().rect_filled(r, radius, p.accent);
     }
     resp
 }
@@ -547,9 +555,10 @@ pub fn group<R>(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, add: impl F
 
 fn group_dyn(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, add: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
-    kit::card(ui).corner_radius(CornerRadius::same(RADIUS_LG)).inner_margin(Margin::symmetric(20, 16)).show(ui, |ui| {
+    // The design's settings groups: 18 × 20 points of padding, 14 between rows.
+    kit::card(ui).inner_margin(Margin::symmetric(20, 18)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = 12.0;
+        ui.spacing_mut().item_spacing.y = 14.0;
         if title.is_some() || sub.is_some() {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
@@ -591,20 +600,29 @@ pub fn stat_tile(ui: &mut Ui, label: &str, value: &str, sub: Option<&str>) -> Re
         .response
 }
 
-/// A form row with a label column of `label_w`: the label (muted), then `add`.
+/// A form row as in the design: a label column of `label_w` (the design's dialogs use 150, its
+/// settings 168) with the label muted and top-aligned 6 points down, 16 points, then `add`
+/// (laid out in a row, centred on its tallest control); the row is as tall as its controls.
 pub fn form_row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.horizontal(|ui| {
+    let mut add = Some(add);
+    let mut out = None;
+    form_row_dyn(ui, label, label_w, &mut |ui| out = add.take().map(|a| a(ui)));
+    out.expect("a form row's control runs once")
+}
+
+fn form_row_dyn(ui: &mut Ui, label: &str, label_w: f32, add: &mut dyn FnMut(&mut Ui)) {
+    ui.horizontal_top(|ui| {
         form_label(ui, label, label_w);
-        add(ui)
-    })
-    .inner
+        ui.add_space((16.0 - ui.spacing().item_spacing.x).max(0.0));
+        ui.horizontal(|ui| add(ui));
+    });
 }
 
 fn form_label(ui: &mut Ui, label: &str, label_w: f32) {
     let p = style::pal(ui);
-    let h = ui.spacing().interact_size.y.max(style::CONTROL_H);
-    ui.allocate_ui_with_layout(vec2(label_w, h), Layout::left_to_right(Align::Center), |ui| {
+    ui.allocate_ui_with_layout(vec2(label_w, 0.0), Layout::top_down(Align::Min), |ui| {
         ui.set_min_width(label_w);
+        ui.add_space(6.0);
         ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
     });
 }
@@ -651,7 +669,7 @@ fn page_header_dyn(ui: &mut Ui, icon: &str, place: &[&str], title: &str, facts: 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.set_min_height(28.0);
-            ui.label(RichText::new(icon).font(style::icon_font(15.5)).color(p.text_muted));
+            ui.label(RichText::new(icon).font(style::icon_font(18.0)).color(p.text_muted));
             for part in place {
                 ui.label(RichText::new(*part).size(13.0).color(p.text_muted));
                 ui.label(RichText::new("›").size(13.0).color(p.text_faint));

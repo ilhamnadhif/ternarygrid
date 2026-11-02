@@ -84,7 +84,7 @@ fn collect_project(cx: &AppContext, state: &mut PaletteState) -> Vec<Item> {
         .clone();
     let mut items = Vec::new();
     for (name, path) in &data.0 {
-        items.push(Item { icon: icon::FILE_SQL, label: name.clone(), detail: tr("Script").to_string(), target: Target::Script(path.clone()) });
+        items.push(Item { icon: icon::FILE_CODE, label: name.clone(), detail: tr("Script").to_string(), target: Target::Script(path.clone()) });
     }
     for b in &data.1 {
         items.push(Item {
@@ -101,7 +101,7 @@ fn collect(cx: &AppContext) -> Vec<Item> {
     let mut items = vec![
         Item { icon: icon::PLUS, label: tr("New connection").into(), detail: String::new(), target: Target::Command(|| AppCommand::NewConnection { kind: None, folder: None }) },
         Item {
-            icon: icon::FILE_SQL,
+            icon: icon::FILE_CODE,
             label: tr("New SQL editor").into(),
             detail: String::new(),
             target: Target::Command(|| AppCommand::NewSqlEditor { connection: None, schema: None, text: None }),
@@ -143,7 +143,7 @@ fn collect(cx: &AppContext) -> Vec<Item> {
         if !connected {
             items.push(Item { icon: icon::PLUGS_CONNECTED, label: format!("{} {}", tr("Connect:"), c.name), detail: c.summary(), target: Target::Connect(c.id.clone()) });
         }
-        items.push(Item { icon: icon::FILE_SQL, label: format!("{} {}", tr("SQL editor:"), c.name), detail: c.summary(), target: Target::Editor(c.id.clone()) });
+        items.push(Item { icon: icon::FILE_CODE, label: format!("{} {}", tr("SQL editor:"), c.name), detail: c.summary(), target: Target::Editor(c.id.clone()) });
     }
     for id in cx.conns.live_ids() {
         let Some(live) = cx.conns.live(&id) else { continue };
@@ -183,7 +183,7 @@ fn row(ui: &mut egui::Ui, it: &Item, selected: bool) -> egui::Response {
     let icon_color = if selected { p.accent_text } else { ternarygrid_icons::color(it.icon).unwrap_or(p.text_muted) };
     // As in the design: the icon 12 points in, the label 12 after it (13.5), the detail at the
     // right in small faint text.
-    ui.painter().text(rect.left_center() + egui::vec2(19.5, 0.0), egui::Align2::CENTER_CENTER, it.icon, ternarygrid_ui::style::icon_font(13.0), icon_color);
+    ui.painter().text(rect.left_center() + egui::vec2(19.5, 0.0), egui::Align2::CENTER_CENTER, it.icon, ternarygrid_ui::style::icon_font(15.0), icon_color);
     let fit = |text: RichText, width: f32, style: egui::TextStyle| egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), width, style);
     let detail = (!it.detail.is_empty()).then(|| fit(RichText::new(&it.detail).size(12.0).color(weak), rect.width() * 0.45, egui::TextStyle::Small));
     let detail_w = detail.as_ref().map_or(0.0, |g| g.size().x + 16.0);
@@ -242,7 +242,7 @@ pub fn show(ctx: &egui::Context, cx: &mut AppContext, open: &mut bool) {
                     .desired_width(f32::INFINITY),
             );
             let glass = egui::pos2(r.rect.left() + 24.5, r.rect.center().y);
-            ui.painter().text(glass, egui::Align2::CENTER_CENTER, icon::MAGNIFYING_GLASS, ternarygrid_ui::style::icon_font(14.5), p.text_faint);
+            ui.painter().text(glass, egui::Align2::CENTER_CENTER, icon::MAGNIFYING_GLASS, ternarygrid_ui::style::icon_font(17.0), p.text_faint);
             if !state.focus_requested {
                 r.request_focus();
                 state.focus_requested = true;

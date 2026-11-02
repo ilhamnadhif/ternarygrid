@@ -69,7 +69,7 @@ fn button_impl(ui: &mut Ui, kind: Kind, icon: Option<&str>, text: &str, keys: Op
     let galley = (!text.is_empty()).then(|| ui.painter().layout_no_wrap(text.to_string(), style::medium(ui.ctx(), size), Color32::PLACEHOLDER));
     // A lone icon is muted until hovered (an icon button); beside a text it takes the text's colour.
     let icon_color = if galley.is_none() && matches!(kind, Kind::Secondary | Kind::Ghost) && !on { p.text_muted } else { text_color };
-    let icon_galley = icon.map(|i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size - 1.0), Color32::PLACEHOLDER));
+    let icon_galley = icon.map(|i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size + 1.0), Color32::PLACEHOLDER));
     let keys_galley = keys.map(|k| ui.painter().layout_no_wrap(k.to_string(), FontId::proportional(size - 2.0), Color32::PLACEHOLDER));
     let gap = 6.0;
     let parts = [galley.as_ref().map(|g| g.size().x), icon_galley.as_ref().map(|g| g.size().x), keys_galley.as_ref().map(|g| g.size().x)];
@@ -107,16 +107,8 @@ fn button_impl(ui: &mut Ui, kind: Kind, icon: Option<&str>, text: &str, keys: Op
             painter.rect_stroke(rect.expand(2.0), CornerRadius::same(RADIUS + 2), Stroke::new(1.5, p.accent), StrokeKind::Outside);
         }
         let mut x = rect.center().x - content_w / 2.0;
-        // Disabled: the faint text colour (filled buttons fade).
-        let fade = |c: Color32| {
-            if enabled {
-                c
-            } else if matches!(kind, Kind::Primary | Kind::DangerFilled) {
-                c.gamma_multiply(0.45)
-            } else {
-                p.text_faint
-            }
-        };
+        // Disabled, as in the design: the fill stays, the text and the icon turn faint.
+        let fade = |c: Color32| if enabled { c } else { p.text_faint };
         if let Some(g) = icon_galley {
             let pos = egui::pos2(x, rect.center().y - g.size().y / 2.0);
             x += g.size().x + gap;
@@ -143,7 +135,7 @@ pub fn button_width(ui: &Ui, icon: Option<&str>, text: &str, small: bool) -> f32
         return height;
     }
     let text_w = ui.painter().layout_no_wrap(text.to_string(), style::medium(ui.ctx(), size), Color32::PLACEHOLDER).size().x;
-    let icon_w = icon.map_or(0.0, |i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size - 1.0), Color32::PLACEHOLDER).size().x + 6.0);
+    let icon_w = icon.map_or(0.0, |i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size + 1.0), Color32::PLACEHOLDER).size().x + 6.0);
     (text_w + icon_w + pad * 2.0).max(height)
 }
 
@@ -180,7 +172,7 @@ pub fn icon_toggle(ui: &mut Ui, icon: &str, tooltip: &str, on: bool) -> Response
 /// [`icon_button`] `side` points square (the design's are 20, 26, 28, 30 and 34) with an icon
 /// that suits it.
 pub fn icon_button_ex(ui: &mut Ui, icon: &str, tooltip: &str, on: bool, side: f32) -> Response {
-    icon_button_sized(ui, icon, tooltip, on, side, (side * 0.47).round().max(10.0))
+    icon_button_sized(ui, icon, tooltip, on, side, (side * 0.54).round().max(11.0))
 }
 
 /// [`icon_button_ex`] with the icon at `glyph` points.
@@ -249,7 +241,7 @@ pub fn button_group(ui: &mut Ui, segments: &[Segment]) -> Vec<Response> {
         }
         let color = if seg.on || hovered { p.text } else { p.text_muted };
         let color = if enabled { color } else { color.gamma_multiply(0.45) };
-        painter.text(r.center(), Align2::CENTER_CENTER, seg.icon, style::icon_font(13.0), color);
+        painter.text(r.center(), Align2::CENTER_CENTER, seg.icon, style::icon_font(15.0), color);
         if resp.has_focus() {
             painter.rect_stroke(r, radius, Stroke::new(1.5, p.accent), StrokeKind::Inside);
         }
@@ -380,11 +372,11 @@ pub fn radio_value<T: PartialEq>(ui: &mut Ui, current: &mut T, value: T, label: 
     resp
 }
 
-/// A full-width row of a side navigation (settings sections, panels): its icon and name, the
+/// A full-width row of a side navigation (settings sections, panels), 32 points high: its icon and name, the
 /// selected one on a soft accent.
 pub fn nav_item(ui: &mut Ui, icon: &str, text: &str, selected: bool) -> Response {
     let p = style::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
     resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, text));
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
@@ -416,7 +408,7 @@ pub fn underline_tab(ui: &mut Ui, icon: Option<&str>, text: &str, badge: Option<
     let size = style::body_size(ui.ctx());
     let font = if selected && icon.is_none() { style::medium(ui.ctx(), size) } else { FontId::proportional(size) };
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER);
-    let icon_galley = icon.map(|i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size - 1.0), Color32::PLACEHOLDER));
+    let icon_galley = icon.map(|i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size + 1.0), Color32::PLACEHOLDER));
     let badge_galley = badge.map(|b| ui.painter().layout_no_wrap(b.to_string(), style::medium(ui.ctx(), style::SMALL), Color32::PLACEHOLDER));
     let (pad, gap) = (if icon.is_some() { 6.0 } else { 2.0 }, 6.0);
     let badge_w = |g: &std::sync::Arc<egui::Galley>| (g.size().x + 10.0).max(16.0);
@@ -624,7 +616,7 @@ fn empty_state_dyn(ui: &mut Ui, top: f32, icon: &str, title: &str, body: &str, a
         ui.add_space(top);
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
         ui.painter().circle_filled(rect.center(), 26.0, p.subtle);
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, style::icon_font(21.0), p.text_muted);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, style::icon_font(24.0), p.text_muted);
         ui.add_space(12.0);
         semibold_label(ui, title, 15.0, p.text);
         ui.add_space(8.0);
@@ -665,12 +657,12 @@ pub fn field_with_icon(ui: &mut Ui, id: egui::Id, text: &mut String, hint_text: 
     if resp.has_focus() {
         style::focus_halo(ui, r, RADIUS);
     }
-    ui.painter().text(egui::pos2(r.left() + 17.0, r.center().y), Align2::CENTER_CENTER, icon, style::icon_font(12.5), p.text_faint);
+    ui.painter().text(egui::pos2(r.left() + 17.0, r.center().y), Align2::CENTER_CENTER, icon, style::icon_font(14.0), p.text_faint);
     if clear && !text.is_empty() {
         let x_rect = Rect::from_center_size(egui::pos2(r.right() - 15.0, r.center().y), Vec2::splat(18.0));
         let x = ui.interact(x_rect, resp.id.with("clear"), Sense::click());
         let color = if x.hovered() { p.text } else { p.text_faint };
-        ui.painter().text(x_rect.center(), Align2::CENTER_CENTER, egui_phosphor::regular::X_CIRCLE, style::icon_font(13.0), color);
+        ui.painter().text(x_rect.center(), Align2::CENTER_CENTER, egui_phosphor::regular::X_CIRCLE, style::icon_font(15.0), color);
         if x.clicked() {
             text.clear();
         }
@@ -715,10 +707,10 @@ pub fn tree_row(ui: &mut Ui, depth: usize, caret: Option<bool>, glyph: &str, lab
         let cy = inner.center().y;
         if let Some(open) = caret {
             let chevron = if open { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT };
-            painter.text(egui::pos2(x + 6.0, cy), Align2::CENTER_CENTER, chevron, style::icon_font(10.5), p.text_faint);
+            painter.text(egui::pos2(x + 6.0, cy), Align2::CENTER_CENTER, chevron, style::icon_font(12.0), p.text_faint);
         }
         x += 18.0;
-        painter.text(egui::pos2(x + 7.5, cy), Align2::CENTER_CENTER, glyph, style::icon_font(13.0), if selected { p.accent_text } else { p.text_muted });
+        painter.text(egui::pos2(x + 7.5, cy), Align2::CENTER_CENTER, glyph, style::icon_font(15.0), if selected { p.accent_text } else { p.text_muted });
         x += 21.0;
         let size = style::body_size(ui.ctx());
         let mut right_x = inner.right() - 10.0;
@@ -763,8 +755,8 @@ pub fn tree_section(ui: &mut Ui, open: &mut bool, glyph: &str, title: &str) -> R
         let cy = rect.center().y;
         let color = if resp.hovered() { p.text } else { p.text_muted };
         let chevron = if *open { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT };
-        painter.text(egui::pos2(rect.left() + 19.5, cy), Align2::CENTER_CENTER, chevron, style::icon_font(9.5), p.text_faint);
-        painter.text(egui::pos2(rect.left() + 37.5, cy), Align2::CENTER_CENTER, glyph, style::icon_font(11.5), p.text_muted);
+        painter.text(egui::pos2(rect.left() + 19.5, cy), Align2::CENTER_CENTER, chevron, style::icon_font(11.0), p.text_faint);
+        painter.text(egui::pos2(rect.left() + 37.5, cy), Align2::CENTER_CENTER, glyph, style::icon_font(13.0), p.text_muted);
         let g = painter.layout_no_wrap(title.to_string(), style::medium(ui.ctx(), 12.0), color);
         paint_semibold(painter, egui::pos2(rect.left() + 50.0, cy - g.size().y / 2.0), g, color);
         if resp.has_focus() {
@@ -817,7 +809,7 @@ fn menu_item_ex(ui: &mut Ui, icon: Option<&str>, text: &str, keys: &str, danger:
     let size = style::body_size(ui.ctx());
     let (icon_color, text_color) = if danger { (p.err, p.err) } else { (p.text_muted, p.text) };
     let lead =
-        RichText::new(icon.unwrap_or(egui_phosphor::regular::SQUARE)).font(style::icon_font(size - 1.0)).color(if icon.is_some() { icon_color } else { Color32::TRANSPARENT });
+        RichText::new(icon.unwrap_or(egui_phosphor::regular::SQUARE)).font(style::icon_font(size + 1.0)).color(if icon.is_some() { icon_color } else { Color32::TRANSPARENT });
     let mut b = egui::Button::new((lead, RichText::new(text).color(text_color)));
     if !keys.is_empty() {
         b = b.shortcut_text(RichText::new(keys).size(size - 1.5).color(p.text_faint));
@@ -830,7 +822,7 @@ fn menu_item_ex(ui: &mut Ui, icon: Option<&str>, text: &str, keys: &str, danger:
 pub fn menu_check(ui: &mut Ui, on: &mut bool, text: &str) -> Response {
     let p = style::pal(ui);
     let size = style::body_size(ui.ctx());
-    let lead = RichText::new(egui_phosphor::regular::CHECK).font(style::icon_font(size - 1.0)).color(if *on { p.accent_text } else { Color32::TRANSPARENT });
+    let lead = RichText::new(egui_phosphor::regular::CHECK).font(style::icon_font(size + 1.0)).color(if *on { p.accent_text } else { Color32::TRANSPARENT });
     let mut resp = ui.add(egui::Button::new((lead, RichText::new(text).color(p.text))));
     resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, *on, text));
     if resp.clicked() {
@@ -845,8 +837,8 @@ pub fn submenu(ui: &mut Ui, icon: Option<&str>, text: &str, width: f32, add: &mu
     let p = style::pal(ui);
     let size = style::body_size(ui.ctx());
     let lead =
-        RichText::new(icon.unwrap_or(egui_phosphor::regular::SQUARE)).font(style::icon_font(size - 1.0)).color(if icon.is_some() { p.text_muted } else { Color32::TRANSPARENT });
-    let chevron = RichText::new(egui_phosphor::regular::CARET_RIGHT).font(style::icon_font(size - 2.5)).color(p.text_faint);
+        RichText::new(icon.unwrap_or(egui_phosphor::regular::SQUARE)).font(style::icon_font(size + 1.0)).color(if icon.is_some() { p.text_muted } else { Color32::TRANSPARENT });
+    let chevron = RichText::new(egui_phosphor::regular::CARET_RIGHT).font(style::icon_font(size - 1.0)).color(p.text_faint);
     let button = egui::Button::new((lead, RichText::new(text).color(p.text))).right_text(chevron);
     egui::containers::menu::SubMenuButton::from_button(button)
         .ui(ui, |ui| {

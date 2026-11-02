@@ -238,7 +238,7 @@ impl TernaryGridApp {
             let at = egui::Rect::from_min_size(egui::pos2(last + 2.0, bar.top() + 6.0), egui::vec2(26.0, 26.0));
             if last.is_finite() && at.right() <= bar.right() - 8.0 {
                 let mut b = ui.new_child(egui::UiBuilder::new().max_rect(at).id_salt(("tab_bar_new", path.node)));
-                if kit::icon_button_sized(&mut b, icon::PLUS, tr("New SQL editor"), false, 26.0, 12.5).clicked() {
+                if kit::icon_button_sized(&mut b, icon::PLUS, tr("New SQL editor"), false, 26.0, 14.0).clicked() {
                     cx.commands.push(AppCommand::Action(crate::keys::Action::NewSqlEditor));
                 }
             }

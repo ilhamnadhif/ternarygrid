@@ -280,7 +280,7 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         let format = |font: egui::FontId, color: egui::Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
         let mut job = egui::text::LayoutJob::default();
         // egui_dock pads the title by 8 points: 6 more on the left, the rest on the right.
-        job.append(tab.view.icon(), 6.0, format(ternarygrid_ui::style::icon_font(12.5), if open { p.text_muted } else { p.text_faint }));
+        job.append(tab.view.icon(), 6.0, format(ternarygrid_ui::style::icon_font(14.0), if open { p.text_muted } else { p.text_faint }));
         let font = if open { egui::FontId::new(size, egui::FontFamily::Name(ternarygrid_ui::style::MEDIUM.into())) } else { egui::FontId::proportional(size) };
         job.append(&title, 8.0, format(font, egui::Color32::PLACEHOLDER));
         job.append("\u{200b}", if open { TAB_CLOSE_ROOM } else { 4.0 }, format(egui::FontId::proportional(size), egui::Color32::PLACEHOLDER));
@@ -331,7 +331,7 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
             if hover {
                 painter.rect_filled(x, ternarygrid_ui::style::RADIUS, p.hover);
             }
-            painter.text(x.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::X, ternarygrid_ui::style::icon_font(10.5), if hover { p.text } else { p.text_muted });
+            painter.text(x.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::X, ternarygrid_ui::style::icon_font(12.0), if hover { p.text } else { p.text_muted });
             if response.clicked() && response.interact_pointer_pos().is_some_and(|q| x.contains(q)) {
                 self.cx.commands.push(crate::command::AppCommand::CloseTab(tab.id));
             }

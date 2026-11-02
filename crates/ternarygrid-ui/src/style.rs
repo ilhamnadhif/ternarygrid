@@ -171,9 +171,15 @@ pub fn semibold(ctx: &Context, size: f32) -> FontId {
     family_or_proportional(ctx, SEMIBOLD, size)
 }
 
-/// Icons at `size`: the Phosphor font is a fallback of proportional text.
+/// How much smaller a Phosphor glyph is drawn than its nominal size so it matches the design's
+/// icons of that size (Phosphor's glyphs fill more of their box than the design's SVG icons).
+pub const ICON_SCALE: f32 = 0.87;
+
+/// Icons as large as the design's icons of `size` points (14 beside 13-point text, 15 in a
+/// 28-point icon button, 18 on the rail): the Phosphor font, a fallback of proportional text,
+/// at [`ICON_SCALE`] of `size`.
 pub fn icon_font(size: f32) -> FontId {
-    FontId::proportional(size)
+    FontId::proportional(size * ICON_SCALE)
 }
 
 /// Register the [`MEDIUM`] and [`SEMIBOLD`] families with the fonts named
@@ -207,7 +213,8 @@ pub fn form_spacing(ui: &mut Ui) {
     let s = ui.spacing_mut();
     s.interact_size.y = CONTROL_H;
     s.item_spacing = vec2(8.0, 8.0);
-    s.button_padding = vec2(12.0, 5.0);
+    // Select boxes: their text 11 points in (the design's 10 and the hairline).
+    s.button_padding = vec2(11.0, 5.0);
 }
 
 /// Focus of a control drawn by hand: a 1 px accent border and a soft accent

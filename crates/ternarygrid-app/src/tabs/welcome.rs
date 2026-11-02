@@ -115,7 +115,7 @@ fn new_connection_button(ui: &mut Ui) -> egui::Response {
         }
         // The plus, 8 points, the text (13.5, medium), centred.
         let size = ternarygrid_ui::style::body_size(ui.ctx()) + 0.5;
-        let plus = ui.painter().layout_no_wrap(icon::PLUS.to_string(), ternarygrid_ui::style::icon_font(13.0), p.on_accent);
+        let plus = ui.painter().layout_no_wrap(icon::PLUS.to_string(), ternarygrid_ui::style::icon_font(15.0), p.on_accent);
         let g = ui.painter().layout_no_wrap(tr("New connection").to_string(), ternarygrid_ui::style::medium(ui.ctx(), size), p.on_accent);
         let w = plus.size().x + 8.0 + g.size().x;
         let x = rect.center().x - w / 2.0;
@@ -131,7 +131,7 @@ fn app_mark(ui: &mut Ui) {
     let p = ternarygrid_ui::pal(ui);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 14, p.accent);
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon::TABLE, ternarygrid_ui::style::icon_font(28.0), p.on_accent);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon::TABLE, ternarygrid_ui::style::icon_font(30.0), p.on_accent);
 }
 
 /// Draw the start page in `ui` (new connection, recent connections and scripts).

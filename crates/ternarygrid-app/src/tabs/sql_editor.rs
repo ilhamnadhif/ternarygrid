@@ -1201,8 +1201,8 @@ impl SqlEditorTab {
                 ui.spacing_mut().button_padding = egui::vec2(8.0, 0.0);
                 ui.spacing_mut().icon_spacing = 6.0;
                 ui.spacing_mut().interact_size.y = 28.0;
-                let caret = RichText::new(icon::CARET_DOWN).font(ternarygrid_ui::style::icon_font(9.5)).color(p.text_faint);
-                ui.add(egui::Button::new((lead.font(ternarygrid_ui::style::icon_font(12.5)), RichText::new(text).size(13.0).color(p.text), caret)).frame_when_inactive(false))
+                let caret = RichText::new(icon::CARET_DOWN).font(ternarygrid_ui::style::icon_font(11.0)).color(p.text_faint);
+                ui.add(egui::Button::new((lead.font(ternarygrid_ui::style::icon_font(14.0)), RichText::new(text).size(13.0).color(p.text), caret)).frame_when_inactive(false))
                     .on_hover_text(tip)
             })
             .inner
@@ -1334,9 +1334,9 @@ impl SqlEditorTab {
                 let explain = self.can_explain(cx);
                 let (mut new_tab, mut script, mut plan) = (false, false, false);
                 ui.add_enabled_ui(!running, |ui| {
-                    new_tab = kit::icon_button_sized(ui, icon::PLUS, &tip(Action::ExecuteInNewTab), false, 26.0, 12.5).clicked();
-                    script = kit::icon_button_sized(ui, icon::FAST_FORWARD, &tip(Action::ExecuteScript), false, 26.0, 12.5).clicked();
-                    plan = explain && kit::icon_button_sized(ui, icon::TREE_STRUCTURE, &tip(Action::ExplainPlan), false, 26.0, 12.5).clicked();
+                    new_tab = kit::icon_button_sized(ui, icon::PLUS, &tip(Action::ExecuteInNewTab), false, 26.0, 14.0).clicked();
+                    script = kit::icon_button_sized(ui, icon::FAST_FORWARD, &tip(Action::ExecuteScript), false, 26.0, 14.0).clicked();
+                    plan = explain && kit::icon_button_sized(ui, icon::TREE_STRUCTURE, &tip(Action::ExplainPlan), false, 26.0, 14.0).clicked();
                 });
                 if new_tab {
                     self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None });
@@ -1347,10 +1347,10 @@ impl SqlEditorTab {
                 if plan {
                     self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None });
                 }
-                if self.is_sql(cx) && kit::icon_button_sized(ui, icon::TEXT_AA, &tip(Action::FormatSql), false, 26.0, 12.5).clicked() {
+                if self.is_sql(cx) && kit::icon_button_sized(ui, icon::TEXT_AA, &tip(Action::FormatSql), false, 26.0, 14.0).clicked() {
                     self.format(cx);
                 }
-                let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More editor commands"), false, 26.0, 12.5);
+                let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More editor commands"), false, 26.0, 14.0);
                 egui::Popup::menu(&more).gap(4.0).show(|ui| {
                     kit::menu_look(ui, 260.0);
                     for a in [
@@ -1412,13 +1412,13 @@ impl SqlEditorTab {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    if kit::icon_button_sized(ui, icon::LIST_BULLETS, tr("Outline"), self.show_outline, 28.0, 13.0).clicked() {
+                    if kit::icon_button_sized(ui, icon::LIST_BULLETS, tr("Outline"), self.show_outline, 28.0, 15.0).clicked() {
                         self.show_outline = !self.show_outline;
                     }
-                    if kit::icon_button_sized(ui, icon::TERMINAL_WINDOW, tr("Terminal mode: print results as text"), self.terminal, 28.0, 13.0).clicked() {
+                    if kit::icon_button_sized(ui, icon::TERMINAL_WINDOW, tr("Terminal mode: print results as text"), self.terminal, 28.0, 15.0).clicked() {
                         self.terminal = !self.terminal;
                     }
-                    if kit::icon_button_sized(ui, icon::ROWS, &tip(Action::ToggleResultsPanel), self.show_results, 28.0, 13.0).clicked() {
+                    if kit::icon_button_sized(ui, icon::ROWS, &tip(Action::ToggleResultsPanel), self.show_results, 28.0, 15.0).clicked() {
                         self.show_results = !self.show_results;
                     }
                     if running && let Some(e) = &self.exec {
@@ -1514,7 +1514,7 @@ impl SqlEditorTab {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(10.0);
                 let (ic, on) = if self.maximized { (icon::CORNERS_IN, true) } else { (icon::CORNERS_OUT, false) };
-                if kit::icon_button_sized(ui, ic, crate::keys::action_label(Action::MaximizeResults), on, 26.0, 12.5).clicked() {
+                if kit::icon_button_sized(ui, ic, crate::keys::action_label(Action::MaximizeResults), on, 26.0, 14.0).clicked() {
                     self.maximized = !self.maximized;
                 }
             });
@@ -1671,7 +1671,7 @@ impl SqlEditorTab {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 10.0;
-                                    ui.label(RichText::new(icon::PAUSE).font(ternarygrid_ui::style::icon_font(17.0)).color(pal.warn));
+                                    ui.label(RichText::new(icon::PAUSE).font(ternarygrid_ui::style::icon_font(16.0)).color(pal.warn));
                                     ui.label(
                                         RichText::new(trf("{} statements are not committed yet.", &[&log.len()]))
                                             .font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0))

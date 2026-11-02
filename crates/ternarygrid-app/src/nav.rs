@@ -1054,7 +1054,7 @@ impl Navigator {
             ui.set_min_height(34.0);
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.add_space(14.0);
-            ui.label(RichText::new(icon::INFO).font(ternarygrid_ui::style::icon_font(12.0)).color(p.text_muted));
+            ui.label(RichText::new(icon::INFO).font(ternarygrid_ui::style::icon_font(14.0)).color(p.text_muted));
             ternarygrid_ui::kit::semibold_label(ui, tr("Properties"), 12.5, p.text);
         });
         // only a node of the tree (not one removed since it was selected)
@@ -1104,7 +1104,7 @@ impl Navigator {
             ui.spacing_mut().item_spacing.x = 2.0;
             let sel_conn = self.selected.as_ref().and_then(|n| n.connection()).map(str::to_string);
             let connected = sel_conn.as_deref().is_some_and(|c| cx.conns.is_connected(c));
-            let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More"), false, 26.0, 14.0);
+            let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More"), false, 26.0, 15.0);
             egui::Popup::menu(&more).gap(4.0).show(|ui| {
                 kit::menu_look(ui, 200.0);
                 // A new folder inside the selected folder, else at the top level.
@@ -1141,11 +1141,11 @@ impl Navigator {
             });
             // No connections (the empty state): New connection and "⋯" only, as in the design.
             if !cx.conns.configs().is_empty()
-                && ui.add_enabled_ui(connected, |ui| kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 13.0)).inner.clicked()
+                && ui.add_enabled_ui(connected, |ui| kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 15.0)).inner.clicked()
             {
                 self.refresh_selected(cx);
             }
-            if kit::icon_button_sized(ui, icon::PLUS, tr("New connection"), false, 26.0, 13.0).clicked() {
+            if kit::icon_button_sized(ui, icon::PLUS, tr("New connection"), false, 26.0, 15.0).clicked() {
                 cx.push(AppCommand::Action(crate::keys::Action::NewConnection));
             }
         });
@@ -1253,7 +1253,7 @@ impl Navigator {
                 if r.expandable {
                     let arrow = if r.expanded { icon::CARET_DOWN } else { icon::CARET_RIGHT };
                     let arrow_rect = egui::Rect::from_center_size(egui::pos2(x + 6.0, y), egui::vec2(16.0, row_h));
-                    ui.painter().text(arrow_rect.center(), egui::Align2::CENTER_CENTER, arrow, ternarygrid_ui::style::icon_font(10.5), p.text_faint);
+                    ui.painter().text(arrow_rect.center(), egui::Align2::CENTER_CENTER, arrow, ternarygrid_ui::style::icon_font(12.0), p.text_faint);
                     if resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| arrow_rect.contains(q)) {
                         toggled = Some(i);
                     }
@@ -1262,7 +1262,7 @@ impl Navigator {
                 let small = egui::FontId::proportional(12.5);
                 match &r.kind {
                     RowKind::Loading => {
-                        ui.painter().text(egui::pos2(x + 6.5, y), egui::Align2::CENTER_CENTER, icon::HOURGLASS, ternarygrid_ui::style::icon_font(13.0), p.text_faint);
+                        ui.painter().text(egui::pos2(x + 6.5, y), egui::Align2::CENTER_CENTER, icon::CLOCK_COUNTER_CLOCKWISE, ternarygrid_ui::style::icon_font(13.0), p.text_faint);
                         ui.painter().text(egui::pos2(x + 19.0, y), egui::Align2::LEFT_CENTER, tr("Loading…"), small, p.text_faint);
                         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                         continue;
@@ -1297,7 +1297,7 @@ impl Navigator {
                 let logo_rect = egui::Rect::from_center_size(egui::pos2(x + 7.5, y), egui::vec2(15.0, 15.0));
                 let drawn = r.logo.is_some_and(|kind| crate::dblogo::paint(ui, kind, logo_rect, crate::theme::legible_on(icol, row_bg)));
                 if !drawn {
-                    ui.painter().text(egui::pos2(x + 7.5, y), egui::Align2::CENTER_CENTER, r.icon, ternarygrid_ui::style::icon_font(13.0), icol);
+                    ui.painter().text(egui::pos2(x + 7.5, y), egui::Align2::CENTER_CENTER, r.icon, ternarygrid_ui::style::icon_font(15.0), icol);
                 }
                 x += 21.0;
                 // Name and detail cut with "…" at the panel's edge (or the size).

@@ -126,14 +126,14 @@ impl ProjectView {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.add_space(8.0);
-            if kit::icon_button_sized(ui, icon::PLUS, tr("New SQL editor"), false, 26.0, 12.5).clicked() {
+            if kit::icon_button_sized(ui, icon::PLUS, tr("New SQL editor"), false, 26.0, 14.0).clicked() {
                 cx.push(AppCommand::NewSqlEditor { connection: None, schema: None, text: None });
             }
-            if kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 12.5).clicked() {
+            if kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 14.0).clicked() {
                 self.reload(cx);
             }
             if let Some(p) = cx.services.projects.as_ref().and_then(|m| m.default_project().ok())
-                && kit::icon_button_sized(ui, icon::FOLDER_OPEN, tr("Show in Finder"), false, 26.0, 12.5).clicked()
+                && kit::icon_button_sized(ui, icon::FOLDER_OPEN, tr("Show in Finder"), false, 26.0, 14.0).clicked()
             {
                 let _ = open::that(p.path());
             }

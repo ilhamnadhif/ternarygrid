@@ -247,7 +247,8 @@ impl Shots {
         }
         self.h.state_mut().toasts.clear();
         self.h.event(egui::Event::PointerMoved(pointer.unwrap_or(egui::pos2(1439.0, 899.0))));
-        self.frames(8);
+        // A submenu opened by the pointer fades in: let it finish.
+        self.frames(if pointer.is_some() { 30 } else { 8 });
         let out = self.h.output();
         let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
         let size = self.h.ctx.content_rect().size() * ppp();
