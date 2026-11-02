@@ -903,18 +903,9 @@ pub fn body_text_lh(ui: &mut Ui, text: &str, factor: f32) -> Response {
     label_lh(ui, RichText::new(text).color(p.text), egui::FontId::proportional(13.5), factor, false)
 }
 
-/// A wrapping label in `font` whose lines are `factor` times its size apart with the text
-/// in the middle of each line, like CSS `line-height` (egui puts the extra space under it).
+/// A wrapping label on CSS-style line heights ([`kit::label_lh`]).
 pub fn label_lh(ui: &mut Ui, text: RichText, font: egui::FontId, factor: f32, selectable: bool) -> Response {
-    let lh = (font.size * factor * 2.0).floor() / 2.0;
-    let row = ui.fonts_mut(|f| f.row_height(&font));
-    let half = ((lh - row) / 2.0).max(0.0);
-    // Room for the lines; the text drawn half the extra height lower, inside it.
-    let text = egui::WidgetText::from(text.font(font).line_height(Some(lh)));
-    let galley = text.into_galley(ui, Some(egui::TextWrapMode::Wrap), ui.available_width(), egui::TextStyle::Body);
-    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
-    let mut child = ui.new_child(UiBuilder::new().max_rect(rect.translate(vec2(0.0, half))).layout(Layout::top_down(Align::Min)));
-    child.add(egui::Label::new(galley).selectable(selectable))
+    ternarygrid_ui::kit::label_lh(ui, text, font, factor, selectable)
 }
 
 /// Wrapping muted text (explanations).

@@ -576,6 +576,20 @@ pub fn section_title(ui: &Ui, text: &str) -> RichText {
     RichText::new(text).font(style::semibold(ui.ctx(), 13.0))
 }
 
+/// A wrapping label in `font` whose lines are `factor` times its size apart with the text in
+/// the middle of each line, like CSS `line-height` (egui puts the extra space under it).
+pub fn label_lh(ui: &mut Ui, text: RichText, font: FontId, factor: f32, selectable: bool) -> Response {
+    let lh = (font.size * factor * 2.0).floor() / 2.0;
+    let row = ui.fonts_mut(|f| f.row_height(&font));
+    let half = ((lh - row) / 2.0).max(0.0);
+    // Room for the lines; the text drawn half the extra height lower, inside it.
+    let text = egui::WidgetText::from(text.font(font).line_height(Some(lh)));
+    let galley = text.into_galley(ui, Some(egui::TextWrapMode::Wrap), ui.available_width(), egui::TextStyle::Body);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.translate(vec2(0.0, half))).layout(egui::Layout::top_down(egui::Align::Min)));
+    child.add(egui::Label::new(galley).selectable(selectable))
+}
+
 /// An icon on its own, as a label.
 pub fn icon(ui: &mut Ui, icon: &str, size: f32, color: Color32) -> Response {
     ui.add(egui::Label::new(RichText::new(icon).font(style::icon_font(size)).color(color)).selectable(false))

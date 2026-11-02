@@ -367,7 +367,8 @@ fn callout_dyn(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: &m
                     if let Some(t) = title {
                         kit::semibold_label(ui, t, 13.0, p.text);
                     }
-                    ui.add(egui::Label::new(RichText::new(body).size(12.5).color(p.text)).wrap().selectable(true));
+                    // The design's body lines: 12.5 points on 1.45.
+                    kit::label_lh(ui, RichText::new(body).color(p.text), egui::FontId::proportional(12.5), 1.45, true);
                     // Extra content (buttons) under the text at the right; nothing when empty
                     // (a right-to-left layout beside the text would take the panel's height).
                     ui.scope(|ui| {
