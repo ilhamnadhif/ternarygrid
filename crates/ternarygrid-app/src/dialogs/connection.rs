@@ -553,21 +553,26 @@ impl ConnectionDialog {
                 }
             });
             form_row(ui, tr("Authentication"), |ui| {
-                egui::ComboBox::from_id_salt("auth_method").icon(kit::combo_caret).width(200.0).selected_text(auth_label(&self.cfg.auth)).show_ui(ui, |ui| {
-                    kit::menu_look(ui, 200.0);
-                    let mut options = vec![AuthMethod::Password, AuthMethod::Prompt];
-                    if kind.is_postgres_family() {
-                        options.push(AuthMethod::Pgpass);
-                    }
-                    options.push(AuthMethod::Command { command: String::new() });
-                    options.push(AuthMethod::None);
-                    for o in options {
-                        let mut same = std::mem::discriminant(&o) == std::mem::discriminant(&self.cfg.auth);
-                        if kit::menu_check(ui, &mut same, auth_label(&o)).clicked() && same {
-                            self.cfg.auth = o;
+                egui::ComboBox::from_id_salt("auth_method")
+                    .icon(kit::combo_caret)
+                    .popup_style(egui::containers::menu::menu_style.into())
+                    .width(200.0)
+                    .selected_text(auth_label(&self.cfg.auth))
+                    .show_ui(ui, |ui| {
+                        kit::menu_look(ui, 200.0);
+                        let mut options = vec![AuthMethod::Password, AuthMethod::Prompt];
+                        if kind.is_postgres_family() {
+                            options.push(AuthMethod::Pgpass);
                         }
-                    }
-                });
+                        options.push(AuthMethod::Command { command: String::new() });
+                        options.push(AuthMethod::None);
+                        for o in options {
+                            let mut same = std::mem::discriminant(&o) == std::mem::discriminant(&self.cfg.auth);
+                            if kit::menu_check(ui, &mut same, auth_label(&o)).clicked() && same {
+                                self.cfg.auth = o;
+                            }
+                        }
+                    });
             });
             if !matches!(self.cfg.auth, AuthMethod::None) {
                 form_row(ui, tr("User"), |ui| opt_field(ui, &mut self.cfg.user, "", f32::INFINITY, false));
@@ -599,20 +604,25 @@ impl ConnectionDialog {
         form_row(ui, tr("Connection type"), |ui| {
             let types = cx.conns.connection_types();
             let current = types.iter().find(|t| t.id == self.cfg.connection_type).map(|t| t.name.clone()).unwrap_or_default();
-            egui::ComboBox::from_id_salt("conn_type").icon(kit::combo_caret).width(180.0).selected_text(tr(&current)).show_ui(ui, |ui| {
-                kit::menu_look(ui, 180.0);
-                for t in &types {
-                    let mut on = self.cfg.connection_type == t.id;
-                    let r = kit::menu_check(ui, &mut on, tr(&t.name));
-                    // The type's colour at the right, as its marker in the navigator.
-                    if let Some(c) = crate::theme::connection_marker(t.color) {
-                        ui.painter().circle_filled(egui::pos2(r.rect.right() - 14.0, r.rect.center().y), 4.0, c);
+            egui::ComboBox::from_id_salt("conn_type")
+                .icon(kit::combo_caret)
+                .popup_style(egui::containers::menu::menu_style.into())
+                .width(180.0)
+                .selected_text(tr(&current))
+                .show_ui(ui, |ui| {
+                    kit::menu_look(ui, 180.0);
+                    for t in &types {
+                        let mut on = self.cfg.connection_type == t.id;
+                        let r = kit::menu_check(ui, &mut on, tr(&t.name));
+                        // The type's colour at the right, as its marker in the navigator.
+                        if let Some(c) = crate::theme::connection_marker(t.color) {
+                            ui.painter().circle_filled(egui::pos2(r.rect.right() - 14.0, r.rect.center().y), 4.0, c);
+                        }
+                        if r.clicked() {
+                            self.cfg.connection_type = t.id.clone();
+                        }
                     }
-                    if r.clicked() {
-                        self.cfg.connection_type = t.id.clone();
-                    }
-                }
-            });
+                });
             ternarygrid_ui::kit::checkbox(ui, &mut self.cfg.read_only, tr("Read-only"));
         });
         form_row(ui, tr("Auto-commit"), |ui| {
@@ -684,16 +694,19 @@ impl ConnectionDialog {
                 .and_then(|id| profiles.iter().find(|(i, _)| i == id))
                 .map(|(_, n)| n.clone())
                 .unwrap_or_else(|| tr("(none — settings below)").to_string());
-            egui::ComboBox::from_id_salt("net_profile").icon(kit::combo_caret).width(280.0).selected_text(current).show_ui(ui, |ui| {
-                kit::menu_look(ui, 280.0);
-                let none = tr("(none — settings below)");
-                for (id, name) in std::iter::once((None, none)).chain(profiles.iter().map(|(id, n)| (Some(id), n.as_str()))) {
-                    let mut on = self.cfg.network_profile.as_ref() == id;
-                    if kit::menu_check(ui, &mut on, name).clicked() {
-                        self.cfg.network_profile = id.cloned();
+            egui::ComboBox::from_id_salt("net_profile").icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).width(280.0).selected_text(current).show_ui(
+                ui,
+                |ui| {
+                    kit::menu_look(ui, 280.0);
+                    let none = tr("(none — settings below)");
+                    for (id, name) in std::iter::once((None, none)).chain(profiles.iter().map(|(id, n)| (Some(id), n.as_str()))) {
+                        let mut on = self.cfg.network_profile.as_ref() == id;
+                        if kit::menu_check(ui, &mut on, name).clicked() {
+                            self.cfg.network_profile = id.cloned();
+                        }
                     }
-                }
-            });
+                },
+            );
         });
         if self.cfg.network_profile.is_some() {
             form_row(ui, "", |ui| muted(ui, tr("SSH and proxy settings come from the network profile (Settings → Network profiles).")));
@@ -937,7 +950,7 @@ impl ConnectionDialog {
             if add_field(ui, text_field(&mut folder, w).hint_text(hint(ui, tr("none")))).changed() {
                 self.cfg.folder = if folder.trim().is_empty() { None } else { Some(folder.trim().trim_matches('/').to_string()) };
             }
-            egui::ComboBox::from_id_salt("folders").icon(kit::combo_caret).selected_text("").width(44.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("folders").icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text("").width(44.0).show_ui(ui, |ui| {
                 kit::menu_look(ui, 220.0);
                 for f in cx.conns.folders() {
                     let mut on = self.cfg.folder.as_deref() == Some(f);
@@ -1130,15 +1143,20 @@ pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut Strin
         });
         form_row(ui, tr("Keep-alive (s)"), |ui| number_field(ui, (id, "keepalive"), &mut ssh.keepalive_secs, 0..=3600, 90.0));
         form_row(ui, tr("Host key check"), |ui| {
-            egui::ComboBox::from_id_salt((id, "hostkey")).icon(kit::combo_caret).width(240.0).selected_text(host_key_label(ssh.host_key_policy)).show_ui(ui, |ui| {
-                kit::menu_look(ui, 240.0);
-                for p in [HostKeyPolicy::AcceptNew, HostKeyPolicy::Strict, HostKeyPolicy::AcceptAll] {
-                    let mut on = ssh.host_key_policy == p;
-                    if kit::menu_check(ui, &mut on, host_key_label(p)).clicked() {
-                        ssh.host_key_policy = p;
+            egui::ComboBox::from_id_salt((id, "hostkey"))
+                .icon(kit::combo_caret)
+                .popup_style(egui::containers::menu::menu_style.into())
+                .width(240.0)
+                .selected_text(host_key_label(ssh.host_key_policy))
+                .show_ui(ui, |ui| {
+                    kit::menu_look(ui, 240.0);
+                    for p in [HostKeyPolicy::AcceptNew, HostKeyPolicy::Strict, HostKeyPolicy::AcceptAll] {
+                        let mut on = ssh.host_key_policy == p;
+                        if kit::menu_check(ui, &mut on, host_key_label(p)).clicked() {
+                            ssh.host_key_policy = p;
+                        }
                     }
-                }
-            });
+                });
         });
     });
 }

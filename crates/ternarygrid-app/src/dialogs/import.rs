@@ -180,7 +180,12 @@ impl ImportDialog {
                         let w = rest(ui, find_w + browse_w + 16.0).min(420.0);
                         // At most `w` wide: a long path is cut, the dialog does not grow.
                         ui.allocate_ui_with_layout(egui::vec2(w, ternarygrid_ui::style::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let combo = egui::ComboBox::from_id_salt("dbeaver_ws").icon(kit::combo_caret).selected_text(current).width(w).truncate();
+                            let combo = egui::ComboBox::from_id_salt("dbeaver_ws")
+                                .icon(kit::combo_caret)
+                                .popup_style(egui::containers::menu::menu_style.into())
+                                .selected_text(current)
+                                .width(w)
+                                .truncate();
                             combo.show_ui(ui, |ui| {
                                 kit::menu_look(ui, w);
                                 for ws in &self.workspaces {
