@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use ternarygrid_core::{tr, trf};
+use ternarygrid_ui::kit;
+use ternarygrid_ui::parts::{self, Dialog};
+use ternarygrid_ui::style;
 use tokio_util::sync::CancellationToken;
 
 /// Progress shared between the background task and the UI.
@@ -149,61 +152,128 @@ impl Operations {
         }
     }
 
-    /// Operations panel content.
+    /// The operations window beside the rail's button (`at`: its bottom-left
+    /// corner); clears [`Operations::panel_open`] when it is closed.
+    pub fn window(&mut self, ctx: &egui::Context, at: egui::Pos2) {
+        if !self.panel_open {
+            return;
+        }
+        let title = tr("Background operations");
+        let shown = egui::Window::new(title)
+            .id(egui::Id::new("ternarygrid_operations"))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .frame(crate::dialogs::window_frame(ctx))
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .default_pos(at)
+            .show(ctx, |ui| Dialog::new(title).icon(icon::CLOCK_COUNTER_CLOCKWISE).width(420.0).body_padding(egui::Margin::ZERO).contents(ui, |ui| self.ui(ui), None).0);
+        let closed = shown.as_ref().and_then(|s| s.inner).unwrap_or(false);
+        if closed || crate::widgets::escape_closes(ctx, shown.map(|s| s.response.layer_id)) {
+            self.panel_open = false;
+        }
+    }
+
+    /// Operations panel content: the number running, then one row per operation.
     pub fn ui(&mut self, ui: &mut Ui) {
         self.collect();
+        let p = style::pal(ui);
+        let line = if ui.visuals().dark_mode { egui::Color32::from_rgb(0x33, 0x35, 0x3e) } else { egui::Color32::from_rgb(0xed, 0xed, 0xf2) };
+        ui.spacing_mut().item_spacing.y = 0.0;
         if self.list.is_empty() {
-            ui.weak(tr("No background operations."));
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 18)).show(ui, |ui| {
+                ui.label(RichText::new(tr("No background operations.")).color(p.text_muted));
+            });
             return;
         }
         let mut clear = false;
-        ui.horizontal(|ui| {
-            ui.strong(trf("{} running", &[&self.running()]));
-            if ui.small_button(tr("Clear finished")).clicked() {
-                clear = true;
-            }
-        });
-        ui.separator();
-        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-            for op in self.list.iter().rev() {
-                ui.horizontal(|ui| {
-                    let (glyph, txt) = match &op.state {
-                        OpState::Running => (icon::HOURGLASS, String::new()),
-                        OpState::Succeeded(m) => (icon::CHECK_CIRCLE, m.clone()),
-                        OpState::Failed(m) => (icon::X_CIRCLE, m.clone()),
-                        OpState::Cancelled => (icon::PROHIBIT, tr("Cancelled").to_string()),
-                    };
-                    ui.label(glyph);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&op.title).strong());
-                        let elapsed = op.finished.unwrap_or_else(Instant::now).duration_since(op.started);
-                        let done = op.progress.done.load(Ordering::Relaxed);
-                        let total = op.progress.total.load(Ordering::Relaxed);
-                        if matches!(op.state, OpState::Running) {
-                            if total > 0 {
-                                ui.add(egui::ProgressBar::new((done as f32 / total as f32).clamp(0.0, 1.0)).desired_width(220.0).text(format!("{done} / {total}")));
-                            } else {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    if done > 0 {
-                                        ui.label(done.to_string());
-                                    }
-                                });
-                            }
-                            let msg = op.progress.message.lock().clone();
-                            if !msg.is_empty() {
-                                ui.small(msg);
-                            }
-                        } else if !txt.is_empty() {
-                            ui.small(txt);
-                        }
-                        ui.small(format!("{:.1}s", elapsed.as_secs_f32()));
-                    });
-                    if matches!(op.state, OpState::Running) && ui.button(ternarygrid_icons::ic(icon::STOP)).on_hover_text(tr("Cancel")).clicked() {
-                        op.cancel.cancel();
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(26.0);
+                ui.label(RichText::new(trf("{} running", &[&self.running()])).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if kit::ghost(ui, None, tr("Clear finished")).clicked() {
+                        clear = true;
                     }
                 });
-                ui.separator();
+            });
+        });
+        parts::hline(ui);
+        egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let n = self.list.len();
+            for (i, op) in self.list.iter().rev().enumerate() {
+                let running = matches!(op.state, OpState::Running);
+                let (glyph, color, txt) = match &op.state {
+                    OpState::Running => (icon::CLOCK_COUNTER_CLOCKWISE, p.accent_text, String::new()),
+                    OpState::Succeeded(m) => (icon::CHECK_CIRCLE, p.ok, m.clone()),
+                    OpState::Failed(m) => (icon::X_CIRCLE, p.err, m.clone()),
+                    OpState::Cancelled => (icon::PROHIBIT, p.text_faint, tr("Cancelled").to_string()),
+                };
+                let row = egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.label(RichText::new(glyph).font(style::icon_font(16.0)).color(color));
+                        let cancel_w = if running { 34.0 } else { 0.0 };
+                        let w = (ui.available_width() - cancel_w).max(80.0);
+                        ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.set_width(w);
+                            ui.spacing_mut().item_spacing.y = 5.0;
+                            let elapsed = op.finished.unwrap_or_else(Instant::now).duration_since(op.started);
+                            ui.horizontal(|ui| {
+                                let time = format!("{:.1}s", elapsed.as_secs_f32());
+                                let time_w = ui.painter().layout_no_wrap(time.clone(), egui::FontId::proportional(11.5), p.text_faint).size().x;
+                                let title_w = (ui.available_width() - time_w - 8.0).max(40.0);
+                                ui.allocate_ui_with_layout(egui::vec2(title_w, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.set_min_width(title_w);
+                                    ui.add(egui::Label::new(RichText::new(&op.title).font(style::semibold(ui.ctx(), 13.0)).color(p.text)).truncate());
+                                });
+                                ui.label(RichText::new(time).size(11.5).color(p.text_faint));
+                            });
+                            let faint = |ui: &mut Ui, s: &str| ui.add(egui::Label::new(RichText::new(s).size(11.5).color(p.text_faint)).wrap());
+                            if running {
+                                let done = op.progress.done.load(Ordering::Relaxed);
+                                let total = op.progress.total.load(Ordering::Relaxed);
+                                let msg = op.progress.message.lock().clone();
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let mut detail = if total > 0 {
+                                        format!("{} / {}", group(done), group(total))
+                                    } else if done > 0 {
+                                        group(done)
+                                    } else {
+                                        String::new()
+                                    };
+                                    if !msg.is_empty() {
+                                        if !detail.is_empty() {
+                                            detail.push_str(" · ");
+                                        }
+                                        detail.push_str(&msg);
+                                    }
+                                    if total > 0 {
+                                        let bar_w = (ui.available_width() * 0.5).max(60.0);
+                                        parts::progress(ui, (done as f32 / total as f32).clamp(0.0, 1.0), bar_w);
+                                    } else {
+                                        ui.add(egui::Spinner::new().size(12.0).color(p.accent_text));
+                                    }
+                                    if !detail.is_empty() {
+                                        ui.add(egui::Label::new(RichText::new(detail).size(11.5).color(p.text_faint)).truncate());
+                                    }
+                                });
+                            } else if !txt.is_empty() {
+                                faint(ui, &txt);
+                            }
+                        });
+                        if running && kit::icon_button_ex(ui, icon::STOP, tr("Cancel"), false, 24.0).clicked() {
+                            op.cancel.cancel();
+                        }
+                    });
+                });
+                if i + 1 < n {
+                    let r = row.response.rect;
+                    ui.painter().hline(r.x_range(), r.bottom() - 0.5, egui::Stroke::new(1.0, line));
+                }
             }
         });
         if clear {
@@ -215,9 +285,30 @@ impl Operations {
     }
 }
 
+/// `48210` as `48,210`.
+fn group(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_counts() {
+        assert_eq!(group(0), "0");
+        assert_eq!(group(999), "999");
+        assert_eq!(group(48_210), "48,210");
+        assert_eq!(group(1_234_567), "1,234,567");
+    }
 
     #[test]
     fn a_task_ends_its_operation() {

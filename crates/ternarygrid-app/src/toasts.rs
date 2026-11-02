@@ -1,7 +1,7 @@
-//! Transient notifications shown in the bottom-right corner.
+//! Transient notifications: cards above the status bar with an icon, a title,
+//! the detail, a link and ×.
 
-use crate::theme;
-use egui::{Align2, Context, Id, RichText};
+use egui::{Align2, Context, CornerRadius, Id, Margin, RichText, Stroke};
 use egui_phosphor::regular as icon;
 use std::time::{Duration, Instant};
 use ternarygrid_core::tr;
@@ -92,39 +92,53 @@ impl Toasts {
             return;
         }
         let dark = ctx.theme() == egui::Theme::Dark;
+        let p = ternarygrid_ui::palette(dark);
         let mut close: Option<usize> = None;
         // Centred above the status bar and the result toolbar: not over the side panels'
         // buttons (Value: Apply, Set NULL) or the fetch buttons at the right.
         egui::Area::new(Id::new("ternarygrid_toasts")).anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -76.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-            ui.set_max_width(380.0);
+            ui.set_width(380.0);
+            ui.spacing_mut().item_spacing.y = 8.0;
             for (i, t) in self.items.iter().enumerate().rev() {
                 let (glyph, color) = match t.kind {
-                    ToastKind::Info => (icon::INFO, ui.visuals().hyperlink_color),
-                    ToastKind::Success => (icon::CHECK_CIRCLE, theme::success_color(dark)),
-                    ToastKind::Warning => (icon::WARNING, theme::warning_color(dark)),
-                    ToastKind::Error => (icon::X_CIRCLE, theme::error_color(dark)),
+                    ToastKind::Info => (icon::INFO, p.accent_text),
+                    ToastKind::Success => (icon::CHECK_CIRCLE, p.ok),
+                    ToastKind::Warning => (icon::WARNING, p.warn),
+                    ToastKind::Error => (icon::X_CIRCLE, p.err),
                 };
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                // A card: the icon, the title, the detail, a link, ×.
+                let card = egui::Frame::new()
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(CornerRadius::same(ternarygrid_ui::style::RADIUS_LG))
+                    .shadow(ui.visuals().popup_shadow)
+                    .inner_margin(Margin { left: 14, right: 10, top: 12, bottom: 12 });
+                card.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.horizontal_top(|ui| {
-                        ui.label(RichText::new(glyph).color(color).size(16.0));
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&t.title).strong());
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.label(RichText::new(glyph).font(ternarygrid_ui::style::icon_font(17.0)).color(color));
+                        let w = (ui.available_width() - 32.0).max(120.0);
+                        ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.set_width(w);
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.add(egui::Label::new(RichText::new(&t.title).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(p.text)).wrap());
                             if let Some(d) = &t.detail {
                                 let short: String = d.chars().take(600).collect();
-                                ui.label(RichText::new(short).small());
+                                ui.add(egui::Label::new(RichText::new(short).size(12.0).color(p.text_muted)).wrap());
                             }
-                            if let Some(p) = &t.reveal
-                                && ui.link(if cfg!(target_os = "macos") { tr("Show in Finder") } else { tr("Show in folder") }).clicked()
-                            {
-                                reveal(p);
+                            if let Some(path) = &t.reveal {
+                                let label = if cfg!(target_os = "macos") { tr("Show in Finder") } else { tr("Show in folder") };
+                                if ui.add(egui::Link::new(RichText::new(label).size(12.0).color(p.accent_text))).clicked() {
+                                    reveal(path);
+                                }
                             }
                         });
-                        if ui.add(egui::Button::new(ternarygrid_icons::ic(icon::X)).frame(false)).on_hover_text(tr("Dismiss")).clicked() {
+                        if ternarygrid_ui::kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 22.0).clicked() {
                             close = Some(i);
                         }
                     });
                 });
-                ui.add_space(4.0);
             }
         });
         if let Some(i) = close {

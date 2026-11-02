@@ -1,9 +1,13 @@
 //! Tip of the day: short hints about features, shown on start (can be
 //! turned off) and from Help › Tip of the day.
 
-use egui::{Context, RichText};
+use egui::{Align, Context, Id, Layout, Margin, RichText};
 use egui_phosphor::regular as icon;
+use std::cell::Cell;
 use ternarygrid_core::tr;
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts::Dialog;
+use ternarygrid_ui::style;
 
 pub const TIPS: &[&str] = &[
     "Press Ctrl+Enter (⌘↩ on macOS) to run the statement under the cursor; select text to run only the selection.",
@@ -40,35 +44,40 @@ impl TipWindow {
     /// Show the tip; `show_on_start` is the setting. Returns false when closed.
     pub fn show(&mut self, ctx: &Context, show_on_start: &mut bool) -> bool {
         let mut open = true;
-        let mut close = false;
         let n = TIPS.len();
-        let shown = egui::Window::new(format!("{} {}", icon::LIGHTBULB, tr("Tip of the day")))
-            .id(egui::Id::new("tip_of_the_day"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.add(egui::Label::new(RichText::new(tr(TIPS[self.index % n])).size(14.0)).wrap());
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.checkbox(show_on_start, tr("Show tips on start"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(tr("Close")).clicked() {
-                            close = true;
-                        }
-                        if ui.button(format!("{} {}", tr("Next tip"), icon::CARET_RIGHT)).clicked() {
-                            self.index = (self.index + 1) % n;
-                        }
-                        if ui.button(ternarygrid_icons::ic(icon::CARET_LEFT)).on_hover_text(tr("Previous tip")).clicked() {
-                            self.index = (self.index + n - 1) % n;
-                        }
-                        ui.weak(format!("{}/{n}", self.index % n + 1));
-                    });
+        let (close, step) = (Cell::new(false), Cell::new(0i32));
+        let tip = tr(TIPS[self.index % n]);
+        let position = format!("{}/{n}", self.index % n + 1);
+        let (resp, _) = Dialog::new(tr("Tip of the day")).icon(icon::LIGHTBULB).width(480.0).body_padding(Margin::symmetric(22, 20)).show_window(
+            ctx,
+            Id::new("tip_of_the_day"),
+            &mut open,
+            None,
+            |ui| {
+                let p = style::pal(ui);
+                ui.add(egui::Label::new(RichText::new(tip).size(14.5).color(p.text)).wrap());
+            },
+            Some(&mut |ui: &mut egui::Ui| {
+                ui.checkbox(show_on_start, tr("Show tips on start"));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if kit::button_ex(ui, Kind::Ghost, None, tr("Close"), false).clicked() {
+                        close.set(true);
+                    }
+                    if kit::button_ex(ui, Kind::Secondary, Some(icon::ARROW_RIGHT), tr("Next tip"), false).clicked() {
+                        step.set(1);
+                    }
+                    if kit::icon_button(ui, icon::ARROW_LEFT, tr("Previous tip")).clicked() {
+                        step.set(-1);
+                    }
+                    ui.label(RichText::new(&position).size(12.0).color(style::pal(ui).text_faint));
                 });
-            });
-        open && !close && !crate::widgets::escape_closes(ctx, shown.map(|r| r.response.layer_id))
+            }),
+        );
+        match step.get() {
+            1 => self.index = (self.index + 1) % n,
+            -1 => self.index = (self.index + n - 1) % n,
+            _ => {}
+        }
+        open && !close.get() && !crate::widgets::escape_closes(ctx, resp.layer)
     }
 }
