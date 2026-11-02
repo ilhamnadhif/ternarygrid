@@ -6,7 +6,7 @@ use crate::backend::Backend;
 use crate::command::AppCommand;
 use crate::conn::{ConnectionManager, Credentials};
 use crate::cx::AppContext;
-use crate::dialogs::{Dialogs, FolderAction};
+use crate::dialogs::{self, Dialogs, FolderAction};
 use crate::nav::Navigator;
 use crate::ops::Operations;
 use crate::services::{Services, Settings};
@@ -18,6 +18,8 @@ use egui_phosphor::regular as icon;
 use std::sync::Arc;
 use std::time::Instant;
 use ternarygrid_core::tr;
+use ternarygrid_ui::kit;
+use ternarygrid_ui::parts::Dialog;
 
 /// Settings changed are written after this long without another change.
 const SETTINGS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
@@ -323,26 +325,30 @@ impl TernaryGridApp {
             self.close_confirm.remove(0);
             return;
         };
-        let mut decided: Option<bool> = None;
-        let modal = egui::Modal::new(egui::Id::new(("confirm_close", id))).show(ctx, |ui| {
-            // Pending edits, or edits saved inside a transaction that closing rolls back.
-            let (heading, text, button) = if dirty {
-                (tr("Unsaved changes"), ternarygrid_core::trf("\"{}\" has unsaved changes; closing it discards them.", &[&title]), tr("Discard and close"))
-            } else {
-                (tr("Uncommitted transaction"), ternarygrid_core::trf("\"{}\" has uncommitted changes; closing it rolls them back.", &[&title]), tr("Roll back and close"))
-            };
-            ui.heading(heading);
-            ui.label(text);
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new(button).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                    decided = Some(true);
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    decided = Some(false);
-                }
-            });
-        });
-        if decided.is_none() && modal.should_close() {
+        // Pending edits, or edits saved inside a transaction that closing rolls back.
+        let (heading, text, button) = if dirty {
+            (tr("Unsaved changes"), ternarygrid_core::trf("\"{}\" has unsaved changes; closing it discards them.", &[&title]), tr("Discard and close"))
+        } else {
+            (tr("Uncommitted transaction"), ternarygrid_core::trf("\"{}\" has uncommitted changes; closing it rolls them back.", &[&title]), tr("Roll back and close"))
+        };
+        let answer = std::cell::Cell::new(None::<bool>);
+        let (resp, _) = Dialog::new(heading).icon(icon::WARNING).width(460.0).show_modal(
+            ctx,
+            egui::Id::new(("confirm_close", id)),
+            |ui| dialogs::body_text(ui, &text),
+            |ui| {
+                dialogs::right(ui, |ui| {
+                    if dialogs::danger_button(ui, None, button).clicked() {
+                        answer.set(Some(true));
+                    }
+                    if dialogs::cancel_button(ui).clicked() {
+                        answer.set(Some(false));
+                    }
+                });
+            },
+        );
+        let mut decided = answer.get();
+        if decided.is_none() && resp.close {
             decided = Some(false);
         }
         if let Some(close) = decided {
@@ -384,32 +390,39 @@ impl TernaryGridApp {
     fn confirm_disconnect_ui(&mut self, ctx: &egui::Context) {
         let Some((ids, reconnect)) = self.confirm_disconnect.clone() else { return };
         let pending: Vec<_> = crate::pending_tx::collect(&self.dock, &self.conns).into_iter().filter(|p| ids.contains(&p.conn)).collect();
-        let mut decided: Option<bool> = None;
+        let mut decided: Option<bool>;
         let mut review = false;
         if pending.is_empty() {
             // Committed or rolled back meanwhile (Review transactions): nothing is lost any more.
             decided = Some(true);
         } else {
-            let modal = egui::Modal::new(egui::Id::new("confirm_disconnect")).show(ctx, |ui| {
-                ui.heading(tr("Uncommitted transactions"));
-                ui.label(tr("Disconnecting rolls back the uncommitted changes of:"));
-                for p in pending.iter().take(10) {
-                    ui.label(format!("• {} — {}", p.conn_name, p.owner));
-                }
-                ui.horizontal(|ui| {
-                    if ui.button(tr("Review transactions")).clicked() {
-                        review = true;
+            let (answer, reviewed) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false));
+            let (resp, _) = Dialog::new(tr("Uncommitted transactions")).icon(icon::WARNING).width(520.0).show_modal(
+                ctx,
+                egui::Id::new("confirm_disconnect"),
+                |ui| {
+                    dialogs::body_text(ui, tr("Disconnecting rolls back the uncommitted changes of:"));
+                    let p = ternarygrid_ui::pal(ui);
+                    dialogs::bullets(ui, pending.iter().take(10).map(|p| format!("{} — {}", p.conn_name, p.owner)), p.text);
+                },
+                |ui| {
+                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Review transactions"), false).clicked() {
+                        reviewed.set(true);
                     }
-                    let label = if reconnect { tr("Roll back and reconnect") } else { tr("Roll back and disconnect") };
-                    if ui.button(RichText::new(label).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        decided = Some(false);
-                    }
-                });
-            });
-            if modal.should_close() && decided.is_none() && !review {
+                    dialogs::right(ui, |ui| {
+                        let label = if reconnect { tr("Roll back and reconnect") } else { tr("Roll back and disconnect") };
+                        if dialogs::danger_button(ui, None, label).clicked() {
+                            answer.set(Some(true));
+                        }
+                        if dialogs::cancel_button(ui).clicked() {
+                            answer.set(Some(false));
+                        }
+                    });
+                },
+            );
+            decided = answer.get();
+            review = reviewed.get();
+            if resp.close && decided.is_none() && !review {
                 decided = Some(false);
             }
         }
@@ -1601,38 +1614,42 @@ impl eframe::App for TernaryGridApp {
         if self.confirm_quit {
             let dirty: Vec<String> = self.dock.iter_all_tabs().filter(|(_, t)| t.view.is_dirty()).map(|(_, t)| t.view.title()).collect();
             let pending = crate::pending_tx::collect(&self.dock, &self.conns);
-            let mut decided: Option<bool> = None;
-            let mut review = false;
-            let modal = egui::Modal::new(egui::Id::new("confirm_quit")).show(&ctx, |ui| {
-                ui.heading(tr("Quit TernaryGrid?"));
-                if !dirty.is_empty() {
-                    ui.label(tr("These tabs have unsaved changes:"));
-                    for t in dirty.iter().take(10) {
-                        ui.label(format!("• {t}"));
+            let running = self.ops.running();
+            let (answer, reviewed) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false));
+            let (resp, _) = Dialog::new(tr("Quit TernaryGrid?")).icon(icon::WARNING).width(560.0).show_modal(
+                &ctx,
+                egui::Id::new("confirm_quit"),
+                |ui| {
+                    let p = ternarygrid_ui::pal(ui);
+                    if !dirty.is_empty() {
+                        dialogs::strong(ui, tr("These tabs have unsaved changes:"));
+                        let tabs: Vec<String> = dirty.iter().take(10).map(|t| format!("•  {t}")).collect();
+                        ui.add(egui::Label::new(RichText::new(tabs.join("     ")).color(p.text_muted)).wrap());
                     }
-                }
-                if !pending.is_empty() {
-                    ui.label(tr("These connections have uncommitted transactions; quitting rolls them back:"));
-                    for p in pending.iter().take(10) {
-                        ui.label(format!("• {} — {}", p.conn_name, p.owner));
+                    if !pending.is_empty() {
+                        dialogs::strong(ui, tr("These connections have uncommitted transactions; quitting rolls them back:"));
+                        dialogs::bullets(ui, pending.iter().take(10).map(|p| format!("{} — {}", p.conn_name, p.owner)), p.text_muted);
                     }
-                }
-                let running = self.ops.running();
-                if running > 0 {
-                    ui.label(ternarygrid_core::trf("{} operation(s) are still running (export, import, migration …); quitting stops them half way.", &[&running]));
-                }
-                ui.horizontal(|ui| {
-                    if !pending.is_empty() && ui.button(tr("Review transactions")).clicked() {
-                        review = true;
+                    if running > 0 {
+                        let text = ternarygrid_core::trf("{} operation(s) are still running (export, import, migration …); quitting stops them half way.", &[&running]);
+                        dialogs::note(ui, ternarygrid_ui::parts::Tone::Warning, &text);
                     }
-                    if ui.button(RichText::new(tr("Quit without saving")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        decided = Some(true);
+                },
+                |ui| {
+                    if !pending.is_empty() && kit::button_ex(ui, kit::Kind::Ghost, None, tr("Review transactions"), false).clicked() {
+                        reviewed.set(true);
                     }
-                    if ui.button(tr("Cancel")).clicked() {
-                        decided = Some(false);
-                    }
-                });
-            });
+                    dialogs::right(ui, |ui| {
+                        if dialogs::danger_button(ui, None, tr("Quit without saving")).clicked() {
+                            answer.set(Some(true));
+                        }
+                        if dialogs::cancel_button(ui).clicked() {
+                            answer.set(Some(false));
+                        }
+                    });
+                },
+            );
+            let (mut decided, review) = (answer.get(), reviewed.get());
             if review {
                 self.pending_tx.open = true;
                 decided = Some(false);
@@ -1647,7 +1664,7 @@ impl eframe::App for TernaryGridApp {
                     self.confirm_quit = false;
                     self.updates.quit_cancelled();
                 }
-                None if modal.should_close() => {
+                None if resp.close => {
                     self.confirm_quit = false;
                     self.updates.quit_cancelled();
                 }
@@ -1776,34 +1793,45 @@ impl eframe::App for TernaryGridApp {
         let pressed = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten());
         let mut clicked_popup = None;
         for tab in &mut self.popups {
-            let mut open = true;
-            let size = tab.view.popup_size().unwrap_or(egui::vec2(720.0, 520.0));
-            // Title: coloured icon, the tab's title and its connection.
-            let mut title = egui::text::LayoutJob::default();
-            let style = ctx.global_style();
-            let font = egui::FontSelection::Default;
-            ternarygrid_icons::ic(tab.view.icon()).append_to(&mut title, &style, font.clone(), egui::Align::Center);
-            RichText::new(format!("  {}", tab.view.title())).append_to(&mut title, &style, font.clone(), egui::Align::Center);
-            if let Some(name) = tab.view.connection_id().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()) {
-                RichText::new(format!("  ·  {name}")).weak().append_to(&mut title, &style, font, egui::Align::Center);
-            }
-            let shown = egui::Window::new(title)
+            // The header of the dialogs (a taller one than a title bar): the tab's icon, its
+            // title and its connection, and ×.
+            let size = tab.view.popup_size().unwrap_or(egui::vec2(720.0, 520.0)) + egui::vec2(0.0, 30.0);
+            let title = tab.view.title();
+            let subtitle = tab.view.connection_id().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_default();
+            let tab_icon = tab.view.icon();
+            let shown = egui::Window::new(&title)
                 .id(egui::Id::new(("ternarygrid_popup", tab.id)))
+                .title_bar(false)
+                .frame(dialogs::window_frame(&ctx))
                 .default_size(size)
                 .min_size(egui::vec2(360.0, 240.0))
                 .pivot(egui::Align2::CENTER_CENTER)
                 .default_pos(center)
                 .collapsible(false)
                 .resizable(true)
-                .open(&mut open)
                 .show(&ctx, |ui| {
-                    cx.tab_active = true;
-                    cx.current_tab = Some(tab.id);
-                    cx.popup = true;
-                    tab.view.ui(ui, &mut cx);
-                    cx.popup = false;
-                    cx.current_tab = None;
+                    // The tab is laid out with the usual spacing, not the dialogs'.
+                    let spacing = ui.spacing().item_spacing;
+                    let width = ui.available_width();
+                    let dialog = Dialog::new(&title).icon(tab_icon).subtitle(&subtitle).width(width).body_padding(egui::Margin::ZERO);
+                    dialog
+                        .contents(
+                            ui,
+                            |ui| {
+                                ui.spacing_mut().item_spacing = spacing;
+                                cx.tab_active = true;
+                                cx.current_tab = Some(tab.id);
+                                cx.popup = true;
+                                tab.view.ui(ui, &mut cx);
+                                cx.popup = false;
+                                cx.current_tab = None;
+                            },
+                            None,
+                        )
+                        .0
                 });
+            // Closed by its ×.
+            let open = !shown.as_ref().and_then(|s| s.inner).unwrap_or(false);
             if let Some(shown) = &shown
                 && raise == Some(tab.id)
             {
@@ -1824,18 +1852,9 @@ impl eframe::App for TernaryGridApp {
         }
 
         self.dialogs.show(&ctx, &mut cx);
-        if self.ops.panel_open {
-            let mut open = true;
-            // Beside its button at the bottom of the rail, above the status bar.
-            let at = egui::pos2(shell::RAIL_W + 8.0, ctx.content_rect().bottom() - shell::STATUS_H - 8.0);
-            egui::Window::new(format!("{} {}", icon::HOURGLASS, tr("Background operations")))
-                .open(&mut open)
-                .default_width(360.0)
-                .pivot(egui::Align2::LEFT_BOTTOM)
-                .default_pos(at)
-                .show(&ctx, |ui| self.ops.ui(ui));
-            self.ops.panel_open = open;
-        }
+        // Beside its button at the bottom of the rail, above the status bar.
+        let at = egui::pos2(shell::RAIL_W + 8.0, ctx.content_rect().bottom() - shell::STATUS_H - 8.0);
+        self.ops.window(&ctx, at);
         if self.updates.ui(&ctx, &self.backend, &mut self.settings, &mut self.toasts) {
             self.save_settings();
         }

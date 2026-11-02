@@ -1002,8 +1002,10 @@ fn tool_tabs_run() {
     assert_eq!(popup_rect(&h), r0, "the pop-up keeps its size");
     let screen = h.ctx.content_rect();
     assert!(screen.contains_rect(r0), "{r0:?} inside {screen:?}");
-    // The window's close button closes it; opening export again shows a new one.
-    click(&mut h, "Close window");
+    // The window's close button (× in its header) closes it; opening export again shows a new one.
+    pause(&mut h);
+    h.query_all_by_label("Close").find(|n| r0.contains(n.rect().center())).expect("the pop-up's ×").click();
+    frames(&mut h, 2);
     assert!(h.state().popups.is_empty());
     nav_menu(&mut h, "customer", &["Export data"]);
     assert_eq!(h.state().popups.len(), 1);
