@@ -692,6 +692,12 @@ impl MySqlSession {
                 "EXPLAIN ANALYZE requires MySQL 8.0.18 or later (or MariaDB 10.1 or later)",
             ));
         }
+        // ANALYZE executes the statement: a file it writes cannot be undone.
+        if analyze && sqltext::writes_file(&stmt) {
+            return Err(DbError::unsupported(
+                "EXPLAIN ANALYZE would run the statement and write its INTO OUTFILE / DUMPFILE file",
+            ));
+        }
         // ANALYZE executes the statement: undo data changes afterwards.
         let writes = analyze && !sqltext::is_read_only_statement(&stmt);
         if !writes {

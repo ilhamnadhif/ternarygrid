@@ -56,6 +56,10 @@ pub(crate) struct Job {
     pub timeout: Option<Duration>,
     /// Command tag for a single statement whose OK packet has no info text.
     pub tag: Option<String>,
+    /// Nothing follows the statement's rows ([`sqltext::is_single_result`]):
+    /// unread rows skipped by `next_result` are discarded like those of a closed
+    /// cursor. (In a script a `KILL QUERY` would stop the statements after them.)
+    pub single_result: bool,
 }
 
 /// Returned to the session when the worker releases the connection.
@@ -554,6 +558,16 @@ async fn serve<P: Protocol>(
             Req::NextResult(tx) => {
                 // Move past the current result.
                 match std::mem::replace(&mut pos, Pos::AtHeader) {
+                    // The rest are discarded, with KILL QUERY when much remains.
+                    Pos::InRows(_) if job.single_result => {
+                        let mut out = abandon(qr, w).await;
+                        let result = match &out.broken {
+                            Some(e) => Err(e.clone()),
+                            None => Ok(None),
+                        };
+                        out.pending = Some(Pending::Next(tx, result));
+                        return out;
+                    }
                     Pos::InRows(_) => loop {
                         let r = w.guard(qr.next()).await;
                         if w.abandoned {

@@ -83,6 +83,25 @@ fn fk_clause(fk: &ForeignKeyDef) -> String {
     s
 }
 
+/// Same foreign key. The owning table's `schema` / `table` are not compared (they may
+/// be left empty inside a `TableDef`, and differ between two compared schemas), nor
+/// `on_update` (Oracle has none); a reference to the table's own schema is schema
+/// relative.
+fn same_fk(a: &ForeignKeyDef, from: &TableDef, b: &ForeignKeyDef, to: &TableDef) -> bool {
+    let ref_schema = |fk: &ForeignKeyDef, t: &TableDef| {
+        fk.ref_schema
+            .clone()
+            .filter(|s| Some(s) != t.schema.as_ref())
+    };
+    a.name == b.name
+        && a.columns == b.columns
+        && a.ref_table == b.ref_table
+        && a.ref_columns == b.ref_columns
+        && ref_schema(a, from) == ref_schema(b, to)
+        && a.on_delete == b.on_delete
+        && a.deferrable == b.deferrable
+}
+
 fn index_columns(idx: &IndexDef) -> String {
     idx.columns
         .iter()
@@ -187,7 +206,7 @@ impl DdlGenerator for OracleDdl {
         }
         let (pairs, dropped, added) = match_columns(from, to, renamed);
         for fk in &from.foreign_keys {
-            if !to.foreign_keys.contains(fk) {
+            if !to.foreign_keys.iter().any(|x| same_fk(fk, from, x, to)) {
                 out.push(self.drop_foreign_key(to, fk));
             }
         }
@@ -281,7 +300,7 @@ impl DdlGenerator for OracleDdl {
             }
         }
         for fk in &to.foreign_keys {
-            if !from.foreign_keys.contains(fk) {
+            if !from.foreign_keys.iter().any(|x| same_fk(x, from, fk, to)) {
                 out.push(self.add_foreign_key(to, fk));
             }
         }
@@ -781,6 +800,41 @@ mod tests {
             "DROP TABLE HR.\"orders\" CASCADE CONSTRAINTS"
         );
         assert_eq!(d.create_schema("APP"), "CREATE USER APP NO AUTHENTICATION");
+    }
+
+    #[test]
+    fn foreign_keys_of_two_schemas_compare_equal() {
+        let d = OracleDdl;
+        let fk = |schema: &str| ForeignKeyDef {
+            name: Some("ORDERS_CUST_FK".into()),
+            schema: Some(schema.into()),
+            table: "orders".into(),
+            columns: vec!["CUST_ID".into()],
+            ref_schema: Some(schema.into()),
+            ref_table: "CUSTOMERS".into(),
+            ref_columns: vec!["ID".into()],
+            on_delete: FkAction::Cascade,
+            ..Default::default()
+        };
+        let mut from = table();
+        from.schema = Some("PROD".into());
+        from.foreign_keys = vec![fk("PROD")];
+        let mut to = table();
+        to.foreign_keys = vec![fk("HR")];
+        assert!(d.alter_table(&from, &to, &[]).is_empty());
+        // Left empty inside the TableDef (as the table designer may).
+        to.foreign_keys[0].schema = None;
+        to.foreign_keys[0].table = String::new();
+        assert!(d.alter_table(&from, &to, &[]).is_empty());
+        // A real change is still made.
+        to.foreign_keys[0].on_delete = FkAction::NoAction;
+        assert_eq!(
+            d.alter_table(&from, &to, &[]),
+            vec![
+                "ALTER TABLE HR.\"orders\" DROP CONSTRAINT ORDERS_CUST_FK",
+                "ALTER TABLE HR.\"orders\" ADD CONSTRAINT ORDERS_CUST_FK FOREIGN KEY (CUST_ID) REFERENCES HR.CUSTOMERS (ID)"
+            ]
+        );
     }
 
     #[test]

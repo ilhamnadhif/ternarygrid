@@ -234,11 +234,24 @@ pub fn leading_keyword(sql: &str) -> Option<String> {
     })
 }
 
+/// `SELECT ... INTO OUTFILE | DUMPFILE`: the statement writes a file on the
+/// server (also from a `/*! ... */` comment), which no rollback undoes.
+pub fn writes_file(sql: &str) -> bool {
+    tokens(sql).windows(2).any(|w| {
+        matches!(&w[0].0, Tok::Word(a) if a == "INTO")
+            && matches!(&w[1].0, Tok::Word(b) if b == "OUTFILE" || b == "DUMPFILE")
+    })
+}
+
 /// The statement only reads data (SELECT / WITH / TABLE / VALUES / SHOW ...).
+/// `SELECT ... INTO OUTFILE` writes a file: not read-only.
 pub fn is_read_only_statement(sql: &str) -> bool {
+    if writes_file(sql) {
+        return false;
+    }
     match leading_keyword(sql).as_deref() {
         Some("SELECT" | "TABLE" | "VALUES" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "HELP") => {
-            // SELECT ... INTO OUTFILE / FOR UPDATE still only reads table data.
+            // SELECT ... FOR UPDATE still only reads table data.
             true
         }
         Some("WITH") => {
@@ -382,6 +395,25 @@ pub fn strip_schema_qualifier(sql: &str, schema: &str) -> String {
     out
 }
 
+/// A single statement with one result at most (no script, no `CALL`): nothing
+/// follows its rows.
+pub fn is_single_result(sql: &str) -> bool {
+    matches!(
+        leading_keyword(sql).as_deref(),
+        Some(
+            "SELECT"
+                | "WITH"
+                | "TABLE"
+                | "VALUES"
+                | "SHOW"
+                | "DESCRIBE"
+                | "DESC"
+                | "EXPLAIN"
+                | "HELP"
+        )
+    ) && split_statements(sql).len() == 1
+}
+
 /// Command tag of a single statement (`CREATE TABLE`, `INSERT`, `SET` ...),
 /// used when the server sends no info text. `None` for scripts with several
 /// statements.
@@ -517,6 +549,22 @@ mod tests {
             "WITH x AS (SELECT 1) UPDATE t JOIN x SET a=1"
         ));
         assert!(!is_read_only_statement("DELETE FROM t"));
+        // Writes a file on the server.
+        assert!(!is_read_only_statement(
+            "SELECT * FROM t INTO OUTFILE '/tmp/x'"
+        ));
+        assert!(!is_read_only_statement(
+            "select a into dumpfile '/tmp/x' from t"
+        ));
+        assert!(!is_read_only_statement(
+            "SELECT * FROM t /*!INTO OUTFILE '/tmp/x'*/"
+        ));
+        assert!(is_read_only_statement("SELECT 'into outfile' FROM t"));
+        assert!(is_read_only_statement("SELECT a INTO @v FROM t"));
+        assert!(is_single_result("SELECT * FROM t;"));
+        assert!(!is_single_result("SELECT 1; SELECT 2"));
+        assert!(!is_single_result("CALL p()"));
+        assert!(!is_single_result("UPDATE t SET a = 1"));
         assert!(causes_implicit_commit("CREATE TABLE t (a int)"));
         assert!(!causes_implicit_commit("CREATE TEMPORARY TABLE t (a int)"));
         assert!(!causes_implicit_commit("INSERT INTO t VALUES (1)"));

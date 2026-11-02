@@ -26,6 +26,9 @@ use tokio_postgres::{AsyncMessage, CancelToken, Client};
 /// Maximum number of buffered server messages per session (oldest are dropped).
 const MAX_NOTICES: usize = 10_000;
 
+/// Severity of LISTEN notifications among the session's messages.
+const NOTIFICATION: &str = "NOTIFICATION";
+
 /// State shared between a session, its cursors and its connection task.
 pub(crate) struct SessionShared {
     notices: Mutex<VecDeque<ServerMessage>>,
@@ -68,8 +71,10 @@ impl SessionShared {
         self.notices.lock().drain(..).collect()
     }
 
+    /// Drop the messages of earlier work (metadata queries ...) before a statement.
+    /// LISTEN notifications that arrived meanwhile are kept: the statement reports them.
     pub(crate) fn clear_notices(&self) {
-        self.notices.lock().clear();
+        self.notices.lock().retain(|m| m.severity == NOTIFICATION);
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -446,7 +451,7 @@ pub(crate) async fn open(params: &ConnectParams) -> DbResult<Connected> {
             match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
                 Some(Ok(AsyncMessage::Notice(n))) => task_shared.push_notice(notice_message(&n)),
                 Some(Ok(AsyncMessage::Notification(n))) => {
-                    task_shared.push_notice(ServerMessage::new("NOTIFICATION", format!("{}: {} (pid {})", n.channel(), n.payload(), n.process_id())))
+                    task_shared.push_notice(ServerMessage::new(NOTIFICATION, format!("{}: {} (pid {})", n.channel(), n.payload(), n.process_id())))
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {

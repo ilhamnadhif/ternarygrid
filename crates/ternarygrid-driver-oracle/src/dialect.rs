@@ -634,12 +634,17 @@ impl Dialect for OracleDialect {
         Some(sql)
     }
 
+    /// `None` for a password with a `"`: Oracle passwords cannot contain one (the
+    /// quoted form has no escape), and removing it would set a password other than the
+    /// one asked for.
     fn change_password_sql(&self, user: Option<&str>, new_password: &str) -> Option<String> {
         let user = user?;
+        if new_password.contains('"') {
+            return None;
+        }
         Some(format!(
-            "ALTER USER {} IDENTIFIED BY \"{}\"",
-            quote(user),
-            new_password.replace('"', "")
+            "ALTER USER {} IDENTIFIED BY \"{new_password}\"",
+            quote(user)
         ))
     }
 }
@@ -689,6 +694,17 @@ mod tests {
         );
         assert_eq!(d.literal(&Value::Bool(true), None), "1");
         assert_eq!(d.literal(&Value::Text("it's".into()), None), "'it''s'");
+    }
+
+    #[test]
+    fn passwords_are_never_altered() {
+        let d = OracleDialect::new();
+        assert_eq!(
+            d.change_password_sql(Some("app"), "s3cret!'x").as_deref(),
+            Some("ALTER USER \"app\" IDENTIFIED BY \"s3cret!'x\"")
+        );
+        // Not expressible: refused instead of setting `abc`.
+        assert_eq!(d.change_password_sql(Some("APP"), "a\"bc"), None);
     }
 
     #[test]

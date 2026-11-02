@@ -91,6 +91,19 @@ async fn explain_plans() {
                 srv.name
             );
             assert!(!s.in_transaction());
+            // ANALYZE would write the file (MariaDB does), which no rollback undoes.
+            let into_file = format!(
+                "SELECT * FROM ea INTO OUTFILE '/tmp/ternarygrid_{}.txt'",
+                suffix()
+            );
+            let e = s.explain(&into_file, true).await.unwrap_err();
+            assert_eq!(
+                e.kind,
+                ErrorKind::Unsupported,
+                "[{}] {}",
+                srv.name,
+                e.full_text()
+            );
         }
         // plain EXPLAIN of DML
         let p = s
@@ -220,6 +233,19 @@ async fn sessions_locks_and_kill() {
                 .await
                 .is_err()
         );
+        // the session's own connection is refused
+        let own = c.server_info().session_id.clone().unwrap();
+        for mode in [KillMode::Terminate, KillMode::CancelQuery] {
+            let e = c.kill_session(&own, mode).await.unwrap_err();
+            assert_eq!(
+                e.kind,
+                ErrorKind::Config,
+                "[{}] {}",
+                srv.name,
+                e.full_text()
+            );
+        }
+        c.ping().await.unwrap();
 
         // metrics
         let metrics = c.server_metrics().await.unwrap();

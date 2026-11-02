@@ -531,6 +531,20 @@ async fn dropped_cursor_does_not_hang() {
         c.close().await.unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(c);
+        // 4b. next_result past unread rows of a huge result (the last one)
+        let mut c = s.execute(&sql, &[], &ExecOptions::default()).await.unwrap();
+        c.next_result().await.unwrap();
+        c.fetch(1).await.unwrap();
+        let started = Instant::now();
+        assert!(c.next_result().await.unwrap().is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "[{}] next_result took {:?}",
+            srv.name,
+            started.elapsed()
+        );
+        drop(c);
+        assert_eq!(query(&mut s, "SELECT 9").await[0][0], Value::Int(9));
         // 5. session.close() while a cursor is still alive
         let c = s
             .execute("SELECT SLEEP(20)", &[], &ExecOptions::default())

@@ -60,14 +60,24 @@ pub struct PgSession {
     source_cache: HashMap<(u32, i16), Option<SourceInfo>>,
     /// The database never changes during a session.
     database: Option<String>,
-    /// The `SET search_path` of the chosen schema, and whether it ran inside a
-    /// transaction: a ROLLBACK undoes it, so it is applied again afterwards.
-    search_path: std::sync::Mutex<Option<(String, bool)>>,
+    /// The `SET search_path` of the chosen schema and, when it ran inside a
+    /// transaction, the search_path from before: a ROLLBACK returns to that value
+    /// and the SET is applied again (not after a COMMIT, which keeps it, or keeps a
+    /// `SET search_path` the user ran afterwards).
+    search_path: std::sync::Mutex<Option<(String, Option<String>)>>,
 }
 
 /// Session settings applied right after connecting.
-const SESSION_SETUP: &[&str] =
-    &["SET DateStyle = 'ISO, MDY'", "SET IntervalStyle = 'postgres'", "SET extra_float_digits = 3", "SET bytea_output = 'hex'", "SET client_encoding = 'UTF8'"];
+/// `standard_conforming_strings`: generated string literals only double quotes
+/// ([`crate::dialect`]), a backslash in them must stay a backslash.
+const SESSION_SETUP: &[&str] = &[
+    "SET DateStyle = 'ISO, MDY'",
+    "SET IntervalStyle = 'postgres'",
+    "SET extra_float_digits = 3",
+    "SET bytea_output = 'hex'",
+    "SET client_encoding = 'UTF8'",
+    "SET standard_conforming_strings = on",
+];
 
 /// Wraps a metadata operation: takes the session gate and, inside an open
 /// transaction, protects it with a savepoint so a failing catalog query
@@ -214,22 +224,34 @@ impl PgSession {
         Ok(g)
     }
 
-    /// The transaction in which the schema was chosen ended (a rollback reverted it): set it again.
+    /// The transaction in which the schema was chosen ended: a rollback reverted the
+    /// search_path to its value from before, and the schema is set again. After a
+    /// commit it is left alone: it is the chosen schema, or a `SET search_path` the
+    /// user ran later in the transaction, which is not overwritten.
     async fn restore_search_path(&self) -> DbResult<()> {
-        let again = match self.search_path.lock() {
+        let ended = match self.search_path.lock() {
             Ok(mut p) => match p.as_mut() {
-                Some((sql, in_tx)) if *in_tx && !self.shared.in_tx() => {
-                    *in_tx = false;
-                    Some(sql.clone())
-                }
+                Some((sql, before @ Some(_))) if !self.shared.in_tx() => before.take().map(|b| (sql.clone(), b)),
                 _ => None,
             },
             Err(_) => None,
         };
-        match again {
-            Some(sql) => self.batch(&sql).await,
-            None => Ok(()),
+        match ended {
+            Some((sql, before)) if self.search_path_now().await? == before => self.batch(&sql).await,
+            _ => Ok(()),
         }
+    }
+
+    /// The session's current `search_path`.
+    async fn search_path_now(&self) -> DbResult<String> {
+        let msgs = self.client()?.simple_query("SHOW search_path").await.map_err(pg)?;
+        Ok(msgs
+            .into_iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+                _ => None,
+            })
+            .unwrap_or_default())
     }
 
     /// Inside a transaction every statement runs in the `ternarygrid_stmt`
@@ -319,8 +341,18 @@ impl PgSession {
         if !savepoint {
             return;
         }
-        let sql = if ok { "RELEASE SAVEPOINT ternarygrid_meta" } else { "ROLLBACK TO SAVEPOINT ternarygrid_meta; RELEASE SAVEPOINT ternarygrid_meta" };
-        if let Err(e) = self.batch(sql).await {
+        const UNDO: &str = "ROLLBACK TO SAVEPOINT ternarygrid_meta; RELEASE SAVEPOINT ternarygrid_meta";
+        let r = if ok {
+            match self.batch("RELEASE SAVEPOINT ternarygrid_meta").await {
+                // A loader that tolerates a failing query (and returned Ok) left the
+                // transaction aborted: back to the savepoint, or the user's transaction is lost.
+                Err(e) if e.code.as_deref() == Some("25P02") => self.batch(UNDO).await,
+                r => r,
+            }
+        } else {
+            self.batch(UNDO).await
+        };
+        if let Err(e) = r {
             tracing::warn!("releasing the metadata savepoint failed: {e}");
         }
     }
@@ -428,6 +460,10 @@ impl PgSession {
                 }
                 Err(e) if is_prepare_unsupported(&e) => {
                     tracing::debug!("statement cannot be described, executing without metadata: {}", map_error(&e));
+                    // In a transaction the failed Parse aborted it: back to the statement's savepoint first.
+                    if self.shared.in_tx() && self.shared.stmt_savepoint.load(std::sync::atomic::Ordering::Acquire) {
+                        self.batch("ROLLBACK TO SAVEPOINT ternarygrid_stmt").await?;
+                    }
                 }
                 Err(e) => return Err(map_error(&e)),
             }
@@ -675,9 +711,19 @@ impl Session for PgSession {
     async fn set_current_schema(&mut self, schema: &str) -> DbResult<()> {
         let _g = self.acquire().await?;
         let sql = if schema == "public" { "SET search_path TO public".to_string() } else { format!("SET search_path TO {}, public", catalog::quote_ident_always(schema)) };
+        // In a transaction: the search_path a rollback returns to (from before the
+        // first schema chosen in it).
+        let before = if self.shared.in_tx() {
+            match self.search_path.lock().ok().and_then(|p| p.as_ref().and_then(|(_, b)| b.clone())) {
+                Some(b) => Some(b),
+                None => Some(self.search_path_now().await?),
+            }
+        } else {
+            None
+        };
         self.batch(&sql).await?;
         if let Ok(mut p) = self.search_path.lock() {
-            *p = Some((sql, self.shared.in_tx()));
+            *p = Some((sql, before));
         }
         Ok(())
     }
@@ -784,5 +830,68 @@ mod tests {
     fn placeholders() {
         assert_eq!(count_placeholders("select $1, '$5', $3"), 3);
         assert_eq!(count_placeholders("select 1"), 0);
+    }
+
+    /// `TERNARYGRID_TEST_PG` (`postgres://user:password@host:port/db`) as parameters.
+    fn live_params() -> Option<ConnectParams> {
+        let url = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.is_empty())?;
+        let rest = url.split_once("://").map_or(url.as_str(), |x| x.1);
+        let (auth, hostpart) = rest.rsplit_once('@').unwrap_or(("", rest));
+        let (user, pass) = auth.split_once(':').unwrap_or((auth, ""));
+        let (hostport, db) = hostpart.split_once('/').unwrap_or((hostpart, "postgres"));
+        let (host, port) = hostport.rsplit_once(':').unwrap_or((hostport, "5432"));
+        let mut cfg = ternarygrid_core::ConnectionConfig::new(DbKind::Postgres, "test");
+        cfg.host = host.to_string();
+        cfg.port = port.parse().ok();
+        cfg.user = Some(user.to_string());
+        cfg.database = Some(db.split('?').next().unwrap_or(db).to_string());
+        cfg.ssl.mode = ternarygrid_core::config::SslMode::Disable;
+        Some(ConnectParams::from_config(&cfg, Some(ternarygrid_core::Secret::new(pass))))
+    }
+
+    /// A metadata loader that tolerates a failing query (and returns Ok) must not
+    /// leave the user's transaction aborted.
+    #[tokio::test]
+    async fn tolerated_metadata_error_keeps_the_transaction() {
+        let Some(params) = live_params() else { return };
+        let mut s = PgSession::open(&params, DbKind::Postgres).await.unwrap();
+        for sql in ["BEGIN", "CREATE TEMP TABLE ternarygrid_meta_t (a int)", "INSERT INTO ternarygrid_meta_t VALUES (1)"] {
+            ternarygrid_core::driver::execute_update(&mut s, sql, &[]).await.unwrap();
+        }
+        let tolerant: DbResult<()> = async {
+            guarded!(
+                s,
+                async {
+                    assert!(s.q("SELECT 1 / 0", &[]).await.is_err());
+                    Ok(())
+                }
+                .await
+            )
+        }
+        .await;
+        tolerant.unwrap();
+        assert!(s.in_transaction());
+        let count = ternarygrid_core::driver::query_scalar(&mut s, "SELECT count(*) FROM ternarygrid_meta_t", &[]).await;
+        assert_eq!(count.unwrap(), Value::Int(1));
+        s.rollback().await.unwrap();
+        s.close().await.unwrap();
+    }
+
+    /// A statement that cannot be described runs without metadata, also inside a
+    /// transaction (where the failed Parse aborted it).
+    #[tokio::test]
+    async fn undescribable_statement_in_a_transaction() {
+        let Some(params) = live_params() else { return };
+        let mut s = PgSession::open(&params, DbKind::Postgres).await.unwrap();
+        // The names tokio-postgres gives its statements are taken, as behind a pooler
+        // that keeps other clients' statements: describing fails with 42P05.
+        let taken: String = (0..5000).map(|i| format!("PREPARE s{i} AS SELECT 1;")).collect();
+        s.batch(&taken).await.unwrap();
+        s.set_transaction_mode(TransactionMode::Manual).await.unwrap();
+        let (_, rows) = ternarygrid_core::driver::query_all(&mut s, "SELECT 42", &[]).await.unwrap_or_else(|e| panic!("{}", e.full_text()));
+        assert_eq!(rows.len(), 1);
+        assert!(s.in_transaction());
+        s.rollback().await.unwrap();
+        s.close().await.unwrap();
     }
 }

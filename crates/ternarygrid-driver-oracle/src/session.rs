@@ -174,6 +174,51 @@ fn compiled_object(sql: &str) -> Option<(String, String)> {
     Some((ty, name))
 }
 
+/// `sql` ends the transaction: COMMIT, ROLLBACK and DDL, which commits implicitly.
+/// `ROLLBACK [WORK] TO [SAVEPOINT] x` keeps it open, and so do `ALTER SESSION` and
+/// `ALTER SYSTEM` (not DDL: they commit nothing).
+fn ends_transaction(sql: &str) -> bool {
+    let w = leading_words(sql, 3);
+    match w.first().map(String::as_str) {
+        Some("COMMIT") => true,
+        Some("ROLLBACK") => !w.iter().skip(1).any(|w| w == "TO"),
+        Some("ALTER") => !matches!(w.get(1).map(String::as_str), Some("SESSION" | "SYSTEM")),
+        Some("CREATE" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE" | "RENAME" | "COMMENT") => true,
+        _ => false,
+    }
+}
+
+/// Savepoint set before `EXPLAIN PLAN`, whose PLAN_TABLE rows join the open transaction.
+const EXPLAIN_SAVEPOINT: &str = "ternarygrid_explain";
+
+/// Statements undoing what `EXPLAIN PLAN` wrote: back to [`EXPLAIN_SAVEPOINT`], which
+/// keeps the user's transaction and its pending changes as they were; when no
+/// transaction was open before, the one `EXPLAIN PLAN` started ends with a rollback.
+/// Never a COMMIT: that would commit the user's pending work.
+fn explain_cleanup(transaction_before: bool) -> Vec<String> {
+    let mut out = vec![format!("ROLLBACK TO SAVEPOINT {EXPLAIN_SAVEPOINT}")];
+    if !transaction_before {
+        out.push("ROLLBACK".into());
+    }
+    out
+}
+
+/// A transaction is open on the server (also one the session's flag does not know of:
+/// `SELECT ... FOR UPDATE`, `LOCK TABLE`). Assumed open when it cannot be told.
+fn transaction_open(conn: &Connection) -> bool {
+    match catalog::query(
+        conn,
+        "SELECT DBMS_TRANSACTION.LOCAL_TRANSACTION_ID FROM dual",
+        &[],
+    ) {
+        Ok(rows) => rows
+            .first()
+            .and_then(|r| r.first())
+            .is_some_and(|v| !v.is_null()),
+        Err(_) => true,
+    }
+}
+
 /// Command tag of a statement without rows: `INSERT`, `CREATE TABLE` ...
 fn tag(sql: &str) -> String {
     let w = leading_words(sql, 2);
@@ -204,7 +249,8 @@ impl CancelHandle for Cancel {
             let r = conn
                 .execute(&format!("ALTER SYSTEM CANCEL SQL '{target}'"), &[])
                 .db();
-            let _ = Arc::new(conn);
+            // Logs the helper connection off.
+            drop(conn);
             r.map(|_| ()).map_err(|e| {
                 if e.code.as_deref() == Some("ORA-01031") {
                     DbError::unsupported("Cancelling a statement needs the ALTER SYSTEM privilege")
@@ -250,7 +296,8 @@ fn open(params: &ConnectParams) -> DbResult<Connection> {
 }
 
 pub struct OracleSession {
-    conn: Arc<Connection>,
+    /// Taken (and logged off) by [`Session::close`].
+    conn: Option<Arc<Connection>>,
     info: ServerInfo,
     dialect: Arc<OracleDialect>,
     mode: TransactionMode,
@@ -293,7 +340,7 @@ impl OracleSession {
             requested: AtomicBool::new(false),
         });
         Ok(OracleSession {
-            conn: Arc::new(conn),
+            conn: Some(Arc::new(conn)),
             info,
             dialect: Arc::new(OracleDialect::new()),
             mode: if params.auto_commit {
@@ -313,10 +360,13 @@ impl OracleSession {
         &self,
         f: impl FnOnce(&Connection) -> DbResult<T> + Send + 'static,
     ) -> DbResult<T> {
-        if self.closed.load(Ordering::SeqCst) {
+        let Some(conn) = self
+            .conn
+            .clone()
+            .filter(|_| !self.closed.load(Ordering::SeqCst))
+        else {
             return Err(DbError::connection("The connection is closed"));
-        }
-        let conn = self.conn.clone();
+        };
         let closed = self.closed.clone();
         let r = tokio::task::spawn_blocking(move || f(&conn))
             .await
@@ -472,6 +522,8 @@ struct OracleCursor {
     messages: Vec<ServerMessage>,
     cancel: Arc<Cancel>,
     done: bool,
+    /// The session's flag: a fetch that loses the connection sets it too.
+    closed: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -489,7 +541,7 @@ impl QueryCursor for OracleCursor {
         };
         let reads = self.reads.clone();
         let cancel = self.cancel.clone();
-        let (cursor, rows, done) = tokio::task::spawn_blocking(move || -> DbResult<_> {
+        let fetched = tokio::task::spawn_blocking(move || -> DbResult<_> {
             let mut rows = Vec::with_capacity(max_rows.min(4096));
             let mut done = false;
             while rows.len() < max_rows.max(1) {
@@ -507,7 +559,12 @@ impl QueryCursor for OracleCursor {
             Ok((cursor, rows, done))
         })
         .await
-        .map_err(|e| DbError::internal(e.to_string()))??;
+        .map_err(|e| DbError::internal(e.to_string()))?;
+        let (cursor, rows, done) = fetched.inspect_err(|e| {
+            if e.kind == ErrorKind::Connection {
+                self.closed.store(true, Ordering::SeqCst);
+            }
+        })?;
         self.done = done;
         if !done {
             self.cursor = Some(cursor);
@@ -556,7 +613,12 @@ impl Session for OracleSession {
 
     async fn close(&mut self) -> DbResult<()> {
         self.closed.store(true, Ordering::SeqCst);
-        // The connection closes when the last reference (a cursor) is dropped.
+        // Dropping the last reference logs off (a cursor keeps none). Off the async
+        // threads, and not waited for long: a dead network may not answer the logoff.
+        if let Some(conn) = self.conn.take() {
+            let logoff = tokio::task::spawn_blocking(move || drop(conn));
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), logoff).await;
+        }
         Ok(())
     }
 
@@ -579,11 +641,13 @@ impl Session for OracleSession {
                 messages: Vec::new(),
                 cancel: self.cancel.clone(),
                 done: true,
+                closed: self.closed.clone(),
             }));
         }
         self.cancel.requested.store(false, Ordering::SeqCst);
         let words = leading_words(&sql, 1);
         let first = words.first().map(String::as_str).unwrap_or("");
+        let ends_tx = ends_transaction(&sql);
         let params = params.to_vec();
         let opts = opts.clone();
         let auto = self.mode == TransactionMode::Auto;
@@ -608,6 +672,7 @@ impl Session for OracleSession {
                     messages: Vec::new(),
                     cancel,
                     done: false,
+                    closed: self.closed.clone(),
                 }))
             }
             Outcome::Done {
@@ -617,13 +682,10 @@ impl Session for OracleSession {
                 dml,
                 plsql,
             } => {
-                match first {
-                    "COMMIT" | "ROLLBACK" if !words.is_empty() => self.in_tx = false,
-                    // DDL commits implicitly.
-                    "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE" | "RENAME"
-                    | "COMMENT" => self.in_tx = false,
-                    _ if !auto && (dml || plsql) => self.in_tx = true,
-                    _ => {}
+                if ends_tx {
+                    self.in_tx = false;
+                } else if !auto && (dml || plsql) {
+                    self.in_tx = true;
                 }
                 let rows_affected = if dml { Some(rows) } else { None };
                 Ok(Box::new(OracleCursor {
@@ -637,6 +699,7 @@ impl Session for OracleSession {
                     messages,
                     cancel,
                     done: true,
+                    closed: self.closed.clone(),
                 }))
             }
         }
@@ -853,19 +916,27 @@ impl Session for OracleSession {
                     .unwrap_or(0) as u64)
         );
         self.blocking(move |c| {
-            c.execute(&format!("EXPLAIN PLAN SET STATEMENT_ID = '{id}' FOR {sql}"), &[]).db()?;
-            let rows = catalog::query(
-                c,
-                "SELECT id, parent_id, operation, options, object_owner, object_name, object_alias, cost, cardinality, bytes, access_predicates, filter_predicates \
-                 FROM plan_table WHERE statement_id = :1 ORDER BY id",
-                &[&id.as_str()],
-            )?;
-            let text = catalog::query(c, "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', :1, 'TYPICAL'))", &[&id.as_str()])
-                .map(|r| r.iter().filter_map(|r| r.first().and_then(catalog::text)).collect::<Vec<_>>().join("\n"))
-                .unwrap_or_default();
-            let _ = c.execute("DELETE FROM plan_table WHERE statement_id = :1", &[&id.as_str()]);
-            let _ = c.commit();
-            Ok(QueryPlan { roots: plan_tree(&rows), text, raw: None, planning_ms: None, execution_ms: None, analyzed: false })
+            // EXPLAIN PLAN writes PLAN_TABLE rows in the open transaction: they are undone
+            // to a savepoint, so the user's transaction is neither committed nor ended.
+            let transaction_before = transaction_open(c);
+            c.execute(&format!("SAVEPOINT {EXPLAIN_SAVEPOINT}"), &[]).db()?;
+            let plan = (|| -> DbResult<QueryPlan> {
+                c.execute(&format!("EXPLAIN PLAN SET STATEMENT_ID = '{id}' FOR {sql}"), &[]).db()?;
+                let rows = catalog::query(
+                    c,
+                    "SELECT id, parent_id, operation, options, object_owner, object_name, object_alias, cost, cardinality, bytes, access_predicates, filter_predicates \
+                     FROM plan_table WHERE statement_id = :1 ORDER BY id",
+                    &[&id.as_str()],
+                )?;
+                let text = catalog::query(c, "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', :1, 'TYPICAL'))", &[&id.as_str()])
+                    .map(|r| r.iter().filter_map(|r| r.first().and_then(catalog::text)).collect::<Vec<_>>().join("\n"))
+                    .unwrap_or_default();
+                Ok(QueryPlan { roots: plan_tree(&rows), text, raw: None, planning_ms: None, execution_ms: None, analyzed: false })
+            })();
+            for stmt in explain_cleanup(transaction_before) {
+                let _ = c.execute(&stmt, &[]);
+            }
+            plan
         })
         .await
     }
@@ -981,6 +1052,48 @@ mod tests {
         );
         assert_eq!(tag("create table t (a number)"), "CREATE TABLE");
         assert_eq!(tag("insert into t values (1)"), "INSERT");
+    }
+
+    #[test]
+    fn statements_ending_the_transaction() {
+        assert!(ends_transaction("COMMIT"));
+        assert!(ends_transaction("commit work"));
+        assert!(ends_transaction("ROLLBACK"));
+        assert!(ends_transaction("rollback work"));
+        assert!(ends_transaction("CREATE TABLE t (a NUMBER)"));
+        assert!(ends_transaction("ALTER TABLE t ADD (b NUMBER)"));
+        assert!(ends_transaction("TRUNCATE TABLE t"));
+        // The transaction stays open.
+        assert!(!ends_transaction("ROLLBACK TO SAVEPOINT ternarygrid_save"));
+        assert!(!ends_transaction("rollback to s1"));
+        assert!(!ends_transaction("ROLLBACK WORK TO SAVEPOINT s1"));
+        assert!(!ends_transaction("SAVEPOINT s1"));
+        assert!(!ends_transaction(
+            "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'"
+        ));
+        assert!(!ends_transaction("ALTER SYSTEM CANCEL SQL '1,2'"));
+        assert!(!ends_transaction("INSERT INTO t VALUES (1)"));
+    }
+
+    #[test]
+    fn explain_never_commits() {
+        // A transaction of the user's: only what EXPLAIN PLAN wrote is undone.
+        assert_eq!(
+            explain_cleanup(true),
+            vec!["ROLLBACK TO SAVEPOINT ternarygrid_explain"]
+        );
+        // None before: the one EXPLAIN PLAN started is rolled back as well.
+        assert_eq!(
+            explain_cleanup(false),
+            vec!["ROLLBACK TO SAVEPOINT ternarygrid_explain", "ROLLBACK"]
+        );
+        for before in [true, false] {
+            assert!(
+                explain_cleanup(before)
+                    .iter()
+                    .all(|s| !s.to_ascii_uppercase().contains("COMMIT"))
+            );
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! synchronously on a blocking thread (see `session::OracleSession::blocking`).
 
 use crate::convert;
-use crate::dialect::qualified;
+use crate::dialect::{qualified, quote};
 use crate::error::OraResultExt;
 use oracledb::{Connection, ToDbValue};
 use std::collections::BTreeMap;
@@ -241,11 +241,21 @@ fn type_text(row: &[Value], base: usize) -> String {
 
 const COLUMN_COLS: &str = "c.column_name, c.data_type, c.data_length, c.char_length, c.char_used, c.data_precision, c.data_scale, c.nullable";
 
+/// The table whose children are listed: `parent` itself, or the table owning it
+/// when it is a table child (an index, a constraint ...).
+fn owning_table(parent: &ObjectRef) -> ObjectRef {
+    match parent.parent_table() {
+        Some(table) if parent.kind.is_table_child() => table,
+        _ => parent.clone(),
+    }
+}
+
 pub(crate) fn list_children(
     conn: &Connection,
     parent: &ObjectRef,
     kind: ObjectKind,
 ) -> DbResult<Vec<ObjectInfo>> {
+    let parent = &owning_table(parent);
     let schema = owner(parent.schema.as_deref())?;
     let table = parent.name.as_str();
     let child = |k: ObjectKind, name: String| ObjectInfo::new(ObjectRef::child(k, parent, name));
@@ -320,6 +330,24 @@ pub(crate) fn list_children(
             .collect(),
         _ => Vec::new(),
     })
+}
+
+/// An index column from its `ALL_IND_EXPRESSIONS` text. A DESC column is indexed as
+/// the expression `"COL"`: that is the plain column again.
+fn index_expression(expression: &str, descending: bool) -> IndexColumn {
+    let e = expression.trim();
+    match e.strip_prefix('"').and_then(|e| e.strip_suffix('"')) {
+        Some(column) if !column.is_empty() && !column.contains('"') => IndexColumn {
+            name: column.to_string(),
+            is_expression: false,
+            descending,
+        },
+        _ => IndexColumn {
+            name: e.to_string(),
+            is_expression: true,
+            descending,
+        },
+    }
 }
 
 /// Oracle keeps NOT NULL as check constraints `"COL" IS NOT NULL`.
@@ -490,6 +518,24 @@ pub(crate) fn table_definitions(
         }
 
         if opts.indexes || only.is_some() {
+            // Expressions of function-based indexes, and of DESC columns (indexed as
+            // expressions too): ALL_IND_COLUMNS names them by hidden `SYS_NC...$` columns.
+            let mut expressions: BTreeMap<(String, String, i64), String> = BTreeMap::new();
+            for r in query(
+                conn,
+                &format!(
+                    "SELECT e.table_name, e.index_name, e.column_position, e.column_expression \
+                     FROM all_ind_expressions e WHERE e.table_owner = :1{}",
+                    filter.replace("t.table_name", "e.table_name")
+                ),
+                &params,
+            )? {
+                if let (Some(table), Some(index), Some(position), Some(expression)) =
+                    (col(&r, 0), col(&r, 1), r.get(2).and_then(int), col(&r, 3))
+                {
+                    expressions.insert((table, index, position), expression);
+                }
+            }
             for r in query(
                 conn,
                 &format!(
@@ -509,15 +555,19 @@ pub(crate) fn table_definitions(
                 };
                 let columns = split_list(col(&r, 4))
                     .into_iter()
-                    .map(|c| {
-                        let (name, descending) = match c.strip_suffix(" DESC") {
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let (column, descending) = match c.strip_suffix(" DESC") {
                             Some(n) => (n.to_string(), true),
                             None => (c, false),
                         };
-                        IndexColumn {
-                            is_expression: name.starts_with("SYS_NC"),
-                            name,
-                            descending,
+                        match expressions.get(&(table.clone(), name.clone(), i as i64 + 1)) {
+                            Some(expression) => index_expression(expression, descending),
+                            None => IndexColumn {
+                                is_expression: column.starts_with("SYS_NC"),
+                                name: column,
+                                descending,
+                            },
                         }
                     })
                     .collect();
@@ -579,7 +629,8 @@ pub(crate) fn table_definitions(
         for r in query(
             conn,
             &format!(
-                "SELECT t.table_name, t.trigger_name, t.trigger_type, t.triggering_event, t.status, t.description, t.trigger_body \
+                "SELECT t.table_name, t.trigger_name, t.trigger_type, t.triggering_event, t.status, t.description, t.trigger_body, \
+                   t.owner, t.when_clause \
                  FROM all_triggers t WHERE t.table_owner = :1{filter} AND t.base_object_type = 'TABLE' ORDER BY t.table_name, t.trigger_name"
             ),
             &params,
@@ -592,6 +643,14 @@ pub(crate) fn table_definitions(
             };
             let ty = col(&r, 2).unwrap_or_default();
             let body = col(&r, 6).unwrap_or_default();
+            let definition = trigger_definition(
+                &col(&r, 7).unwrap_or_else(|| schema.to_string()),
+                &name,
+                schema,
+                &col(&r, 5).unwrap_or_default(),
+                col(&r, 8).as_deref(),
+                &body,
+            );
             t.triggers.push(TriggerDef {
                 name,
                 timing: ty.split_whitespace().next().unwrap_or("").to_string(),
@@ -602,11 +661,7 @@ pub(crate) fn table_definitions(
                     .collect(),
                 for_each_row: ty.contains("EACH ROW"),
                 enabled: col(&r, 4).as_deref() == Some("ENABLED"),
-                definition: format!(
-                    "CREATE OR REPLACE TRIGGER {}{}",
-                    col(&r, 5).unwrap_or_default().trim_end(),
-                    format_args!("\n{}", body.trim_end())
-                ),
+                definition,
                 body: Some(body),
                 comment: None,
             });
@@ -617,6 +672,92 @@ pub(crate) fn table_definitions(
         .into_iter()
         .filter_map(|n| tables.remove(&n))
         .collect())
+}
+
+/// Byte length of the name at the start of `s` (quoted or not, `schema.`-qualified or
+/// not) and whether it is qualified.
+fn leading_name(s: &str) -> Option<(usize, bool)> {
+    let part = |s: &str| -> Option<usize> {
+        match s.strip_prefix('"') {
+            Some(rest) => rest.find('"').map(|i| i + 2),
+            None => {
+                let n = s
+                    .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$' | '#')))
+                    .unwrap_or(s.len());
+                (n > 0).then_some(n)
+            }
+        }
+    };
+    let first = part(s)?;
+    match s[first..].strip_prefix('.') {
+        Some(rest) => part(rest).map(|n| (first + 1 + n, true)),
+        None => Some((first, false)),
+    }
+}
+
+/// Byte offset just after the first word `keyword` of `s` outside quoted names.
+fn keyword_end(s: &str, keyword: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        let c = rest.chars().next()?;
+        if c == '"' {
+            i += rest[1..].find('"').map(|n| n + 2)?;
+        } else if c.is_alphanumeric() || c == '_' {
+            let (n, _) = leading_name(rest)?;
+            if rest[..n].eq_ignore_ascii_case(keyword) {
+                return Some(i + n);
+            }
+            i += n;
+        } else {
+            i += c.len_utf8();
+        }
+    }
+    None
+}
+
+/// `CREATE OR REPLACE TRIGGER` statement from `ALL_TRIGGERS`. DESCRIPTION is the
+/// header as it was written (`trg BEFORE INSERT ON emp FOR EACH ROW`), usually
+/// unqualified: the trigger and its table are qualified with their owners, so the
+/// statement does not create them in the current schema. WHEN_CLAUSE is kept apart
+/// from DESCRIPTION and is put back.
+fn trigger_definition(
+    owner: &str,
+    name: &str,
+    table_owner: &str,
+    description: &str,
+    when: Option<&str>,
+    body: &str,
+) -> String {
+    let description = description.trim();
+    let qualify = || -> Option<String> {
+        let (n, _) = leading_name(description)?;
+        let rest = &description[n..];
+        let on = keyword_end(rest, "ON")?;
+        let table = rest[on..].trim_start();
+        let table_at = rest.len() - table.len();
+        let (_, qualified_table) = leading_name(table)?;
+        let mut header = qualified(Some(owner), name);
+        header.push_str(&rest[..table_at]);
+        if !qualified_table {
+            header.push_str(&quote(table_owner));
+            header.push('.');
+        }
+        header.push_str(table);
+        Some(header)
+    };
+    let mut s = format!(
+        "CREATE OR REPLACE TRIGGER {}",
+        qualify().unwrap_or_else(|| description.to_string())
+    );
+    if let Some(w) = when.map(str::trim).filter(|w| !w.is_empty())
+        && keyword_end(description, "WHEN").is_none()
+    {
+        s.push_str(&format!("\nWHEN ({w})"));
+    }
+    s.push('\n');
+    s.push_str(body.trim_end());
+    s
 }
 
 pub(crate) fn kind_of(type_text: &str) -> DataKind {
@@ -1039,5 +1180,67 @@ mod tests {
         assert_eq!(kind_of("NUMBER(10,2)"), DataKind::Decimal);
         assert_eq!(kind_of("TIMESTAMP(6) WITH TIME ZONE"), DataKind::DateTimeTz);
         assert_eq!(kind_of("DATE"), DataKind::DateTime);
+    }
+
+    #[test]
+    fn function_based_index_columns_are_expressions() {
+        assert_eq!(
+            index_expression("UPPER(\"NAME\")", false),
+            IndexColumn {
+                name: "UPPER(\"NAME\")".into(),
+                is_expression: true,
+                descending: false
+            }
+        );
+        // A DESC column: Oracle indexes it as the expression "COL".
+        assert_eq!(
+            index_expression("\"CREATED_AT\"", true),
+            IndexColumn {
+                name: "CREATED_AT".into(),
+                is_expression: false,
+                descending: true
+            }
+        );
+        assert!(index_expression("\"A\"||\"B\"", false).is_expression);
+    }
+
+    #[test]
+    fn trigger_definitions_are_qualified() {
+        assert_eq!(
+            trigger_definition(
+                "HR",
+                "TRG_BI",
+                "HR",
+                "trg_bi\nBEFORE INSERT OR UPDATE OF sal ON emp\nFOR EACH ROW\n",
+                Some("new.sal > 0"),
+                "BEGIN\n  :new.id := 1;\nEND;\n",
+            ),
+            "CREATE OR REPLACE TRIGGER HR.TRG_BI\nBEFORE INSERT OR UPDATE OF sal ON HR.emp\nFOR EACH ROW\nWHEN (new.sal > 0)\nBEGIN\n  :new.id := 1;\nEND;"
+        );
+        // Already qualified table, quoted names, no WHEN clause.
+        assert_eq!(
+            trigger_definition(
+                "app",
+                "Audit",
+                "data",
+                "\"Audit\" AFTER DELETE ON \"data\".\"Orders\" FOR EACH ROW",
+                None,
+                "BEGIN NULL; END;",
+            ),
+            "CREATE OR REPLACE TRIGGER \"app\".\"Audit\" AFTER DELETE ON \"data\".\"Orders\" FOR EACH ROW\nBEGIN NULL; END;"
+        );
+        // A header that cannot be read is kept as is.
+        assert_eq!(
+            trigger_definition("HR", "T", "HR", "???", None, "BEGIN NULL; END;"),
+            "CREATE OR REPLACE TRIGGER ???\nBEGIN NULL; END;"
+        );
+    }
+
+    #[test]
+    fn children_of_a_table_child_are_the_table_children() {
+        let table = ObjectRef::table(Some("HR".into()), "EMP");
+        let index = ObjectRef::child(ObjectKind::Index, &table, "EMP_IX");
+        assert_eq!(owning_table(&index), table);
+        assert_eq!(owning_table(&table), table);
     }
 }

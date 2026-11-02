@@ -178,6 +178,19 @@ async fn transactions_auto_and_manual() {
     exec(s.as_mut(), "SAVEPOINT ternarygrid_save").await;
     exec(s.as_mut(), "INSERT INTO ternarygrid_tx VALUES (5, 'e')").await;
     exec(s.as_mut(), "ROLLBACK TO SAVEPOINT ternarygrid_save").await;
+    // Row 4 is still pending: the transaction stays open.
+    assert!(s.in_transaction());
+    // EXPLAIN (the AI tab runs it on its own) neither commits nor ends it.
+    s.explain("SELECT * FROM ternarygrid_tx", false)
+        .await
+        .unwrap();
+    assert!(s.in_transaction());
+    assert_eq!(
+        query_scalar(other.as_mut(), "SELECT COUNT(*) FROM ternarygrid_tx", &[])
+            .await
+            .unwrap(),
+        Value::Int(2)
+    );
     s.commit().await.unwrap();
     assert_eq!(
         query_scalar(other.as_mut(), "SELECT COUNT(*) FROM ternarygrid_tx", &[])

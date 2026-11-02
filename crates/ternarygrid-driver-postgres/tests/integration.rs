@@ -579,6 +579,50 @@ async fn notices_and_error_details() {
 }
 
 #[tokio::test]
+async fn notifications_received_while_idle_are_reported() {
+    let Some(url) = url() else { return };
+    let params = params_from_url(&url);
+    let mut s = connect(&params).await;
+    let mut other = connect(&params).await;
+    let channel = format!("ternarygrid_{}", suffix());
+    exec(&mut s, &format!("LISTEN {channel}")).await;
+    exec(&mut other, &format!("NOTIFY {channel}, 'hello'")).await;
+    // Delivered while `s` is idle; metadata loads in between do not lose it either.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    s.list_schemas().await.unwrap();
+    let mut cur = s.execute("SELECT 1", &[], &ExecOptions::default()).await.unwrap();
+    while cur.next_result().await.unwrap().is_some() {
+        while !cur.fetch(100).await.unwrap().is_empty() {}
+    }
+    let msgs = cur.take_messages();
+    cur.close().await.unwrap();
+    assert!(msgs.iter().any(|m| m.severity == "NOTIFICATION" && m.message.contains("hello")), "{msgs:?}");
+    // Reported once.
+    let mut cur = s.execute("SELECT 1", &[], &ExecOptions::default()).await.unwrap();
+    while cur.next_result().await.unwrap().is_some() {
+        while !cur.fetch(100).await.unwrap().is_empty() {}
+    }
+    assert!(!cur.take_messages().iter().any(|m| m.severity == "NOTIFICATION"));
+    cur.close().await.unwrap();
+    s.close().await.ok();
+    other.close().await.ok();
+}
+
+#[tokio::test]
+async fn string_literals_are_standard_conforming() {
+    let Some(url) = url() else { return };
+    let mut params = params_from_url(&url);
+    // A server (or role) still configured the pre-9.1 way.
+    params.properties.insert("options".into(), "-c standard_conforming_strings=off".into());
+    let mut s = connect(&params).await;
+    assert_eq!(scalar(&mut s, "SHOW standard_conforming_strings").await, Value::text("on"));
+    let text = "C:\\temp\\new 'x'";
+    let literal = s.dialect().string_literal(text);
+    assert_eq!(scalar(&mut s, &format!("SELECT {literal}")).await, Value::text(text));
+    s.close().await.ok();
+}
+
+#[tokio::test]
 async fn parameters_round_trip() {
     let Some(url) = url() else { return };
     let params = params_from_url(&url);
@@ -757,6 +801,22 @@ async fn context_and_databases() {
         let schemas = s.list_schemas().await.unwrap();
         assert!(schemas.iter().any(|x| x.name == schema && !x.is_system));
         assert!(schemas.iter().any(|x| x.name == "pg_catalog" && x.is_system));
+
+        // Schema chosen inside a transaction: a SET search_path the user ran after it
+        // and committed is kept ...
+        s.set_transaction_mode(TransactionMode::Manual).await.unwrap();
+        exec(&mut s, "SELECT 1").await;
+        assert!(s.in_transaction());
+        s.set_current_schema(&schema).await.unwrap();
+        exec(&mut s, "SET search_path TO pg_catalog").await;
+        s.commit().await.unwrap();
+        assert_eq!(scalar(&mut s, "SHOW search_path").await, Value::text("pg_catalog"));
+        // ... while a rollback (which reverts the SET) gets the chosen schema back.
+        exec(&mut s, "SELECT 1").await;
+        s.set_current_schema(&schema).await.unwrap();
+        s.rollback().await.unwrap();
+        assert_eq!(scalar(&mut s, "SELECT current_schema()::text").await, Value::text(schema.as_str()));
+        s.rollback().await.unwrap();
         s.close().await.ok();
     })
     .await;
