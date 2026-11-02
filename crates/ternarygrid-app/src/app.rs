@@ -1910,9 +1910,10 @@ impl eframe::App for TernaryGridApp {
         }
         let mut focused_layer = None;
         for tab in &mut self.popups {
-            // The header of the dialogs (a taller one than a title bar): the tab's icon, its
-            // title and its connection, and ×.
-            let size = tab.view.popup_size().unwrap_or(egui::vec2(720.0, 520.0)) + egui::vec2(0.0, 30.0);
+            // In the header of the dialogs: the tab's icon, its title and its connection, and ×.
+            // `popup_size` is the design's window inside its 1-point border (the modal's CSS
+            // width and height, header included), as `Dialog::width`; the window adds the border.
+            let size = tab.view.popup_size().unwrap_or(egui::vec2(720.0, 520.0)) + egui::vec2(2.0, 2.0);
             let title = tab.view.title();
             let subtitle = tab.view.connection_id().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_default();
             let tab_icon = tab.view.icon();
