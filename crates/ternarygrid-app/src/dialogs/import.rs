@@ -244,9 +244,9 @@ impl ImportDialog {
             muted(ui, tr("No connections found."));
             return;
         }
-        // As tall as its small buttons (26), not a form row.
+        // As tall as its small buttons, not a form row (the label centred on them).
         let control_h = ui.spacing().interact_size.y;
-        ui.spacing_mut().interact_size.y = 0.0;
+        ui.spacing_mut().interact_size.y = style::SMALL_H;
         ui.horizontal(|ui| {
             let n = r.connections.len();
             let found = if n == 1 { tr("1 connection found").to_string() } else { trf("{} connections found", &[&n]) };

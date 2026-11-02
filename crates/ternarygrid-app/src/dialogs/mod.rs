@@ -1221,7 +1221,7 @@ fn table_dyn(ui: &mut Ui, id: Id, cols: &[Column<'_>], rows: usize, row_h: f32, 
                 let layout = if col.right {
                     Layout::right_to_left(Align::Center)
                 } else if col.center {
-                    Layout::left_to_right(Align::Center).with_main_align(Align::Center)
+                    Layout::centered_and_justified(egui::Direction::LeftToRight)
                 } else {
                     Layout::left_to_right(Align::Center)
                 };
