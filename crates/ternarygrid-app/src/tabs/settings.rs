@@ -268,10 +268,17 @@ fn blocking<T: Send + 'static>(cx: &AppContext, work: impl FnOnce() -> Result<T,
 
 /// Width of the label column: 220 points, less in a half-width group.
 fn label_w(ui: &Ui) -> f32 {
-    // In a half-width group the label column leaves the controls 196 points (a three-option
-    // segmented control) instead of overflowing the group as the mockup does.
+    // In a half-width group the label column leaves the controls `narrow_controls()` points
+    // (196: a three-option segmented control) instead of overflowing the group as the mockup
+    // does.
     let w = ui.available_width();
-    if w < 600.0 { (w - 16.0 - 196.0).clamp(110.0, 165.0) } else { 220.0 }
+    let controls = ui.data(|d| d.get_temp::<f32>(narrow_controls_id())).unwrap_or(196.0);
+    if w < 600.0 { (w - 16.0 - controls).clamp(110.0, 165.0) } else { 220.0 }
+}
+
+/// The room a narrow group's rows keep for their controls (see [`label_w`]).
+fn narrow_controls_id() -> egui::Id {
+    egui::Id::new("settings_narrow_controls")
 }
 
 /// What "Search settings" looks for (lower case), kept for the frame in the ui's memory.
@@ -764,10 +771,13 @@ impl SettingsTab {
             0.427,
             |ui| {
                 group(ui, tr("Memory"), |ui| {
+                    // Number fields only: the labels get more room.
+                    ui.data_mut(|d| d.insert_temp(narrow_controls_id(), 120.0f32));
                     let mut c = false;
                     c |= row(ui, tr("Memory per result set"), |ui| num(ui, store_mb, 16..=16_384, "MB"));
                     c |= row(ui, tr("Memory for all result sets"), |ui| num(ui, global_mb, 64..=65_536, "MB"));
                     c |= row(ui, tr("Maximum text length"), |ui| num(ui, max_text, 64..=10_000_000, ""));
+                    ui.data_mut(|d| d.remove_temp::<f32>(narrow_controls_id()));
                     c
                 })
             },
