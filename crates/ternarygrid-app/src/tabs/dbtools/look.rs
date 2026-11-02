@@ -20,6 +20,16 @@ pub(crate) const BODY: Margin = Margin { left: 20, right: 20, top: 16, bottom: 1
 /// A note on a soft tinted background (an icon, an optional bold title, the text) and
 /// `add` after the text (a button). Like `parts::callout`, but as high as its text.
 pub(crate) fn note_with(ui: &mut Ui, tone: parts::Tone, title: Option<&str>, body: &str, add: impl FnOnce(&mut Ui)) -> Response {
+    let mut add = Some(add);
+    note_dyn(ui, tone, title, body, &mut |ui| {
+        if let Some(a) = add.take() {
+            a(ui)
+        }
+    })
+}
+
+// The frame code is compiled once, not once per caller.
+fn note_dyn(ui: &mut Ui, tone: parts::Tone, title: Option<&str>, body: &str, add: &mut dyn FnMut(&mut Ui)) -> Response {
     let p = style::pal(ui);
     let color = tone.color(&p);
     Frame::new()
@@ -327,49 +337,52 @@ pub(crate) fn collapsible_card(ui: &mut Ui, open: &mut bool, title: &str, summar
 /// The footer of a tool window: a bar on the chrome colour with a hairline above it, across
 /// the whole window, at the bottom of `ui`. `add` lays out its buttons from the left.
 pub(crate) fn footer(ui: &mut Ui, id: impl Hash + std::fmt::Debug, add: impl FnOnce(&mut Ui)) {
+    let mut add = Some(add);
+    footer_dyn(ui, Id::new(id), &mut |ui| {
+        if let Some(a) = add.take() {
+            a(ui)
+        }
+    });
+}
+
+fn footer_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
     // In a window: across the whole window, whatever its margins; in a tab: across the tab.
     let layer = ui.layer_id();
     let area = (layer.order != egui::Order::Background).then(|| ui.ctx().memory(|m| m.area_rect(layer.id))).flatten();
     let outer = area.map(|r| r.shrink(1.0)).unwrap_or_else(|| ui.clip_rect());
-    egui::Panel::bottom(Id::new(id)).resizable(false).show_separator_line(false).frame(Frame::new().inner_margin(Margin { left: 20, right: 16, top: 12, bottom: 12 })).show(
-        ui,
-        |ui| {
-            let top = ui.max_rect().top() - 12.0;
-            let fill = Rect::from_min_max(pos2(outer.left(), top), pos2(outer.right(), outer.bottom().max(ui.max_rect().bottom() + 12.0)));
-            let painter = ui.ctx().layer_painter(layer).with_clip_rect(outer);
-            let r = style::RADIUS_LG + 1;
-            painter.rect_filled(fill, CornerRadius { nw: 0, ne: 0, sw: r, se: r }, p.chrome);
-            painter.hline(fill.x_range(), top + 0.5, Stroke::new(1.0, p.border));
-            ui.set_min_height(style::CONTROL_H);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                add(ui);
-            });
-        },
-    );
+    egui::Panel::bottom(id).resizable(false).show_separator_line(false).frame(Frame::new().inner_margin(Margin { left: 20, right: 16, top: 12, bottom: 12 })).show(ui, |ui| {
+        let top = ui.max_rect().top() - 12.0;
+        let fill = Rect::from_min_max(pos2(outer.left(), top), pos2(outer.right(), outer.bottom().max(ui.max_rect().bottom() + 12.0)));
+        let painter = ui.ctx().layer_painter(layer).with_clip_rect(outer);
+        let r = style::RADIUS_LG + 1;
+        painter.rect_filled(fill, CornerRadius { nw: 0, ne: 0, sw: r, se: r }, p.chrome);
+        painter.hline(fill.x_range(), top + 0.5, Stroke::new(1.0, p.border));
+        ui.set_min_height(style::CONTROL_H);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            add(ui);
+        });
+    });
 }
 
 /// The padded body of a tool window (scrolls when it does not fit).
 pub(crate) fn body<R>(ui: &mut Ui, id: impl Hash + std::fmt::Debug, add: impl FnOnce(&mut Ui) -> R) -> R {
-    egui::CentralPanel::default()
-        .frame(Frame::new())
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt(id)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    Frame::new()
-                        .inner_margin(BODY)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 12.0;
-                            add(ui)
-                        })
-                        .inner
-                })
-                .inner
-        })
-        .inner
+    let mut add = Some(add);
+    let mut out = None;
+    body_dyn(ui, Id::new(id), &mut |ui| out = add.take().map(|a| a(ui)));
+    out.expect("a tool body runs once")
+}
+
+fn body_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
+    egui::CentralPanel::default().frame(Frame::new()).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
+            Frame::new().inner_margin(BODY).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 12.0;
+                add(ui);
+            });
+        });
+    });
 }
 
 /// A hairline across `ui` with room above and below.
@@ -509,6 +522,10 @@ fn paint_cell(ui: &mut Ui, c: &Cell, header: bool) {
 /// A bordered table of styled cells like the mockups' (header on the header colour, striped
 /// rows, resizable columns, the last column takes the rest).
 pub(crate) fn table(ui: &mut Ui, id: impl Hash + std::fmt::Debug, headers: &[Cell], rows: &[Vec<Cell>], selected: Option<usize>) -> TableResponse {
+    table_dyn(ui, Id::new(id), headers, rows, selected)
+}
+
+fn table_dyn(ui: &mut Ui, id: Id, headers: &[Cell], rows: &[Vec<Cell>], selected: Option<usize>) -> TableResponse {
     let mut out = TableResponse::default();
     parts::bordered(ui).show(ui, |ui| {
         ui.scope(|ui| {
@@ -587,6 +604,10 @@ pub(crate) fn headers(names: &[&str]) -> Vec<Cell> {
 /// A bordered grid of widgets with a header row like [`table`]: `cell(ui, row, column)` draws
 /// each cell; `widths` are the column widths (the last one takes the rest).
 pub(crate) fn widget_table(ui: &mut Ui, id: impl Hash + std::fmt::Debug, names: &[&str], widths: &[f32], rows: usize, row_h: f32, mut cell: impl FnMut(&mut Ui, usize, usize)) {
+    widget_table_dyn(ui, Id::new(id), names, widths, rows, row_h, &mut cell);
+}
+
+fn widget_table_dyn(ui: &mut Ui, id: Id, names: &[&str], widths: &[f32], rows: usize, row_h: f32, cell: &mut dyn FnMut(&mut Ui, usize, usize)) {
     parts::bordered(ui).show(ui, |ui| {
         ui.scope(|ui| {
             let p = style::pal(ui);

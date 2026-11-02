@@ -21,6 +21,21 @@ pub(crate) const INPUT_MARGIN: Margin = Margin::symmetric(8, 6);
 
 /// The row under the window's header: the stepper (and the title when the wizard is a tab).
 pub(crate) fn top_panel(ui: &mut Ui, id: Id, add: impl FnOnce(&mut Ui)) {
+    top_panel_dyn(ui, id, &mut once(add));
+}
+
+/// Wraps a closure that runs once so that the code around it is compiled once, not once per
+/// caller (the wizards call these helpers a few hundred times).
+fn once<R>(f: impl FnOnce(&mut Ui) -> R) -> impl FnMut(&mut Ui) {
+    let mut f = Some(f);
+    move |ui| {
+        if let Some(f) = f.take() {
+            f(ui);
+        }
+    }
+}
+
+fn top_panel_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
     egui::Panel::top(id).resizable(false).frame(Frame::new().fill(p.surface).inner_margin(Margin { left: 22, right: 22, top: 14, bottom: 14 })).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
@@ -30,6 +45,10 @@ pub(crate) fn top_panel(ui: &mut Ui, id: Id, add: impl FnOnce(&mut Ui)) {
 
 /// The footer on the chrome colour: Back on the left, the actions on the right.
 pub(crate) fn bottom_panel(ui: &mut Ui, id: Id, add: impl FnOnce(&mut Ui)) {
+    bottom_panel_dyn(ui, id, &mut once(add));
+}
+
+fn bottom_panel_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
     let r = style::RADIUS_LG + 1;
     egui::Panel::bottom(id)
@@ -46,6 +65,10 @@ pub(crate) fn bottom_panel(ui: &mut Ui, id: Id, add: impl FnOnce(&mut Ui)) {
 
 /// The scrolling body on the surface colour.
 pub(crate) fn body(ui: &mut Ui, id: Id, add: impl FnOnce(&mut Ui)) {
+    body_dyn(ui, id, &mut once(add));
+}
+
+fn body_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
     egui::CentralPanel::default().frame(Frame::new().fill(p.surface)).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
@@ -337,32 +360,41 @@ const FORM_COLUMN_GAP: f32 = 28.0;
 
 /// A form (see [`Form`]).
 pub(crate) fn form<R>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, per_row: usize, label_w: f32, add: impl FnOnce(&mut Form<'_>) -> R) -> R {
-    ui.push_id(Id::new(id), |ui| {
+    let mut add = Some(add);
+    let mut out = None;
+    form_dyn(ui, Id::new(id), per_row, label_w, &mut |f: &mut Form<'_>| out = add.take().map(|a| a(f)));
+    out.expect("a form body runs once")
+}
+
+fn form_dyn(ui: &mut Ui, id: Id, per_row: usize, label_w: f32, add: &mut dyn FnMut(&mut Form<'_>)) {
+    ui.push_id(id, |ui| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = GAP;
             let mut f = Form { ui, per_row: per_row.max(1), label_w, n: 0, top: 0.0, height: 0.0 };
-            let r = add(&mut f);
+            add(&mut f);
             f.finish_line();
-            r
-        })
-        .inner
-    })
-    .inner
+        });
+    });
 }
 
 /// A label of `label_w` (wrapped when longer) and the control(s) `add` draws on its right.
 pub(crate) fn form_row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let p = style::pal(ui);
     ui.horizontal(|ui| {
-        let h = ui.spacing().interact_size.y;
-        ui.allocate_ui_with_layout(vec2(label_w, h), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_min_width(label_w);
-            ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).wrap());
-        });
-        ui.add_space(16.0 - ui.spacing().item_spacing.x);
+        row_label(ui, label, label_w);
         add(ui)
     })
     .inner
+}
+
+/// The label column of a form row and the gap after it.
+fn row_label(ui: &mut Ui, label: &str, label_w: f32) {
+    let p = style::pal(ui);
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(vec2(label_w, h), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_width(label_w);
+        ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).wrap());
+    });
+    ui.add_space(16.0 - ui.spacing().item_spacing.x);
 }
 
 impl Form<'_> {
@@ -371,6 +403,14 @@ impl Form<'_> {
         if self.per_row == 1 {
             return form_row(self.ui, label, self.label_w, add);
         }
+        let mut child = self.column_ui();
+        let r = form_row(&mut child, label, self.label_w, add);
+        self.end_column(&child);
+        r
+    }
+
+    /// The ui of the next column of a line.
+    fn column_ui(&mut self) -> Ui {
         let column = self.n % self.per_row;
         if column == 0 {
             self.top = self.ui.cursor().top();
@@ -380,14 +420,15 @@ impl Form<'_> {
         let w = (full.width() - FORM_COLUMN_GAP * (self.per_row - 1) as f32) / self.per_row as f32;
         let x = full.left() + column as f32 * (w + FORM_COLUMN_GAP);
         let rect = Rect::from_min_size(pos2(x, self.top), vec2(w, 4000.0));
-        let mut child = self.ui.new_child(UiBuilder::new().id_salt(("row", self.n)).max_rect(rect).layout(Layout::top_down(Align::Min)));
-        let r = form_row(&mut child, label, self.label_w, add);
+        self.ui.new_child(UiBuilder::new().id_salt(("row", self.n)).max_rect(rect).layout(Layout::top_down(Align::Min)))
+    }
+
+    fn end_column(&mut self, child: &Ui) {
         self.height = self.height.max(child.min_rect().height());
         self.n += 1;
         if self.n.is_multiple_of(self.per_row) {
             self.finish_line();
         }
-        r
     }
 
     /// Ends a line of columns that is not full yet.
@@ -441,6 +482,10 @@ pub(crate) fn facts(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, lab
 /// A card that folds open: a chevron, its title and a faint summary; `fill` makes it as wide as
 /// the row. Returns true when its header was clicked.
 pub(crate) fn fold_card(ui: &mut Ui, id: Id, open: &mut bool, title: &str, summary: Option<&str>, fill: bool, body: impl FnOnce(&mut Ui)) -> bool {
+    fold_card_dyn(ui, id, open, title, summary, fill, &mut once(body))
+}
+
+fn fold_card_dyn(ui: &mut Ui, id: Id, open: &mut bool, title: &str, summary: Option<&str>, fill: bool, body: &mut dyn FnMut(&mut Ui)) -> bool {
     let p = style::pal(ui);
     let mut toggled = false;
     kit::card(ui).corner_radius(CornerRadius::same(style::RADIUS_LG)).inner_margin(Margin::same(12)).show(ui, |ui| {
@@ -545,9 +590,13 @@ pub(crate) fn table(
     mut header: impl FnMut(&mut Ui, usize),
     mut cell: impl FnMut(&mut Ui, usize, usize),
 ) {
+    table_dyn(ui, Id::new(id), cols, row_h, max_h, rows, &mut header, &mut cell);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn table_dyn(ui: &mut Ui, id: Id, cols: &[Col], row_h: f32, max_h: Option<f32>, rows: usize, header: &mut dyn FnMut(&mut Ui, usize), cell: &mut dyn FnMut(&mut Ui, usize, usize)) {
     let p = style::pal(ui);
     let stripe = ui.visuals().faint_bg_color;
-    let id = Id::new(id);
     let avail = ui.available_width() - 2.0;
     let fixed: f32 = cols.iter().map(|c| if let W::Px(w) = c.w { w } else { 0.0 }).sum();
     let fr: f32 = cols.iter().map(|c| c.w.flex().0).sum();

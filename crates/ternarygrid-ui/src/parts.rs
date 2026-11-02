@@ -78,6 +78,14 @@ impl<'a> Dialog<'a> {
 
     /// The header, the body and the footer inside an already open `ui`; returns whether × was clicked.
     pub fn contents<R>(&self, ui: &mut Ui, body: impl FnOnce(&mut Ui) -> R, footer: Option<&mut dyn FnMut(&mut Ui)>) -> (bool, R) {
+        let mut body = Some(body);
+        let mut out = None;
+        let close = self.contents_dyn(ui, &mut |ui| out = body.take().map(|b| b(ui)), footer);
+        (close, out.expect("a dialog body runs once"))
+    }
+
+    // The frame code is not generic so it is compiled once, not once per dialog.
+    fn contents_dyn(&self, ui: &mut Ui, body: &mut dyn FnMut(&mut Ui), footer: Option<&mut dyn FnMut(&mut Ui)>) -> bool {
         let p = style::pal(ui);
         ui.set_width(self.width);
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -114,12 +122,12 @@ impl<'a> Dialog<'a> {
         });
         hline(ui);
         // Body.
-        let inner = Frame::new().inner_margin(self.pad).show(ui, |ui| {
+        Frame::new().inner_margin(self.pad).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             if let Some(h) = self.min_height {
                 ui.set_min_height(h);
             }
-            body(ui)
+            body(ui);
         });
         // Footer.
         if let Some(footer) = footer {
@@ -136,29 +144,30 @@ impl<'a> Dialog<'a> {
                 });
             });
         }
-        (close, inner.inner)
+        close
     }
 
     /// A modal dialog (dimmed backdrop). `close` is set by ×, a click on the backdrop and Escape.
     pub fn show_modal<R>(&self, ctx: &egui::Context, id: Id, body: impl FnOnce(&mut Ui) -> R, mut footer: impl FnMut(&mut Ui)) -> (DialogResponse, R) {
-        let dark = ctx.global_style().visuals.dark_mode;
-        let backdrop = if dark { Color32::from_black_alpha(140) } else { Color32::from_rgba_unmultiplied(30, 30, 45, 70) };
-        let modal = egui::Modal::new(id).frame(Self::frame(ctx)).backdrop_color(backdrop).show(ctx, |ui| self.contents(ui, body, Some(&mut footer)));
-        let should_close = modal.should_close();
-        let (layer, rect) = (modal.response.layer_id, modal.response.rect);
-        let (close, r) = modal.inner;
-        (DialogResponse { close: close || should_close, layer: Some(layer), rect: Some(rect) }, r)
+        let mut body = Some(body);
+        let mut out = None;
+        let resp = self.modal_dyn(ctx, id, &mut |ui| out = body.take().map(|b| b(ui)), Some(&mut footer));
+        (resp, out.expect("a dialog body runs once"))
     }
 
     /// A modal dialog without a footer.
     pub fn show_modal_plain<R>(&self, ctx: &egui::Context, id: Id, body: impl FnOnce(&mut Ui) -> R) -> (DialogResponse, R) {
+        let mut body = Some(body);
+        let mut out = None;
+        let resp = self.modal_dyn(ctx, id, &mut |ui| out = body.take().map(|b| b(ui)), None);
+        (resp, out.expect("a dialog body runs once"))
+    }
+
+    fn modal_dyn(&self, ctx: &egui::Context, id: Id, body: &mut dyn FnMut(&mut Ui), footer: Option<&mut dyn FnMut(&mut Ui)>) -> DialogResponse {
         let dark = ctx.global_style().visuals.dark_mode;
         let backdrop = if dark { Color32::from_black_alpha(140) } else { Color32::from_rgba_unmultiplied(30, 30, 45, 70) };
-        let modal = egui::Modal::new(id).frame(Self::frame(ctx)).backdrop_color(backdrop).show(ctx, |ui| self.contents(ui, body, None));
-        let should_close = modal.should_close();
-        let (layer, rect) = (modal.response.layer_id, modal.response.rect);
-        let (close, r) = modal.inner;
-        (DialogResponse { close: close || should_close, layer: Some(layer), rect: Some(rect) }, r)
+        let modal = egui::Modal::new(id).frame(Self::frame(ctx)).backdrop_color(backdrop).show(ctx, |ui| self.contents_dyn(ui, body, footer));
+        DialogResponse { close: modal.inner || modal.should_close(), layer: Some(modal.response.layer_id), rect: Some(modal.response.rect) }
     }
 
     /// A floating, movable tool window (wizards, tools) with this frame; `open` is cleared by ×.
@@ -171,24 +180,35 @@ impl<'a> Dialog<'a> {
         body: impl FnOnce(&mut Ui) -> R,
         footer: Option<&mut dyn FnMut(&mut Ui)>,
     ) -> (DialogResponse, Option<R>) {
+        let mut body = Some(body);
+        let mut out = None;
+        let resp = self.window_dyn(ctx, id, open, default_pos, &mut |ui| out = body.take().map(|b| b(ui)), footer);
+        (resp, out)
+    }
+
+    fn window_dyn(
+        &self,
+        ctx: &egui::Context,
+        id: Id,
+        open: &mut bool,
+        default_pos: Option<egui::Pos2>,
+        body: &mut dyn FnMut(&mut Ui),
+        footer: Option<&mut dyn FnMut(&mut Ui)>,
+    ) -> DialogResponse {
         if !*open {
-            return (DialogResponse::default(), None);
+            return DialogResponse::default();
         }
         let mut w = egui::Window::new(self.title).id(id).title_bar(false).resizable(false).collapsible(false).frame(Self::frame(ctx));
         w = match default_pos {
             Some(pos) => w.default_pos(pos),
             None => w.pivot(Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()),
         };
-        let shown = w.show(ctx, |ui| self.contents(ui, body, footer));
-        let Some(shown) = shown else { return (DialogResponse::default(), None) };
-        let (close, r) = match shown.inner {
-            Some((c, r)) => (c, Some(r)),
-            None => (false, None),
-        };
+        let Some(shown) = w.show(ctx, |ui| self.contents_dyn(ui, body, footer)) else { return DialogResponse::default() };
+        let close = shown.inner.unwrap_or(false);
         if close {
             *open = false;
         }
-        (DialogResponse { close, layer: Some(shown.response.layer_id), rect: Some(shown.response.rect) }, r)
+        DialogResponse { close, layer: Some(shown.response.layer_id), rect: Some(shown.response.rect) }
     }
 }
 
@@ -307,6 +327,15 @@ fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
 /// A note on a soft tinted background: an icon, an optional bold title and the text. `add`
 /// draws extra content at its right (buttons).
 pub fn callout(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: impl FnOnce(&mut Ui)) -> Response {
+    let mut add = Some(add);
+    callout_dyn(ui, tone, title, body, &mut |ui| {
+        if let Some(a) = add.take() {
+            a(ui)
+        }
+    })
+}
+
+fn callout_dyn(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: &mut dyn FnMut(&mut Ui)) -> Response {
     let p = style::pal(ui);
     let color = tone.color(&p);
     Frame::new()
@@ -338,12 +367,29 @@ pub fn callout(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: im
 
 /// Selectable chips that wrap (export formats, filters). Returns true when the choice changed.
 pub fn chips<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T, &str)]) -> bool {
+    pick(current, items, |sel, labels| chips_idx(ui, sel, labels))
+}
+
+/// Runs a non-generic index picker over `items` and stores the clicked value.
+fn pick<T: PartialEq + Copy>(current: &mut T, items: &[(T, &str)], f: impl FnOnce(Option<usize>, &[&str]) -> Option<usize>) -> bool {
+    let labels: Vec<&str> = items.iter().map(|(_, l)| *l).collect();
+    let sel = items.iter().position(|(v, _)| v == current);
+    match f(sel, &labels) {
+        Some(i) => {
+            *current = items[i].0;
+            true
+        }
+        None => false,
+    }
+}
+
+fn chips_idx(ui: &mut Ui, sel: Option<usize>, labels: &[&str]) -> Option<usize> {
     let p = style::pal(ui);
-    let mut changed = false;
+    let mut clicked = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-        for (value, label) in items {
-            let on = *current == *value;
+        for (i, label) in labels.iter().enumerate() {
+            let on = sel == Some(i);
             let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(12.5), Color32::PLACEHOLDER);
             let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 24.0, 30.0), Sense::click());
             resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, on, *label));
@@ -356,39 +402,38 @@ pub fn chips<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T, &st
                 style::focus_halo(ui, rect, 15);
             }
             if resp.clicked() && !on {
-                *current = *value;
-                changed = true;
+                clicked = Some(i);
             }
         }
     });
-    changed
+    clicked
 }
 
 /// Text options in a pill group (Server / Client, Light / Dark …). Returns true when changed.
 pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T, &str)]) -> bool {
-    segmented_ex(ui, current, items, false)
+    pick(current, items, |sel, labels| segmented_idx(ui, sel, labels, false))
 }
 
 /// [`segmented`] at 24 px instead of 28.
 pub fn segmented_small<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T, &str)]) -> bool {
-    segmented_ex(ui, current, items, true)
+    pick(current, items, |sel, labels| segmented_idx(ui, sel, labels, true))
 }
 
-fn segmented_ex<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T, &str)], small: bool) -> bool {
+fn segmented_idx(ui: &mut Ui, sel: Option<usize>, labels: &[&str], small: bool) -> Option<usize> {
     let p = style::pal(ui);
     let h = if small { 24.0 } else { 28.0 };
     let fs = 12.5;
-    let galleys: Vec<_> = items.iter().map(|(_, l)| ui.painter().layout_no_wrap(l.to_string(), egui::FontId::proportional(fs), Color32::PLACEHOLDER)).collect();
+    let galleys: Vec<_> = labels.iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), egui::FontId::proportional(fs), Color32::PLACEHOLDER)).collect();
     let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + 20.0).collect();
-    let total = widths.iter().sum::<f32>() + 4.0 + (items.len().saturating_sub(1)) as f32 * 2.0;
+    let total = widths.iter().sum::<f32>() + 4.0 + (labels.len().saturating_sub(1)) as f32 * 2.0;
     let (rect, _) = ui.allocate_exact_size(vec2(total, h), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::same(7), p.subtle);
     let mut x = rect.left() + 2.0;
-    let mut changed = false;
-    for (i, ((value, label), g)) in items.iter().zip(galleys).enumerate() {
+    let mut clicked = None;
+    for (i, (label, g)) in labels.iter().zip(galleys).enumerate() {
         let r = Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), vec2(widths[i], h - 4.0));
         let resp = ui.interact(r, ui.id().with(("seg", rect.min.x as i32, rect.min.y as i32, i)), Sense::click());
-        let on = *current == *value;
+        let on = sel == Some(i);
         resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, on, *label));
         if on {
             ui.painter().rect_filled(r, CornerRadius::same(5), p.surface);
@@ -402,12 +447,11 @@ fn segmented_ex<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T, 
             ui.painter().rect_stroke(r, CornerRadius::same(5), Stroke::new(1.5, p.accent), StrokeKind::Inside);
         }
         if resp.clicked() && !on {
-            *current = *value;
-            changed = true;
+            clicked = Some(i);
         }
         x += widths[i] + 2.0;
     }
-    changed
+    clicked
 }
 
 /// An on/off switch with its label (and an optional line of explanation under it).
@@ -487,27 +531,30 @@ pub fn status(ui: &mut Ui, tone: Tone, text: &str) -> Response {
 /// A titled group on a card (settings sections, wizard sections): the title in semibold, an
 /// optional line under it, then `add`.
 pub fn group<R>(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let mut add = Some(add);
+    let mut out = None;
+    group_dyn(ui, title, sub, &mut |ui| out = add.take().map(|a| a(ui)));
+    out.expect("a group body runs once")
+}
+
+fn group_dyn(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, add: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
-    kit::card(ui)
-        .corner_radius(CornerRadius::same(RADIUS_LG))
-        .inner_margin(Margin::symmetric(20, 16))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 12.0;
-            if title.is_some() || sub.is_some() {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    if let Some(t) = title {
-                        ui.label(RichText::new(t).font(style::semibold(ui.ctx(), 13.5)).color(p.text));
-                    }
-                    if let Some(s) = sub {
-                        ui.add(egui::Label::new(RichText::new(s).size(12.5).color(p.text_muted)).wrap());
-                    }
-                });
-            }
-            add(ui)
-        })
-        .inner
+    kit::card(ui).corner_radius(CornerRadius::same(RADIUS_LG)).inner_margin(Margin::symmetric(20, 16)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 12.0;
+        if title.is_some() || sub.is_some() {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                if let Some(t) = title {
+                    ui.label(RichText::new(t).font(style::semibold(ui.ctx(), 13.5)).color(p.text));
+                }
+                if let Some(s) = sub {
+                    ui.add(egui::Label::new(RichText::new(s).size(12.5).color(p.text_muted)).wrap());
+                }
+            });
+        }
+        add(ui);
+    });
 }
 
 /// A section title with optional content at its right (buttons, counts).
@@ -538,16 +585,20 @@ pub fn stat_tile(ui: &mut Ui, label: &str, value: &str, sub: Option<&str>) -> Re
 
 /// A form row with a label column of `label_w`: the label (muted), then `add`.
 pub fn form_row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let p = style::pal(ui);
     ui.horizontal(|ui| {
-        let h = ui.spacing().interact_size.y.max(style::CONTROL_H);
-        ui.allocate_ui_with_layout(vec2(label_w, h), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_min_width(label_w);
-            ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
-        });
+        form_label(ui, label, label_w);
         add(ui)
     })
     .inner
+}
+
+fn form_label(ui: &mut Ui, label: &str, label_w: f32) {
+    let p = style::pal(ui);
+    let h = ui.spacing().interact_size.y.max(style::CONTROL_H);
+    ui.allocate_ui_with_layout(vec2(label_w, h), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_width(label_w);
+        ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
+    });
 }
 
 /// A bordered frame for code, logs and previews (radius 8, surface fill).
@@ -578,6 +629,15 @@ pub fn spinner_label(ui: &mut Ui, text: &str) -> Response {
 /// A page header for tools and object tabs: icon, faint place parts, the title in semibold and
 /// faint facts; `right` adds the actions at the right.
 pub fn page_header(ui: &mut Ui, icon: &str, place: &[&str], title: &str, facts: Option<&str>, right: impl FnOnce(&mut Ui)) {
+    let mut right = Some(right);
+    page_header_dyn(ui, icon, place, title, facts, &mut |ui| {
+        if let Some(r) = right.take() {
+            r(ui)
+        }
+    });
+}
+
+fn page_header_dyn(ui: &mut Ui, icon: &str, place: &[&str], title: &str, facts: Option<&str>, right: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -598,17 +658,19 @@ pub fn page_header(ui: &mut Ui, icon: &str, place: &[&str], title: &str, facts: 
 
 /// A toolbar row with padding and a hairline under it.
 pub fn toolbar<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let r = Frame::new()
-        .inner_margin(Margin { left: 12, right: 12, top: 6, bottom: 6 })
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.set_min_height(28.0);
-                add(ui)
-            })
-            .inner
-        })
-        .inner;
+    let mut add = Some(add);
+    let mut out = None;
+    toolbar_dyn(ui, &mut |ui| out = add.take().map(|a| a(ui)));
+    out.expect("a toolbar body runs once")
+}
+
+fn toolbar_dyn(ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)) {
+    Frame::new().inner_margin(Margin { left: 12, right: 12, top: 6, bottom: 6 }).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.set_min_height(28.0);
+            add(ui);
+        });
+    });
     hline(ui);
-    r
 }

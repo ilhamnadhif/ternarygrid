@@ -190,6 +190,11 @@ impl<'a> Col<'a> {
 /// semibold names, striped rows of [`ROW_H`] with hairlines between them. `body` draws a
 /// row's cells with [`cell`] (and may use the row's response for clicks and menus).
 pub fn table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, cols: &[Col], rows: usize, mut body: impl FnMut(&mut TableRow<'_, '_>, usize)) {
+    table_dyn(ui, egui::Id::new(id), cols, rows, &mut body);
+}
+
+// The table code is compiled once, not once per caller.
+fn table_dyn(ui: &mut Ui, id: egui::Id, cols: &[Col], rows: usize, body: &mut dyn FnMut(&mut TableRow<'_, '_>, usize)) {
     let pal = ternarygrid_ui::pal(ui);
     ternarygrid_ui::parts::bordered(ui).show(ui, |ui| {
         ui.scope(|ui| {
