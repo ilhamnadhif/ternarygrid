@@ -1,0 +1,26 @@
+[package]
+name = "ternarygrid-visual"
+description = "ER diagrams, plan diagrams, query builder, charts and spatial viewer for TernaryGrid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ternarygrid-core.workspace = true
+ternarygrid-icons.workspace = true
+egui.workspace = true
+epaint_default_fonts.workspace = true
+egui-phosphor.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+egui_plot.workspace = true
+petgraph.workspace = true
+resvg.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+eframe.workspace = true
+egui = { workspace = true, features = ["default_fonts"] }

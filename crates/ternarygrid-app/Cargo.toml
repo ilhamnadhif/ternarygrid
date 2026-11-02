@@ -1,0 +1,105 @@
+[package]
+name = "ternarygrid-app"
+description = "TernaryGrid desktop application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ternarygrid"
+path = "src/main.rs"
+
+[lib]
+name = "ternarygrid_app"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+ternarygrid-core.workspace = true
+ternarygrid-icons.workspace = true
+ternarygrid-config.workspace = true
+ternarygrid-net.workspace = true
+ternarygrid-visual.workspace = true
+ternarygrid-grid.workspace = true
+ternarygrid-sql.workspace = true
+ternarygrid-editor.workspace = true
+ternarygrid-compare.workspace = true
+ternarygrid-tasks.workspace = true
+ternarygrid-ai.workspace = true
+ternarygrid-driver-mysql.workspace = true
+ternarygrid-driver-postgres.workspace = true
+ternarygrid-driver-mssql.workspace = true
+ternarygrid-driver-clickhouse.workspace = true
+ternarygrid-driver-oracle.workspace = true
+ternarygrid-driver-cassandra.workspace = true
+ternarygrid-driver-redis.workspace = true
+ternarygrid-driver-mongodb.workspace = true
+ternarygrid-driver-elasticsearch.workspace = true
+ternarygrid-driver-sqlite.workspace = true
+ternarygrid-transfer.workspace = true
+eframe.workspace = true
+egui.workspace = true
+epaint_default_fonts.workspace = true
+egui_dock.workspace = true
+egui-phosphor.workspace = true
+egui_plot.workspace = true
+egui_extras.workspace = true
+rfd.workspace = true
+image.workspace = true
+resvg.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustls.workspace = true
+ureq.workspace = true
+open.workspace = true
+sha2.workspace = true
+zip.workspace = true
+# The computer's time zone (already built for chrono's clock).
+iana-time-zone = "0.1.65"
+
+[target.'cfg(unix)'.dependencies]
+# The time zone's abbreviation (WIB) in the status bar.
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.21.2", default-features = false }
+
+# Screen readers (AccessKit) on Windows and Linux. Not on macOS: there its
+# adapter changes the class of the window's view at run time and puts it back
+# on quit, while AppKit's Touch Bar still observes that view (KVO); AppKit
+# then fails to remove its observer and crashes the app on Macs with a Touch Bar.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+eframe = { workspace = true, features = ["accesskit"] }
+
+# Windows without OpenGL 2 draws with Direct3D 12 instead (see run()).
+[target.'cfg(windows)'.dependencies]
+eframe = { workspace = true, features = ["wgpu_no_default_features"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12"] }
+
+[build-dependencies]
+# CHANGELOG.md compressed into the binary (build.rs).
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# ternarygrid.exe's icon and version information (build.rs).
+winresource = { version = "0.1.34", default-features = false }
+
+[dev-dependencies]
+egui = { workspace = true, features = ["default_fonts"] }
+egui_kittest = { version = "0.36", features = ["eframe"] }
+regex.workspace = true
+tempfile.workspace = true

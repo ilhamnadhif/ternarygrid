@@ -1,0 +1,763 @@
+//! PRD phase 1 gate: query, edit data, save and cancel work on PostgreSQL,
+//! MySQL, MariaDB and SQLite. The table data view is drawn in headless egui
+//! frames; edits go through the grid model exactly like keyboard edits, and
+//! saving runs the generated statements in one transaction.
+//! Servers: `TERNARYGRID_TEST_PG`, `TERNARYGRID_TEST_MYSQL`, `TERNARYGRID_TEST_MARIADB` (SQLite always runs).
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use ternarygrid_app::backend::Backend;
+use ternarygrid_app::command::AppCommand;
+use ternarygrid_app::conn::{ConnectionManager, Credentials, DirectNet, MemorySecrets, SecretSource};
+use ternarygrid_app::cx::AppContext;
+use ternarygrid_app::keys::Keymap;
+use ternarygrid_app::ops::Operations;
+use ternarygrid_app::results::data_tab::TableDataView;
+use ternarygrid_app::services::{Services, Settings};
+use ternarygrid_app::toasts::Toasts;
+use ternarygrid_core::config::{SecretSlot, secret_key};
+use ternarygrid_core::meta::ObjectRef;
+
+fn servers() -> Vec<(&'static str, String)> {
+    let file = std::env::temp_dir().join(format!("ternarygrid-edit-e2e-{}.db", uuid::Uuid::new_v4().simple()));
+    let mut out = vec![("sqlite", format!("sqlite://{}", file.display()))];
+    for (name, var) in
+        [("postgres", "TERNARYGRID_TEST_PG"), ("cockroach", "TERNARYGRID_TEST_COCKROACH"), ("mysql", "TERNARYGRID_TEST_MYSQL"), ("mariadb", "TERNARYGRID_TEST_MARIADB")]
+    {
+        if let Ok(url) = std::env::var(var)
+            && !url.trim().is_empty()
+        {
+            out.push((name, url));
+        }
+    }
+    out
+}
+
+struct H {
+    backend: Arc<Backend>,
+    ctx: egui::Context,
+    cm: ConnectionManager,
+    services: Services,
+    settings: Settings,
+    keymap: Keymap,
+    toasts: Toasts,
+    ops: Operations,
+    commands: Vec<AppCommand>,
+    time: f64,
+    id: String,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for H {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl H {
+    fn new(url: &str) -> H {
+        Self::new_with(url, |_| {})
+    }
+
+    fn new_with(url: &str, adjust: impl FnOnce(&mut ternarygrid_core::config::ConnectionConfig)) -> H {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let backend = Arc::new(Backend::new().unwrap());
+        let ctx = egui::Context::default();
+        backend.set_context(ctx.clone());
+        let (mut cfg, password) = ternarygrid_config::parse_connection_url(url).unwrap();
+        adjust(&mut cfg);
+        cfg.save_password = true;
+        if password.is_none() {
+            cfg.auth = ternarygrid_core::config::AuthMethod::None;
+        }
+        if password.is_none() {
+            cfg.auth = ternarygrid_core::config::AuthMethod::None;
+        }
+        let secrets = Arc::new(MemorySecrets::default());
+        if let Some(pw) = &password {
+            secrets.set(&secret_key(&cfg.id, SecretSlot::Password), pw).unwrap();
+        }
+        let mut cm = ConnectionManager::new(ternarygrid_app::driver_registry(), secrets, Arc::new(DirectNet));
+        let id = cfg.id.clone();
+        cm.upsert(cfg);
+        cm.connect(&backend, &id, Credentials::default()).unwrap();
+        let t0 = Instant::now();
+        while !cm.is_connected(&id) {
+            assert!(cm.errors().is_empty(), "{:?}", cm.errors());
+            assert!(t0.elapsed() < Duration::from_secs(20));
+            cm.poll(&backend);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let dir = std::env::temp_dir().join(format!("ternarygrid-edit-e2e-home-{}", uuid::Uuid::new_v4().simple()));
+        let services = Services::ephemeral(&dir);
+        let settings = Settings::default();
+        let (keymap, _) = Keymap::from_config(&settings.keymap, ternarygrid_app::keys::IS_MAC);
+        H { backend, ctx, cm, services, settings, keymap, toasts: Toasts::default(), ops: Operations::default(), commands: Vec::new(), time: 0.0, id, dir }
+    }
+
+    fn frame(&mut self, view: &mut TableDataView) {
+        self.time += 1.0 / 60.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+            time: Some(self.time),
+            focused: true,
+            ..Default::default()
+        };
+        let ctx = self.ctx.clone();
+        let mut out = ctx.run_ui(input, |ui| {
+            let mut cx = AppContext {
+                backend: &self.backend,
+                conns: &mut self.cm,
+                services: &self.services,
+                settings: &mut self.settings,
+                commands: &mut self.commands,
+                toasts: &mut self.toasts,
+                ops: &mut self.ops,
+                keymap: &self.keymap,
+                tab_active: true,
+                current_tab: Some(1),
+                popup: false,
+            };
+            view.ui(ui, &mut cx);
+        });
+        out.textures_delta.clear();
+        self.cm.poll(&self.backend);
+    }
+
+    fn until(&mut self, view: &mut TableDataView, what: &str, mut done: impl FnMut(&mut TableDataView) -> bool) {
+        let t0 = Instant::now();
+        loop {
+            self.frame(view);
+            if done(view) {
+                return;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(30), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn try_sql(&self, sql: &str) -> Result<(), String> {
+        self.try_sql_within(sql, Duration::from_secs(3600))
+    }
+
+    /// [`try_sql`](Self::try_sql) giving up after `limit` (a call that never returns).
+    fn try_sql_within(&self, sql: &str, limit: Duration) -> Result<(), String> {
+        let s = self.cm.live(&self.id).unwrap().main.clone();
+        let owned = sql.to_string();
+        match self.backend.block_on(async move { tokio::time::timeout(limit, s.execute_update(&owned, &[])).await }) {
+            Ok(r) => r.map(|_| ()).map_err(|e| e.to_string()),
+            Err(_) => Err(format!("no answer in {limit:?}")),
+        }
+    }
+
+    fn sql(&self, sql: &str) {
+        let s = self.cm.live(&self.id).unwrap().main.clone();
+        let owned = sql.to_string();
+        self.backend.block_on(async move { s.execute_update(&owned, &[]).await }).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    fn query(&self, sql: &str) -> Vec<Vec<String>> {
+        let s = self.cm.live(&self.id).unwrap().main.clone();
+        let sql = sql.to_string();
+        let (_, rows) = self.backend.block_on(async move { s.query_all(&sql, &[]).await }).unwrap();
+        rows.iter().map(|r| r.iter().map(|v| v.to_text().into_owned()).collect()).collect()
+    }
+}
+
+fn save_and_wait(h: &mut H, view: &mut TableDataView) {
+    {
+        let mut cx = AppContext {
+            backend: &h.backend,
+            conns: &mut h.cm,
+            services: &h.services,
+            settings: &mut h.settings,
+            commands: &mut h.commands,
+            toasts: &mut h.toasts,
+            ops: &mut h.ops,
+            keymap: &h.keymap,
+            tab_active: true,
+            current_tab: Some(1),
+            popup: false,
+        };
+        view.panel.as_mut().unwrap().save(&mut cx);
+    }
+    h.until(view, "save", |v| !v.panel.as_ref().unwrap().has_changes());
+}
+
+#[test]
+fn edit_save_and_cancel() {
+    for (name, url) in servers() {
+        let mut h = H::new(&url);
+        let table = format!("ternarygrid_edit_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        h.sql(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, name VARCHAR(40), qty INT)"));
+        h.sql(&format!("INSERT INTO {table} VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)"));
+        let schema = {
+            let live = h.cm.live(&h.id).unwrap();
+            if name == "sqlite" { None } else { live.current_schema.clone().or(live.current_database.clone()) }
+        };
+        let obj = ObjectRef::table(schema, table.clone());
+        let mut view = TableDataView::new(h.id.clone(), obj, None);
+        h.until(&mut view, "rows", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() == 3 && p.model.is_editable()));
+
+        // Cancel: edits are discarded and nothing reaches the database.
+        {
+            let p = view.panel.as_mut().unwrap();
+            p.model.set_cell(0, 1, "changed").unwrap();
+            assert!(p.model.has_changes());
+            p.discard();
+            assert!(!p.model.has_changes());
+        }
+        assert_eq!(h.query(&format!("SELECT name FROM {table} WHERE id = 1")), vec![vec!["one".to_string()]], "{name}: cancel");
+
+        // Update, insert and delete, saved together.
+        let rows = {
+            let p = view.panel.as_mut().unwrap();
+            let id_col = p.model.columns().iter().position(|c| c.name.eq_ignore_ascii_case("id")).unwrap();
+            let name_col = p.model.columns().iter().position(|c| c.name.eq_ignore_ascii_case("name")).unwrap();
+            let qty_col = p.model.columns().iter().position(|c| c.name.eq_ignore_ascii_case("qty")).unwrap();
+            let row_of = |p: &ternarygrid_app::results::panel::ResultPanel, id: i64| {
+                (0..p.model.row_count()).find(|&r| p.model.cell(r, id_col).and_then(|v| v.as_i64()) == Some(id)).unwrap()
+            };
+            let r1 = row_of(p, 1);
+            p.model.set_cell(r1, name_col, "uno").unwrap();
+            let r2 = row_of(p, 2);
+            p.model.delete_rows(&[r2]).unwrap();
+            let new = p.model.add_row(None).unwrap();
+            p.model.set_cell(new, id_col, "4").unwrap();
+            p.model.set_cell(new, name_col, "four").unwrap();
+            p.model.set_cell(new, qty_col, "40").unwrap();
+            p.model.row_count()
+        };
+        assert!(rows >= 3);
+        save_and_wait(&mut h, &mut view);
+        let got = h.query(&format!("SELECT id, name, qty FROM {table} ORDER BY id"));
+        assert_eq!(
+            got,
+            vec![vec!["1".to_string(), "uno".into(), "10".into()], vec!["3".to_string(), "three".into(), "30".into()], vec!["4".to_string(), "four".into(), "40".into()],],
+            "{name}: saved"
+        );
+
+        // NULL and duplicate rows.
+        {
+            let p = view.panel.as_mut().unwrap();
+            let qty_col = p.model.columns().iter().position(|c| c.name.eq_ignore_ascii_case("qty")).unwrap();
+            let id_col = p.model.columns().iter().position(|c| c.name.eq_ignore_ascii_case("id")).unwrap();
+            let r = (0..p.model.row_count()).find(|&r| p.model.cell(r, id_col).and_then(|v| v.as_i64()) == Some(3)).unwrap();
+            p.model.set_cells(vec![(r, qty_col, ternarygrid_grid::model::CellValue::Value(ternarygrid_core::Value::Null))]).unwrap();
+            let dup = p.model.duplicate_rows(&[r]).unwrap();
+            p.model.set_cell(dup[0], id_col, "5").unwrap();
+        }
+        save_and_wait(&mut h, &mut view);
+        let got = h.query(&format!("SELECT id, qty FROM {table} WHERE id IN (3, 5) ORDER BY id"));
+        assert_eq!(got.len(), 2, "{name}: duplicate saved");
+        assert!(got.iter().all(|r| r[1].is_empty() || r[1].eq_ignore_ascii_case("null")), "{name}: NULL saved: {got:?}");
+
+        h.sql(&format!("DROP TABLE {table}"));
+        h.cm.disconnect_all(&h.backend);
+        if let Some(p) = url.strip_prefix("sqlite://") {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+#[test]
+fn generated_values_show_after_save() {
+    for (name, url) in servers() {
+        let mut h = H::new(&url);
+        let table = format!("ternarygrid_gen_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let id = match name {
+            "sqlite" => "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            "postgres" | "cockroach" => "id SERIAL PRIMARY KEY",
+            _ => "id INT AUTO_INCREMENT PRIMARY KEY",
+        };
+        h.sql(&format!("CREATE TABLE {table} ({id}, name VARCHAR(40), note VARCHAR(10) DEFAULT 'n/a')"));
+        h.sql(&format!("INSERT INTO {table} (name) VALUES ('one')"));
+        let schema = {
+            let live = h.cm.live(&h.id).unwrap();
+            if name == "sqlite" { None } else { live.current_schema.clone().or(live.current_database.clone()) }
+        };
+        let mut view = TableDataView::new(h.id.clone(), ObjectRef::table(schema, table.clone()), None);
+        h.until(&mut view, "rows", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() == 1 && p.model.is_editable()));
+        let (id_col, note_col) = {
+            let p = view.panel.as_mut().unwrap();
+            let col = |n: &str| p.model.columns().iter().position(|c| c.name.eq_ignore_ascii_case(n)).unwrap();
+            let (id_col, name_col, note_col) = (col("id"), col("name"), col("note"));
+            // A new row with the id and the note left to the database.
+            let new = p.model.add_row(None).unwrap();
+            p.model.set_cell(new, name_col, "two").unwrap();
+            (id_col, note_col)
+        };
+        save_and_wait(&mut h, &mut view);
+        let db_id = h.query(&format!("SELECT id FROM {table} WHERE name = 'two'"))[0][0].clone();
+        let p = view.panel.as_ref().unwrap();
+        let row = (0..p.model.row_count()).find(|&r| p.model.cell(r, id_col).is_some_and(|v| !v.is_null() && v.to_text() == db_id));
+        assert!(row.is_some(), "{name}: the generated id {db_id} shows without a refresh");
+        assert_eq!(p.model.cell(row.unwrap(), note_col).map(|v| v.to_text().into_owned()), Some("n/a".to_string()), "{name}: the default shows");
+        h.sql(&format!("DROP TABLE {table}"));
+        h.cm.disconnect_all(&h.backend);
+        if let Some(p) = url.strip_prefix("sqlite://") {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// `now()` typed in a timestamp is saved as SQL, and the time the database stored shows at once.
+#[test]
+fn sql_functions_in_timestamps_are_saved_and_read_back() {
+    for (name, url) in servers() {
+        let mut h = H::new(&url);
+        let table = format!("ternarygrid_ts_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let (stamp, func) = match name {
+            "sqlite" => ("TIMESTAMP", "CURRENT_TIMESTAMP"),
+            "postgres" | "cockroach" => ("TIMESTAMPTZ", "now()"),
+            _ => ("DATETIME", "now()"),
+        };
+        h.sql(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, at {stamp}, note VARCHAR(20))"));
+        h.sql(&format!("INSERT INTO {table} VALUES (1, '2020-01-02 03:04:05', 'a')"));
+        let schema = {
+            let live = h.cm.live(&h.id).unwrap();
+            if name == "sqlite" { None } else { live.current_schema.clone().or(live.current_database.clone()) }
+        };
+        let mut view = TableDataView::new(h.id.clone(), ObjectRef::table(schema, table.clone()), None);
+        h.until(&mut view, "rows", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() == 1 && p.model.is_editable()));
+        let (id_col, at_col) = {
+            let p = view.panel.as_mut().unwrap();
+            let col = |n: &str| p.model.columns().iter().position(|c| c.name.eq_ignore_ascii_case(n)).unwrap();
+            let (id_col, at_col, note_col) = (col("id"), col("at"), col("note"));
+            p.model.set_cell(0, at_col, func).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(p.model.is_cell_modified(0, at_col), "{name}");
+            // In a text column it stays text.
+            p.model.set_cell(0, note_col, "now()").unwrap();
+            let new = p.model.add_row(None).unwrap();
+            p.model.set_cell(new, id_col, "2").unwrap();
+            p.model.set_cell(new, at_col, func).unwrap();
+            (id_col, at_col)
+        };
+        save_and_wait(&mut h, &mut view);
+        let year = chrono::Datelike::year(&chrono::Local::now()).to_string();
+        assert_eq!(h.query(&format!("SELECT note FROM {table} WHERE id = 1"))[0][0], "now()", "{name}");
+        let stored = h.query(&format!("SELECT at FROM {table} ORDER BY id"));
+        let p = view.panel.as_ref().unwrap();
+        for (r, db) in stored.iter().enumerate() {
+            assert!(db[0].starts_with(&year), "{name}: the database evaluated {func}: {db:?}");
+            let row = (0..p.model.row_count()).find(|&d| p.model.cell(d, id_col).is_some_and(|v| v.to_text() == (r + 1).to_string())).unwrap();
+            let shown = p.model.cell(row, at_col).unwrap();
+            assert!(!shown.is_null() && shown.to_text().starts_with(&year), "{name}: row {} shows the stored time without a refresh, not {shown:?}", r + 1);
+        }
+        h.sql(&format!("DROP TABLE {table}"));
+        h.cm.disconnect_all(&h.backend);
+        if let Some(p) = url.strip_prefix("sqlite://") {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+#[test]
+fn virtual_model_dictionary_and_virtual_columns() {
+    let file = std::env::temp_dir().join(format!("ternarygrid-vm-e2e-{}.db", uuid::Uuid::new_v4().simple()));
+    let url = format!("sqlite://{}", file.display());
+    let mut h = H::new(&url);
+    h.sql("CREATE TABLE customer (id INTEGER PRIMARY KEY, name TEXT)");
+    h.sql("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customer(id), qty INTEGER, price REAL)");
+    h.sql("INSERT INTO customer VALUES (1, 'Ani'), (2, 'Budi')");
+    h.sql("INSERT INTO orders VALUES (1, 1, 2, 10.0), (2, 2, 3, 1.5)");
+    // Virtual model: dictionary on customer, virtual column on orders.
+    let p = h.services.projects.as_ref().unwrap();
+    let mut vm = p.virtual_model(&h.id).unwrap_or_default();
+    let cust = ObjectRef::table(None, "customer");
+    let ord = ObjectRef::table(None, "orders");
+    vm.set(
+        ternarygrid_config::project::VirtualTableKey::of(&cust),
+        ternarygrid_config::VirtualTable { dictionary: Some(ternarygrid_config::project::DictionaryConfig { description_columns: vec!["name".into()] }), ..Default::default() },
+    );
+    vm.set(
+        ternarygrid_config::project::VirtualTableKey::of(&ord),
+        ternarygrid_config::VirtualTable {
+            virtual_columns: vec![ternarygrid_config::project::VirtualColumn { name: "amount".into(), expression: "qty * price".into(), ..Default::default() }],
+            ..Default::default()
+        },
+    );
+    p.save_virtual_model(&h.id, &vm).unwrap();
+    let mut view = TableDataView::new(h.id.clone(), ord, None);
+    h.until(&mut view, "rows", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() == 2));
+    let fk_col = view.panel.as_ref().unwrap().model.columns().iter().position(|c| c.name == "customer_id").unwrap();
+    h.until(&mut view, "dictionary", |v| v.panel.as_ref().unwrap().model.dictionary(fk_col).is_some());
+    let p = view.panel.as_ref().unwrap();
+    let d = p.model.dictionary(fk_col).unwrap();
+    assert_eq!(d.describe("1"), Some("Ani"));
+    let vcol = p.model.columns().len();
+    assert_eq!(p.model.cell(0, vcol).and_then(|v| v.as_f64()), Some(20.0), "virtual column qty * price");
+    h.cm.disconnect_all(&h.backend);
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn server_side_sort_asc_desc() {
+    for (name, url) in servers() {
+        let mut h = H::new(&url);
+        let table = format!("ternarygrid_sort_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        h.sql(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, name VARCHAR(10))"));
+        h.sql(&format!("INSERT INTO {table} VALUES (2, 'b'), (3, 'c'), (1, 'a')"));
+        let mut view = TableDataView::new(h.id.clone(), ObjectRef::table(None, table.clone()), None);
+        h.until(&mut view, "rows", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() == 3));
+        for (dir, expect) in [("", [1, 2, 3]), (" DESC", [3, 2, 1])] {
+            {
+                let mut cx = AppContext {
+                    backend: &h.backend,
+                    conns: &mut h.cm,
+                    services: &h.services,
+                    settings: &mut h.settings,
+                    commands: &mut h.commands,
+                    toasts: &mut h.toasts,
+                    ops: &mut h.ops,
+                    keymap: &h.keymap,
+                    tab_active: true,
+                    current_tab: Some(1),
+                    popup: false,
+                };
+                let d = cx.conns.live(&h.id).unwrap().dialect.clone();
+                let order = format!("{}{dir}", d.quote_ident("id"));
+                view.panel.as_mut().unwrap().handle_for_tests(ternarygrid_grid::GridAction::ServerQueryChanged { where_clause: None, order_by: Some(order) }, &mut cx);
+            }
+            h.until(&mut view, "sorted", |v| {
+                let p = v.panel.as_ref().unwrap();
+                !p.src.is_fetching() && p.model.row_count() == 3 && (0..3).all(|r| p.model.cell(r, 0).and_then(|x| x.as_i64()) == Some(expect[r]))
+            });
+        }
+        h.sql(&format!("DROP TABLE {table}"));
+        let _ = name;
+        if let Some(p) = url.strip_prefix("sqlite://") {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Production-style connection (manual commit) on PostgreSQL / CockroachDB:
+/// changing the ORDER BY while a big table is still loading cancels the old
+/// query, which used to leave the transaction aborted ("25P02 current
+/// transaction is aborted").
+#[test]
+fn manual_commit_reorder_while_loading() {
+    let stage = watchdog("manual_commit_reorder_while_loading", Duration::from_secs(180));
+    let at = |s: String| *stage.lock().unwrap() = s;
+    for (name, url) in servers().into_iter().filter(|(n, _)| matches!(*n, "postgres" | "cockroach")) {
+        let table = format!("ternarygrid_big_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        at(format!("[{name}] create table"));
+        let setup = H::new(&url);
+        setup.sql(&format!("CREATE TABLE {table} AS SELECT g AS id, repeat('x', 100) AS pad FROM generate_series(1, 200000) g"));
+        let mut h = H::new_with(&url, |cfg| cfg.auto_commit = Some(false));
+        let mut view = TableDataView::new(h.id.clone(), ObjectRef::table(None, table.clone()), None);
+        at(format!("[{name}] first page"));
+        h.until(&mut view, "first page", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() > 0));
+        for (dir, first) in [(" DESC", 200000), ("", 1), (" DESC", 200000)] {
+            at(format!("[{name}] order by id{dir}"));
+            {
+                let mut cx = AppContext {
+                    backend: &h.backend,
+                    conns: &mut h.cm,
+                    services: &h.services,
+                    settings: &mut h.settings,
+                    commands: &mut h.commands,
+                    toasts: &mut h.toasts,
+                    ops: &mut h.ops,
+                    keymap: &h.keymap,
+                    tab_active: true,
+                    current_tab: Some(1),
+                    popup: false,
+                };
+                let order = format!("id{dir}");
+                view.panel.as_mut().unwrap().handle_for_tests(ternarygrid_grid::GridAction::ServerQueryChanged { where_clause: None, order_by: Some(order) }, &mut cx);
+            }
+            h.until(&mut view, "re-ordered", |v| {
+                let p = v.panel.as_ref().unwrap();
+                if let Some((msg, true)) = p.status.as_ref().or(p.view.toolbar.notice.as_ref()) {
+                    panic!("[{name}] {msg}");
+                }
+                p.model.row_count() > 0 && p.model.cell(0, 0).and_then(|x| x.as_i64()) == Some(first)
+            });
+        }
+        // The view's manual-commit transaction holds a lock on the table
+        // until its session is closed (asynchronously): retry the DROP.
+        at(format!("[{name}] disconnect"));
+        drop(view);
+        let (backend, id) = (h.backend.clone(), h.id.clone());
+        h.cm.disconnect(&backend, &id);
+        drop(h);
+        at(format!("[{name}] drop table"));
+        // Clean-up only. CI runs (PostgreSQL 11) hung here several times with no call
+        // returning, lock_timeout and statement_timeout set: each try is bounded on the
+        // client too, and a table that cannot be dropped is reported (with what holds
+        // it, read on a new connection) and left in the throw-away CI database.
+        let limit = Duration::from_secs(15);
+        let _ = setup.try_sql_within("SET lock_timeout = '2s'", limit);
+        let _ = setup.try_sql_within("SET statement_timeout = '10s'", limit);
+        let t0 = Instant::now();
+        while let Err(e) = setup.try_sql_within(&format!("DROP TABLE IF EXISTS {table}"), limit) {
+            if t0.elapsed() >= Duration::from_secs(45) {
+                let holders = if name == "postgres" {
+                    let probe = H::new(&url);
+                    let s = probe.cm.live(&probe.id).unwrap().main.clone();
+                    let sql = format!(
+                        "SELECT a.pid::text, coalesce(a.state, ''), coalesce(a.application_name, ''), coalesce(a.wait_event, ''), left(a.query, 120) \
+                         FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.relation = '{table}'::regclass AND a.pid <> pg_backend_pid()"
+                    );
+                    let rows = probe.backend.block_on(async move { tokio::time::timeout(limit, s.query_all(&sql, &[])).await });
+                    format!("{rows:?}")
+                } else {
+                    String::new()
+                };
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "[{name}] DROP TABLE {table} not done after {:?}: {e}; held by {holders}", t0.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    at(String::new());
+}
+
+/// Ends the test run when `test` is still at the stage it last set after
+/// `limit` (a CI run once hung in it for 30 minutes without telling where);
+/// an empty stage means done.
+fn watchdog(test: &'static str, limit: Duration) -> Arc<std::sync::Mutex<String>> {
+    let stage = Arc::new(std::sync::Mutex::new(String::from("start")));
+    let watched = stage.clone();
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        // The stage and since when it runs.
+        let (mut last, mut since) = (String::from("start"), Instant::now());
+        while t0.elapsed() < limit {
+            std::thread::sleep(Duration::from_millis(500));
+            let now = watched.lock().unwrap().clone();
+            if now.is_empty() {
+                return;
+            }
+            if now != last {
+                (last, since) = (now, Instant::now());
+            }
+        }
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{test} hung at: {last} (for {:?})", since.elapsed());
+        std::process::exit(101);
+    });
+    stage
+}
+
+/// "Save as default filter": the table opens with the saved WHERE / ORDER BY
+/// until the default is reset (stored in the project's virtual model).
+#[test]
+fn default_filter_per_table() {
+    for (name, url) in servers().into_iter().filter(|(n, _)| matches!(*n, "sqlite" | "postgres" | "mysql")) {
+        let mut h = H::new(&url);
+        let table = format!("ternarygrid_deflt_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        h.sql(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, name VARCHAR(10))"));
+        h.sql(&format!("INSERT INTO {table} VALUES (1, 'a'), (2, 'b'), (3, 'c')"));
+        let obj = ObjectRef::table(None, table.clone());
+        let mut view = TableDataView::new(h.id.clone(), obj.clone(), None);
+        h.until(&mut view, "rows", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() == 3));
+        let act = |h: &mut H, view: &mut TableDataView, a: ternarygrid_grid::GridAction| {
+            let mut cx = AppContext {
+                backend: &h.backend,
+                conns: &mut h.cm,
+                services: &h.services,
+                settings: &mut h.settings,
+                commands: &mut h.commands,
+                toasts: &mut h.toasts,
+                ops: &mut h.ops,
+                keymap: &h.keymap,
+                tab_active: true,
+                current_tab: Some(1),
+                popup: false,
+            };
+            view.panel.as_mut().unwrap().handle_for_tests(a, &mut cx);
+        };
+        act(&mut h, &mut view, ternarygrid_grid::GridAction::DefaultFilter { where_clause: Some("id > 1".into()), order_by: Some("id DESC".into()) });
+        let mut again = TableDataView::new(h.id.clone(), obj.clone(), None);
+        h.until(&mut again, "default filter applied", |v| {
+            v.panel.as_ref().is_some_and(|p| p.model.row_count() == 2 && p.model.cell(0, 0).and_then(|x| x.as_i64()) == Some(3) && p.view.toolbar.filter_text == "id > 1")
+        });
+        act(&mut h, &mut again, ternarygrid_grid::GridAction::DefaultFilter { where_clause: None, order_by: None });
+        let mut reset = TableDataView::new(h.id.clone(), obj.clone(), None);
+        h.until(&mut reset, "default removed", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() == 3 && p.view.toolbar.filter_text.is_empty()));
+        drop((view, again, reset));
+        h.sql(&format!("DROP TABLE {table}"));
+        let _ = name;
+    }
+}
+
+/// A table of another database of the server (PostgreSQL shows every
+/// database in the navigator): its data tab connects to that database
+/// instead of failing with "relation … does not exist".
+#[test]
+fn table_of_another_database() {
+    let Some(url) = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.trim().is_empty()) else { return };
+    let mut h = H::new(&url);
+    let db = format!("ternarygrid_otherdb_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    h.sql(&format!("CREATE DATABASE {db}"));
+    // The table exists only in the other database.
+    let (base, query) = url.split_once('?').map_or((url.as_str(), ""), |(b, q)| (b, q));
+    let other_url = format!("{}/{db}{}{query}", base.rsplit_once('/').unwrap().0, if query.is_empty() { "" } else { "?" });
+    {
+        let other = H::new(&other_url);
+        other.sql("CREATE TABLE api_calls (id INT PRIMARY KEY, path TEXT)");
+        other.sql("INSERT INTO api_calls VALUES (1, '/a'), (2, '/b')");
+    }
+    let obj = ObjectRef::table(Some("public".into()), "api_calls").with_database(Some(db.clone()));
+    let mut view = TableDataView::new(h.id.clone(), obj, None);
+    h.until(&mut view, "rows of the other database", |v| {
+        assert!(v.error().is_none(), "{:?}", v.error());
+        v.panel.as_ref().is_some_and(|p| p.model.row_count() == 2)
+    });
+    // Its primary key is read in that database too: the rows can be edited.
+    h.until(&mut view, "editable rows", |v| v.panel.as_ref().is_some_and(|p| p.model.is_editable()));
+    drop(view);
+    let _ = h.try_sql(&format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db}' AND pid <> pg_backend_pid()"));
+    let _ = h.try_sql(&format!("DROP DATABASE {db}"));
+}
+
+/// A table without a primary key or unique constraint, but with a unique
+/// index (`CREATE UNIQUE INDEX`): the index identifies rows, so the data tab
+/// is editable (as in DBeaver). Without any of them it stays read-only.
+#[test]
+fn unique_index_makes_a_table_editable() {
+    let Some(url) = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.trim().is_empty()) else { return };
+    let mut h = H::new(&url);
+    let table = format!("ternarygrid_noindex_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    h.sql(&format!("CREATE TABLE {table} (id INT NOT NULL, method TEXT)"));
+    h.sql(&format!("INSERT INTO {table} VALUES (1, 'GET'), (2, 'POST')"));
+    let obj = ObjectRef::table(Some("public".into()), table.clone());
+    let mut view = TableDataView::new(h.id.clone(), obj.clone(), None);
+    h.until(&mut view, "read-only rows", |v| {
+        v.panel.as_ref().is_some_and(|p| p.model.row_count() == 2 && p.model.read_only_reason() == Some(&ternarygrid_grid::ReadOnlyReason::NoKey))
+    });
+    drop(view);
+
+    h.sql(&format!("CREATE UNIQUE INDEX {table}_id ON {table} (id)"));
+    h.cm.live_mut(&h.id).unwrap().meta.table_defs.clear();
+    let mut view = TableDataView::new(h.id.clone(), obj, None);
+    h.until(&mut view, "editable rows", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() == 2 && p.model.is_editable()));
+    {
+        let p = view.panel.as_mut().unwrap();
+        let row = (0..2).find(|&r| p.model.cell(r, 0) == Some(ternarygrid_core::Value::Int(2))).unwrap();
+        p.model.set_cell(row, 1, "PUT").unwrap();
+    }
+    save_and_wait(&mut h, &mut view);
+    assert_eq!(h.query(&format!("SELECT method FROM {table} ORDER BY id")), vec![vec!["GET".to_string()], vec!["PUT".to_string()]]);
+    drop(view);
+    h.sql(&format!("DROP TABLE {table}"));
+}
+
+/// Sessions show dates and times in the computer's time zone (as DBeaver),
+/// unless the connection sets its own; MySQL and MariaDB get its offset.
+#[test]
+fn sessions_use_the_computer_time_zone() {
+    use ternarygrid_config::settings::TimeZoneChoice;
+    let tz = ternarygrid_app::conn::session_time_zone(TimeZoneChoice::System).unwrap();
+    for (name, url) in servers() {
+        let (sql, expected) = match name {
+            "postgres" | "cockroach" => ("SHOW TimeZone", tz.name.clone()),
+            "mysql" | "mariadb" => ("SELECT @@session.time_zone", tz.offset.clone()),
+            _ => continue,
+        };
+        let h = H::new(&url);
+        assert_eq!(h.query(sql)[0][0], expected, "{name}");
+        let pg = name == "postgres" || name == "cockroach";
+        let own = H::new_with(&url, |c| {
+            let key = if pg { "timezone" } else { "time_zone" };
+            c.properties.insert(key.into(), if pg { "UTC".into() } else { "+00:00".into() });
+        });
+        assert_eq!(own.query(sql)[0][0], if pg { "UTC" } else { "+00:00" }, "{name}: the connection's own time zone");
+    }
+}
+
+/// Cancel stops a slow query on the server: the fetch ends at once and the
+/// session can run the next statement.
+#[test]
+fn cancel_stops_a_slow_query_on_the_server() {
+    let Some(url) = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.trim().is_empty()) else { return };
+    let h = H::new(&url);
+    let session = h.cm.live(&h.id).unwrap().main.clone();
+    let mut src = ternarygrid_app::results::source::ResultSource::new(session, "SELECT pg_sleep(30)".into(), Vec::new(), Vec::new(), None, 1 << 20);
+    // As the data tab runs its query (open, refresh, a server-side filter).
+    src.refresh(&h.backend, 100);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(src.is_fetching());
+    let t0 = Instant::now();
+    src.stop(&h.backend);
+    while src.is_fetching() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the query was not cancelled");
+        src.poll();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    assert_eq!(h.query("SELECT 1")[0][0], "1", "the session still works");
+}
+
+/// SQL Server (`datetimeoffset`) and ClickHouse (`DateTime`) show the same
+/// instant in the computer's time zone too.
+#[test]
+fn other_servers_show_dates_in_the_computer_time_zone() {
+    use chrono::TimeZone;
+    let instant = chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
+    let local = instant.with_timezone(&chrono::Local);
+    let with_offset = ternarygrid_core::Value::DateTimeTz(local.fixed_offset()).to_text().into_owned();
+    let naive = local.format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut cases = Vec::new();
+    if let Some(url) = std::env::var("TERNARYGRID_TEST_MSSQL").ok().filter(|u| !u.trim().is_empty()) {
+        cases.push(("mssql", url, "SELECT CAST('2024-01-02T03:04:05+00:00' AS datetimeoffset)", with_offset.clone()));
+    }
+    if let Some(url) = std::env::var("TERNARYGRID_TEST_CLICKHOUSE").ok().filter(|u| !u.trim().is_empty()) {
+        cases.push(("clickhouse", url.replacen("http://", "clickhouse://", 1), "SELECT toDateTime(1704164645)", naive.clone()));
+    }
+    for (name, url, sql, expected) in cases {
+        let h = H::new(&url);
+        assert_eq!(h.query(sql)[0][0], expected, "{name}");
+    }
+}
+
+/// "Statistics of the whole column" asks the server about all rows of the
+/// query, not only the fetched page.
+#[test]
+fn whole_column_statistics() {
+    let mssql = std::env::var("TERNARYGRID_TEST_MSSQL").ok().filter(|u| !u.trim().is_empty()).map(|u| ("mssql", u));
+    for (name, url) in servers().into_iter().filter(|(n, _)| matches!(*n, "sqlite" | "postgres" | "mysql")).chain(mssql) {
+        let mut h = H::new(&url);
+        let table = format!("ternarygrid_stats_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        h.sql(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, city VARCHAR(10))"));
+        h.sql(&format!("INSERT INTO {table} VALUES (1, 'Bandung'), (2, 'Medan'), (3, 'Bandung'), (4, NULL), (5, 'Ambon')"));
+        let mut view = TableDataView::new(h.id.clone(), ObjectRef::table(None, table.clone()), None);
+        h.until(&mut view, "rows", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() == 5));
+        {
+            let mut cx = AppContext {
+                backend: &h.backend,
+                conns: &mut h.cm,
+                services: &h.services,
+                settings: &mut h.settings,
+                commands: &mut h.commands,
+                toasts: &mut h.toasts,
+                ops: &mut h.ops,
+                keymap: &h.keymap,
+                tab_active: true,
+                current_tab: Some(1),
+                popup: false,
+            };
+            view.panel.as_mut().unwrap().handle_for_tests(ternarygrid_grid::GridAction::ColumnStatistics { column: 1 }, &mut cx);
+        }
+        let toast = {
+            let t0 = Instant::now();
+            loop {
+                h.frame(&mut view);
+                if let Some(t) = h.toasts.take_log().into_iter().find(|t| t.title.starts_with("Statistics of")) {
+                    break t;
+                }
+                assert!(t0.elapsed() < Duration::from_secs(20), "[{name}] no statistics");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let detail = toast.detail.unwrap_or_default();
+        assert!(detail.contains("Rows: 5 · NULLs: 1 · Distinct: 3"), "[{name}] {detail}");
+        assert!(detail.contains("Min: Ambon · Max: Medan"), "[{name}] {detail}");
+        drop(view);
+        h.sql(&format!("DROP TABLE {table}"));
+    }
+}

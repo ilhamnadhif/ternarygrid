@@ -1,0 +1,257 @@
+//! TernaryGrid application crate: window, tabs, navigator and the wiring of all
+//! TernaryGrid crates. The `ternarygrid` binary calls [`run`].
+
+// `DbError` carries the server diagnostics and is returned by value.
+#![allow(clippy::result_large_err, clippy::type_complexity, clippy::too_many_arguments)]
+
+pub mod app;
+pub mod applog;
+pub mod backend;
+pub mod bench;
+pub mod bench_ui;
+pub mod command;
+pub mod conn;
+pub mod cx;
+pub mod dblogo;
+pub mod diagnostics;
+pub mod dialogs;
+pub mod drivers;
+pub mod exec;
+pub mod headless;
+pub mod keys;
+#[cfg(target_os = "macos")]
+pub mod macmenu;
+pub mod menu;
+pub mod nav;
+pub mod ops;
+pub mod palette;
+pub mod pending_tx;
+pub mod project_view;
+pub mod results;
+pub mod router;
+pub mod sample;
+#[cfg(target_os = "macos")]
+pub mod selfupdate;
+pub mod services;
+pub mod sqllang;
+pub mod sqlprep;
+pub mod tabs;
+pub mod taskexec;
+pub mod textops;
+pub mod theme;
+pub mod tips;
+pub mod toasts;
+pub mod tools;
+pub mod transferexec;
+pub mod updates;
+pub mod urls;
+pub mod widgets;
+
+use std::process::ExitCode;
+use std::sync::Arc;
+
+const HELP: &str = "TernaryGrid - lightweight SQL database client
+
+Usage: ternarygrid [OPTIONS] [FILE.sql | DATABASE.db ...]
+
+Options:
+  --execute                Execute the given SQL scripts once connected
+  --run-task <ID|NAME>     Run a saved task headless and exit
+  --bench <NAME>           Run a headless benchmark (startup, memory, grid, editor, all)
+  --bench-report <FILE>    Write benchmark results as JSON
+  --exit-after-first-frame Exit right after the first frame (startup measurement)
+  --portable <DIR>         Keep all settings and data in DIR
+  -V, --version            Print version
+  -h, --help               Print help";
+
+#[derive(Debug, Default, Clone)]
+pub struct CliArgs {
+    pub run_task: Option<String>,
+    pub bench: Option<String>,
+    pub bench_report: Option<String>,
+    pub exit_after_first_frame: bool,
+    pub portable: Option<String>,
+    pub files: Vec<String>,
+    pub execute: bool,
+}
+
+pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<CliArgs>, String> {
+    let mut out = CliArgs::default();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("{HELP}");
+                return Ok(None);
+            }
+            "-V" | "--version" => {
+                println!("ternarygrid {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
+            "--run-task" => out.run_task = Some(it.next().ok_or("--run-task needs a task id or name")?),
+            "--bench" => out.bench = Some(it.next().ok_or("--bench needs a name")?),
+            "--bench-report" => out.bench_report = Some(it.next().ok_or("--bench-report needs a file")?),
+            "--exit-after-first-frame" => out.exit_after_first_frame = true,
+            "--execute" => out.execute = true,
+            "--portable" => out.portable = Some(it.next().ok_or("--portable needs a directory")?),
+            s if s.starts_with("-psn_") => {} // macOS process serial number
+            s if s.starts_with('-') => return Err(format!("unknown option {s}\n\n{HELP}")),
+            _ => out.files.push(a),
+        }
+    }
+    Ok(Some(out))
+}
+
+fn init_logging() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer};
+    let filter = EnvFilter::try_from_env("TERNARYGRID_LOG").unwrap_or_else(|_| EnvFilter::new("warn,ternarygrid=info"));
+    // the application log (Error log view, logs/ternarygrid.log) keeps warnings of every crate
+    let app_filter = EnvFilter::new("warn,ternarygrid=info");
+    let _ = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_target(false).with_filter(filter)).with(applog::LogLayer.with_filter(app_filter)).try_init();
+}
+
+fn window_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../assets/icon-256.png");
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Some(egui::IconData { rgba: img.into_raw(), width: w, height: h })
+}
+
+/// All drivers built into this binary.
+pub fn driver_registry() -> ternarygrid_core::registry::DriverRegistry {
+    let mut reg = ternarygrid_core::registry::DriverRegistry::new();
+    drivers::register_all(&mut reg);
+    reg
+}
+
+/// Connection manager over the saved connections, the configured secret
+/// store, SSH tunnels / proxies and `~/.pgpass`.
+pub fn connection_manager(services: &services::Services) -> (conn::ConnectionManager, Vec<String>) {
+    let (store, warnings) = ternarygrid_config::ConnectionStore::load_or_recover(&services.paths);
+    let secrets = Arc::new(conn::ManagedSecrets(services.secrets.clone()));
+    let net = Arc::new(conn::TunnelNet { known_hosts: services.paths.known_hosts_file() });
+    let mut conns = conn::ConnectionManager::new(driver_registry(), secrets, net);
+    conns.store = store;
+    conns.pgpass = Some(Arc::new(|host: &str, port: u16, db: &str, user: &str| ternarygrid_config::import::pgpass::lookup(host, port, db, user)));
+    (conns, warnings)
+}
+
+/// Entry point of the `ternarygrid` binary.
+pub fn run() -> ExitCode {
+    bench::mark_process_start();
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(Some(a)) => a,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    init_logging();
+    if let Some(name) = &args.bench {
+        return bench::run(name, args.bench_report.as_deref());
+    }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    if let Some(dir) = &args.portable {
+        // SAFETY: called before any other thread is spawned.
+        unsafe { std::env::set_var("TERNARYGRID_HOME", dir) };
+    }
+    let paths = match ternarygrid_config::AppPaths::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cannot determine the configuration directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = applog::open_file(paths.logs_dir()) {
+        eprintln!("cannot open the log file: {e}");
+    }
+    tracing::info!("TernaryGrid {} started", env!("CARGO_PKG_VERSION"));
+    let (settings, mut warnings) = ternarygrid_config::settings::load_with_warnings(&paths);
+    settings.results.apply_memory_limits();
+
+    let backend = match backend::Backend::new() {
+        Ok(b) => Arc::new(b),
+        Err(e) => {
+            eprintln!("cannot start the I/O runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(task) = &args.run_task {
+        return headless::run_task(&backend, &paths, &settings, task);
+    }
+    let mut services = services::Services::load(paths, &settings, backend.handle());
+    services.warnings.append(&mut warnings);
+    let (conns, mut conn_warnings) = connection_manager(&services);
+    services.warnings.append(&mut conn_warnings);
+
+    let mut viewport =
+        egui::ViewportBuilder::default().with_title("TernaryGrid").with_app_id("dev.ternarygrid.TernaryGrid").with_inner_size([1280.0, 820.0]).with_min_inner_size([640.0, 400.0]);
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+    let exit_after_first = args.exit_after_first_frame;
+    let files = args.files.clone();
+    let execute = args.execute;
+    let creator: eframe::AppCreator<'static> = Box::new(move |cc| {
+        theme::setup_fonts(&cc.egui_ctx);
+        theme::apply_settings(&cc.egui_ctx, &settings);
+        backend.set_context(cc.egui_ctx.clone());
+        let mut app = app::TernaryGridApp::new(backend, conns, services, settings);
+        app.exit_after_first_frame = exit_after_first;
+        #[cfg(target_os = "macos")]
+        {
+            app.app_menu = macmenu::AppMenu::install(&cc.egui_ctx);
+        }
+        match std::env::var("TERNARYGRID_BENCH_SCENARIO").as_deref() {
+            Ok("workload") => app.start_bench_workload(),
+            Ok(_) => {}
+            Err(_) if app.settings.general.restore_session => app.restore_session(),
+            Err(_) => {}
+        }
+        // Database files first, so scripts can use their connection.
+        let (dbs, scripts): (Vec<&String>, Vec<&String>) = files.iter().partition(|f| app::is_database_file(std::path::Path::new(f)));
+        for f in dbs.into_iter().chain(scripts) {
+            app.open_path(std::path::Path::new(f), execute);
+        }
+        Ok(Box::new(app))
+    });
+    // Taken by the attempt whose window opens: a renderer that cannot start fails before.
+    let creator = std::rc::Rc::new(std::cell::RefCell::new(Some(creator)));
+    let attempt = |renderer| {
+        let creator = creator.clone();
+        let options = eframe::NativeOptions { viewport: viewport.clone(), renderer, ..Default::default() };
+        eframe::run_native("TernaryGrid", options, Box::new(move |cc| (creator.borrow_mut().take().expect("the app is created once"))(cc)))
+    };
+    let result = attempt(eframe::Renderer::Glow);
+    // Windows without OpenGL 2 (a virtual machine, Remote Desktop, no graphics
+    // driver): Direct3D 12, in software (WARP) when there is no graphics card.
+    #[cfg(windows)]
+    let result = match result {
+        Err(e) if creator.borrow().is_some() => {
+            tracing::warn!("OpenGL: {e}; trying Direct3D 12");
+            attempt(eframe::Renderer::Wgpu)
+        }
+        r => r,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("TernaryGrid failed: {e}");
+            tracing::error!("TernaryGrid failed: {e}");
+            // Started from a menu, the Dock or Explorer, nobody sees the console.
+            let _ = rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("TernaryGrid")
+                .set_description(ternarygrid_core::trf(
+                    "TernaryGrid could not open its window: {}\n\nIt needs OpenGL 2.0 or later; updating the graphics driver usually helps.",
+                    &[&e],
+                ))
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
+            ExitCode::FAILURE
+        }
+    }
+}

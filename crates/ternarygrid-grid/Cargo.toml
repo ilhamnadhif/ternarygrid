@@ -1,0 +1,39 @@
+[package]
+name = "ternarygrid-grid"
+description = "Virtual data grid and result views for TernaryGrid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+uuid.workspace = true
+ternarygrid-core.workspace = true
+ternarygrid-icons.workspace = true
+egui.workspace = true
+egui-phosphor.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+image.workspace = true
+chrono.workspace = true
+regex.workspace = true
+parking_lot.workspace = true
+quick-xml.workspace = true
+
+[dev-dependencies]
+eframe.workspace = true
+egui = { workspace = true, features = ["default_fonts"] }
+
+[[example]]
+name = "grid_demo"
+path = "examples/grid_demo.rs"
+
+[[example]]
+name = "grid_bench"
+path = "examples/grid_bench.rs"
+
+[[example]]
+name = "grid_snapshot"
+path = "examples/grid_snapshot.rs"

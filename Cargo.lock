@@ -1421,463 +1421,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
-name = "dbiji-ai"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "dbiji-core",
- "parking_lot",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "ureq",
-]
-
-[[package]]
-name = "dbiji-app"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "chrono",
- "dbiji-ai",
- "dbiji-compare",
- "dbiji-config",
- "dbiji-core",
- "dbiji-driver-cassandra",
- "dbiji-driver-clickhouse",
- "dbiji-driver-elasticsearch",
- "dbiji-driver-mongodb",
- "dbiji-driver-mssql",
- "dbiji-driver-mysql",
- "dbiji-driver-oracle",
- "dbiji-driver-postgres",
- "dbiji-driver-redis",
- "dbiji-driver-sqlite",
- "dbiji-editor",
- "dbiji-grid",
- "dbiji-icons",
- "dbiji-net",
- "dbiji-sql",
- "dbiji-tasks",
- "dbiji-transfer",
- "dbiji-visual",
- "eframe",
- "egui",
- "egui-phosphor",
- "egui_dock",
- "egui_extras",
- "egui_kittest",
- "egui_plot",
- "epaint_default_fonts",
- "flate2",
- "futures",
- "iana-time-zone",
- "image",
- "libc",
- "muda",
- "open",
- "parking_lot",
- "regex",
- "resvg",
- "rfd",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "uuid",
- "wgpu",
- "winresource",
- "zip 9.0.5",
-]
-
-[[package]]
-name = "dbiji-compare"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "chrono",
- "dbiji-core",
- "quick-xml 0.42.0",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-config"
-version = "0.5.1"
-dependencies = [
- "aes",
- "argon2",
- "cbc",
- "chacha20poly1305",
- "chrono",
- "dbiji-core",
- "directories",
- "hex",
- "keyring",
- "parking_lot",
- "quick-xml 0.42.0",
- "rand 0.10.3",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "dbiji-core"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "chrono",
- "hex",
- "parking_lot",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "dbiji-driver-cassandra"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "chrono",
- "dbiji-core",
- "futures",
- "hex",
- "rustls",
- "rustls-native-certs",
- "scylla",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-driver-clickhouse"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "chrono",
- "dbiji-core",
- "hex",
- "rustls",
- "rustls-native-certs",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "ureq",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-driver-elasticsearch"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "chrono",
- "dbiji-core",
- "rustls",
- "rustls-native-certs",
- "serde_json",
- "tokio",
- "tracing",
- "ureq",
-]
-
-[[package]]
-name = "dbiji-driver-mongodb"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "chrono",
- "dbiji-core",
- "futures",
- "hex",
- "mongodb",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-driver-mssql"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "chrono",
- "dbiji-core",
- "futures",
- "hex",
- "quick-xml 0.42.0",
- "tiberius",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-driver-mysql"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "chrono",
- "dbiji-core",
- "encoding_rs",
- "mysql_async",
- "parking_lot",
- "rustls",
- "rustls-native-certs",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-driver-oracle"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "chrono",
- "dbiji-core",
- "hex",
- "oracledb",
- "parking_lot",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "dbiji-driver-postgres"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "dbiji-core",
- "futures",
- "hex",
- "parking_lot",
- "postgres-protocol",
- "postgres-types",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "socket2",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "uuid",
- "webpki-roots",
-]
-
-[[package]]
-name = "dbiji-driver-redis"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "dbiji-core",
- "redis",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "dbiji-driver-sqlite"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "chrono",
- "dbiji-core",
- "hex",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-editor"
-version = "0.5.1"
-dependencies = [
- "dbiji-core",
- "eframe",
- "egui",
- "egui-phosphor",
- "image",
- "regex",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "dbiji-grid"
-version = "0.5.1"
-dependencies = [
- "chrono",
- "dbiji-core",
- "dbiji-icons",
- "eframe",
- "egui",
- "egui-phosphor",
- "image",
- "parking_lot",
- "quick-xml 0.42.0",
- "regex",
- "serde",
- "serde_json",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-icons"
-version = "0.5.1"
-dependencies = [
- "egui",
- "egui-phosphor",
-]
-
-[[package]]
-name = "dbiji-net"
-version = "0.5.1"
-dependencies = [
- "base64 0.23.1",
- "dbiji-core",
- "directories",
- "futures",
- "hmac",
- "libc",
- "rand 0.10.3",
- "russh",
- "sha1 0.11.0",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "dbiji-sql"
-version = "0.5.1"
-dependencies = [
- "dbiji-core",
- "flate2",
- "serde",
- "serde_json",
- "sqlparser",
- "tracing",
-]
-
-[[package]]
-name = "dbiji-tasks"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "chrono",
- "cron",
- "dbiji-core",
- "libc",
- "parking_lot",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-transfer"
-version = "0.5.1"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "calamine",
- "chrono",
- "dbiji-core",
- "encoding_rs",
- "hex",
- "parking_lot",
- "parquet",
- "quick-xml 0.42.0",
- "rand 0.10.3",
- "rusqlite",
- "rust_xlsxwriter",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dbiji-visual"
-version = "0.5.1"
-dependencies = [
- "chrono",
- "dbiji-core",
- "dbiji-icons",
- "eframe",
- "egui",
- "egui-phosphor",
- "egui_plot",
- "epaint_default_fonts",
- "petgraph",
- "resvg",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
 name = "debug_unsafe"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6880,6 +6423,463 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "ternarygrid-ai"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "rustls",
+ "serde",
+ "serde_json",
+ "ternarygrid-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
+name = "ternarygrid-app"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "eframe",
+ "egui",
+ "egui-phosphor",
+ "egui_dock",
+ "egui_extras",
+ "egui_kittest",
+ "egui_plot",
+ "epaint_default_fonts",
+ "flate2",
+ "futures",
+ "iana-time-zone",
+ "image",
+ "libc",
+ "muda",
+ "open",
+ "parking_lot",
+ "regex",
+ "resvg",
+ "rfd",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "ternarygrid-ai",
+ "ternarygrid-compare",
+ "ternarygrid-config",
+ "ternarygrid-core",
+ "ternarygrid-driver-cassandra",
+ "ternarygrid-driver-clickhouse",
+ "ternarygrid-driver-elasticsearch",
+ "ternarygrid-driver-mongodb",
+ "ternarygrid-driver-mssql",
+ "ternarygrid-driver-mysql",
+ "ternarygrid-driver-oracle",
+ "ternarygrid-driver-postgres",
+ "ternarygrid-driver-redis",
+ "ternarygrid-driver-sqlite",
+ "ternarygrid-editor",
+ "ternarygrid-grid",
+ "ternarygrid-icons",
+ "ternarygrid-net",
+ "ternarygrid-sql",
+ "ternarygrid-tasks",
+ "ternarygrid-transfer",
+ "ternarygrid-visual",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "uuid",
+ "wgpu",
+ "winresource",
+ "zip 9.0.5",
+]
+
+[[package]]
+name = "ternarygrid-compare"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "quick-xml 0.42.0",
+ "serde",
+ "serde_json",
+ "ternarygrid-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-config"
+version = "0.5.1"
+dependencies = [
+ "aes",
+ "argon2",
+ "cbc",
+ "chacha20poly1305",
+ "chrono",
+ "directories",
+ "hex",
+ "keyring",
+ "parking_lot",
+ "quick-xml 0.42.0",
+ "rand 0.10.3",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ternarygrid-core",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "ternarygrid-core"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "ternarygrid-driver-cassandra"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "hex",
+ "rustls",
+ "rustls-native-certs",
+ "scylla",
+ "serde_json",
+ "ternarygrid-core",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-driver-clickhouse"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "ternarygrid-core",
+ "tokio",
+ "tracing",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-driver-elasticsearch"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "rustls",
+ "rustls-native-certs",
+ "serde_json",
+ "ternarygrid-core",
+ "tokio",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
+name = "ternarygrid-driver-mongodb"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "futures",
+ "hex",
+ "mongodb",
+ "serde_json",
+ "ternarygrid-core",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-driver-mssql"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "hex",
+ "quick-xml 0.42.0",
+ "ternarygrid-core",
+ "tiberius",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-driver-mysql"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "encoding_rs",
+ "mysql_async",
+ "parking_lot",
+ "rustls",
+ "rustls-native-certs",
+ "serde_json",
+ "ternarygrid-core",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-driver-oracle"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "oracledb",
+ "parking_lot",
+ "serde_json",
+ "ternarygrid-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ternarygrid-driver-postgres"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "parking_lot",
+ "postgres-protocol",
+ "postgres-types",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "socket2",
+ "ternarygrid-core",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ternarygrid-driver-redis"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "redis",
+ "serde_json",
+ "ternarygrid-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ternarygrid-driver-sqlite"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ternarygrid-core",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-editor"
+version = "0.5.1"
+dependencies = [
+ "eframe",
+ "egui",
+ "egui-phosphor",
+ "image",
+ "regex",
+ "serde",
+ "serde_json",
+ "ternarygrid-core",
+ "tracing",
+]
+
+[[package]]
+name = "ternarygrid-grid"
+version = "0.5.1"
+dependencies = [
+ "chrono",
+ "eframe",
+ "egui",
+ "egui-phosphor",
+ "image",
+ "parking_lot",
+ "quick-xml 0.42.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "ternarygrid-core",
+ "ternarygrid-icons",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-icons"
+version = "0.5.1"
+dependencies = [
+ "egui",
+ "egui-phosphor",
+]
+
+[[package]]
+name = "ternarygrid-net"
+version = "0.5.1"
+dependencies = [
+ "base64 0.23.1",
+ "directories",
+ "futures",
+ "hmac",
+ "libc",
+ "rand 0.10.3",
+ "russh",
+ "sha1 0.11.0",
+ "tempfile",
+ "ternarygrid-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "ternarygrid-sql"
+version = "0.5.1"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "ternarygrid-core",
+ "tracing",
+]
+
+[[package]]
+name = "ternarygrid-tasks"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cron",
+ "libc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ternarygrid-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-transfer"
+version = "0.5.1"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "calamine",
+ "chrono",
+ "encoding_rs",
+ "hex",
+ "parking_lot",
+ "parquet",
+ "quick-xml 0.42.0",
+ "rand 0.10.3",
+ "rusqlite",
+ "rust_xlsxwriter",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ternarygrid-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ternarygrid-visual"
+version = "0.5.1"
+dependencies = [
+ "chrono",
+ "eframe",
+ "egui",
+ "egui-phosphor",
+ "egui_plot",
+ "epaint_default_fonts",
+ "petgraph",
+ "resvg",
+ "serde",
+ "serde_json",
+ "ternarygrid-core",
+ "ternarygrid-icons",
+ "tracing",
 ]
 
 [[package]]

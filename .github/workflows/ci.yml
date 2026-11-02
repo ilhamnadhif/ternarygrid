@@ -56,51 +56,51 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: dbiji
-          POSTGRES_PASSWORD: dbiji
-          POSTGRES_DB: dbiji
+          POSTGRES_USER: ternarygrid
+          POSTGRES_PASSWORD: ternarygrid
+          POSTGRES_DB: ternarygrid
         ports: ["55432:5432"]
         options: >-
-          --health-cmd "pg_isready -U dbiji" --health-interval 5s --health-timeout 5s --health-retries 20
+          --health-cmd "pg_isready -U ternarygrid" --health-interval 5s --health-timeout 5s --health-retries 20
       mssql:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
-          MSSQL_SA_PASSWORD: Dbiji_test1
+          MSSQL_SA_PASSWORD: TernaryGrid_test1
         ports: ["51433:1433"]
         options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P Dbiji_test1 -Q 'SELECT 1' -b -o /dev/null"
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P TernaryGrid_test1 -Q 'SELECT 1' -b -o /dev/null"
           --health-interval 10s --health-timeout 10s --health-retries 30
       mysql:
         image: mysql:8.0
         env:
-          MYSQL_ROOT_PASSWORD: dbiji
-          MYSQL_DATABASE: dbiji
+          MYSQL_ROOT_PASSWORD: ternarygrid
+          MYSQL_DATABASE: ternarygrid
         ports: ["53306:3306"]
         options: >-
-          --health-cmd "mysqladmin ping -pdbiji" --health-interval 5s --health-timeout 5s --health-retries 30
+          --health-cmd "mysqladmin ping -pternarygrid" --health-interval 5s --health-timeout 5s --health-retries 30
       mariadb:
         image: mariadb:11
         env:
-          MARIADB_ROOT_PASSWORD: dbiji
-          MARIADB_DATABASE: dbiji
+          MARIADB_ROOT_PASSWORD: ternarygrid
+          MARIADB_DATABASE: ternarygrid
         ports: ["53307:3306"]
         options: >-
           --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 5s --health-retries 30
       clickhouse:
         image: clickhouse/clickhouse-server:latest
         env:
-          CLICKHOUSE_USER: dbiji
-          CLICKHOUSE_PASSWORD: dbiji
+          CLICKHOUSE_USER: ternarygrid
+          CLICKHOUSE_PASSWORD: ternarygrid
           CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
         ports: ["58123:8123"]
     env:
-      DBIJI_TEST_PG: postgres://dbiji:dbiji@127.0.0.1:55432/dbiji
-      DBIJI_TEST_MYSQL: mysql://root:dbiji@127.0.0.1:53306/dbiji
-      DBIJI_TEST_MARIADB: mariadb://root:dbiji@127.0.0.1:53307/dbiji
-      DBIJI_TEST_CLICKHOUSE: http://dbiji:dbiji@127.0.0.1:58123
-      DBIJI_TEST_COCKROACH: cockroachdb://root@127.0.0.1:26257/defaultdb?sslmode=disable
-      DBIJI_TEST_MSSQL: sqlserver://sa:Dbiji_test1@127.0.0.1:51433/master
+      TERNARYGRID_TEST_PG: postgres://ternarygrid:ternarygrid@127.0.0.1:55432/ternarygrid
+      TERNARYGRID_TEST_MYSQL: mysql://root:ternarygrid@127.0.0.1:53306/ternarygrid
+      TERNARYGRID_TEST_MARIADB: mariadb://root:ternarygrid@127.0.0.1:53307/ternarygrid
+      TERNARYGRID_TEST_CLICKHOUSE: http://ternarygrid:ternarygrid@127.0.0.1:58123
+      TERNARYGRID_TEST_COCKROACH: cockroachdb://root@127.0.0.1:26257/defaultdb?sslmode=disable
+      TERNARYGRID_TEST_MSSQL: sqlserver://sa:TernaryGrid_test1@127.0.0.1:51433/master
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -113,21 +113,21 @@ jobs:
           for i in $(seq 1 60); do docker exec crdb ./cockroach sql --insecure -e "select 1" && break; sleep 2; done
       - name: Driver and end-to-end integration tests
         run: >-
-          cargo test -p dbiji-driver-postgres -p dbiji-driver-mysql -p dbiji-driver-sqlite
-          -p dbiji-driver-clickhouse -p dbiji-driver-mssql -p dbiji-transfer
-          -p dbiji-compare -p dbiji-tasks -p dbiji-app -- --test-threads=4
+          cargo test -p ternarygrid-driver-postgres -p ternarygrid-driver-mysql -p ternarygrid-driver-sqlite
+          -p ternarygrid-driver-clickhouse -p ternarygrid-driver-mssql -p ternarygrid-transfer
+          -p ternarygrid-compare -p ternarygrid-tasks -p ternarygrid-app -- --test-threads=4
 
-  # The oldest server versions DBiji supports: catalog columns, syntax or TLS
+  # The oldest server versions TernaryGrid supports: catalog columns, syntax or TLS
   # ciphers of newer versions fail here (PostgreSQL 11's attgenerated, MySQL
   # 5.7's DHE-only TLS).
   integration-oldest:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      DBIJI_TEST_PG: postgres://dbiji:dbiji@127.0.0.1:55411/dbiji
-      DBIJI_TEST_MYSQL: mysql://root:dbiji@127.0.0.1:53357/dbiji
-      DBIJI_TEST_MARIADB: mariadb://root:dbiji@127.0.0.1:53316/dbiji
-      DBIJI_TEST_MSSQL: sqlserver://sa:Dbiji_test1@127.0.0.1:51417/master
+      TERNARYGRID_TEST_PG: postgres://ternarygrid:ternarygrid@127.0.0.1:55411/ternarygrid
+      TERNARYGRID_TEST_MYSQL: mysql://root:ternarygrid@127.0.0.1:53357/ternarygrid
+      TERNARYGRID_TEST_MARIADB: mariadb://root:ternarygrid@127.0.0.1:53316/ternarygrid
+      TERNARYGRID_TEST_MSSQL: sqlserver://sa:TernaryGrid_test1@127.0.0.1:51417/master
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -145,19 +145,19 @@ jobs:
             done
             return 1
           }
-          start pg11 -e POSTGRES_USER=dbiji -e POSTGRES_PASSWORD=dbiji -e POSTGRES_DB=dbiji -p 55411:5432 postgres:11
-          start mysql57 -e MYSQL_ROOT_PASSWORD=dbiji -e MYSQL_DATABASE=dbiji -p 53357:3306 mysql:5.7
-          start mariadb106 -e MARIADB_ROOT_PASSWORD=dbiji -e MARIADB_DATABASE=dbiji -p 53316:3306 mariadb:10.6
-          start mssql2017 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD=Dbiji_test1 -p 51417:1433 mcr.microsoft.com/mssql/server:2017-latest
+          start pg11 -e POSTGRES_USER=ternarygrid -e POSTGRES_PASSWORD=ternarygrid -e POSTGRES_DB=ternarygrid -p 55411:5432 postgres:11
+          start mysql57 -e MYSQL_ROOT_PASSWORD=ternarygrid -e MYSQL_DATABASE=ternarygrid -p 53357:3306 mysql:5.7
+          start mariadb106 -e MARIADB_ROOT_PASSWORD=ternarygrid -e MARIADB_DATABASE=ternarygrid -p 53316:3306 mariadb:10.6
+          start mssql2017 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD=TernaryGrid_test1 -p 51417:1433 mcr.microsoft.com/mssql/server:2017-latest
           ready() { for i in $(seq 1 120); do "$@" >/dev/null 2>&1 && return 0; sleep 2; done; echo "not ready: $*"; return 1; }
-          ready docker exec pg11 pg_isready -U dbiji
-          ready docker exec mysql57 mysql -uroot -pdbiji -e "SELECT 1"
+          ready docker exec pg11 pg_isready -U ternarygrid
+          ready docker exec mysql57 mysql -uroot -pternarygrid -e "SELECT 1"
           ready docker exec mariadb106 healthcheck.sh --connect --innodb_initialized
-          ready docker exec mssql2017 /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P Dbiji_test1 -Q "SELECT 1" -b
+          ready docker exec mssql2017 /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P TernaryGrid_test1 -Q "SELECT 1" -b
       - name: Driver and end-to-end tests on the oldest servers
         run: >-
-          cargo test -p dbiji-driver-postgres -p dbiji-driver-mysql -p dbiji-driver-mssql -p dbiji-transfer
-          -p dbiji-compare -p dbiji-tasks -p dbiji-app -- --test-threads=4
+          cargo test -p ternarygrid-driver-postgres -p ternarygrid-driver-mysql -p ternarygrid-driver-mssql -p ternarygrid-transfer
+          -p ternarygrid-compare -p ternarygrid-tasks -p ternarygrid-app -- --test-threads=4
 
   # Oracle, Cassandra / ScyllaDB, Redis, MongoDB and Elasticsearch in a job of
   # their own: the Oracle image is large and starts slowly.
@@ -165,11 +165,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      DBIJI_TEST_ORACLE: oracle://dbiji:dbiji@127.0.0.1:51521/FREEPDB1
-      DBIJI_TEST_CASSANDRA: cassandra://127.0.0.1:59042
-      DBIJI_TEST_REDIS: redis://127.0.0.1:56379
-      DBIJI_TEST_MONGO: mongodb://127.0.0.1:57017
-      DBIJI_TEST_ELASTIC: http://127.0.0.1:59200
+      TERNARYGRID_TEST_ORACLE: oracle://ternarygrid:ternarygrid@127.0.0.1:51521/FREEPDB1
+      TERNARYGRID_TEST_CASSANDRA: cassandra://127.0.0.1:59042
+      TERNARYGRID_TEST_REDIS: redis://127.0.0.1:56379
+      TERNARYGRID_TEST_MONGO: mongodb://127.0.0.1:57017
+      TERNARYGRID_TEST_ELASTIC: http://127.0.0.1:59200
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -183,7 +183,7 @@ jobs:
             done
             return 1
           }
-          start oracle -e ORACLE_PASSWORD=Dbiji_test1 -e APP_USER=dbiji -e APP_USER_PASSWORD=dbiji -p 51521:1521 gvenzl/oracle-free:23-slim-faststart
+          start oracle -e ORACLE_PASSWORD=TernaryGrid_test1 -e APP_USER=ternarygrid -e APP_USER_PASSWORD=ternarygrid -p 51521:1521 gvenzl/oracle-free:23-slim-faststart
           start scylla -p 59042:9042 scylladb/scylla:6.2 --smp 1 --memory 750M --overprovisioned 1 --developer-mode 1
           start redis -p 56379:6379 redis:7
           start mongo -p 57017:27017 mongo:7
@@ -196,8 +196,8 @@ jobs:
           ready curl -sf http://127.0.0.1:59200/_cluster/health
       - name: Driver tests
         run: >-
-          cargo test -p dbiji-driver-oracle -p dbiji-driver-cassandra -p dbiji-driver-redis
-          -p dbiji-driver-mongodb -p dbiji-driver-elasticsearch -- --test-threads=2
+          cargo test -p ternarygrid-driver-oracle -p ternarygrid-driver-cassandra -p ternarygrid-driver-redis
+          -p ternarygrid-driver-mongodb -p ternarygrid-driver-elasticsearch -- --test-threads=2
 
   audit:
     runs-on: ubuntu-24.04
@@ -214,14 +214,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release
-        run: cargo build --release -p dbiji-app
+        run: cargo build --release -p ternarygrid-app
       - name: Binary size (< 50 MB)
         run: |
-          size=$(stat -f%z target/release/dbiji)
+          size=$(stat -f%z target/release/ternarygrid)
           echo "binary size: $size bytes"
           test "$size" -lt 52428800
       - name: Headless benchmarks (startup, memory, grid, editor)
-        run: target/release/dbiji --bench all --bench-report bench.json
+        run: target/release/ternarygrid --bench all --bench-report bench.json
       - uses: actions/upload-artifact@v7
         with:
           name: benchmarks
@@ -282,7 +282,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.runner }}
-          path: dist/DBiji-*-linux-*
+          path: dist/TernaryGrid-*-linux-*
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')

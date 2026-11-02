@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Publishes the version in Cargo.toml as a GitHub release. Installed copies
 # that check for updates offer it at their next start (or within a few hours)
-# and install it in place from DBiji-<version>.zip.
+# and install it in place from TernaryGrid-<version>.zip.
 #
 #   scripts/release.sh            # notes from this version's CHANGELOG.md section
 #   scripts/release.sh notes.md   # notes from a file
 #   scripts/release.sh --ci       # only tag and push: CI tests, builds and
 #                                 # publishes it (scripts/ci-publish.sh)
 #
-# Set DBIJI_SIGN_IDENTITY and DBIJI_NOTARY_PROFILE (see bundle-macos.sh) for
-# Developer ID signed, notarized builds; DBIJI_SKIP_TESTS=1 leaves the tests
+# Set TERNARYGRID_SIGN_IDENTITY and TERNARYGRID_NOTARY_PROFILE (see bundle-macos.sh) for
+# Developer ID signed, notarized builds; TERNARYGRID_SKIP_TESTS=1 leaves the tests
 # to CI.
 #
 # Steps: checks → tests → build (.app, .dmg, .zip) → tag → push → draft
@@ -29,7 +29,7 @@ NOTES_FILE="${1:-}"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 TAG="v$VERSION"
 BRANCH="master"
-FILES=("dist/DBiji-$VERSION.dmg" "dist/DBiji-$VERSION.zip")
+FILES=("dist/TernaryGrid-$VERSION.dmg" "dist/TernaryGrid-$VERSION.zip")
 
 fail() { echo "Error: $*" >&2; exit 1; }
 command -v gh >/dev/null || fail "the GitHub CLI (gh) is needed: brew install gh"
@@ -55,14 +55,14 @@ fi
 
 if [ -n "$CI_ONLY" ]; then
     echo "==> Tag $TAG"
-    git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git tag -a "$TAG" -m "DBiji $VERSION"
+    git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git tag -a "$TAG" -m "TernaryGrid $VERSION"
     git push --quiet origin "$BRANCH"
     git push --quiet origin "$TAG"
     echo "==> Pushed: CI publishes $TAG once its tests pass ($(gh repo view --json url --jq .url)/actions)"
     exit 0
 fi
 
-if [ -z "${DBIJI_SKIP_TESTS:-}" ]; then
+if [ -z "${TERNARYGRID_SKIP_TESTS:-}" ]; then
     echo "==> Tests"
     cargo test --workspace --quiet
 fi
@@ -72,14 +72,14 @@ scripts/bundle-macos.sh --universal
 for f in "${FILES[@]}"; do [ -f "$f" ] || fail "missing $f"; done
 
 echo "==> Tag $TAG"
-git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git tag -a "$TAG" -m "DBiji $VERSION"
+git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git tag -a "$TAG" -m "TernaryGrid $VERSION"
 git push --quiet origin "$BRANCH"
 # A tag alone shows users nothing: they are offered the published release.
 git push --quiet origin "$TAG"
 
 echo "==> Draft release"
 if [ "$STATE" = "none" ]; then
-    gh release create "$TAG" --draft --title "DBiji $VERSION" --notes-file "$NOTES" "${FILES[@]}"
+    gh release create "$TAG" --draft --title "TernaryGrid $VERSION" --notes-file "$NOTES" "${FILES[@]}"
 else
     gh release upload "$TAG" --clobber "${FILES[@]}"
 fi

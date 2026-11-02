@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=TernaryGrid
+GenericName=SQL Database Client
+Comment=A lightweight SQL database client
+Exec=ternarygrid %F
+Icon=dev.ternarygrid.TernaryGrid
+Terminal=false
+Categories=Development;Database;
+Keywords=sql;database;postgresql;mysql;sqlite;sqlserver;clickhouse;
+MimeType=application/sql;application/x-sqlite3;application/vnd.sqlite3;
+StartupWMClass=dev.ternarygrid.TernaryGrid
+StartupNotify=true

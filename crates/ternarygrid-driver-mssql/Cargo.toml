@@ -1,0 +1,24 @@
+[package]
+name = "ternarygrid-driver-mssql"
+description = "Microsoft SQL Server driver for TernaryGrid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ternarygrid-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+tiberius.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+hex.workspace = true
+tracing.workspace = true
+quick-xml.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

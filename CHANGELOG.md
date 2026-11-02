@@ -1,12 +1,12 @@
 # Changelog
 
-All notable changes to DBiji. The newest version comes first; DBiji shows the
+All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
 ## 0.5.1 — 2026-11-02
 
 ### Fixed
-- macOS: DBiji no longer crashes when it quits on MacBooks with a Touch Bar. The fix in 0.3.5 did not reach the cause: the accessibility layer changed the window's view while the Touch Bar was still watching it. On macOS that layer is now off, so VoiceOver no longer reads DBiji's contents there (Windows and Linux keep screen reader support).
+- macOS: TernaryGrid no longer crashes when it quits on MacBooks with a Touch Bar. The fix in 0.3.5 did not reach the cause: the accessibility layer changed the window's view while the Touch Bar was still watching it. On macOS that layer is now off, so VoiceOver no longer reads TernaryGrid's contents there (Windows and Linux keep screen reader support).
 
 ### Changed
 - The interface is in English only: the language choice is gone from Settings and the status bar.
@@ -44,7 +44,7 @@ notes of a new version once after it was updated (Help → What's new).
 - The app is about 44 MB (it was 40 MB) with the Oracle and Cassandra drivers; it starts as fast as before.
 
 ### Removed
-- DuckDB, which was only available in builds made with the `duckdb` feature: its engine is C++, and every DBiji driver is now written in Rust. A saved DuckDB connection is no longer listed; it stays unchanged in the connections file.
+- DuckDB, which was only available in builds made with the `duckdb` feature: its engine is C++, and every TernaryGrid driver is now written in Rust. A saved DuckDB connection is no longer listed; it stays unchanged in the connections file.
 
 ## 0.3.50 — 2026-10-31
 
@@ -57,18 +57,18 @@ notes of a new version once after it was updated (Help → What's new).
 - After the computer slept (or the network or the server dropped it), a connection stayed red in the navigator even once its tabs worked again with Retry: only unfolding it or Reconnect brought it back. It now connects again by itself — at once, then less and less often while the server does not answer, and at once when a tab's Retry got through — and turns green. A connection through an SSH tunnel or a proxy gets a new tunnel too. SQL editors sharing its session work again, and navigator folders that failed to load meanwhile load again.
 
 ### Changed
-- README: new screenshots (SQL editor, a table's data, ER diagram), current measurements, and the AI assistant's agent mode; the update check runs when DBiji starts and every 6 hours, not once a day as it said.
+- README: new screenshots (SQL editor, a table's data, ER diagram), current measurements, and the AI assistant's agent mode; the update check runs when TernaryGrid starts and every 6 hours, not once a day as it said.
 - The app is about 115 KB smaller: the translations and release notes are stored compressed.
 
 ## 0.3.48 — 2026-10-30
 
 ### Added
-- DBiji for Windows and Linux. Every release now has, besides the macOS disk image:
-  - Windows 10 / 11 (x64): an installer (`DBiji-<version>-windows-x64-setup.exe`, per user, no administrator rights) and a portable `.zip`;
+- TernaryGrid for Windows and Linux. Every release now has, besides the macOS disk image:
+  - Windows 10 / 11 (x64): an installer (`TernaryGrid-<version>-windows-x64-setup.exe`, per user, no administrator rights) and a portable `.zip`;
   - Linux (x86_64 and ARM64): a `.deb` (Ubuntu, Debian, Linux Mint), an `.rpm` (Fedora, RHEL, openSUSE), an Arch Linux package, an AppImage and a `.tar.gz`.
   On Windows passwords are kept in the Credential Manager, on Linux in the desktop's keyring (Secret Service). The update dialog's Download gets the Windows installer; on Linux it opens the release page.
   Windows without OpenGL 2.0 (a virtual machine, Remote Desktop, no graphics driver) draws the window with Direct3D 12 instead.
-- When the window cannot open at all, DBiji says why in a dialog instead of quitting silently.
+- When the window cannot open at all, TernaryGrid says why in a dialog instead of quitting silently.
 
 ## 0.3.47 — 2026-10-30
 
@@ -87,7 +87,7 @@ notes of a new version once after it was updated (Help → What's new).
 - The record view edits like the grid: typing on a field starts editing it with what is typed, Enter / F2 edit its value, ↑ ↓ go to the field above / below, and after Enter the keyboard goes on in the record.
 
 ### Fixed
-- Copying several cells (⌘C, in the grid and the record view) wrapped values with quotes, tabs or line breaks in quotes and doubled the quotes inside (`"{""a"":1}"`). Values are copied as they are, as in DBeaver; pasted back into DBiji they are the same cells. Advanced copy keeps its quoting options for spreadsheets.
+- Copying several cells (⌘C, in the grid and the record view) wrapped values with quotes, tabs or line breaks in quotes and doubled the quotes inside (`"{""a"":1}"`). Values are copied as they are, as in DBeaver; pasted back into TernaryGrid they are the same cells. Advanced copy keeps its quoting options for spreadsheets.
 - In the record view, a value typed over a field and confirmed at once was not saved when the edit was started from the keyboard or the menu.
 - In the record view, ↑ / ↓ right after an edit could move the keyboard to the toolbar's ORDER BY field.
 
@@ -99,7 +99,7 @@ notes of a new version once after it was updated (Help → What's new).
 ## 0.3.44 — 2026-10-27
 
 ### Added
-- A database's menu in the navigator is complete: Edit database…, Rename… (F2), Maintenance, Copy name, Refresh and Drop… (⌘⌫). Edit database shows what the server tells (owner, encoding, collation, character type, tablespace, connection limit, allow connections, template, comment, size), changes what the database type allows (PostgreSQL: name, owner, tablespace, limits, template, comment; CockroachDB: name, owner, comment; MySQL / MariaDB: character set, collation; SQL Server: name, owner, collation; ClickHouse: name) and shows the statements first. PostgreSQL renames a database only while nobody uses it: DBiji closes its own session on it first and can disconnect the others.
+- A database's menu in the navigator is complete: Edit database…, Rename… (F2), Maintenance, Copy name, Refresh and Drop… (⌘⌫). Edit database shows what the server tells (owner, encoding, collation, character type, tablespace, connection limit, allow connections, template, comment, size), changes what the database type allows (PostgreSQL: name, owner, tablespace, limits, template, comment; CockroachDB: name, owner, comment; MySQL / MariaDB: character set, collation; SQL Server: name, owner, collation; ClickHouse: name) and shows the statements first. PostgreSQL renames a database only while nobody uses it: TernaryGrid closes its own session on it first and can disconnect the others.
 - SQL functions in typed cells: `now()`, `CURRENT_TIMESTAMP`, `now() - interval '1 day'`, `gen_random_uuid()` … typed in a timestamp, date, number or uuid column are written into the UPDATE / INSERT as typed (marked SQL in the grid) and evaluated by the database. Text columns keep the text.
 - Autocomplete offers PostgreSQL partitions (after their table, "partition of …"), with their table's columns.
 
@@ -209,7 +209,7 @@ notes of a new version once after it was updated (Help → What's new).
 ## 0.3.28 — 2026-10-22
 
 ### Fixed
-- MySQL 5.7: connecting failed with "TLS error: HandshakeFailure" in the default SSL mode (Prefer). MySQL 5.7 offers only DHE ciphers, which DBiji's TLS library does not support; Prefer now goes on without TLS, as the mysql client does, and Require explains why it fails.
+- MySQL 5.7: connecting failed with "TLS error: HandshakeFailure" in the default SSL mode (Prefer). MySQL 5.7 offers only DHE ciphers, which TernaryGrid's TLS library does not support; Prefer now goes on without TLS, as the mysql client does, and Require explains why it fails.
 
 ### Added
 - "Statistics of the whole column" in a column's menu: rows, NULLs, distinct values, the smallest and the largest over all rows of the query, computed by the server (the header's tooltip covers the fetched rows).
@@ -278,12 +278,12 @@ notes of a new version once after it was updated (Help → What's new).
 - Columns fit their header and their first values when a result opens, as in DBeaver (timestamps and e-mail addresses are no longer cut, short columns take less room); widths you set yourself are kept.
 - Column headers show a small icon of the column's type (number, text, date, JSON …); hovering a header shows its database type.
 - Result toolbar: Refresh has a label, Save and Cancel form a group of their own next to it with their labels, and the status shows when the rows were fetched; after a refresh it shows the new run's time.
-- The window title names the active tab ("DBiji - orders"), so DBiji windows can be told apart in ⌘-Tab and Mission Control.
+- The window title names the active tab ("TernaryGrid - orders"), so TernaryGrid windows can be told apart in ⌘-Tab and Mission Control.
 
 ## 0.3.20 — 2026-10-22
 
 ### Fixed
-- A date or time format that does not fit the value (`%H` in the date format, `%z` in the timestamp format) made DBiji crash every time a table was opened; such formats now fall back to the standard ones.
+- A date or time format that does not fit the value (`%H` in the date format, `%z` in the timestamp format) made TernaryGrid crash every time a table was opened; such formats now fall back to the standard ones.
 - An open cell editor wrote into another row when the filter was cleared or the data refreshed while typing; it now stays with its row, and auto-refresh waits while a cell is being edited.
 - `WITH … (…)` or `INSERT INTO t (a, b)` followed by a blank line was split into two statements, so the wrong statement could run.
 - SQL Server: `UPDATE` or `DELETE` without WHERE ran without the confirmation when another statement followed on the next line.
@@ -293,7 +293,7 @@ notes of a new version once after it was updated (Help → What's new).
 - Copying a value and a NULL and pasting them lost the NULL row; a block pasted onto a selected range starts at its top left; copies with gaps (⌘-click) are refused instead of pasting empty values.
 - A header sort clicked while a filter was still being computed dropped the filter; the Record, Text, JSON and XML views now show filtered rows too.
 - Grouping merged different integers above 2^53; Calc no longer reports "only the first cells were analysed" for overlapping selections.
-- Scheduled tasks also registered with the system scheduler ran twice while DBiji was open.
+- Scheduled tasks also registered with the system scheduler ran twice while TernaryGrid was open.
 - Migrations: MySQL TIMESTAMP values into PostgreSQL timestamptz were shifted by the time zone difference; text primary keys into MySQL or SQL Server failed (they get varchar(255) / nvarchar(450)); MySQL BIT and geometry values were written as strings; ids into a PostgreSQL GENERATED ALWAYS identity were refused.
 - ClickHouse: imports, migrations and mock data failed at the start ("does not support transactions"); binary String values (`unhex`, digests) are kept as bytes instead of being garbled.
 - SQL Server: NULL into varbinary or image columns was refused; rows with a `datetime` key were often "not found" when saved.
@@ -305,9 +305,9 @@ notes of a new version once after it was updated (Help → What's new).
 ## 0.3.19 — 2026-10-21
 
 ### Fixed
-- Shift+click in the Calc table could crash DBiji after the selected cells changed.
+- Shift+click in the Calc table could crash TernaryGrid after the selected cells changed.
 - Saving grid edits failed for no reason on SQL Server with SET NOCOUNT ON or a trigger ("the row was not found", "would change 2 rows"), and on MySQL when a value was saved unchanged: the row count check now applies only where the count can be trusted.
-- One-column CSV files lost a NULL in their last row (DBiji's own export writes NULL as an empty line).
+- One-column CSV files lost a NULL in their last row (TernaryGrid's own export writes NULL as an empty line).
 - A JSON file holding one object with an array of objects (`{"id": 1, "orders": [...]}`) was read as a wrapper of those objects; only keys such as items, data, results or records are taken as a wrapper now.
 - MySQL before 8.0.19 and MariaDB: times with a time zone before 1970 or after 2038 were not converted to the session's zone.
 - Migrations to DuckDB no longer draw the sequence for hours when ids are huge; above a million draws a message says how to set it.
@@ -354,12 +354,12 @@ notes of a new version once after it was updated (Help → What's new).
 ## 0.3.14 — 2026-10-21
 
 ### Changed
-- A smaller app: egui's Ubuntu font, which DBiji does not use, is no longer bundled (about 360 KB). The few symbols the code font lacks are drawn with Inter, like the rest of the UI.
+- A smaller app: egui's Ubuntu font, which TernaryGrid does not use, is no longer bundled (about 360 KB). The few symbols the code font lacks are drawn with Inter, like the rest of the UI.
 
 ## 0.3.13 — 2026-10-21
 
 ### Fixed
-- The connection's dot turns red when the connection is lost: also when the server closed it while DBiji was idle (idle timeout, restart), and when a data tab or SQL editor found its own session closed (the connection is checked then). Double-click a red connection to reconnect.
+- The connection's dot turns red when the connection is lost: also when the server closed it while TernaryGrid was idle (idle timeout, restart), and when a data tab or SQL editor found its own session closed (the connection is checked then). Double-click a red connection to reconnect.
 - A data tab or SQL editor result whose session was lost saves and loads through a new session instead of failing with "connection closed" until the tab is opened again; a session of another database is opened again too.
 - New rows show the values the database gave them right after **Save**: a generated id (serial, identity, auto increment) and column defaults (they stayed NULL until a refresh). PostgreSQL, SQLite, DuckDB and MariaDB return the row (`RETURNING`); MySQL and SQL Server read it back by its key.
 - Security: certificate checks of TLS connections no longer accept distrusted intermediate certificates (rustls-webpki 0.103.16, webpki-roots 1.0.10).
@@ -370,7 +370,7 @@ notes of a new version once after it was updated (Help → What's new).
 - Scrolling a result after saving no longer skips rows; a result whose columns changed (ALTER, another statement) is editable again with its new columns; cancelled fetches leave the operations list; a server-side filter or sort of a query ending in a `-- comment` works.
 - An open cursor not read for 5 minutes is closed (it held a snapshot and table locks: an ALTER of the table waited).
 - Database nodes: New SQL editor, New schema, Backup / Restore and Query builder use that database instead of the default one; Refresh of a database reloads only it; the navigator shows tables created or dropped by a script in any schema; revealing an object picks the one of the right database.
-- Connections that failed to connect stay red; two connection dialogs no longer share one window; applying a URL keeps SSH, colour, filters and the other settings; the update installer starts only once DBiji really quits.
+- Connections that failed to connect stay red; two connection dialogs no longer share one window; applying a URL keeps SSH, colour, filters and the other settings; the update installer starts only once TernaryGrid really quits.
 - MySQL: dropping a partition runs `ALTER TABLE … DROP PARTITION` (it ran `DROP TABLE` with the partition's name) and its data opens as `t PARTITION (p)`; moving the primary key to a new column while dropping the old one works; imports split very wide VARCHAR tables (row size limit) by turning the longest columns into TEXT.
 - SQL Server: an ALTER that would silently lose another table's foreign key (key removed or retyped) is refused before anything runs; queries with `OPTION (…)` / `FOR XML` are no longer wrapped into invalid SQL.
 - ClickHouse: extending the sorting key adds its new columns in the same ALTER (ClickHouse requires it), and an unsupported key change fails before the other changes are applied.
@@ -418,7 +418,7 @@ notes of a new version once after it was updated (Help → What's new).
 - **Data transfer**: migrations into SQL Server identity columns failed and PostgreSQL sequences stayed behind the copied ids (SQL Server identity columns work for imports and data compare scripts too); JSON Lines whose first record holds an array imported nothing; two tables migrated into one target table are refused; a parallel export reported "cancelled" instead of the error that stopped it; rows written in replace mode were overcounted; XLSX: blank rows above the data, and a warning for cells right of the columns found.
 - **Schema compare**: foreign keys of a dropped table on a key that changes are dropped first; Apply re-ticked the excluded objects.
 - **Drivers**: PostgreSQL collations like `"en_US.utf8"`, `REINDEX SCHEMA` in manual commit mode, the `sslmode` property for the client tools. MySQL: a new primary key on a column added in the same change, `RANGE COLUMNS … MAXVALUE`, metadata search under `NO_BACKSLASH_ESCAPES`, table statistics and internal queries with a non-UTF-8 connection character set, client tools through an SSH tunnel with Verify full. SQL Server: Count rows and paging of `WITH` queries, key changes of a table other tables reference, error positions after `GO`. ClickHouse: `USE` after a comment containing "use", the engine of a materialized view without `TO`, sorting key changes that ClickHouse cannot make fail instead of doing nothing. DuckDB: the sequence of a renamed table or column, `TIME '24:00:00'`, Checkpoint of a schema, TIME_NS results (an error instead of a closed connection). SQLite: Cancel of a statement waiting to start. A SQL Server or ClickHouse session could hang when an old result was dropped late.
-- **Other**: Reset all settings did nothing; Terminate session could hit another session after an auto-refresh; a backup or maintenance closed while running stayed "Running"; Show rows of a data search used the connection chosen afterwards; Save as task saved twice on a double-click; closing a SQL editor on another database closed the session the navigator and other tabs share there. Tasks: SQL tasks with a database on PostgreSQL always failed, an import with a repeated id, Windows task ids, runs of a live `--run-task` marked interrupted. A password saved by another DBiji process could be lost; the connection dialog deleted a saved password it could not read (locked vault); double-quoted passwords stayed in the history; SQL Server JDBC URLs with `{…}` values; a before-connect command that starts a background helper timed out; external formatter output over 64 KB; the last lines of a client tool's error; `~` for paths next to the home folder; renaming a script by case only (macOS).
+- **Other**: Reset all settings did nothing; Terminate session could hit another session after an auto-refresh; a backup or maintenance closed while running stayed "Running"; Show rows of a data search used the connection chosen afterwards; Save as task saved twice on a double-click; closing a SQL editor on another database closed the session the navigator and other tabs share there. Tasks: SQL tasks with a database on PostgreSQL always failed, an import with a repeated id, Windows task ids, runs of a live `--run-task` marked interrupted. A password saved by another TernaryGrid process could be lost; the connection dialog deleted a saved password it could not read (locked vault); double-quoted passwords stayed in the history; SQL Server JDBC URLs with `{…}` values; a before-connect command that starts a background helper timed out; external formatter output over 64 KB; the last lines of a client tool's error; `~` for paths next to the home folder; renaming a script by case only (macOS).
 
 ## 0.3.11 — 2026-10-20
 
@@ -469,7 +469,7 @@ notes of a new version once after it was updated (Help → What's new).
 
 ### Fixed
 - SQL editor: an editor opened on a database in the navigator (PostgreSQL) suggested only keywords after FROM — its schema snapshot had no schema; it now uses the database's current schema (partitioned tables included, partitions not), reads another database of the server through its own session, and no longer mixes in tables of other databases. The schema button shows the schema in use.
-- macOS: a crash on MacBooks with a Touch Bar (an AppKit exception in the Touch Bar's responder tracking); DBiji now keeps the Touch Bar machinery away (it has no Touch Bar items).
+- macOS: a crash on MacBooks with a Touch Bar (an AppKit exception in the Touch Bar's responder tracking); TernaryGrid now keeps the Touch Bar machinery away (it has no Touch Bar items).
 
 ## 0.3.4 — 2026-10-20
 
@@ -506,8 +506,8 @@ notes of a new version once after it was updated (Help → What's new).
 ## 0.3.1 — 2026-10-20
 
 ### New
-- macOS application menu like other Mac apps: About DBiji, **Check for Updates…**, Settings… (⌘,), Services, Hide DBiji / Hide Others / Show All, Quit DBiji (⌘Q, asks about unsaved scripts first).
-- One-line installer: `curl -fsSL https://raw.githubusercontent.com/ilhamnadhif/dbiji/master/scripts/install.sh | bash` installs or updates DBiji in /Applications without the Gatekeeper prompt.
+- macOS application menu like other Mac apps: About TernaryGrid, **Check for Updates…**, Settings… (⌘,), Services, Hide TernaryGrid / Hide Others / Show All, Quit TernaryGrid (⌘Q, asks about unsaved scripts first).
+- One-line installer: `curl -fsSL https://raw.githubusercontent.com/ilhamnadhif/ternarygrid/master/scripts/install.sh | bash` installs or updates TernaryGrid in /Applications without the Gatekeeper prompt.
 
 ## 0.3.0 — 2026-10-20
 
@@ -518,7 +518,7 @@ notes of a new version once after it was updated (Help → What's new).
 - SQL editor: code folding, mark occurrences, open declaration (⌘ click / F3), next / previous statement, copy the statement, count its rows, evaluate an expression, morph to a delimited list, trim trailing spaces, search on the web, save / load execution plans, formatter choices (compact, external command, current statement only).
 - Data editor: add a row before the current one, copy a value from the row above / below, generate UUIDs, fit columns, hide empty columns, move columns, zoom, highlight rows by value, save the filter and order as the table default.
 - Database tools: PostgreSQL backup of all databases or only roles and tablespaces (pg_dumpall), enable / disable triggers, a foreign data wrapper configurator, InnoDB memory and key cache charts in the MySQL dashboard.
-- Software update (macOS): with automatic checks on, DBiji looks for a new release at every start and every 6 hours; a new version shows its notes and installs in place (download, signature check, quit, swap, reopen — an administrator password only when needed), or lights up an Update button in the toolbar. Help → Check for updates… does the same on demand.
+- Software update (macOS): with automatic checks on, TernaryGrid looks for a new release at every start and every 6 hours; a new version shows its notes and installs in place (download, signature check, quit, swap, reopen — an administrator password only when needed), or lights up an Update button in the toolbar. Help → Check for updates… does the same on demand.
 - Pending transactions (Database menu): every connection with uncommitted changes, commit or roll back one or all; quitting with open transactions asks first.
 - Help → Error log, Tip of the day, Collect diagnostic info (a zip without passwords, host names or other connection details); Settings → Reset all settings.
 - Clearer text and calmer colours: the Inter typeface, near-black (light) / near-white (dark) text instead of thin grey text, new light and dark themes.
@@ -533,7 +533,7 @@ notes of a new version once after it was updated (Help → What's new).
 - Tab in the result grid shows the selected row as a record (column → value, long values wrapped) like DBeaver; Tab goes back, ← / → show the previous / next row.
 - New schema… is on database and schema nodes (a schema belongs to a database), not on the connection of servers with several databases; the start page lists recent connections on two lines (name, then the address).
 - Production connections ask before statements that change data or schema only; SELECT, EXPLAIN and sorting or filtering a table run without a question (dangerous statements still always ask).
-- macOS Keychain: all DBiji passwords are kept in one Keychain entry, read once per launch, so the Keychain asks at most once (not once per password and connection); existing entries move into it automatically.
+- macOS Keychain: all TernaryGrid passwords are kept in one Keychain entry, read once per launch, so the Keychain asks at most once (not once per password and connection); existing entries move into it automatically.
 - Fixed: the Create button of New database… could not be clicked (the dialog grew every frame); New database… is also on database nodes, and the new database appears in the navigator ("Show all databases" is turned on when only the connection's database was listed).
 - New database… and New schema… (connection menu, database menu, Database menu, command palette): name, owner / encoding / template (PostgreSQL) or character set / collation (MySQL, MariaDB, SQL Server), the statement shown before it runs.
 - Main toolbar buttons that cannot work in the current tab are greyed out and say why (e.g. Run needs a SQL editor, Commit needs manual commit).

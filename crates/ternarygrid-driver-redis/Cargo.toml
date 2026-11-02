@@ -1,0 +1,19 @@
+[package]
+name = "ternarygrid-driver-redis"
+description = "Redis / Valkey driver for TernaryGrid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ternarygrid-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+redis.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

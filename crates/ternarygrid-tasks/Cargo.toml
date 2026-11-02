@@ -1,0 +1,29 @@
+[package]
+name = "ternarygrid-tasks"
+description = "Task definitions, scheduler and run log for TernaryGrid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ternarygrid-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+cron.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Whether the process of a run in progress is still alive.
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true

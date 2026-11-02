@@ -1,0 +1,25 @@
+[package]
+name = "ternarygrid-driver-mysql"
+description = "MySQL and MariaDB driver for TernaryGrid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ternarygrid-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+mysql_async.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+encoding_rs.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid.workspace = true

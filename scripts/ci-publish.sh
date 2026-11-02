@@ -16,15 +16,15 @@ TAG="${GITHUB_REF_NAME:?the tag to publish}"
 VERSION="${TAG#v}"
 BRANCH="master"
 # macOS (the updater installs the .zip), Windows, and Linux for x86_64 and aarch64.
-FILES=("dist/DBiji-$VERSION.dmg" "dist/DBiji-$VERSION.zip"
-    "dist/DBiji-$VERSION-windows-x64-setup.exe" "dist/DBiji-$VERSION-windows-x64.zip")
+FILES=("dist/TernaryGrid-$VERSION.dmg" "dist/TernaryGrid-$VERSION.zip"
+    "dist/TernaryGrid-$VERSION-windows-x64-setup.exe" "dist/TernaryGrid-$VERSION-windows-x64.zip")
 for arch in x86_64 aarch64; do
     case "$arch" in x86_64) deb=amd64 ;; aarch64) deb=arm64 ;; esac
-    FILES+=("dist/DBiji-$VERSION-linux-$arch.tar.gz" "dist/DBiji-$VERSION-linux-$arch.AppImage"
-        "dist/DBiji-$VERSION-linux-$deb.deb" "dist/DBiji-$VERSION-linux-$arch.rpm"
-        "dist/DBiji-$VERSION-linux-$arch.pkg.tar.zst")
+    FILES+=("dist/TernaryGrid-$VERSION-linux-$arch.tar.gz" "dist/TernaryGrid-$VERSION-linux-$arch.AppImage"
+        "dist/TernaryGrid-$VERSION-linux-$deb.deb" "dist/TernaryGrid-$VERSION-linux-$arch.rpm"
+        "dist/TernaryGrid-$VERSION-linux-$arch.pkg.tar.zst")
 done
-CASK="packaging/homebrew/dbiji.rb"
+CASK="packaging/homebrew/ternarygrid.rb"
 
 fail() { echo "Error: $*" >&2; exit 1; }
 grep -q "^version = \"$VERSION\"" Cargo.toml || fail "Cargo.toml is not at version $VERSION"
@@ -39,7 +39,7 @@ else
     awk -v v="$VERSION" '$0 ~ "^## " v " " {on=1; next} on && /^## / {exit} on' CHANGELOG.md >"$NOTES"
     echo "==> Draft release"
     if [ "$STATE" = "none" ]; then
-        gh release create "$TAG" --draft --verify-tag --title "DBiji $VERSION" --notes-file "$NOTES" "${FILES[@]}"
+        gh release create "$TAG" --draft --verify-tag --title "TernaryGrid $VERSION" --notes-file "$NOTES" "${FILES[@]}"
     else
         gh release upload "$TAG" --clobber "${FILES[@]}"
     fi
@@ -49,8 +49,8 @@ fi
 
 echo "==> Homebrew cask"
 DOWNLOAD="$(mktemp -d)"
-gh release download "$TAG" --pattern "DBiji-$VERSION.dmg" --dir "$DOWNLOAD"
-SHA="$(shasum -a 256 "$DOWNLOAD/DBiji-$VERSION.dmg" | cut -d' ' -f1)"
+gh release download "$TAG" --pattern "TernaryGrid-$VERSION.dmg" --dir "$DOWNLOAD"
+SHA="$(shasum -a 256 "$DOWNLOAD/TernaryGrid-$VERSION.dmg" | cut -d' ' -f1)"
 git fetch --quiet origin "$BRANCH"
 git checkout --quiet -B "$BRANCH" FETCH_HEAD
 sed -i '' -e "s/^  version \".*\"/  version \"$VERSION\"/" -e "s/^  sha256 \".*\"/  sha256 \"$SHA\"/" "$CASK"

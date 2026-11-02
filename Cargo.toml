@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-default-members = ["crates/dbiji-app"]
+default-members = ["crates/ternarygrid-app"]
 
 [workspace.package]
 version = "0.5.1"
@@ -9,33 +9,33 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["Tommy Lumos Empire"]
-repository = "https://github.com/dbiji/dbiji"
-description = "DBiji - lightweight SQL database client written in Rust"
+repository = "https://github.com/ilhamnadhif/ternarygrid"
+description = "TernaryGrid - lightweight SQL database client written in Rust"
 
 [workspace.dependencies]
 # --- internal crates
-dbiji-core = { path = "crates/dbiji-core" }
-dbiji-sql = { path = "crates/dbiji-sql" }
-dbiji-driver-postgres = { path = "crates/dbiji-driver-postgres" }
-dbiji-driver-mysql = { path = "crates/dbiji-driver-mysql" }
-dbiji-driver-sqlite = { path = "crates/dbiji-driver-sqlite" }
-dbiji-driver-mssql = { path = "crates/dbiji-driver-mssql" }
-dbiji-driver-clickhouse = { path = "crates/dbiji-driver-clickhouse" }
-dbiji-driver-oracle = { path = "crates/dbiji-driver-oracle" }
-dbiji-driver-cassandra = { path = "crates/dbiji-driver-cassandra" }
-dbiji-driver-redis = { path = "crates/dbiji-driver-redis" }
-dbiji-driver-mongodb = { path = "crates/dbiji-driver-mongodb" }
-dbiji-driver-elasticsearch = { path = "crates/dbiji-driver-elasticsearch" }
-dbiji-net = { path = "crates/dbiji-net" }
-dbiji-config = { path = "crates/dbiji-config" }
-dbiji-transfer = { path = "crates/dbiji-transfer" }
-dbiji-compare = { path = "crates/dbiji-compare" }
-dbiji-tasks = { path = "crates/dbiji-tasks" }
-dbiji-ai = { path = "crates/dbiji-ai" }
-dbiji-grid = { path = "crates/dbiji-grid" }
-dbiji-icons = { path = "crates/dbiji-icons" }
-dbiji-editor = { path = "crates/dbiji-editor" }
-dbiji-visual = { path = "crates/dbiji-visual" }
+ternarygrid-core = { path = "crates/ternarygrid-core" }
+ternarygrid-sql = { path = "crates/ternarygrid-sql" }
+ternarygrid-driver-postgres = { path = "crates/ternarygrid-driver-postgres" }
+ternarygrid-driver-mysql = { path = "crates/ternarygrid-driver-mysql" }
+ternarygrid-driver-sqlite = { path = "crates/ternarygrid-driver-sqlite" }
+ternarygrid-driver-mssql = { path = "crates/ternarygrid-driver-mssql" }
+ternarygrid-driver-clickhouse = { path = "crates/ternarygrid-driver-clickhouse" }
+ternarygrid-driver-oracle = { path = "crates/ternarygrid-driver-oracle" }
+ternarygrid-driver-cassandra = { path = "crates/ternarygrid-driver-cassandra" }
+ternarygrid-driver-redis = { path = "crates/ternarygrid-driver-redis" }
+ternarygrid-driver-mongodb = { path = "crates/ternarygrid-driver-mongodb" }
+ternarygrid-driver-elasticsearch = { path = "crates/ternarygrid-driver-elasticsearch" }
+ternarygrid-net = { path = "crates/ternarygrid-net" }
+ternarygrid-config = { path = "crates/ternarygrid-config" }
+ternarygrid-transfer = { path = "crates/ternarygrid-transfer" }
+ternarygrid-compare = { path = "crates/ternarygrid-compare" }
+ternarygrid-tasks = { path = "crates/ternarygrid-tasks" }
+ternarygrid-ai = { path = "crates/ternarygrid-ai" }
+ternarygrid-grid = { path = "crates/ternarygrid-grid" }
+ternarygrid-icons = { path = "crates/ternarygrid-icons" }
+ternarygrid-editor = { path = "crates/ternarygrid-editor" }
+ternarygrid-visual = { path = "crates/ternarygrid-visual" }
 
 # --- async / runtime
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "process", "signal"] }
@@ -110,7 +110,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # --- UI
 # Without egui's bundled fonts: the app loads the ones it uses (theme.rs), so
 # the unused Ubuntu-Light (360 KB) is not linked. Tests turn them back on.
-# AccessKit is added per platform by dbiji-app (not on macOS).
+# AccessKit is added per platform by ternarygrid-app (not on macOS).
 eframe = { version = "0.36", default-features = false, features = ["glow", "links", "wayland", "x11"] }
 egui = { version = "0.36", default-features = false }
 epaint_default_fonts = "0.36"

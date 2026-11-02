@@ -1,4 +1,4 @@
-# PRD: DBiji, Klien Database SQL Ringan (Full Rust)
+# PRD: TernaryGrid, Klien Database SQL Ringan (Full Rust)
 
 Oct 18, 2026 · @Tommy Lumos Empire
 
@@ -6,7 +6,7 @@ Oct 18, 2026 · @Tommy Lumos Empire
 
 Produk ini adalah aplikasi desktop klien database SQL yang ditulis 100% Rust, termasuk UI dan driver, dengan paritas fitur terhadap DBeaver untuk database relasional. Tujuannya menggantikan DBeaver bagi pengguna yang terganggu oleh pemakaian memori, waktu start, dan ketergantungan pada Java.
 
-Nama proyek: **DBiji**.
+Nama proyek: **TernaryGrid** (keluarga Ternary, bersama TernaryWire dan TernaryShell).
 
 **Masalah.** DBeaver sangat lengkap, tetapi dibangun di atas Java dan Eclipse/SWT sehingga membawa JVM, banyak plugin, dan driver JDBC. Akibatnya start lambat dan memori besar, terutama saat banyak koneksi dan result set terbuka.
 
@@ -341,7 +341,7 @@ Lima keputusan di bawah menentukan arah teknis dan perlu dijawab sebelum pengerj
 - [ ] **Cakupan platform**: hanya macOS dulu, atau Windows dan Linux sejak fase 1? PRD ini mengasumsikan macOS dulu dengan kode lintas platform.
 - [ ] **Lapisan akses database**: driver langsung per database (`tokio-postgres`, `mysql_async`, dan seterusnya) atau satu abstraksi seperti `sqlx`? Rekomendasi awal: driver langsung, karena fitur metadata dan tipe khusus butuh kontrol penuh.
 - [ ] **Asisten AI**: tetap di fase 3, atau dikeluarkan dari lingkup karena tidak esensial untuk tujuan ringan?
-- [ ] **Lisensi dan nama**: lisensi proyek (MIT, Apache-2.0, atau tertutup) ; periksa ketersediaan nama DBiji di crates.io, GitHub, dan domain.
+- [x] **Lisensi dan nama**: lisensi MIT OR Apache-2.0; nama final TernaryGrid.
 
 ## 15. Sumber
 

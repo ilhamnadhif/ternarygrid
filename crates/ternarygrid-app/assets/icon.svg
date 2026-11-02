@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- TernaryGrid: a table, one of the Ternary family (TernaryGrid, TernaryWire, TernaryShell).
+       All three share a 3 x 3 lattice of points (base three); each draws its own path
+       through it. Source of every icon size: render with scripts/make-icons.sh. -->
+  <rect x="72" y="72" width="880" height="880" rx="196" fill="#0f7a68"/>
+  <path d="M 312 312 L 712 312" fill="none" stroke="#fff6ea" stroke-width="72" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 312 512 L 712 512" fill="none" stroke="#fff6ea" stroke-width="72" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 312 712 L 712 712" fill="none" stroke="#fff6ea" stroke-width="72" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 312 312 L 312 712" fill="none" stroke="#fff6ea" stroke-width="72" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 512 312 L 512 712" fill="none" stroke="#fff6ea" stroke-width="72" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 712 312 L 712 712" fill="none" stroke="#fff6ea" stroke-width="72" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="312" cy="312" r="52" fill="#fff6ea"/>
+  <circle cx="512" cy="312" r="52" fill="#fff6ea"/>
+  <circle cx="712" cy="312" r="52" fill="#fff6ea"/>
+  <circle cx="312" cy="512" r="52" fill="#fff6ea"/>
+  <circle cx="512" cy="512" r="30" fill="#fff6ea" fill-opacity="0.32"/>
+  <circle cx="712" cy="512" r="52" fill="#fff6ea"/>
+  <circle cx="312" cy="712" r="52" fill="#fff6ea"/>
+  <circle cx="512" cy="712" r="52" fill="#fff6ea"/>
+  <circle cx="712" cy="712" r="52" fill="#fff6ea"/>
+</svg>
