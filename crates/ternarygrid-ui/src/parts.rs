@@ -133,12 +133,13 @@ impl<'a> Dialog<'a> {
         // Footer.
         if let Some(footer) = footer {
             let top = ui.cursor().top();
-            let rect = Rect::from_min_max(egui::pos2(ui.max_rect().left(), top), egui::pos2(ui.max_rect().right(), top + 54.0));
+            // A hairline, then the design's 54 point band.
+            let rect = Rect::from_min_max(egui::pos2(ui.max_rect().left(), top), egui::pos2(ui.max_rect().right(), top + 55.0));
             // The content is already inside the frame's 1 point border: fill up to it.
             let r = CornerRadius { nw: 0, ne: 0, sw: RADIUS_LG + 1, se: RADIUS_LG + 1 };
             ui.painter().rect_filled(rect, r, p.chrome);
             ui.painter().hline(rect.x_range(), top + 0.5, Stroke::new(1.0, p.border));
-            Frame::new().inner_margin(Margin { left: 20, right: 16, top: 12, bottom: 12 }).show(ui, |ui| {
+            Frame::new().inner_margin(Margin { left: 20, right: 16, top: 13, bottom: 12 }).show(ui, |ui| {
                 // The row is the buttons' height from its first widget on, so a leading label or
                 // check box sits centred on them.
                 ui.allocate_ui_with_layout(vec2(ui.available_width(), style::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
