@@ -108,6 +108,20 @@ fn tool_row(ui: &mut Ui, label_w: f32, tool_path: &mut String, extra_args: &mut 
     changed
 }
 
+/// [`tool_row`] in a card that folds open (the design shows the common options only).
+fn tool_card(ui: &mut Ui, id: &str, label_w: f32, tool_path: &mut String, extra_args: &mut String) -> bool {
+    let key = ui.id().with((id, "tool_more"));
+    let mut open = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+    let mut changed = false;
+    let summary = if tool_path.trim().is_empty() { tr("tool and its arguments") } else { tool_path.as_str() }.to_string();
+    look::collapsible_card(ui, &mut open, tr("More options"), Some(&summary), |ui| {
+        ui.spacing_mut().item_spacing.y = 12.0;
+        changed |= tool_row(ui, label_w, tool_path, extra_args);
+    });
+    ui.data_mut(|d| d.insert_temp(key, open));
+    changed
+}
+
 /// Editable form of [`BackupOptions`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackupForm {
@@ -257,16 +271,12 @@ impl BackupForm {
                 });
             }
             // pg_dumpall has no database, schema or table selection.
-            if !whole_server {
-                look::row(ui, tr("Database"), lw, |ui| changed |= look::field(ui, &mut self.database, tr("(connection database)"), 260.0, false).changed());
-                if !sqlite {
-                    let label = if flavor == ToolFlavor::MySql { tr("Databases") } else { tr("Schemas") };
-                    look::row(ui, label, lw, |ui| changed |= look::field(ui, &mut self.schemas, tr("comma separated; empty = all"), f32::INFINITY, false).changed());
-                }
-                look::row(ui, tr("Tables"), lw, |ui| changed |= look::field(ui, &mut self.tables, tr("comma separated; empty = all"), f32::INFINITY, false).changed());
+            if !whole_server && !sqlite {
+                let label = if flavor == ToolFlavor::MySql { tr("Databases") } else { tr("Schemas") };
+                look::row(ui, label, lw, |ui| changed |= look::field(ui, &mut self.schemas, tr("comma separated; empty = all"), f32::INFINITY, false).changed());
             }
             if whole_server && self.globals_only {
-                changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
+                changed |= self.more_ui(ui, flavor, id, false);
                 return;
             }
             look::row(ui, tr("Content"), lw, |ui| {
@@ -290,20 +300,15 @@ impl BackupForm {
             });
             if sqlite {
                 // sqlite3 has no further dump options.
-                changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
+                changed |= self.more_ui(ui, flavor, id, !whole_server);
                 return;
             }
             look::row_top(ui, tr("Options"), lw, |ui| {
                 changed |= look::checkbox(ui, &mut self.clean, tr("Drop objects before creating them")).changed();
-                if !whole_server {
-                    changed |= look::checkbox(ui, &mut self.create_database, tr("Include CREATE DATABASE")).changed();
-                }
                 if pg {
                     changed |= look::checkbox(ui, &mut self.no_owner, tr("Do not restore object owners")).changed();
                     changed |= look::checkbox(ui, &mut self.no_privileges, tr("Do not dump privileges (GRANT / REVOKE)")).changed();
                 }
-                let inserts = if flavor == ToolFlavor::MySql { tr("One INSERT statement per row") } else { tr("INSERT statements instead of COPY") };
-                changed |= look::checkbox(ui, &mut self.inserts, inserts).changed();
                 if my {
                     changed |= look::checkbox(ui, &mut self.single_transaction, tr("Single transaction (consistent snapshot)")).changed();
                     changed |= look::checkbox(ui, &mut self.routines, tr("Include routines and events")).changed();
@@ -319,8 +324,38 @@ impl BackupForm {
                     });
                 }
             });
+            changed |= self.more_ui(ui, flavor, id, !whole_server);
+        });
+        changed
+    }
+
+    /// The options used less often, in a card that folds open: the database and the tables
+    /// (`selection`), CREATE DATABASE and INSERT statements, the tool and its arguments.
+    fn more_ui(&mut self, ui: &mut Ui, flavor: ToolFlavor, id: &str, selection: bool) -> bool {
+        let lw = BACKUP_LABEL_W;
+        let key = ui.id().with((id, "backup_more"));
+        let mut open = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+        let mut changed = false;
+        let sqlite = flavor == ToolFlavor::Sqlite;
+        let summary = if self.tool_path.trim().is_empty() { tr("database, tables, tool") } else { self.tool_path.as_str() }.to_string();
+        look::collapsible_card(ui, &mut open, tr("More options"), Some(&summary), |ui| {
+            ui.spacing_mut().item_spacing.y = 12.0;
+            if selection {
+                look::row(ui, tr("Database"), lw, |ui| changed |= look::field(ui, &mut self.database, tr("(connection database)"), 260.0, false).changed());
+                look::row(ui, tr("Tables"), lw, |ui| changed |= look::field(ui, &mut self.tables, tr("comma separated; empty = all"), f32::INFINITY, false).changed());
+            }
+            if !sqlite && !(self.all_databases && self.globals_only) {
+                look::row_top(ui, tr("Statements"), lw, |ui| {
+                    if selection {
+                        changed |= look::checkbox(ui, &mut self.create_database, tr("Include CREATE DATABASE")).changed();
+                    }
+                    let inserts = if flavor == ToolFlavor::MySql { tr("One INSERT statement per row") } else { tr("INSERT statements instead of COPY") };
+                    changed |= look::checkbox(ui, &mut self.inserts, inserts).changed();
+                });
+            }
             changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
         });
+        ui.data_mut(|d| d.insert_temp(key, open));
         changed
     }
 }
@@ -431,7 +466,7 @@ impl RestoreForm {
             }
             look::row(ui, tr("Target database"), lw, |ui| changed |= look::field(ui, &mut self.database, tr("(connection database)"), f32::INFINITY, false).changed());
             if sqlite {
-                changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
+                changed |= tool_card(ui, id, lw, &mut self.tool_path, &mut self.extra_args);
                 return;
             }
             look::row_top(ui, tr("Options"), lw, |ui| {
@@ -446,7 +481,7 @@ impl RestoreForm {
                 }
                 changed |= look::checkbox(ui, &mut self.exit_on_error, tr("Stop at the first error")).changed();
             });
-            changed |= tool_row(ui, lw, &mut self.tool_path, &mut self.extra_args);
+            changed |= tool_card(ui, id, lw, &mut self.tool_path, &mut self.extra_args);
         });
         changed
     }
@@ -1052,7 +1087,7 @@ impl TabView for BackupTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(if self.restore { egui::vec2(860.0, 640.0) } else { egui::vec2(900.0, 760.0) })
+        Some(if self.restore { egui::vec2(860.0, 640.0) } else { egui::vec2(900.0, 703.0) })
     }
 
     fn title(&self) -> String {

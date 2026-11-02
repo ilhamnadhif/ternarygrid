@@ -4,8 +4,8 @@
 
 use super::wizard::{self, Clicked, Form, W, col, line};
 use super::{
-    COMMON_KINDS, MessageLog, Running, TaskSaver, char_edit, combo, connection_name, current_schema, delimiter_choice, error_text, kind_label, lines_edit, next_uid, not_connected,
-    on_error_options, opt_char_edit, opt_number, opt_text, progress_ui, reload_table_def, schema_combo, schema_tables, section, table_def_of, transaction_options,
+    COMMON_KINDS, MessageLog, Running, TaskSaver, char_edit, combo, combo_w, connection_name, current_schema, delimiter_choice, error_text, kind_label, lines_edit, next_uid,
+    not_connected, on_error_options, opt_char_edit, opt_number, opt_text, progress_ui, reload_table_def, schema_combo, schema_tables, section, table_def_of, transaction_options,
 };
 use crate::backend::Job;
 use crate::command::AppCommand;
@@ -659,8 +659,8 @@ impl ImportTab {
             let formats: Vec<(ImportFileFormat, &str)> = ImportFileFormat::ALL.iter().map(|f| (*f, f.label())).collect();
             parts::segmented(ui, &mut self.format, &formats);
         });
-        wizard::form(ui, ("imp_reader", id), 2, 130.0, |f| match self.format {
-            ImportFileFormat::Csv | ImportFileFormat::Tsv => csv_reader_ui(f, id, &mut self.csv, self.format == ImportFileFormat::Tsv),
+        wizard::form(ui, ("imp_reader", id), 2, 150.0, |f| match self.format {
+            ImportFileFormat::Csv | ImportFileFormat::Tsv => csv_reader_ui(f, id, &mut self.csv, self.format == ImportFileFormat::Tsv, false),
             ImportFileFormat::Xlsx => {
                 let sheets = match &self.sheets {
                     Some((p, names)) if *p == self.path.trim() => names.clone(),
@@ -671,12 +671,32 @@ impl ImportTab {
             ImportFileFormat::Xml => xml_reader_ui(f, id, &mut self.xml),
             ImportFileFormat::Json => json_reader_ui(f, id, &mut self.json),
         });
-        ui.horizontal(|ui| {
-            wizard::muted(ui, tr("Rows read for the preview and the type guess"));
-            ui.add(egui::DragValue::new(&mut self.sample_rows).range(10..=100_000));
-        });
-
         section(ui, tr("Preview"));
+        self.preview_ui(ui);
+        // The other reading options, folded under the preview.
+        let key = egui::Id::new(("imp_more", id));
+        let mut open = wizard::remembered_open(ui, key, false);
+        let csv = matches!(self.format, ImportFileFormat::Csv | ImportFileFormat::Tsv);
+        ui.add_space(16.0 - wizard::GAP);
+        let summary = trf("{} rows read for the preview and the type guess", &[&super::group(self.sample_rows as u64)]);
+        if wizard::fold_card(ui, key, &mut open, tr("More options"), Some(&summary), true, |ui| {
+            if csv {
+                wizard::form(ui, ("imp_reader_more", id), 2, 150.0, |f| csv_reader_ui(f, id, &mut self.csv, self.format == ImportFileFormat::Tsv, true));
+            }
+            wizard::form(ui, ("imp_sample", id), 1, 150.0, |f| {
+                f.row(tr("Rows read"), |ui| {
+                    wizard::number(ui, &mut self.sample_rows, 10..=100_000, 120.0);
+                    wizard::faint(ui, tr("for the preview and the type guess"));
+                });
+            });
+        }) {
+            wizard::remember_open(ui, key, open);
+        }
+    }
+
+    /// The first rows of the file, like the data grid.
+    fn preview_ui(&mut self, ui: &mut Ui) {
+        let id = self.uid;
         if self.path.trim().is_empty() {
             wizard::faint(ui, tr("Choose a file to see its first rows."));
             return;
@@ -711,25 +731,29 @@ impl ImportTab {
         let font = egui::FontId::proportional(ternarygrid_ui::style::body_size(ui.ctx()));
         let text_w = |ui: &Ui, s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x;
         let rows: Vec<&Row> = p.rows.iter().take(PREVIEW_ROWS).collect();
-        let mut cols = vec![col("", W::Px(44.0)).right()];
+        // Text files have text columns only.
+        let text_file = matches!(self.format, ImportFileFormat::Csv | ImportFileFormat::Tsv);
+        let type_of = |t: &str| if t.is_empty() && text_file { "text".to_string() } else { t.to_string() };
+        let mut cols = vec![col("", W::Px(48.0)).right().grid()];
         for (i, c) in p.columns.iter().enumerate() {
-            let head = text_w(ui, &c.name) + text_w(ui, &c.type_name) * 0.85 + 34.0;
+            let head = text_w(ui, &c.name) + text_w(ui, &type_of(&c.type_name)) * 0.85 + 34.0;
             let widest = rows.iter().filter_map(|r| r.get(i)).map(|v| text_w(ui, preview_text(v).lines().next().unwrap_or(""))).fold(0.0, f32::max) + 24.0;
-            cols.push(col(&c.name, W::Px(head.max(widest).clamp(80.0, 280.0))));
+            cols.push(col(&c.name, W::Px(head.max(widest).clamp(80.0, 280.0))).grid());
         }
+        // 180 high as in the design; the rows scroll under the header.
         wizard::table(
             ui,
             ("imp_preview", id),
             &cols,
             28.0,
-            Some(260.0),
+            Some(180.0 - 35.0),
             rows.len(),
             |ui, c| {
                 if c > 0
                     && let Some(m) = p.columns.get(c - 1)
                 {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(&m.type_name).monospace().size(10.5).color(pal.text_faint));
+                        ui.label(RichText::new(type_of(&m.type_name)).monospace().size(10.5).color(pal.text_faint));
                     });
                 }
             },
@@ -770,11 +794,11 @@ impl ImportTab {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
             wizard::radio_value(ui, &mut self.target, ImportTarget::Existing, tr("Existing table"));
+            ui.spacing_mut().item_spacing.x = 12.0;
             wizard::radio_value(ui, &mut self.target, ImportTarget::New, tr("New table"));
-            ui.spacing_mut().item_spacing.x = 8.0;
             kit::vdivider(ui, 18.0);
             wizard::muted(ui, tr("Schema"));
-            if schema_combo(ui, cx, &conn, ("imp_schema", id), &mut self.schema) && self.target == ImportTarget::Existing {
+            if schema_combo(ui, cx, &conn, ("imp_schema", id), &mut self.schema, 140.0) && self.target == ImportTarget::Existing {
                 self.table = None;
             }
             match self.target {
@@ -849,7 +873,7 @@ impl ImportTab {
         let id = self.uid;
         let dialect = cx.conns.live(&self.conn).map(|l| l.dialect.clone());
         let names = self.preview_columns();
-        ui.horizontal(|ui| {
+        wizard::tight_row(ui, |ui| {
             if wizard::ghost(ui, Some(icon::MAGIC_WAND), tr("Guess types again")).clicked() {
                 self.columns_edited = false;
                 self.mapping_for = None;
@@ -866,8 +890,8 @@ impl ImportTab {
             col(tr("Source column"), W::Px(130.0)),
             col(tr("Target column"), W::Fr(1.0)),
             col(tr("Type"), W::Fr(1.0)),
-            col(tr("NULL"), W::Px(58.0)),
-            col(tr("Key"), W::Px(48.0)),
+            col(tr("NULL"), W::Px(50.0)),
+            col(tr("Key"), W::Px(44.0)),
             col(tr("Sample values"), W::Fr(1.6)),
         ];
         let (columns, keys) = (&mut self.columns, &mut self.key_columns);
@@ -900,7 +924,7 @@ impl ImportTab {
                     }
                     2 => {
                         let old_name = c.target_name.clone();
-                        if ui.add(line(&mut c.target_name).desired_width(f32::INFINITY)).changed() {
+                        if ui.add(wizard::fit(egui::TextEdit::singleline(&mut c.target_name), 26.0).desired_width(f32::INFINITY)).changed() {
                             edited = true;
                             if let Some(k) = keys.iter_mut().find(|k| **k == old_name) {
                                 *k = c.target_name.clone();
@@ -909,7 +933,8 @@ impl ImportTab {
                     }
                     3 => {
                         let menu_w = if dialect.is_some() { 28.0 } else { 0.0 };
-                        if ui.add(wizard::mono_line(&mut c.target_type, (ui.available_width() - menu_w).max(60.0))).changed() {
+                        let ty = wizard::fit(egui::TextEdit::singleline(&mut c.target_type), 26.0).font(egui::TextStyle::Monospace);
+                        if ui.add(ty.desired_width((ui.available_width() - menu_w).max(60.0))).changed() {
                             c.target_kind = None;
                             edited = true;
                         }
@@ -966,8 +991,8 @@ impl ImportTab {
         let conn = self.conn.clone();
         let Some(Ok(def)) = table_def_of(cx, &conn, &table) else { return };
         let names = self.preview_columns();
-        ui.horizontal(|ui| {
-            if wizard::ghost(ui, Some(icon::ARROWS_CLOCKWISE), tr("Match by name again")).clicked() {
+        wizard::tight_row(ui, |ui| {
+            if wizard::ghost(ui, Some(icon::REPEAT), tr("Match by name again")).clicked() {
                 self.mapping_for = None;
             }
             if !self.key_columns.is_empty() {
@@ -1033,14 +1058,17 @@ impl ImportTab {
     fn options_page(&mut self, ui: &mut Ui, transactions: bool) {
         let id = self.uid;
         let (o, keys) = (&mut self.options, &self.key_columns);
+        // Two columns 24 apart; the selects 300 wide when there is room.
+        ui.spacing_mut().item_spacing.x = 24.0;
         ui.columns(2, |cols| {
             let [left, right] = cols else { return };
-            left.spacing_mut().item_spacing.y = wizard::GAP;
-            right.spacing_mut().item_spacing.y = wizard::GAP;
+            left.spacing_mut().item_spacing = egui::vec2(8.0, wizard::GAP);
+            right.spacing_mut().item_spacing = egui::vec2(8.0, wizard::GAP);
             section(left, tr("Writing"));
             wizard::form(left, ("imp_opts", id), 1, 170.0, |f| {
                 f.row(tr("Existing rows"), |ui| {
-                    combo(
+                    let w = ui.available_width().min(300.0);
+                    combo_w(
                         ui,
                         ("imp_mode", id),
                         &mut o.mode,
@@ -1049,6 +1077,7 @@ impl ImportTab {
                             (ImportMode::TruncateFirst, tr("Delete them first").to_string()),
                             (ImportMode::Replace, tr("Insert or replace rows by key").to_string()),
                         ],
+                        w,
                     )
                 });
                 if o.mode == ImportMode::Replace {
@@ -1064,10 +1093,16 @@ impl ImportTab {
                         super::replace_without_transactions_ui(f);
                     }
                 }
-                f.row(tr("Rows per batch"), |ui| ui.add(egui::DragValue::new(&mut o.batch_size).range(1..=1_000_000)));
-                f.row(tr("Rows per INSERT"), |ui| ui.add(egui::DragValue::new(&mut o.rows_per_statement).range(1..=1000)));
-                f.row(tr("Transactions"), |ui| combo(ui, ("imp_tx", id), &mut o.transaction, &transaction_options()));
-                f.row(tr("On error"), |ui| combo(ui, ("imp_err", id), &mut o.on_error, &on_error_options()));
+                f.row(tr("Rows per batch"), |ui| wizard::number(ui, &mut o.batch_size, 1..=1_000_000, 120.0));
+                f.row(tr("Rows per INSERT"), |ui| wizard::number(ui, &mut o.rows_per_statement, 1..=1000, 120.0));
+                f.row(tr("Transactions"), |ui| {
+                    let w = ui.available_width().min(300.0);
+                    combo_w(ui, ("imp_tx", id), &mut o.transaction, &transaction_options(), w)
+                });
+                f.row(tr("On error"), |ui| {
+                    let w = ui.available_width().min(300.0);
+                    combo_w(ui, ("imp_err", id), &mut o.on_error, &on_error_options(), w)
+                });
                 if o.on_error != OnError::Abort {
                     f.row(tr("Stop after"), |ui| {
                         opt_number(ui, &mut o.max_errors, tr("no limit"));
@@ -1080,11 +1115,20 @@ impl ImportTab {
             let c = &mut o.convert;
             wizard::form(right, ("imp_conv", id), 1, 170.0, |f| {
                 f.row(tr("Date formats"), |ui| lines_edit(ui, &mut c.date_formats, tr("one per line, e.g. %d/%m/%Y"), f32::INFINITY));
-                f.row(tr("Timestamp formats"), |ui| lines_edit(ui, &mut c.datetime_formats, tr("one per line, e.g. %d/%m/%Y %H:%M"), f32::INFINITY));
-                f.row(tr("Time formats"), |ui| lines_edit(ui, &mut c.time_formats, tr("one per line, e.g. %H.%M"), f32::INFINITY));
                 f.row(tr("Decimal separator"), |ui| char_edit(ui, &mut c.decimal_separator));
                 f.row(tr("Thousands separator"), |ui| opt_char_edit(ui, &mut c.thousands_separator, ""));
                 f.row(tr("NULL markers"), |ui| lines_edit(ui, &mut c.null_values, tr("one per line, e.g. NULL or \\N"), f32::INFINITY));
+                f.check_row(tr("Text"), |ui| {
+                    ui.spacing_mut().item_spacing.x = 16.0;
+                    wizard::check(ui, &mut c.trim_text, tr("Trim spaces"));
+                    wizard::check(ui, &mut c.empty_text_as_null, tr("Empty text is NULL"));
+                });
+                f.row(tr("Time zone of timestamps"), |ui| {
+                    opt_number(ui, &mut c.default_offset_minutes, tr("local"));
+                    wizard::faint(ui, tr("minutes east of UTC")).on_hover_text(tr("minutes east of UTC, for timestamps without an offset"));
+                });
+                f.row(tr("Timestamp formats"), |ui| lines_edit(ui, &mut c.datetime_formats, tr("one per line, e.g. %d/%m/%Y %H:%M"), f32::INFINITY));
+                f.row(tr("Time formats"), |ui| lines_edit(ui, &mut c.time_formats, tr("one per line, e.g. %H.%M"), f32::INFINITY));
                 f.row(tr("Binary values"), |ui| {
                     combo(
                         ui,
@@ -1097,17 +1141,6 @@ impl ImportTab {
                             (Some(BinaryEncoding::Text), tr("As text (UTF-8)").to_string()),
                         ],
                     )
-                });
-                f.row(tr("Text"), |ui| {
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 8.0;
-                        wizard::check(ui, &mut c.trim_text, tr("Trim spaces"));
-                        wizard::check(ui, &mut c.empty_text_as_null, tr("Empty text is NULL"));
-                    });
-                });
-                f.row(tr("Time zone of timestamps"), |ui| {
-                    opt_number(ui, &mut c.default_offset_minutes, tr("local"));
-                    wizard::faint(ui, tr("minutes east of UTC")).on_hover_text(tr("minutes east of UTC, for timestamps without an offset"));
                 });
             });
         });
@@ -1159,6 +1192,7 @@ impl ImportTab {
             ui,
             ("imp_sum", self.uid),
             120.0,
+            8.0,
             &[
                 (tr("File"), self.path.trim().to_string(), None),
                 (tr("Format"), self.format.label().to_string(), None),
@@ -1191,7 +1225,7 @@ impl ImportTab {
             let left_w = if s.errors.is_empty() { 300.0_f32.min(ui.available_width()) } else { 300.0 };
             ui.allocate_ui_with_layout(vec2(left_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_width(left_w);
-                wizard::facts(ui, ("imp_res", self.uid), 110.0, &facts);
+                wizard::facts(ui, ("imp_res", self.uid), 140.0, 6.0, &facts);
             });
             if !s.errors.is_empty() {
                 ui.vertical(|ui| {
@@ -1284,7 +1318,8 @@ impl ImportTab {
 }
 
 fn describe(s: &ImportSummary) -> String {
-    if s.rows_failed > 0 { trf("{} rows imported, {} failed", &[&s.rows_written, &s.rows_failed]) } else { trf("{} rows imported", &[&s.rows_written]) }
+    let written = super::group(s.rows_written);
+    if s.rows_failed > 0 { trf("{} rows imported, {} failed", &[&written, &super::group(s.rows_failed)]) } else { trf("{} rows imported", &[&written]) }
 }
 
 /// Text of a preview cell (canonical text, NULL marked).
@@ -1332,15 +1367,30 @@ fn encoding_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value
     });
 }
 
-fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, tsv: bool) {
+/// The CSV reader's options: the common ones, or (`more`) the others, shown under the preview.
+fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, tsv: bool, more: bool) {
+    if more {
+        f.row(tr("Quotes inside values"), |ui| {
+            combo(
+                ui,
+                ("csv_rd_escape", id),
+                &mut o.escape,
+                &[(EscapeStyle::Doubled, tr("Doubled (\"\")").to_string()), (EscapeStyle::Backslash, tr("Backslash (\\\")").to_string())],
+            )
+        });
+        f.row(tr("Comment lines"), |ui| opt_char_edit(ui, &mut o.comment_char, tr("none")));
+        f.check_row(tr("Spaces"), |ui| wizard::check(ui, &mut o.trim, tr("Trim spaces around values")));
+        return;
+    }
     if !tsv {
         f.row(tr("Delimiter"), |ui| {
-            ui.add(wizard::mono_line(&mut o.delimiter, 48.0));
+            ui.add(wizard::mono_line(&mut o.delimiter, 60.0));
             delimiter_choice(ui, &mut o.delimiter);
         });
     }
     f.row(tr("Header"), |ui| {
-        combo(
+        let w = ui.available_width();
+        combo_w(
             ui,
             ("csv_rd_header", id),
             &mut o.header,
@@ -1349,20 +1399,13 @@ fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, tsv: bool) {
                 (CsvHeader::None, tr("No header row").to_string()),
                 (CsvHeader::Auto, tr("Detect").to_string()),
             ],
+            w,
         )
     });
-    f.row(tr("Skip rows"), |ui| {
-        ui.add(egui::DragValue::new(&mut o.skip_rows).range(0..=1_000_000));
-        wizard::faint(ui, tr("before the header"));
-    });
+    f.row(tr("Skip rows"), |ui| wizard::number(ui, &mut o.skip_rows, 0..=1_000_000, 70.0));
     f.row(tr("Quote character"), |ui| opt_char_edit(ui, &mut o.quote_char, tr("none")));
     f.row(tr("NULL text"), |ui| ui.add(line(&mut o.null_string).hint_text(tr("empty")).desired_width(140.0)));
     f.row(tr("Encoding"), |ui| encoding_combo(ui, ("csv_rd_enc", id), &mut o.encoding));
-    f.row(tr("Quotes inside values"), |ui| {
-        combo(ui, ("csv_rd_escape", id), &mut o.escape, &[(EscapeStyle::Doubled, tr("Doubled (\"\")").to_string()), (EscapeStyle::Backslash, tr("Backslash (\\\")").to_string())])
-    });
-    f.row(tr("Comment lines"), |ui| opt_char_edit(ui, &mut o.comment_char, tr("none")));
-    f.row(tr("Spaces"), |ui| wizard::check(ui, &mut o.trim, tr("Trim spaces around values")));
 }
 
 fn xlsx_reader_ui(f: &mut Form<'_>, id: u64, o: &mut XlsxReadOptions, sheets: &[String]) {
@@ -1382,18 +1425,15 @@ fn xlsx_reader_ui(f: &mut Form<'_>, id: u64, o: &mut XlsxReadOptions, sheets: &[
             }
         });
     });
-    f.row(tr("Header"), |ui| wizard::check(ui, &mut o.header, tr("The first row holds the column names")));
-    f.row(tr("Skip rows"), |ui| {
-        ui.add(egui::DragValue::new(&mut o.skip_rows).range(0..=1_000_000));
-        wizard::faint(ui, tr("before the header"));
-    });
-    f.row(tr("Empty rows"), |ui| wizard::check(ui, &mut o.skip_empty_rows, tr("Ignore")));
+    f.check_row(tr("Header"), |ui| wizard::check(ui, &mut o.header, tr("The first row holds the column names")));
+    f.row(tr("Skip rows"), |ui| wizard::number(ui, &mut o.skip_rows, 0..=1_000_000, 70.0));
+    f.check_row(tr("Empty rows"), |ui| wizard::check(ui, &mut o.skip_empty_rows, tr("Ignore")));
 }
 
 fn xml_reader_ui(f: &mut Form<'_>, id: u64, o: &mut XmlReadOptions) {
     f.row(tr("Row element"), |ui| opt_text(ui, &mut o.record_element, tr("every child of the root element"), 220.0));
-    f.row(tr("Attributes"), |ui| wizard::check(ui, &mut o.attributes_as_columns, tr("Attributes of the row element are columns")));
-    f.row(tr("Empty elements"), |ui| wizard::check(ui, &mut o.empty_as_null, tr("Read as NULL")));
+    f.check_row(tr("Attributes"), |ui| wizard::check(ui, &mut o.attributes_as_columns, tr("Attributes of the row element are columns")));
+    f.check_row(tr("Empty elements"), |ui| wizard::check(ui, &mut o.empty_as_null, tr("Read as NULL")));
     f.row(tr("Encoding"), |ui| encoding_combo(ui, ("xml_rd_enc", id), &mut o.encoding));
 }
 
@@ -1419,13 +1459,18 @@ impl TabView for ImportTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(940.0, 660.0))
+        Some(wizard::WINDOW)
     }
 
     fn title(&self) -> String {
+        // An existing table is named; a new one once the import has run.
+        let named = match self.target {
+            ImportTarget::Existing => self.page > PAGE_FILE,
+            ImportTarget::New => self.run.is_some() || self.result.is_some(),
+        };
         match self.target_ref() {
-            Some(t) => trf("Import into {}", &[&t.name]),
-            None => tr("Import data").to_string(),
+            Some(t) if named => trf("Import into {}", &[&t.name]),
+            _ => tr("Import data").to_string(),
         }
     }
 

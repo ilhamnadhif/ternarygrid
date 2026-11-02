@@ -5,7 +5,7 @@
 
 use super::wizard::{self, Clicked, W, col, line};
 use super::{
-    MessageLog, Running, TaskSaver, combo, connection_combo, connection_name, current_schema, error_text, next_uid, not_connected, on_error_options, progress_ui, schema_combo,
+    MessageLog, Running, TaskSaver, combo_w, connection_combo, connection_name, current_schema, error_text, next_uid, not_connected, on_error_options, progress_ui, schema_combo,
     schema_tables, section, table_def_of,
 };
 use crate::cx::AppContext;
@@ -473,7 +473,7 @@ impl MigrationTab {
         };
         ui.horizontal(|ui| {
             wizard::muted(ui, tr("Schema"));
-            schema_combo(ui, cx, &conn, ("mig_schema", self.uid), &mut self.picker_schema);
+            schema_combo(ui, cx, &conn, ("mig_schema", self.uid), &mut self.picker_schema, 160.0);
             kit::search_field(ui, egui::Id::new(("mig_filter", self.uid)), &mut self.picker_filter, tr("Filter…"), 220.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(shown) = &shown {
@@ -508,14 +508,13 @@ impl MigrationTab {
     fn target_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         section(ui, tr("Target"));
         let id = self.uid;
-        let dark = ui.visuals().dark_mode;
         wizard::form(ui, ("mig_target", id), 1, 120.0, |f| {
             f.row(tr("Connection"), |ui| {
                 let kind = self.target_conn.as_ref().and_then(|t| cx.conns.config(t)).map(|c| c.kind);
-                if let Some(img) = kind.and_then(|k| crate::dblogo::image(ui.ctx(), k, 15.0, crate::theme::logo_color(k, dark))) {
-                    ui.add(img);
+                if let Some(k) = kind {
+                    crate::tabs::dbtools::look::logo(ui, k, 15.0);
                 }
-                if connection_combo(ui, cx, ("mig_conn", id), &mut self.target_conn) {
+                if connection_combo(ui, cx, ("mig_conn", id), &mut self.target_conn, 260.0) {
                     self.target_schema = None;
                 }
                 if let Some(t) = self.target_conn.clone()
@@ -528,7 +527,7 @@ impl MigrationTab {
             if let Some(t) = self.target_conn.clone()
                 && cx.conns.is_connected(&t)
             {
-                f.row(tr("Schema"), |ui| schema_combo(ui, cx, &t, ("mig_tschema", id), &mut self.target_schema));
+                f.row(tr("Schema"), |ui| schema_combo(ui, cx, &t, ("mig_tschema", id), &mut self.target_schema, 200.0));
             }
             f.row(tr("Names"), |ui| {
                 parts::segmented(
@@ -644,9 +643,9 @@ impl MigrationTab {
         let id = self.uid;
         let o = &mut self.options;
         wizard::form(ui, ("mig_opts", id), 1, 150.0, |f| {
-            f.row(tr("Target tables"), |ui| wizard::check(ui, &mut o.create_tables, tr("Create the tables that do not exist")));
+            f.check_row(tr("Target tables"), |ui| wizard::check(ui, &mut o.create_tables, tr("Create the tables that do not exist")));
             f.row(tr("Existing rows"), |ui| {
-                combo(
+                combo_w(
                     ui,
                     ("mig_mode", id),
                     &mut o.mode,
@@ -656,20 +655,21 @@ impl MigrationTab {
                         (MigrationMode::Replace, tr("Insert or replace rows by primary key").to_string()),
                         (MigrationMode::DropAndCreate, tr("Drop and create the tables again").to_string()),
                     ],
+                    320.0,
                 )
             });
             if o.mode == MigrationMode::Replace && !transactions {
                 super::replace_without_transactions_ui(f);
             }
-            f.row(tr("Rows per batch"), |ui| ui.add(egui::DragValue::new(&mut o.batch_size).range(1..=100_000)));
-            f.row(tr("Copy"), |ui| {
+            f.row(tr("Rows per batch"), |ui| wizard::number(ui, &mut o.batch_size, 1..=100_000, 120.0));
+            f.check_row(tr("Copy"), |ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
                 wizard::check(ui, &mut o.copy_indexes, tr("Indexes"));
                 wizard::check(ui, &mut o.copy_foreign_keys, tr("Foreign keys"));
             });
-            f.row(tr("Transactions"), |ui| wizard::check(ui, &mut o.transaction_per_table, tr("Load every table in one transaction")));
-            f.row(tr("On error"), |ui| combo(ui, ("mig_err", id), &mut o.on_error, &on_error_options()));
-            f.row(tr("Failed tables"), |ui| wizard::check(ui, &mut o.continue_on_table_error, tr("Continue with the next table")));
+            f.check_row(tr("Transactions"), |ui| wizard::check(ui, &mut o.transaction_per_table, tr("Load every table in one transaction")));
+            f.row(tr("On error"), |ui| combo_w(ui, ("mig_err", id), &mut o.on_error, &on_error_options(), 260.0));
+            f.check_row(tr("Failed tables"), |ui| wizard::check(ui, &mut o.continue_on_table_error, tr("Continue with the next table")));
         });
     }
 
@@ -701,6 +701,7 @@ impl MigrationTab {
                                 wizard::faint(ui, tr("waiting"));
                             }
                             TableState::Running => {
+                                ui.spacing_mut().item_spacing.x = 8.0;
                                 ui.label(RichText::new(icon::CLOCK_COUNTER_CLOCKWISE).font(ternarygrid_ui::style::icon_font(13.0)).color(p.accent_text));
                                 ui.label(RichText::new(tr("copying")).size(12.5).color(p.accent_text));
                             }
@@ -712,7 +713,7 @@ impl MigrationTab {
                             }
                         },
                         _ => {
-                            ui.label(if t.state == TableState::Pending { "—".to_string() } else { t.rows.to_string() });
+                            ui.label(if t.state == TableState::Pending { "—".to_string() } else { super::group(t.rows) });
                         }
                     }
                 },
@@ -749,6 +750,7 @@ impl MigrationTab {
             ui,
             ("mig_sum", self.uid),
             120.0,
+            8.0,
             &[
                 (tr("Source"), connection_name(cx, &self.conn), None),
                 (tr("Target"), format!("{target} / {schema}"), None),
@@ -787,17 +789,17 @@ impl MigrationTab {
                         ui.add(egui::Label::new(t.source.as_ref().map(ObjectRef::display_path).unwrap_or_default()).truncate());
                     }
                     1 => {
-                        let mut target = t.target.as_ref().map(ObjectRef::display_path).unwrap_or_default();
+                        let mut target = t.target.as_ref().map(|o| o.name.clone()).unwrap_or_default();
                         if t.created {
                             target = trf("{} (created)", &[&target]);
                         }
                         ui.add(egui::Label::new(target).truncate());
                     }
                     2 => {
-                        ui.label(t.rows_written.to_string());
+                        ui.label(super::group(t.rows_written));
                     }
                     3 => {
-                        ui.label(t.rows_failed.to_string());
+                        ui.label(super::group(t.rows_failed));
                     }
                     4 => {
                         ui.label(crate::widgets::format_duration(std::time::Duration::from_millis(t.duration_ms)));
@@ -912,9 +914,9 @@ impl MigrationTab {
 fn describe(s: &MigrationSummary) -> String {
     let failed = s.tables.iter().filter(|t| t.error.is_some()).count();
     if failed > 0 {
-        trf("{} rows copied, {} of {} table(s) failed", &[&s.rows, &failed, &s.tables.len()])
+        trf("{} rows copied, {} of {} table(s) failed", &[&super::group(s.rows), &failed, &s.tables.len()])
     } else {
-        trf("{} rows copied into {} table(s)", &[&s.rows, &s.tables.len()])
+        trf("{} rows copied into {} table(s)", &[&super::group(s.rows), &s.tables.len()])
     }
 }
 
@@ -924,7 +926,7 @@ impl TabView for MigrationTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(940.0, 660.0))
+        Some(wizard::WINDOW)
     }
 
     fn title(&self) -> String {
@@ -937,7 +939,7 @@ impl TabView for MigrationTab {
     }
 
     fn icon(&self) -> &'static str {
-        icon::ARROWS_LEFT_RIGHT
+        icon::ARROWS_DOWN_UP
     }
 
     fn connection_id(&self) -> Option<&str> {
@@ -951,7 +953,7 @@ impl TabView for MigrationTab {
             // In a pop-up its title bar names the wizard and the connection.
             if !cx.popup {
                 ui.horizontal(|ui| {
-                    crate::widgets::icon_heading(ui, icon::ARROWS_LEFT_RIGHT, tr("Migrate tables"));
+                    crate::widgets::icon_heading(ui, icon::ARROWS_DOWN_UP, tr("Migrate tables"));
                     ui.weak(connection_name(cx, &self.conn));
                 });
             }

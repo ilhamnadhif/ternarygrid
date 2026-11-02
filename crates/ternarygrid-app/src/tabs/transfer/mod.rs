@@ -47,6 +47,19 @@ pub(crate) use wizard::section;
 /// Messages kept by a tab's log (older ones are dropped).
 const MAX_LOG_MESSAGES: usize = 2000;
 
+/// `48210` as `48,210` (the counts of the wizards).
+pub(crate) fn group(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Unique id for the egui ids of one tab instance.
 pub(crate) fn next_uid() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -140,44 +153,43 @@ pub(crate) fn progress_ui(ui: &mut Ui, progress: &Progress, cancelling: bool) ->
     let p = ternarygrid_ui::pal(ui);
     let s = progress.snapshot();
     let rows_text = match s.total_rows {
-        Some(t) => trf("{} of {} rows", &[&s.rows, &t]),
-        None => trf("{} rows", &[&s.rows]),
+        Some(t) => trf("{} of {} rows", &[&group(s.rows), &group(t)]),
+        None => trf("{} rows", &[&group(s.rows)]),
     };
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 12.0;
-        match s.fraction {
-            Some(f) => {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    let written = if s.bytes > 0 { crate::widgets::format_bytes(s.bytes.min(i64::MAX as u64) as i64) } else { "—".to_string() };
+    let mut facts: Vec<(&str, String, Option<egui::Color32>)> =
+        vec![(tr("Speed"), trf("{} rows/s", &[&group(s.rows_per_second.max(0.0).round() as u64)]), None), (tr("Written"), written, None)];
+    if s.items_total > 0 {
+        facts.push((tr("Objects"), trf("{} of {}", &[&s.items_done, &s.items_total]), None));
+    }
+    if !s.active_items.is_empty() {
+        facts.push((tr("Current"), s.active_items.join(", "), None));
+    }
+    facts.push((tr("Errors"), s.errors.to_string(), (s.errors > 0).then_some(p.err)));
+    facts.push((tr("Elapsed"), crate::widgets::format_duration(Duration::from_secs_f64(s.elapsed_secs.max(0.0))), None));
+    let mut clicked = false;
+    // The bar, the counters and Cancel, 12 apart.
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 12.0;
+        wizard::tight_row(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            match s.fraction {
+                Some(f) => {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(&rows_text).size(12.5).color(p.text_muted));
+                        wizard::bar(ui, f as f32, 8.0);
+                    });
+                }
+                None => {
+                    ui.add(egui::Spinner::new().size(14.0).color(p.accent_text));
                     ui.label(RichText::new(&rows_text).size(12.5).color(p.text_muted));
-                    parts::progress(ui, f as f32, f32::INFINITY);
-                });
+                }
             }
-            None => {
-                ui.add(egui::Spinner::new().size(14.0).color(p.accent_text));
-                ui.label(RichText::new(&rows_text).size(12.5).color(p.text_muted));
-            }
-        }
+        });
+        wizard::fact_grid(ui, &facts);
+        let label = if cancelling { tr("Cancelling…") } else { tr("Cancel") };
+        clicked = ui.add_enabled_ui(!cancelling, |ui| kit::button_ex(ui, Kind::Danger, Some(icon::STOP), label, true)).inner.clicked();
     });
-    let value = |ui: &mut Ui, text: String, color: Option<egui::Color32>| {
-        ui.add(egui::Label::new(RichText::new(text).color(color.unwrap_or(p.text))).truncate());
-    };
-    ui.spacing_mut().interact_size.y = 20.0;
-    wizard::form(ui, "progress", 2, 100.0, |f| {
-        f.row(tr("Speed"), |ui| value(ui, trf("{} rows/s", &[&format!("{:.0}", s.rows_per_second)]), None));
-        let written = if s.bytes > 0 { crate::widgets::format_bytes(s.bytes.min(i64::MAX as u64) as i64) } else { "—".to_string() };
-        f.row(tr("Written"), |ui| value(ui, written, None));
-        if s.items_total > 0 {
-            f.row(tr("Objects"), |ui| value(ui, trf("{} of {}", &[&s.items_done, &s.items_total]), None));
-        }
-        if !s.active_items.is_empty() {
-            f.row(tr("Current"), |ui| value(ui, s.active_items.join(", "), None));
-        }
-        f.row(tr("Errors"), |ui| value(ui, s.errors.to_string(), (s.errors > 0).then_some(p.err)));
-        f.row(tr("Elapsed"), |ui| value(ui, crate::widgets::format_duration(Duration::from_secs_f64(s.elapsed_secs.max(0.0))), None));
-    });
-    ui.spacing_mut().interact_size.y = ternarygrid_ui::style::CONTROL_H;
-    let label = if cancelling { tr("Cancelling…") } else { tr("Cancel") };
-    let clicked = ui.add_enabled_ui(!cancelling, |ui| kit::button_ex(ui, Kind::Danger, Some(icon::STOP), label, true)).inner.clicked();
     ui.ctx().request_repaint_after(Duration::from_millis(100));
     clicked
 }
@@ -226,19 +238,20 @@ impl MessageLog {
                 wizard::faint(ui, &trf("({} older messages not shown)", &[&self.dropped]));
             }
         });
+        // Lines 22 high, each on one line (the whole text in its tooltip).
         wizard::boxed(ui, Margin::symmetric(12, 8), |ui| {
             egui::ScrollArea::vertical().id_salt(id).max_height(max_height).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.spacing_mut().item_spacing.y = 0.0;
                 for m in &self.messages {
                     let (glyph, color) = match m.level {
                         MessageLevel::Info => (icon::INFO, p.text_muted),
                         MessageLevel::Warning => (icon::WARNING, p.warn),
                         MessageLevel::Error => (icon::X_CIRCLE, p.err),
                     };
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
+                    let text = format_message(m);
+                    wizard::row_dyn(ui, 22.0, 8.0, &mut |ui| {
                         ui.label(RichText::new(glyph).font(ternarygrid_ui::style::icon_font(13.0)).color(color));
-                        ui.add(egui::Label::new(RichText::new(format_message(m)).monospace().size(11.5).color(p.text)).wrap().selectable(true));
+                        ui.add(egui::Label::new(RichText::new(&text).monospace().size(11.5).color(p.text)).truncate()).on_hover_text(&text);
                     });
                 }
             });
@@ -296,11 +309,11 @@ impl TaskSaver {
                 let p = ternarygrid_ui::pal(ui);
                 ternarygrid_ui::style::form_spacing(ui);
                 ui.spacing_mut().item_spacing.y = 12.0;
-                ui.add(
-                    egui::Label::new(RichText::new(tr("The task runs the same transfer from the Tasks view, on a schedule or with ternarygrid --run-task.")).color(p.text_muted))
-                        .wrap(),
-                );
-                wizard::form(ui, id.with("grid"), 1, 64.0, |f| {
+                let text = RichText::new(tr("The task runs the same transfer from the Tasks view, on a schedule or with ternarygrid --run-task."))
+                    .color(p.text_muted)
+                    .line_height(Some(19.5));
+                ui.add(egui::Label::new(text).wrap());
+                wizard::form_gap(ui, id.with("grid"), 1, 80.0, 12.0, |f| {
                     f.row(tr("Name"), |ui| ui.add(line(name).desired_width(f32::INFINITY)));
                     f.row(tr("Folder"), |ui| ui.add(line(folder).hint_text(tr("optional, e.g. exports/nightly")).desired_width(f32::INFINITY)));
                 });
@@ -368,23 +381,49 @@ impl TaskSaver {
 
 /// Combo box over a fixed list of (value, label) pairs.
 pub(crate) fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut T, options: &[(T, String)]) -> bool {
-    let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| l.clone()).unwrap_or_default();
-    let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
-        for (v, label) in options {
-            if ui.selectable_label(v == value, label).clicked() && v != value {
-                *value = v.clone();
-                changed = true;
+    combo_w(ui, id, value, options, 0.0)
+}
+
+/// [`combo`] `width` wide (0: egui's default width).
+pub(crate) fn combo_w<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut T, options: &[(T, String)], width: f32) -> bool {
+    let labels: Vec<&str> = options.iter().map(|(_, l)| l.as_str()).collect();
+    let sel = options.iter().position(|(v, _)| v == value);
+    match combo_idx(ui, egui::Id::new(id), sel, &labels, width) {
+        Some(i) => {
+            *value = options[i].0.clone();
+            true
+        }
+        None => false,
+    }
+}
+
+/// The combo box of [`combo_w`] over labels; returns the label picked (another one).
+fn combo_idx(ui: &mut Ui, id: egui::Id, sel: Option<usize>, labels: &[&str], width: f32) -> Option<usize> {
+    let current = sel.and_then(|i| labels.get(i)).copied().unwrap_or_default();
+    let mut picked = None;
+    let mut combo = egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current);
+    if width > 0.0 {
+        combo = combo.width(width);
+    }
+    combo.show_ui(ui, |ui| {
+        for (i, label) in labels.iter().enumerate() {
+            if ui.selectable_label(sel == Some(i), *label).clicked() && sel != Some(i) {
+                picked = Some(i);
             }
         }
     });
-    changed
+    picked
 }
 
 /// Single line editor of an optional text (empty = `None`).
 pub(crate) fn opt_text(ui: &mut Ui, value: &mut Option<String>, hint: &str, width: f32) -> bool {
+    opt_text_h(ui, value, hint, width, ternarygrid_ui::style::CONTROL_H)
+}
+
+/// [`opt_text`] `h` high.
+pub(crate) fn opt_text_h(ui: &mut Ui, value: &mut Option<String>, hint: &str, width: f32, h: f32) -> bool {
     let mut s = value.clone().unwrap_or_default();
-    let changed = ui.add(line(&mut s).hint_text(hint).desired_width(width)).changed();
+    let changed = ui.add(wizard::fit(egui::TextEdit::singleline(&mut s), h).hint_text(hint).desired_width(width)).changed();
     if changed {
         *value = Some(s).filter(|s| !s.is_empty());
     }
@@ -406,7 +445,8 @@ fn parsed_edit_ex(ui: &mut Ui, shown: String, hint: &str, width: f32, multiline:
     if mono {
         edit = edit.font(egui::TextStyle::Monospace);
     }
-    let r = ui.add(edit.margin(wizard::INPUT_MARGIN).hint_text(hint).desired_width(width));
+    let edit = if multiline { edit.margin(wizard::INPUT_MARGIN) } else { wizard::fit(edit, ternarygrid_ui::style::CONTROL_H) };
+    let r = ui.add(edit.hint_text(hint).desired_width(width));
     let changed = r.changed();
     if changed {
         apply(&text);
@@ -608,12 +648,12 @@ pub(crate) fn current_schema(cx: &AppContext, conn: &str) -> Option<SchemaRef> {
     Some(SchemaRef::new(None, schema))
 }
 
-/// Schema picker; returns true when the selection changed.
-pub(crate) fn schema_combo(ui: &mut Ui, cx: &mut AppContext, conn: &str, id: impl std::hash::Hash + std::fmt::Debug, value: &mut Option<SchemaRef>) -> bool {
+/// Schema picker `width` wide; returns true when the selection changed.
+pub(crate) fn schema_combo(ui: &mut Ui, cx: &mut AppContext, conn: &str, id: impl std::hash::Hash + std::fmt::Debug, value: &mut Option<SchemaRef>, width: f32) -> bool {
     let names = schema_names(cx, conn);
     let label = value.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("(default)").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(180.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(width).show_ui(ui, |ui| {
         if ui.selectable_label(value.as_ref().is_none_or(|v| v.schema.is_none()), tr("(default)")).clicked() {
             *value = None;
             changed = true;
@@ -686,11 +726,11 @@ pub(crate) fn reload_table_def(cx: &mut AppContext, conn: &str, table: &ObjectRe
 }
 
 /// Connection picker over all configured connections.
-pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash::Hash + std::fmt::Debug, value: &mut Option<String>) -> bool {
+pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash::Hash + std::fmt::Debug, value: &mut Option<String>, width: f32) -> bool {
     let conns: Vec<(String, String)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
     let current = value.as_ref().and_then(|v| conns.iter().find(|(i, _)| i == v)).map(|(_, n)| n.clone()).unwrap_or_else(|| tr("Choose…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(200.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(width).show_ui(ui, |ui| {
         for (cid, name) in &conns {
             let glyph = if cx.conns.is_connected(cid) { icon::PLUGS_CONNECTED } else { icon::PLUGS };
             let selected = value.as_deref() == Some(cid.as_str());

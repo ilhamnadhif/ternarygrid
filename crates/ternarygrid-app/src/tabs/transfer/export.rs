@@ -4,8 +4,8 @@
 
 use super::wizard::{self, Clicked, Form, W, col, line};
 use super::{
-    MessageLog, Running, TaskSaver, char_edit, combo, connection_name, current_schema, default_output_folder, delimiter_choice, error_text, next_uid, not_connected, opt_char_edit,
-    opt_number, opt_text, progress_ui, schema_combo, schema_tables, section,
+    MessageLog, Running, TaskSaver, char_edit, combo, combo_w, connection_name, current_schema, default_output_folder, delimiter_choice, error_text, next_uid, not_connected,
+    opt_char_edit, opt_number, opt_text, opt_text_h, progress_ui, schema_combo, schema_tables, section,
 };
 use crate::cx::AppContext;
 use crate::tabs::TabView;
@@ -296,6 +296,22 @@ impl ExportTab {
         }
     }
 
+    /// Add a query called `name` (`${table}` in the file name).
+    pub fn add_query(&mut self, name: &str, sql: &str) {
+        self.items.push(SourceItem { enabled: true, item: ExportItem::Query { sql: sql.to_string(), name: Some(name.to_string()).filter(|n| !n.is_empty()) } });
+    }
+
+    /// Set the WHERE filter of the table `name`.
+    pub fn set_filter(&mut self, name: &str, filter: &str) {
+        for i in &mut self.items {
+            if let ExportItem::Table { table, where_clause } = &mut i.item
+                && table.name == name
+            {
+                *where_clause = Some(filter.to_string()).filter(|f| !f.is_empty());
+            }
+        }
+    }
+
     /// Wizard page (0 source, 1 format, 2 output, 3 run).
     pub fn page(&self) -> usize {
         self.page
@@ -552,7 +568,7 @@ impl ExportTab {
             ResultSource::Query => {
                 wizard::faint(ui, tr("The query runs on a new connection and every row is exported, with all its columns."));
                 if let Some(SourceItem { item: ExportItem::Query { name, .. }, .. }) = self.items.first_mut() {
-                    wizard::form(ui, ("exp_rows_name", self.uid), 1, 64.0, |f| {
+                    wizard::form(ui, ("exp_rows_name", self.uid), 1, 80.0, |f| {
                         f.row(tr("Name"), |ui| opt_text(ui, name, tr("name used for ${table}"), f32::INFINITY));
                     });
                 }
@@ -621,7 +637,7 @@ impl ExportTab {
                                 wizard::prefixed_opt_text(ui, where_clause, "WHERE", tr("optional filter, e.g. id > 100"), f32::INFINITY);
                             }
                             ExportItem::Query { name: qname, .. } => {
-                                opt_text(ui, qname, tr("name used for ${table}"), 200.0);
+                                opt_text_h(ui, qname, tr("name used for ${table}"), 172.0, 26.0);
                                 let label = if expanded == Some(i) { tr("Hide SQL") } else { tr("Edit SQL") };
                                 if wizard::ghost(ui, None, label).clicked() {
                                     toggle = Some(i);
@@ -659,8 +675,7 @@ impl ExportTab {
                     .hint_text(tr("SELECT … (one statement returning rows)")),
             );
         }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+        wizard::tight_row(ui, |ui| {
             if wizard::ghost(ui, Some(icon::PLUS), tr("Add query")).clicked() {
                 self.items.push(SourceItem { enabled: true, item: ExportItem::Query { sql: String::new(), name: None } });
                 self.expanded = Some(self.items.len() - 1);
@@ -695,46 +710,50 @@ impl ExportTab {
             }
             _ => None,
         };
-        ui.horizontal(|ui| {
-            wizard::muted(ui, tr("Schema"));
-            schema_combo(ui, cx, &conn, ("exp_schema", self.uid), &mut self.picker_schema);
-            kit::search_field(ui, egui::Id::new(("exp_filter", self.uid)), &mut self.picker_filter, tr("Filter…"), 220.0);
-            wizard::check(ui, &mut self.picker_views, tr("Views"));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(shown) = &shown {
-                    if !shown.is_empty() && wizard::ghost(ui, None, tr("Add all shown")).clicked() {
-                        for o in shown {
-                            self.add_table(o.clone());
+        // The bar and its list, 8 apart.
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            wizard::picker_bar(ui, |ui| {
+                wizard::muted(ui, tr("Schema"));
+                schema_combo(ui, cx, &conn, ("exp_schema", self.uid), &mut self.picker_schema, 160.0);
+                kit::search_field(ui, egui::Id::new(("exp_filter", self.uid)), &mut self.picker_filter, tr("Filter…"), 220.0);
+                wizard::check(ui, &mut self.picker_views, tr("Views"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(shown) = &shown {
+                        if !shown.is_empty() && wizard::ghost(ui, None, tr("Add all shown")).clicked() {
+                            for o in shown {
+                                self.add_table(o.clone());
+                            }
                         }
+                        wizard::faint(ui, &trf("{} objects", &[&shown.len()]));
                     }
-                    wizard::faint(ui, &trf("{} objects", &[&shown.len()]));
-                }
+                });
             });
-        });
-        match list {
-            None => {}
-            Some(None) => {
-                parts::spinner_label(ui, tr("Loading…"));
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
-            }
-            Some(Some(Err(e))) => crate::widgets::error_box(ui, &e.full_text()),
-            Some(Some(Ok(_))) => {
-                let shown = shown.unwrap_or_default();
-                let mut add = None;
-                let items = &self.items;
-                picker_list(ui, ("exp_pick", self.uid), &shown, |o| items.iter().any(|i| matches!(&i.item, ExportItem::Table { table, .. } if table == o)), |o| add = Some(o));
-                if let Some(o) = add {
-                    self.add_table(o);
+            match list {
+                None => {}
+                Some(None) => {
+                    parts::spinner_label(ui, tr("Loading…"));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Some(Some(Err(e))) => crate::widgets::error_box(ui, &e.full_text()),
+                Some(Some(Ok(_))) => {
+                    let shown = shown.unwrap_or_default();
+                    let mut add = None;
+                    let items = &self.items;
+                    picker_list(ui, ("exp_pick", self.uid), &shown, |o| items.iter().any(|i| matches!(&i.item, ExportItem::Table { table, .. } if table == o)), |o| add = Some(o));
+                    if let Some(o) = add {
+                        self.add_table(o);
+                    }
                 }
             }
-        }
+        });
     }
 
     fn format_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         section(ui, tr("Format"));
         let formats: Vec<(ExportFormat, &str)> = ExportFormat::ALL.iter().map(|f| (*f, tr(f.label()))).collect();
         parts::chips(ui, &mut self.settings.format, &formats);
-        parts::hline(ui);
+        wizard::divider(ui);
         let format = self.settings.format;
         let id = self.uid;
         let o = &mut self.settings.options;
@@ -757,7 +776,8 @@ impl ExportTab {
         }
         // The value formatting and the file options fold away under two cards.
         let values = uses_value_format(format);
-        let reading = if format.is_binary() { trf("{} rows per batch", &[&o.fetch_size]) } else { format!("{} · {}", o.encoding, trf("{} rows per batch", &[&o.fetch_size])) };
+        let batch = trf("{} rows per batch", &[&super::group(o.fetch_size as u64)]);
+        let reading = if format.is_binary() { batch } else { format!("{} · {batch}", o.encoding) };
         let (mut values_open, mut common_open) = (self.values_open && values, self.common_open);
         let fill = values_open || common_open;
         let mut cards = |ui: &mut Ui| {
@@ -768,11 +788,11 @@ impl ExportTab {
             }
             wizard::fold_card(ui, egui::Id::new(("exp_common", id)), &mut common_open, tr("File and reading"), Some(&reading), fill, |ui| common_ui(ui, id, o, format));
         };
-        ui.add_space(4.0);
+        ui.add_space(16.0 - wizard::GAP);
         if fill {
             cards(ui);
         } else {
-            ui.horizontal(|ui| {
+            ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 cards(ui)
             });
@@ -787,7 +807,7 @@ impl ExportTab {
         section(ui, tr("Output"));
         let id = self.uid;
         let open_new = self.settings.open_new_connections;
-        wizard::form(ui, ("exp_out", id), 1, 130.0, |f| {
+        wizard::form_gap(ui, ("exp_out", id), 1, 130.0, 12.0, |f| {
             f.row(tr("Folder"), |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if kit::secondary(ui, Some(icon::FOLDER_OPEN), tr("Browse…")).clicked() {
@@ -809,11 +829,11 @@ impl ExportTab {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     ui.add(line(&mut self.settings.file_name_pattern).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
-                    wizard::muted(ui, tr("Variables: ${object} ${database} ${schema} ${table} ${date} ${time} ${timestamp} ${index} ${extension}"));
+                    wizard::sub(ui, tr("Variables: ${object} ${database} ${schema} ${table} ${date} ${time} ${timestamp} ${index} ${extension}"));
                 });
             });
             f.row(tr("Workers"), |ui| {
-                ui.add_enabled(open_new, egui::DragValue::new(&mut self.settings.threads).range(1..=16));
+                ui.add_enabled_ui(open_new, |ui| wizard::number(ui, &mut self.settings.threads, 1..=16, 70.0));
                 wizard::faint(ui, tr("objects exported in parallel"));
             });
         });
@@ -889,6 +909,7 @@ impl ExportTab {
             ui,
             ("exp_sum", self.uid),
             120.0,
+            8.0,
             &[
                 (tr("Connection"), connection_name(cx, &self.conn), None),
                 (tr("Objects"), objects, None),
@@ -944,7 +965,7 @@ impl ExportTab {
                         }
                     },
                     2 => {
-                        ui.label(item.rows.to_string());
+                        ui.label(super::group(item.rows));
                     }
                     3 => {
                         ui.label(crate::widgets::format_bytes(item.bytes.min(i64::MAX as u64) as i64));
@@ -1021,26 +1042,23 @@ fn home_relative(path: &str) -> String {
 pub(crate) fn picker_list(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, shown: &[ObjectRef], added: impl Fn(&ObjectRef) -> bool, mut add: impl FnMut(ObjectRef)) {
     let p = ternarygrid_ui::pal(ui);
     wizard::boxed(ui, Margin::ZERO, |ui| {
-        egui::ScrollArea::vertical().id_salt(egui::Id::new(id)).max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
+        // Rows 28 high with a hairline under each (29 apart).
+        egui::ScrollArea::vertical().id_salt(egui::Id::new(id)).max_height(29.0 * 8.0).auto_shrink([false, true]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            let line = crate::tabs::dbtools::look::line(ui);
             for (i, o) in shown.iter().enumerate() {
                 let already = added(o);
-                let r = ui.horizontal(|ui| {
-                    ui.set_min_height(28.0);
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.add_space(6.0);
-                    if ui.add_enabled_ui(!already, |ui| wizard::icon_button(ui, icon::PLUS, tr("Add"), 22.0)).inner.clicked() {
-                        add(o.clone());
-                    }
-                    let glyph = if o.kind == ObjectKind::View { icon::EYE } else { icon::TABLE };
-                    ui.label(RichText::new(glyph).font(ternarygrid_ui::style::icon_font(13.0)).color(p.text_muted));
-                    ui.label(RichText::new(&o.name).color(if already { p.text_faint } else { p.text }));
-                    ui.allocate_space(vec2(ui.available_width(), 1.0));
-                });
-                if i + 1 < shown.len() {
-                    let rect = r.response.rect;
-                    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, p.border));
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 29.0), egui::Sense::hover());
+                let inner = egui::Rect::from_min_max(rect.min + vec2(10.0, 0.0), rect.max - vec2(10.0, 1.0));
+                let mut row = ui.new_child(egui::UiBuilder::new().id_salt(("pick", i)).max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                row.spacing_mut().item_spacing.x = 8.0;
+                if row.add_enabled_ui(!already, |ui| wizard::icon_button(ui, icon::PLUS, tr("Add"), 22.0)).inner.clicked() {
+                    add(o.clone());
                 }
+                let glyph = if o.kind == ObjectKind::View { icon::EYE } else { icon::TABLE };
+                row.label(RichText::new(glyph).font(ternarygrid_ui::style::icon_font(13.0)).color(p.text_muted));
+                row.label(RichText::new(&o.name).color(if already { p.text_faint } else { p.text }));
+                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, line));
             }
         });
     });
@@ -1086,8 +1104,8 @@ async fn export_fetched(
 fn describe(s: &ExportJobSummary) -> String {
     let files = s.items.iter().filter(|i| i.error.is_none() && i.file.is_some()).count();
     match s.failed() {
-        0 => trf("{} rows exported to {} file(s)", &[&s.rows, &files]),
-        n => trf("{} rows exported to {} file(s), {} failed", &[&s.rows, &files, &n]),
+        0 => trf("{} rows exported to {} file(s)", &[&super::group(s.rows), &files]),
+        n => trf("{} rows exported to {} file(s), {} failed", &[&super::group(s.rows), &files, &n]),
     }
 }
 
@@ -1126,7 +1144,7 @@ fn csv_ui(ui: &mut Ui, id: u64, o: &mut CsvOptions, tsv: bool) {
         f.row(tr("Header row"), |ui| {
             wizard::check(ui, &mut o.header, tr("Write"));
             ui.add_enabled_ui(o.header, |ui| {
-                combo(
+                combo_w(
                     ui,
                     ("csv_header", id),
                     &mut o.header_style,
@@ -1135,6 +1153,7 @@ fn csv_ui(ui: &mut Ui, id: u64, o: &mut CsvOptions, tsv: bool) {
                         (HeaderStyle::Type, tr("Column types").to_string()),
                         (HeaderStyle::Both, tr("Names and types").to_string()),
                     ],
+                    180.0,
                 );
             });
         });
@@ -1160,11 +1179,11 @@ fn json_ui(ui: &mut Ui, id: u64, o: &mut JsonOptions, document: bool) {
                     &[(JsonLayout::ArrayOfObjects, tr("Array of objects").to_string()), (JsonLayout::ColumnsAndRows, tr("Columns and rows").to_string())],
                 )
             });
-            f.row(tr("Indent"), |ui| wizard::check(ui, &mut o.pretty, tr("Pretty print")));
+            f.check_row(tr("Indent"), |ui| wizard::check(ui, &mut o.pretty, tr("Pretty print")));
         }
-        f.row(tr("Table name"), |ui| wizard::check(ui, &mut o.include_table_name, tr("Include the table name")));
+        f.check_row(tr("Table name"), |ui| wizard::check(ui, &mut o.include_table_name, tr("Include the table name")));
         f.row(tr("Binary values"), |ui| combo(ui, ("json_bin", id), &mut o.binary, &binary_options()));
-        f.row(tr("Dates"), |ui| wizard::check(ui, &mut o.format_dates, tr("Use the date formats of the value formatting")));
+        f.check_row(tr("Dates"), |ui| wizard::check(ui, &mut o.format_dates, tr("Use the date formats of the value formatting")));
     });
 }
 
@@ -1196,8 +1215,8 @@ fn sql_ui(ui: &mut Ui, id: u64, o: &mut SqlOptions, dialect: &mut Option<DbKind>
         f.row(tr("Rows per INSERT"), |ui| ui.add(egui::DragValue::new(&mut o.rows_per_statement).range(1..=1000)));
         f.row(tr("Target table"), |ui| opt_text(ui, &mut o.table_name, tr("name of the source table"), 260.0));
         f.row(tr("Target schema"), |ui| opt_text(ui, &mut o.schema_name, tr("schema of the source table"), 260.0));
-        f.row(tr("Qualify names"), |ui| wizard::check(ui, &mut o.qualify_with_schema, tr("Prefix the table with its schema")));
-        f.row(tr("CREATE TABLE"), |ui| wizard::check(ui, &mut o.include_create_table, tr("Write the table definition before the data")));
+        f.check_row(tr("Qualify names"), |ui| wizard::check(ui, &mut o.qualify_with_schema, tr("Prefix the table with its schema")));
+        f.check_row(tr("CREATE TABLE"), |ui| wizard::check(ui, &mut o.include_create_table, tr("Write the table definition before the data")));
         f.row(tr("Quote identifiers"), |ui| {
             combo(ui, ("sql_quote", id), &mut o.quoting, &[(IdentifierQuoting::AsNeeded, tr("When needed").to_string()), (IdentifierQuoting::Always, tr("Always").to_string())])
         });
@@ -1208,7 +1227,7 @@ fn sql_ui(ui: &mut Ui, id: u64, o: &mut SqlOptions, dialect: &mut Option<DbKind>
 fn xlsx_ui(ui: &mut Ui, id: u64, o: &mut XlsxOptions) {
     opts(ui, id, "xlsx", |f| {
         f.row(tr("Sheet name"), |ui| opt_text(ui, &mut o.sheet_name, tr("name of the table"), 260.0));
-        f.row(tr("Header row"), |ui| {
+        f.check_row(tr("Header row"), |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
             wizard::check(ui, &mut o.header, tr("Write"));
             ui.add_enabled_ui(o.header, |ui| {
@@ -1220,21 +1239,21 @@ fn xlsx_ui(ui: &mut Ui, id: u64, o: &mut XlsxOptions) {
         });
         f.row(tr("Column width"), |ui| {
             wizard::check(ui, &mut o.auto_column_width, tr("Fit to the content, at most"));
-            ui.add_enabled(o.auto_column_width, egui::DragValue::new(&mut o.max_column_width).range(5..=255));
+            ui.add_enabled_ui(o.auto_column_width, |ui| wizard::number(ui, &mut o.max_column_width, 5..=255, 70.0));
         });
         f.row(tr("Date format"), |ui| ui.add(line(&mut o.date_format).font(egui::TextStyle::Monospace).desired_width(200.0)));
         f.row(tr("Time format"), |ui| ui.add(line(&mut o.time_format).font(egui::TextStyle::Monospace).desired_width(200.0)));
         f.row(tr("Timestamp format"), |ui| ui.add(line(&mut o.datetime_format).font(egui::TextStyle::Monospace).desired_width(200.0)));
         f.row(tr("Number format"), |ui| opt_text(ui, &mut o.number_format, tr("General"), 200.0));
         f.row(tr("Integer format"), |ui| opt_text(ui, &mut o.integer_format, tr("General"), 200.0));
-        f.row(tr("Rows per sheet"), |ui| ui.add(egui::DragValue::new(&mut o.max_rows_per_sheet).range(1..=1_048_575)));
+        f.row(tr("Rows per sheet"), |ui| wizard::number(ui, &mut o.max_rows_per_sheet, 1..=1_048_575, 140.0));
     });
 }
 
 fn markdown_ui(ui: &mut Ui, id: u64, o: &mut MarkdownOptions) {
     opts(ui, id, "md", |f| {
-        f.row(tr("Numbers"), |ui| wizard::check(ui, &mut o.right_align_numbers, tr("Align right")));
-        f.row(tr("Pipes"), |ui| wizard::check(ui, &mut o.escape_pipes, tr("Escape | inside values")));
+        f.check_row(tr("Numbers"), |ui| wizard::check(ui, &mut o.right_align_numbers, tr("Align right")));
+        f.check_row(tr("Pipes"), |ui| wizard::check(ui, &mut o.escape_pipes, tr("Escape | inside values")));
         f.row(tr("Line breaks become"), |ui| ui.add(line(&mut o.line_break).font(egui::TextStyle::Monospace).desired_width(100.0)));
     });
 }
@@ -1242,8 +1261,8 @@ fn markdown_ui(ui: &mut Ui, id: u64, o: &mut MarkdownOptions) {
 fn html_ui(ui: &mut Ui, id: u64, o: &mut HtmlOptions) {
     opts(ui, id, "html", |f| {
         f.row(tr("Title"), |ui| opt_text(ui, &mut o.title, tr("name of the table"), 260.0));
-        f.row(tr("Style"), |ui| wizard::check(ui, &mut o.embed_css, tr("Embed a style sheet")));
-        f.row(tr("Header row"), |ui| wizard::check(ui, &mut o.header, tr("Write")));
+        f.check_row(tr("Style"), |ui| wizard::check(ui, &mut o.embed_css, tr("Embed a style sheet")));
+        f.check_row(tr("Header row"), |ui| wizard::check(ui, &mut o.header, tr("Write")));
     });
 }
 
@@ -1264,15 +1283,15 @@ fn xml_ui(ui: &mut Ui, id: u64, o: &mut XmlOptions) {
                 ],
             )
         });
-        f.row(tr("Document type"), |ui| wizard::check(ui, &mut o.include_dtd, tr("Include a DTD")));
-        f.row(tr("Indent"), |ui| wizard::check(ui, &mut o.indent, tr("Pretty print")));
+        f.check_row(tr("Document type"), |ui| wizard::check(ui, &mut o.include_dtd, tr("Include a DTD")));
+        f.check_row(tr("Indent"), |ui| wizard::check(ui, &mut o.indent, tr("Pretty print")));
     });
 }
 
 fn txt_ui(ui: &mut Ui, id: u64, o: &mut TxtOptions) {
     opts(ui, id, "txt", |f| {
-        f.row(tr("Borders"), |ui| wizard::check(ui, &mut o.borders, tr("Draw borders")));
-        f.row(tr("Header row"), |ui| wizard::check(ui, &mut o.header, tr("Write")));
+        f.check_row(tr("Borders"), |ui| wizard::check(ui, &mut o.borders, tr("Draw borders")));
+        f.check_row(tr("Header row"), |ui| wizard::check(ui, &mut o.header, tr("Write")));
         f.row(tr("Column width"), |ui| {
             wizard::muted(ui, tr("from"));
             ui.add(egui::DragValue::new(&mut o.min_column_width).range(1..=200));
@@ -1283,7 +1302,7 @@ fn txt_ui(ui: &mut Ui, id: u64, o: &mut TxtOptions) {
             wizard::check(ui, &mut o.show_nulls, tr("Show as"));
             ui.add_enabled(o.show_nulls, line(&mut o.null_text).desired_width(100.0));
         });
-        f.row(tr("Numbers"), |ui| wizard::check(ui, &mut o.right_align_numbers, tr("Align right")));
+        f.check_row(tr("Numbers"), |ui| wizard::check(ui, &mut o.right_align_numbers, tr("Align right")));
         f.row(tr("Rows measured for widths"), |ui| ui.add(egui::DragValue::new(&mut o.width_sample_rows).range(1..=100_000)));
     });
 }
@@ -1303,8 +1322,8 @@ fn dbunit_ui(ui: &mut Ui, id: u64, o: &mut DbUnitOptions) {
 fn php_ui(ui: &mut Ui, id: u64, o: &mut PhpOptions) {
     opts(ui, id, "php", |f| {
         f.row(tr("Variable name"), |ui| opt_text(ui, &mut o.variable_name, tr("name of the table"), 260.0));
-        f.row(tr("Arrays"), |ui| wizard::check(ui, &mut o.short_array_syntax, tr("Short syntax [ ]")));
-        f.row(tr("Opening tag"), |ui| wizard::check(ui, &mut o.open_tag, tr("Start with <?php")));
+        f.check_row(tr("Arrays"), |ui| wizard::check(ui, &mut o.short_array_syntax, tr("Short syntax [ ]")));
+        f.check_row(tr("Opening tag"), |ui| wizard::check(ui, &mut o.open_tag, tr("Start with <?php")));
     });
 }
 
@@ -1368,7 +1387,7 @@ fn common_ui(ui: &mut Ui, id: u64, o: &mut ExportOptions, format: ExportFormat) 
             });
         }
         f.row(tr("Rows fetched per batch"), |ui| ui.add(egui::DragValue::new(&mut o.fetch_size).range(1..=100_000)));
-        f.row(tr("After a failure"), |ui| wizard::check(ui, &mut o.keep_partial_file, tr("Keep the partially written file")));
+        f.check_row(tr("After a failure"), |ui| wizard::check(ui, &mut o.keep_partial_file, tr("Keep the partially written file")));
     });
 }
 
@@ -1378,12 +1397,15 @@ impl TabView for ExportTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(940.0, 660.0))
+        Some(wizard::WINDOW)
     }
 
     fn title(&self) -> String {
-        let subject = self.subject();
-        if subject.is_empty() { tr("Export data").to_string() } else { trf("Export {}", &[&subject]) }
+        // As in the design: "Export data" for tables and queries, the result's name for rows.
+        match &self.fetched {
+            Some(f) => trf("Export {}", &[&f.title]),
+            None => tr("Export data").to_string(),
+        }
     }
 
     fn icon(&self) -> &'static str {

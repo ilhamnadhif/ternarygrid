@@ -168,7 +168,8 @@ pub fn show_query_builder(
     if state.show_toolbar {
         toolbar(ui, model, &sql_now, &mut events);
     }
-    let bottom = (ui.available_height() - 300.0).max(240.0);
+    // The canvas 270 high as in the design.
+    let bottom = (ui.available_height() - 270.0).max(240.0);
     egui::Panel::bottom(id.with("bottom"))
         .resizable(true)
         .default_size(bottom)

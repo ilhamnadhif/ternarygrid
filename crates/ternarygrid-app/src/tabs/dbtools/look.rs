@@ -4,6 +4,7 @@
 //! tool window footers, coloured tables, command and log blocks, chips and
 //! collapsible cards. Built on the tokens and parts of `ternarygrid_ui`.
 
+use crate::tabs::transfer::wizard::W;
 use crate::widgets::TableResponse;
 use egui::text::LayoutJob;
 use egui::{
@@ -69,45 +70,71 @@ pub(crate) fn mono(size: f32) -> FontId {
     FontId::monospace(size)
 }
 
-// ---------------------------------------------------------------------------------------------
-// Check boxes, radio buttons, buttons
-// ---------------------------------------------------------------------------------------------
+// The design's table colours that the kit's palette does not have (`line`, `stripe`, `sel`
+// and `modified` of the mockups' palette).
 
-/// A check box drawn like the mockups: an accent box with a white check when on.
-pub(crate) fn checkbox(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
-    let p = style::pal(ui);
+/// The hairline under a table row.
+pub(crate) fn line(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode { Color32::from_rgb(0x33, 0x35, 0x3e) } else { Color32::from_rgb(0xed, 0xed, 0xf2) }
+}
+
+/// The fill of every other table row.
+pub(crate) fn stripe(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode { Color32::from_rgb(0x26, 0x28, 0x30) } else { Color32::from_rgb(0xfa, 0xfa, 0xfb) }
+}
+
+/// The fill of a selected table row.
+pub(crate) fn selected_row(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode { Color32::from_rgb(0x22, 0x44, 0x44) } else { Color32::from_rgb(0xd4, 0xe7, 0xe4) }
+}
+
+/// The fill of the current line (the debugger's).
+pub(crate) fn current_line(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode { Color32::from_rgb(0x4b, 0x44, 0x3b) } else { Color32::from_rgb(0xf3, 0xea, 0xd6) }
+}
+
+/// The check box of a table cell: 15 px, radius 4, the accent with a white check when on.
+pub(crate) fn cell_check(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let enabled = ui.is_enabled();
-    let galley = (!label.is_empty()).then(|| ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(style::body_size(ui.ctx())), Color32::PLACEHOLDER));
-    let w = 16.0 + galley.as_ref().map_or(0.0, |g| g.size().x + 8.0);
-    let h = galley.as_ref().map_or(16.0, |g| g.size().y).max(20.0);
-    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::click());
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
     }
     resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, *on, label));
     if ui.is_rect_visible(rect) {
-        let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
-        let b = Rect::from_center_size(pos2(rect.left() + 8.0, rect.center().y), Vec2::splat(16.0));
-        let painter = ui.painter();
-        if *on {
-            painter.rect_filled(b, CornerRadius::same(4), fade(p.accent));
-            let c = b.center();
-            let pts = vec![pos2(c.x - 3.6, c.y + 0.2), pos2(c.x - 1.0, c.y + 2.8), pos2(c.x + 3.8, c.y - 2.6)];
-            painter.add(egui::Shape::line(pts, Stroke::new(2.0, fade(Color32::WHITE))));
-        } else {
-            let border = if enabled && resp.hovered() { p.accent } else { p.border_strong };
-            painter.rect(b, CornerRadius::same(4), p.surface, Stroke::new(1.5, fade(border)), StrokeKind::Inside);
-        }
+        paint_check(ui, rect, *on, enabled && resp.hovered(), enabled);
         if resp.has_focus() {
-            style::focus_halo(ui, b, 4);
-        }
-        if let Some(g) = galley {
-            let pos = pos2(b.right() + 8.0, rect.center().y - g.size().y / 2.0);
-            ui.painter().galley(pos, g, fade(p.text));
+            style::focus_halo(ui, rect, 4);
         }
     }
     resp
+}
+
+/// A check box's box in `b` (the check scaled to it, as the design's 24 px check icon).
+fn paint_check(ui: &Ui, b: Rect, on: bool, hovered: bool, enabled: bool) {
+    let p = style::pal(ui);
+    let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(b, CornerRadius::same(4), fade(if hovered { p.accent_hover } else { p.accent }));
+        // The icon is 2/3 of the box; its path is M5.5 12.5 l4.2 4.2 L18.5 8 on 24 units.
+        let k = b.width() * 2.0 / 3.0 / 24.0;
+        let c = b.center();
+        let pts = vec![pos2(c.x - 6.5 * k, c.y + 0.5 * k), pos2(c.x - 2.3 * k, c.y + 4.7 * k), pos2(c.x + 6.5 * k, c.y - 4.0 * k)];
+        painter.add(egui::Shape::line(pts, Stroke::new(2.8 * k, fade(Color32::WHITE))));
+    } else {
+        painter.rect(b, CornerRadius::same(4), p.surface, Stroke::new(1.5, fade(if hovered { p.accent } else { p.border_strong })), StrokeKind::Inside);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Check boxes, radio buttons, buttons
+// ---------------------------------------------------------------------------------------------
+
+/// A check box of the design (the kit's).
+pub(crate) fn checkbox(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
+    kit::checkbox(ui, on, label)
 }
 
 /// A radio button drawn like the mockups (an accent ring with a dot). Returns its response;
@@ -206,22 +233,14 @@ pub(crate) fn conn_title(ui: &mut Ui, name: &str, facts: Option<&str>) {
     });
 }
 
-/// A rounded chip on the subtle fill (objects of a tool).
-pub(crate) fn chip(ui: &mut Ui, glyph: Option<&str>, text: &str) -> Response {
+/// A pill on the subtle fill (the objects of a tool): 18 high, 11 px semibold.
+pub(crate) fn chip(ui: &mut Ui, text: &str) -> Response {
     let p = style::pal(ui);
-    let g = ui.painter().layout_no_wrap(text.to_string(), style::medium(ui.ctx(), 11.5), p.text);
-    let ig = glyph.map(|i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(12.0), p.text_muted));
-    let iw = ig.as_ref().map_or(0.0, |g| g.size().x + 5.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + iw + 16.0, 20.0), Sense::hover());
+    let g = ui.painter().layout_no_wrap(text.to_string(), style::semibold(ui.ctx(), 11.0), p.text);
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 14.0, 18.0), Sense::hover());
     if ui.is_rect_visible(rect) {
-        ui.painter().rect_filled(rect, CornerRadius::same(10), p.subtle);
-        let mut x = rect.left() + 8.0;
-        if let Some(ig) = ig {
-            let w = ig.size().x;
-            ui.painter().galley(pos2(x, rect.center().y - ig.size().y / 2.0), ig, p.text_muted);
-            x += w + 5.0;
-        }
-        ui.painter().galley(pos2(x, rect.center().y - g.size().y / 2.0), g, p.text);
+        ui.painter().rect_filled(rect, CornerRadius::same(9), p.subtle);
+        ui.painter().galley(pos2(rect.left() + 7.0, rect.center().y - g.size().y / 2.0), g, p.text);
     }
     resp
 }
@@ -289,9 +308,13 @@ pub(crate) fn collapsible_card(ui: &mut Ui, open: &mut bool, title: &str, summar
         .corner_radius(CornerRadius::same(style::RADIUS_LG))
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
+            // The head as high as its text (the body keeps the controls' height).
+            let control_h = ui.spacing().interact_size.y;
+            ui.spacing_mut().interact_size.y = 0.0;
             let head = ui
                 .horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.spacing_mut().interact_size.y = control_h;
                     let chevron = if *open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
                     ui.label(RichText::new(chevron).font(style::icon_font(12.0)).color(p.text_faint));
                     ui.label(RichText::new(title).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
@@ -300,6 +323,7 @@ pub(crate) fn collapsible_card(ui: &mut Ui, open: &mut bool, title: &str, summar
                     }
                 })
                 .response;
+            ui.spacing_mut().interact_size.y = control_h;
             let head = ui.interact(head.rect, ui.id().with(("card_head", title)), Sense::click());
             head.widget_info(|| WidgetInfo::selected(WidgetType::CollapsingHeader, true, *open, title));
             if head.hovered() {
@@ -382,25 +406,32 @@ pub(crate) fn row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&m
 /// A form row whose controls are stacked (check boxes): the label at their top.
 pub(crate) fn row_top<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let p = style::pal(ui);
-    ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(vec2(label_w, 20.0), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_min_width(label_w);
-            ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
-        });
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
-            add(ui)
+    // As in the design: the label 6 below the top of the first control (a 22 px row).
+    let control_h = ui.spacing().interact_size.y;
+    ui.spacing_mut().interact_size.y = 0.0;
+    let out = ui
+        .horizontal_top(|ui| {
+            ui.spacing_mut().interact_size.y = control_h;
+            let (rect, _) = ui.allocate_exact_size(vec2(label_w, 22.0), Sense::hover());
+            let at = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(label_w, 16.0));
+            // A child ui: the cursor stays after the label column.
+            ui.new_child(egui::UiBuilder::new().max_rect(at).layout(Layout::left_to_right(Align::Min))).add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                add(ui)
+            })
+            .inner
         })
-        .inner
-    })
-    .inner
+        .inner;
+    ui.spacing_mut().interact_size.y = control_h;
+    out
 }
 
 /// A single-line text field filling `width` (`f32::INFINITY`: the rest of the row).
 pub(crate) fn field(ui: &mut Ui, value: &mut String, hint: &str, width: f32, mono_font: bool) -> Response {
     let p = style::pal(ui);
     let w = if width.is_finite() { width } else { ui.available_width() };
-    let mut edit = egui::TextEdit::singleline(value).desired_width(w).hint_text(RichText::new(hint).color(p.text_faint)).margin(Margin::symmetric(8, 5));
+    let mut edit = crate::tabs::transfer::wizard::fit(egui::TextEdit::singleline(value), style::CONTROL_H).desired_width(w).hint_text(RichText::new(hint).color(p.text_faint));
     if mono_font {
         edit = edit.font(mono(12.5));
     }
@@ -501,40 +532,70 @@ fn paint_cell(ui: &mut Ui, c: &Cell, header: bool) {
     }
 }
 
-/// A bordered table of styled cells like the mockups' (header on the header colour, striped
-/// rows, resizable columns, the last column takes the rest).
+/// A bordered table of styled cells like the mockups' (a 32 px header on the header colour,
+/// striped rows 30 high with a hairline under each, resizable columns, the last column takes
+/// the rest); the column widths come from the content.
 pub(crate) fn table(ui: &mut Ui, id: impl Hash + std::fmt::Debug, headers: &[Cell], rows: &[Vec<Cell>], selected: Option<usize>) -> TableResponse {
-    table_dyn(ui, Id::new(id), headers, rows, selected)
+    table_dyn(ui, Id::new(id), headers, rows, selected, &[])
 }
 
-fn table_dyn(ui: &mut Ui, id: Id, headers: &[Cell], rows: &[Vec<Cell>], selected: Option<usize>) -> TableResponse {
+/// [`table`] with the design's column widths (points or shares of the rest).
+pub(crate) fn table_w(ui: &mut Ui, id: impl Hash + std::fmt::Debug, headers: &[Cell], rows: &[Vec<Cell>], selected: Option<usize>, widths: &[W]) -> TableResponse {
+    table_dyn(ui, Id::new(id), headers, rows, selected, widths)
+}
+
+/// The widths of `headers` from their content (at most 420; the columns before the last
+/// shrink so the last one keeps 160).
+fn content_widths(ui: &Ui, headers: &[Cell], rows: &[Vec<Cell>]) -> Vec<f32> {
+    let mut widths: Vec<f32> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let head = cell_width(ui, &Cell { mono: false, ..h.clone() }) + 2.0 * CELL_PAD + 4.0;
+            let content = rows.iter().take(100).filter_map(|r| r.get(i)).map(|c| cell_width(ui, c)).fold(0.0, f32::max) + 2.0 * CELL_PAD + 4.0;
+            head.max(content).clamp(head.max(44.0), 420.0)
+        })
+        .collect();
+    if let Some((_, first)) = widths.split_last_mut() {
+        let room = (ui.available_width() - 160.0).max(first.len() as f32 * 40.0);
+        let used: f32 = first.iter().sum();
+        if used > room {
+            let k = room / used;
+            for w in first.iter_mut() {
+                *w = (*w * k).max(40.0);
+            }
+        }
+    }
+    widths
+}
+
+/// The widths of the design's columns in `avail` points.
+fn spec_widths(widths: &[W], avail: f32) -> Vec<f32> {
+    let fixed: f32 = widths.iter().map(|w| if let W::Px(p) = w { *p } else { 0.0 }).sum();
+    let fr: f32 = widths.iter().map(|w| if let W::Fr(f) = w { *f } else { 0.0 }).sum();
+    let rest = (avail - fixed).max(0.0);
+    widths
+        .iter()
+        .map(|w| match w {
+            W::Px(p) => *p,
+            W::Fr(f) => (rest * f / fr.max(f32::EPSILON)).max(40.0),
+            W::Min(m) => *m,
+        })
+        .collect()
+}
+
+fn table_dyn(ui: &mut Ui, id: Id, headers: &[Cell], rows: &[Vec<Cell>], selected: Option<usize>, spec: &[W]) -> TableResponse {
     let mut out = TableResponse::default();
+    let (stripe, line, sel) = (stripe(ui), line(ui), selected_row(ui));
     parts::bordered(ui).show(ui, |ui| {
         ui.scope(|ui| {
             let p = style::pal(ui);
-            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 13.0;
-            let widths: Vec<f32> = headers
-                .iter()
-                .enumerate()
-                .map(|(i, h)| {
-                    let head = cell_width(ui, &Cell { mono: false, ..h.clone() }) + 2.0 * CELL_PAD + 4.0;
-                    let content = rows.iter().take(100).filter_map(|r| r.get(i)).map(|c| cell_width(ui, c)).fold(0.0, f32::max) + 2.0 * CELL_PAD + 4.0;
-                    head.max(content).clamp(head.max(44.0), 420.0)
-                })
-                .collect();
-            // The columns before the last share the width the last one leaves (it takes the
-            // rest, at least 160): shrunk to fit, they can be widened again.
-            let mut widths = widths;
-            if let Some((_, first)) = widths.split_last_mut() {
-                let room = (ui.available_width() - 160.0 - first.len() as f32 * 8.0).max(first.len() as f32 * 40.0);
-                let used: f32 = first.iter().sum();
-                if used > room {
-                    let k = room / used;
-                    for w in first.iter_mut() {
-                        *w = (*w * k).max(40.0);
-                    }
-                }
-            }
+            // The cells touch (their hairlines join), the column lines show while resizing only.
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            ui.visuals_mut().faint_bg_color = stripe;
+            ui.visuals_mut().selection.bg_fill = sel;
+            ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
+            let widths = if spec.len() == headers.len() { spec_widths(spec, ui.available_width()) } else { content_widths(ui, headers, rows) };
             let mut tb =
                 TableBuilder::new(ui).id_salt(id).striped(true).resizable(true).sense(Sense::click()).auto_shrink([false, true]).cell_layout(Layout::left_to_right(Align::Center));
             for (i, w) in widths.iter().enumerate() {
@@ -544,21 +605,27 @@ fn table_dyn(ui: &mut Ui, id: Id, headers: &[Cell], rows: &[Vec<Cell>], selected
                     tb.column(Column::initial(*w).at_least(40.0).clip(true).resizable(true))
                 };
             }
-            tb.header(row_h + 2.0, |mut header| {
+            tb.header(33.0, |mut header| {
                 for h in headers {
                     header.col(|ui| {
-                        ui.painter().rect_filled(ui.max_rect().expand2(vec2(4.0, 0.0)), 0.0, p.header);
+                        let r = ui.max_rect();
+                        ui.painter().rect_filled(r, 0.0, p.header);
+                        ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.border));
                         paint_cell(ui, h, true);
                     });
                 }
             })
             .body(|body| {
-                body.rows(row_h, rows.len(), |mut row| {
+                body.rows(31.0, rows.len(), |mut row| {
                     let i = row.index();
                     row.set_selected(selected == Some(i));
                     if let Some(cells) = rows.get(i) {
                         for c in cells.iter().take(headers.len()) {
-                            row.col(|ui| paint_cell(ui, c, false));
+                            row.col(|ui| {
+                                let r = ui.max_rect();
+                                ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, line));
+                                paint_cell(ui, c, false);
+                            });
                         }
                     }
                     let resp = row.response();
@@ -590,27 +657,38 @@ pub(crate) fn widget_table(ui: &mut Ui, id: impl Hash + std::fmt::Debug, names: 
 }
 
 fn widget_table_dyn(ui: &mut Ui, id: Id, names: &[&str], widths: &[f32], rows: usize, row_h: f32, cell: &mut dyn FnMut(&mut Ui, usize, usize)) {
+    let (stripe, line) = (stripe(ui), line(ui));
     parts::bordered(ui).show(ui, |ui| {
         ui.scope(|ui| {
             let p = style::pal(ui);
+            // As [`table`]: the cells touch, a hairline under the header and every row.
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            ui.spacing_mut().interact_size.y = (row_h - 4.0).min(26.0);
+            ui.visuals_mut().faint_bg_color = stripe;
+            ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
             let mut tb = TableBuilder::new(ui).id_salt(id).striped(true).auto_shrink([false, true]).vscroll(false).cell_layout(Layout::left_to_right(Align::Center));
             for (i, w) in widths.iter().enumerate() {
                 tb = if i + 1 == widths.len() { tb.column(Column::remainder().at_least(*w).clip(true)) } else { tb.column(Column::exact(*w).clip(true)) };
             }
-            tb.header(32.0, |mut header| {
+            tb.header(33.0, |mut header| {
                 for n in names {
                     header.col(|ui| {
-                        ui.painter().rect_filled(ui.max_rect().expand2(vec2(4.0, 0.0)), 0.0, p.header);
+                        let r = ui.max_rect();
+                        ui.painter().rect_filled(r, 0.0, p.header);
+                        ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.border));
                         paint_cell(ui, &Cell::new(*n), true);
                     });
                 }
             })
             .body(|mut body| {
                 for r in 0..rows {
-                    body.row(row_h, |mut row| {
+                    body.row(row_h + 1.0, |mut row| {
                         for c in 0..widths.len() {
                             row.col(|ui| {
-                                ui.add_space(8.0);
+                                let rect = ui.max_rect();
+                                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, line));
+                                ui.add_space(CELL_PAD);
+                                ui.spacing_mut().item_spacing.x = 6.0;
                                 cell(ui, r, c);
                             });
                         }

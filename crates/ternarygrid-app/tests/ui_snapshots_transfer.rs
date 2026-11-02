@@ -25,7 +25,7 @@ use ternarygrid_app::conn::{ConnectionManager, DirectNet, MemorySecrets};
 use ternarygrid_app::services::{Services, Settings};
 use ternarygrid_app::tabs::transfer::{ExportTab, ImportTab, MigrationTab, MockDataTab, ResultSource};
 use ternarygrid_config::settings::Theme;
-use ternarygrid_core::meta::{ObjectKind, ObjectRef, SchemaRef};
+use ternarygrid_core::meta::{ObjectRef, SchemaRef};
 use ternarygrid_core::{ColumnMeta, DataKind, Value};
 use ternarygrid_transfer::{ExportFormat, GeneratorKind, ImportMode, MigrationMode, OnError};
 
@@ -158,7 +158,7 @@ impl Shots {
         let services = Services::ephemeral(&home.join("home"));
         let conns = ConnectionManager::new(ternarygrid_app::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
         let h = Harness::builder()
-            .with_size(egui::vec2(1400.0, 900.0))
+            .with_size(egui::vec2(1440.0, 900.0))
             .with_pixels_per_point(PPP)
             .with_max_steps(400)
             .with_step_dt(1.0 / 60.0)
@@ -242,15 +242,51 @@ fn table(name: &str) -> ObjectRef {
     ObjectRef::table(Some("main".into()), name)
 }
 
+/// Run statements on the connection's main session (then refresh its metadata).
+fn run_sql(s: &mut Shots, conn: &str, stmts: &[&str]) {
+    let backend = s.h.state().backend.clone();
+    let session = s.h.state().conns.live(conn).unwrap().main.clone();
+    let stmts: Vec<String> = stmts.iter().map(|s| s.to_string()).collect();
+    backend
+        .block_on(async move {
+            for st in stmts {
+                session.execute_update(&st, &[]).await?;
+            }
+            Ok::<(), ternarygrid_core::DbError>(())
+        })
+        .unwrap();
+    s.h.state_mut().push_command(AppCommand::RefreshMetadata { connection: conn.to_string(), object: None, schema: None });
+    s.frames(20);
+}
+
+/// Tables named like the design's (orders, payments, shipment, a view of open orders) and a
+/// large one that keeps a run going for a screenshot.
+const DESIGN_TABLES: &[&str] = &[
+    "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customer(id), status TEXT NOT NULL, total NUMERIC(10,2) NOT NULL, \
+     created_at TIMESTAMP NOT NULL, note TEXT, internal_ref UUID UNIQUE)",
+    "INSERT INTO orders (customer_id, status, total, created_at, note) SELECT 1 + (n % 5), CASE n % 3 WHEN 0 THEN 'open' WHEN 1 THEN 'shipped' ELSE 'delivered' END, \
+     n * 1.25, datetime('now', '-' || (n % 60) || ' days'), NULL FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 480) SELECT n FROM c)",
+    "CREATE TABLE payments (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, amount NUMERIC(10,2) NOT NULL)",
+    "CREATE TABLE shipment (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, shipped_at TIMESTAMP)",
+    "CREATE VIEW v_open_orders AS SELECT * FROM orders WHERE status = 'open'",
+    "CREATE TABLE order_archive AS WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 600000) \
+     SELECT n AS id, 'order ' || n AS name, n * 1.5 AS total, datetime('now') AS created_at FROM c",
+];
+
 #[test]
 #[ignore = "writes screenshots of the transfer wizards for visual review; run with --ignored"]
 fn transfer_snapshots() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots/transfer");
     std::fs::create_dir_all(&root).unwrap();
+    let only = std::env::var("TERNARYGRID_SNAPSHOT_THEME").ok();
     for theme in [Theme::Dark, Theme::Light] {
+        if only.as_deref().is_some_and(|o| o != if theme == Theme::Dark { "dark" } else { "light" }) {
+            continue;
+        }
         let home = std::env::temp_dir().join(format!("ternarygrid-transfer-shots-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&home).unwrap();
-        let out = home.join("exports");
+        // A short folder, like the design's ~/Downloads/exports.
+        let out = PathBuf::from(format!("/tmp/exports-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]));
         std::fs::create_dir_all(&out).unwrap();
         let mut s = Shots::new(&home, root.clone(), theme);
         {
@@ -263,10 +299,19 @@ fn transfer_snapshots() {
         });
         let conn = s.h.state().conns.configs()[0].id.clone();
 
+        run_sql(&mut s, &conn, DESIGN_TABLES);
+        // The table behind the wizards, as in the design.
+        s.h.state_mut().push_command(AppCommand::OpenObject { connection: conn.clone(), object: table("orders"), page: ternarygrid_app::command::ObjectPage::Data });
+        s.frames(40);
+
         // ------------------------------------------------------------------ export
-        let view = ObjectRef::new(ObjectKind::View, Some("main".into()), "order_total");
-        s.h.state_mut().push_command(AppCommand::OpenExport { connection: conn.clone(), objects: vec![table("customer"), table("order_line"), view], sql: None });
+        s.h.state_mut().push_command(AppCommand::OpenExport { connection: conn.clone(), objects: vec![table("orders"), table("order_line")], sql: None });
         s.frames(30);
+        {
+            let tab = popup::<ExportTab>(&mut s.h);
+            tab.set_filter("orders", "created_at > datetime('now', '-30 days')");
+            tab.add_query("revenue_per_customer", "select c.name, sum(o.total) as revenue from customer c join orders o on o.customer_id = c.id group by c.name");
+        }
         s.wait("the tables to add", |h| has(h, "Add all shown"));
         s.shot("export_1_source");
         popup::<ExportTab>(&mut s.h).set_page(1);
@@ -294,6 +339,29 @@ fn transfer_snapshots() {
         s.shot("export_save_task");
         s.h.key_press(egui::Key::Escape);
         s.frames(30);
+        // A large table: the run is still going when the screenshot is taken.
+        {
+            let tab = popup::<ExportTab>(&mut s.h);
+            tab.add_table(table("order_archive"));
+            tab.settings_mut().count_rows = true;
+            tab.settings_mut().threads = 1;
+        }
+        click(&mut s, "Run export");
+        s.frames(40);
+        if has_popup::<ExportTab>(&mut s.h) && popup::<ExportTab>(&mut s.h).is_running() {
+            s.shot("export_4_running");
+            popup::<ExportTab>(&mut s.h).cancel();
+            s.wait("the cancelled export", |h| !has_popup::<ExportTab>(h) || !popup::<ExportTab>(h).is_running());
+        }
+        close_popups(&mut s);
+        s.h.state_mut().push_command(AppCommand::OpenExport { connection: conn.clone(), objects: vec![table("orders"), table("order_line")], sql: None });
+        s.frames(30);
+        {
+            let tab = popup::<ExportTab>(&mut s.h);
+            tab.add_query("revenue_per_customer", "select c.name, sum(o.total) as revenue from customer c join orders o on o.customer_id = c.id group by c.name");
+            tab.settings_mut().output_folder = out.clone();
+            tab.set_page(3);
+        }
         // One object fails: the summary stays with its results.
         popup::<ExportTab>(&mut s.h).add_table(table("no_such_table"));
         click(&mut s, "Run export");
@@ -306,10 +374,10 @@ fn transfer_snapshots() {
 
         // Rows of a result grid.
         let store = ternarygrid_core::RowStore::shared(1 << 20);
-        store.lock().extend((0..20).map(|i| vec![Value::Int(i), Value::text(format!("customer {i}"))]));
+        store.lock().extend((0..200).map(|i| vec![Value::Int(i), Value::text(format!("order {i}"))]));
         let columns = vec![ColumnMeta::new("id", "int", DataKind::Int), ColumnMeta::new("name", "text", DataKind::Text)];
-        let sql = "select * from customer where city = 'Bandung' order by name".to_string();
-        let mut rows = ExportTab::from_result(conn.clone(), "customer_bandung".into(), None, store, columns, Some(vec![1, 2, 3]), Vec::new(), Some(sql));
+        let sql = "select * from orders where status = 'open' order by created_at desc".to_string();
+        let mut rows = ExportTab::from_result(conn.clone(), "orders_open".into(), None, store, columns, Some((0..14).collect()), Vec::new(), Some(sql));
         rows.set_result_source(ResultSource::Query);
         s.h.state_mut().open_tab(Box::new(rows));
         s.frames(30);
@@ -372,16 +440,13 @@ fn transfer_snapshots() {
         close_popups(&mut s);
 
         // --------------------------------------------------------------- migration
-        s.h.state_mut().push_command(AppCommand::OpenMigration { connection: conn.clone(), objects: vec![table("customer"), table("product"), table("category")] });
+        s.h.state_mut().push_command(AppCommand::OpenMigration { connection: conn.clone(), objects: vec![table("orders"), table("order_line"), table("customer")] });
         s.frames(30);
         s.wait("the tables to add", |h| has(h, "Add all shown"));
         s.shot("migration_1_source");
         {
             let tab = popup::<MigrationTab>(&mut s.h);
             tab.set_target(conn.clone(), None);
-            for t in ["customer", "product", "category"] {
-                tab.set_target_name(t, &format!("{t}_copy"));
-            }
             tab.set_page(1);
         }
         s.frames(10);
@@ -392,6 +457,12 @@ fn transfer_snapshots() {
         popup::<MigrationTab>(&mut s.h).set_page(3);
         s.frames(3);
         s.shot("migration_4_options");
+        {
+            let tab = popup::<MigrationTab>(&mut s.h);
+            for t in ["orders", "order_line", "customer"] {
+                tab.set_target_name(t, &format!("{t}_copy"));
+            }
+        }
         popup::<MigrationTab>(&mut s.h).options_mut().mode = MigrationMode::DropAndCreate;
         popup::<MigrationTab>(&mut s.h).set_page(4);
         s.frames(3);
@@ -400,12 +471,12 @@ fn transfer_snapshots() {
         s.shot("migration_confirm");
         s.h.key_press(egui::Key::Escape);
         s.frames(30);
-        // category into the existing product table fails (its NOT NULL columns): the result stays.
+        // customer into the existing orders table fails (its NOT NULL columns): the result stays.
         {
             let tab = popup::<MigrationTab>(&mut s.h);
             tab.options_mut().mode = MigrationMode::Append;
             tab.options_mut().continue_on_table_error = true;
-            tab.set_target_name("category", "product");
+            tab.set_target_name("customer", "orders");
         }
         s.frames(2);
         click(&mut s, "Run migration");
@@ -415,11 +486,37 @@ fn transfer_snapshots() {
             s.shot("migration_5_done");
         }
         close_popups(&mut s);
+        // A large table: the run is still going when the screenshot is taken.
+        s.h.state_mut().push_command(AppCommand::OpenMigration { connection: conn.clone(), objects: vec![table("customer"), table("order_archive"), table("order_line")] });
+        s.frames(30);
+        {
+            let tab = popup::<MigrationTab>(&mut s.h);
+            tab.set_target(conn.clone(), None);
+            for t in ["customer", "order_archive", "order_line"] {
+                tab.set_target_name(t, &format!("{t}_run"));
+            }
+            tab.set_page(4);
+        }
+        s.frames(3);
+        click(&mut s, "Run migration");
+        s.frames(40);
+        if has_popup::<MigrationTab>(&mut s.h) && popup::<MigrationTab>(&mut s.h).is_running() {
+            s.shot("migration_running");
+            popup::<MigrationTab>(&mut s.h).cancel();
+            s.wait("the cancelled migration", |h| !has_popup::<MigrationTab>(h) || !popup::<MigrationTab>(h).is_running());
+        }
+        close_popups(&mut s);
 
         // --------------------------------------------------------------- mock data
-        s.h.state_mut().push_command(AppCommand::OpenMockData { connection: conn.clone(), table: table("product") });
+        s.h.state_mut().push_command(AppCommand::OpenMockData { connection: conn.clone(), table: table("orders") });
         s.frames(30);
         s.wait("the table definition", |h| popup::<MockDataTab>(h).definition_loaded());
+        {
+            let tab = popup::<MockDataTab>(&mut s.h);
+            tab.config_mut().rows = 10_000;
+            tab.config_mut().batch_size = 1_000;
+            tab.config_mut().on_error = OnError::SkipRow;
+        }
         s.frames(3);
         s.shot("mock_1_settings");
         // Many rows: the run is still going when the screenshot is taken.
@@ -464,5 +561,6 @@ fn transfer_snapshots() {
 
         drop(s);
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&out);
     }
 }

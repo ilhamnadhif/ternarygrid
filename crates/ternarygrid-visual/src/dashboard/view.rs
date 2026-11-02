@@ -251,6 +251,32 @@ fn metric_color(m: &MetricHistory, p: &style::Palette) -> Color32 {
     }
 }
 
+/// A count as in the design: whole numbers with thousands separators ("48,900"), one decimal
+/// below 10 ("1.6", "0").
+fn count_text(v: f64) -> String {
+    if v.abs() < 10.0 {
+        let r = (v * 10.0).round() / 10.0;
+        return if r.fract() == 0.0 {
+            format!("{r:.0}")
+        } else {
+            format!("{r:.1}")
+        };
+    }
+    let n = v.round().abs() as u64;
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3 + 1);
+    if v < 0.0 {
+        out.push('-');
+    }
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// A value with its unit split for display ("1.2K", "/s").
 fn split_unit(text: &str) -> (String, String) {
     let end = text
@@ -293,6 +319,14 @@ fn metric_card(ui: &mut Ui, m: &MetricHistory, now: f64, window: f64, width: f32
     // label, value and unit
     let current = m.window(now - window, now).last().map(|(_, v)| v);
     let (value, unit) = match current {
+        Some(c) if m.unit.is_empty() => (
+            count_text(c),
+            if rate {
+                "/s".to_string()
+            } else {
+                String::new()
+            },
+        ),
         Some(c) => split_unit(&with_unit(c, &m.unit, rate)),
         None => ("–".to_string(), String::new()),
     };
@@ -300,7 +334,7 @@ fn metric_card(ui: &mut Ui, m: &MetricHistory, now: f64, window: f64, width: f32
     let unit_w = if unit.is_empty() {
         0.0
     } else {
-        unit_g.size().x + 4.0
+        unit_g.size().x + 8.0
     };
     painter.galley(
         pos2(

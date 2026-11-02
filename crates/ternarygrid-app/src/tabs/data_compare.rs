@@ -18,6 +18,7 @@ use crate::cx::AppContext;
 use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
 use crate::tabs::dbtools::look::{self, Cell};
+use crate::tabs::transfer::wizard::W;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use parking_lot::Mutex;
@@ -519,10 +520,9 @@ impl DataCompareTab {
         }
         ui.add_space(6.0);
         let p = ternarygrid_ui::pal(ui);
-        let filter = egui::TextEdit::singleline(&mut side.filter)
-            .hint_text(RichText::new(tr("WHERE filter (optional)")).color(p.text_faint))
+        let filter = crate::tabs::transfer::wizard::fit(egui::TextEdit::singleline(&mut side.filter), 28.0)
+            .hint_text(RichText::new(tr("WHERE filter (optional)")).font(look::mono(12.5)).color(p.text_faint))
             .font(look::mono(12.5))
-            .margin(egui::Margin::symmetric(8, 5))
             .desired_width(ui.available_width().max(160.0))
             .id_salt(("dc_filter", uid, tag));
         ui.add(filter);
@@ -896,6 +896,20 @@ impl DataCompareTab {
             }
         };
         let is_null = |v: Option<&Value>| v.is_some_and(|v| v.is_null());
+        // The design's widths: the difference 120, the keys 70, the values by their length.
+        let mut widths = vec![W::Px(120.0)];
+        widths.extend(o.layout.keys.iter().map(|_| W::Px(70.0)));
+        for (j, name) in o.layout.columns.iter().enumerate() {
+            let longest = rows
+                .iter()
+                .take(50)
+                .flat_map(|s| [s.source.as_ref(), s.target.as_ref()])
+                .flatten()
+                .filter_map(|r| r.get(nk + j))
+                .map(|v| text_of(Some(v)).chars().count())
+                .fold(name.chars().count(), usize::max);
+            widths.push(W::Fr((longest as f32 / 14.0).clamp(1.0, 1.6)));
+        }
         let mut headers = vec![Cell::new(tr("Difference"))];
         headers.extend(o.layout.keys.iter().map(|k| Cell::new(k.clone()).glyph(icon::KEY, p.warn)));
         headers.extend(o.layout.columns.iter().zip(&o.layout.target_columns).map(|(c, t)| Cell::new(if c == t { c.clone() } else { format!("{c} → {t}") })));
@@ -921,7 +935,7 @@ impl DataCompareTab {
                 row
             })
             .collect();
-        look::table(ui, ("dc_rows", self.uid), &headers, &cells, None);
+        look::table_w(ui, ("dc_rows", self.uid), &headers, &cells, None, &widths);
     }
 
     fn script_ui(&mut self, ui: &mut Ui) {
@@ -1082,7 +1096,7 @@ impl TabView for DataCompareTab {
     }
 
     fn icon(&self) -> &'static str {
-        icon::GIT_DIFF
+        icon::ARROWS_DOWN_UP
     }
 
     fn tooltip(&self) -> Option<String> {
@@ -1099,7 +1113,8 @@ impl TabView for DataCompareTab {
         let p = ternarygrid_ui::pal(ui);
         ui.spacing_mut().item_spacing.y = 0.0;
         egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
-            egui::Grid::new(("dc_sides", self.uid)).num_columns(2).spacing([12.0, 8.0]).min_col_width(58.0).show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = 28.0;
+            egui::Grid::new(("dc_sides", self.uid)).num_columns(2).spacing([12.0, 8.0]).min_col_width(70.0).show(ui, |ui| {
                 look::muted(ui, tr("Source"));
                 ui.horizontal(|ui| self.side_ui(ui, cx, false));
                 ui.end_row();
@@ -1131,14 +1146,13 @@ impl TabView for DataCompareTab {
                 self.options_ui(ui);
             });
         });
-        ternarygrid_ui::parts::hline(ui);
         let busy = self.run.is_some() || self.apply_job.is_some();
         ternarygrid_ui::parts::toolbar(ui, |ui| {
             let ready = src.is_some() && dst.is_some() && !self.keys.is_empty();
-            if ui.add_enabled_ui(ready && !busy && !self.start_requested, |ui| look::small(ui, kit::Kind::Primary, icon::GIT_DIFF, tr("Compare"))).inner.clicked() {
+            if ui.add_enabled_ui(ready && !busy && !self.start_requested, |ui| look::small(ui, kit::Kind::Primary, icon::ARROWS_DOWN_UP, tr("Compare"))).inner.clicked() {
                 self.start_requested = true;
             }
-            if ui.add_enabled_ui(!busy, |ui| look::small(ui, kit::Kind::Ghost, icon::ARROWS_LEFT_RIGHT, tr("Swap"))).inner.clicked() {
+            if ui.add_enabled_ui(!busy, |ui| look::small(ui, kit::Kind::Ghost, icon::REPEAT, tr("Swap"))).inner.clicked() {
                 std::mem::swap(&mut self.source, &mut self.target);
                 self.result = None;
                 self.chosen_for = None;

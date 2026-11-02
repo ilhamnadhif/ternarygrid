@@ -10,6 +10,7 @@ use crate::cx::AppContext;
 use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
 use crate::tabs::dbtools::look::{self, Cell};
+use crate::tabs::transfer::wizard::W;
 use egui::{Align, Layout, Margin, RichText, Sense, Ui, UiBuilder, vec2};
 use egui_phosphor::regular as icon;
 use std::collections::BTreeSet;
@@ -253,7 +254,7 @@ impl SchemaCompareTab {
         row.add_space(10.0 + depth as f32 * 16.0);
         if depth == 0 {
             let mut on = !self.excluded.contains(&k);
-            if look::checkbox(&mut row, &mut on, "").on_hover_text(tr("Include in the script")).changed() {
+            if look::cell_check(&mut row, &mut on, tr("Include in the script")).on_hover_text(tr("Include in the script")).changed() {
                 if on {
                     self.excluded.remove(&k);
                 } else {
@@ -267,7 +268,9 @@ impl SchemaCompareTab {
             ui.label(RichText::new(tr(item.status.label())).font(style::semibold(ui.ctx(), 11.0)).color(status_color(item.status, &p)));
         });
         row.label(RichText::new(crate::nav::kind_icon(item.kind)).font(style::icon_font(14.0)).color(p.text_muted));
-        row.add(egui::Label::new(RichText::new(item.display_name()).color(p.text)).truncate().selectable(false));
+        // Objects with their schema, their parts (columns, indexes) by name.
+        let name = if depth == 0 { item.qualified_name() } else { item.display_name() };
+        row.add(egui::Label::new(RichText::new(name).color(p.text)).truncate().selectable(false));
         if resp.clicked() {
             self.selected = Some(k.clone());
         }
@@ -276,21 +279,31 @@ impl SchemaCompareTab {
         }
     }
 
-    /// The property changes of the selected object.
+    /// The property changes of the selected object, with those of its parts ("status · type";
+    /// an added or removed part as its kind on its side).
     fn changes_ui(&self, ui: &mut Ui, diff: &SchemaDiff) {
         let Some(item) = self.selected.as_deref().and_then(|k| find(&diff.items, k)) else { return };
-        if item.changes.is_empty() {
-            return;
-        }
         let p = style::pal(ui);
-        ui.add_space(4.0);
-        look::title(ui, &item.qualified_name());
         let value = |v: &Option<String>| match v {
             Some(v) => Cell::new(v.clone()).mono(),
             None => Cell::new("—").mono().color(p.text_faint),
         };
-        let rows: Vec<Vec<Cell>> = item.changes.iter().map(|c| vec![Cell::new(c.property.clone()), value(&c.source), value(&c.target)]).collect();
-        look::table(ui, ("cmp_changes", self.uid), &look::headers(&[tr("Property"), tr("Source"), tr("Target")]), &rows, None);
+        let mut rows: Vec<Vec<Cell>> = item.changes.iter().map(|c| vec![Cell::new(c.property.clone()), value(&c.source), value(&c.target)]).collect();
+        for child in item.children.iter().filter(|c| c.has_changes()) {
+            let kind = Some(child.kind.label().to_lowercase());
+            match child.status {
+                DiffStatus::Added => rows.push(vec![Cell::new(child.display_name()), value(&kind), value(&None)]),
+                DiffStatus::Removed => rows.push(vec![Cell::new(child.display_name()), value(&None), value(&kind)]),
+                _ => rows.extend(child.changes.iter().map(|c| vec![Cell::new(format!("{} · {}", child.display_name(), c.property)), value(&c.source), value(&c.target)])),
+            }
+        }
+        if rows.is_empty() {
+            return;
+        }
+        ui.add_space(4.0);
+        look::title(ui, &item.qualified_name());
+        let widths = [W::Fr(1.0), W::Fr(1.0), W::Fr(1.0)];
+        look::table_w(ui, ("cmp_changes", self.uid), &look::headers(&[tr("Property"), tr("Source"), tr("Target")]), &rows, None, &widths);
     }
 
     /// Counts at the right of the toolbar.
@@ -298,7 +311,7 @@ impl SchemaCompareTab {
         let p = style::pal(ui);
         let t = diff.summary.total;
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(RichText::new(trf("{} unchanged", &[&t.unchanged])).size(12.5).color(p.text_faint));
             ui.label(RichText::new(trf("{} modified", &[&t.modified])).size(12.5).color(p.warn));
             ui.label(RichText::new(trf("{} removed", &[&t.removed])).size(12.5).color(p.err));
@@ -333,7 +346,7 @@ impl SchemaCompareTab {
             let schema = self.target.schema.clone().unwrap_or_else(|| SchemaRef::new(None, None));
             cx.push(AppCommand::OpenTab(Box::new(crate::tabs::er::ErTab::from_saved(tc, schema, name, diagram))));
         }
-        if look::small(ui, kit::Kind::Ghost, icon::FILE_HTML, tr("HTML report…")).clicked()
+        if look::small(ui, kit::Kind::Ghost, icon::EXPORT, tr("HTML report…")).clicked()
             && let Some(path) = rfd::FileDialog::new().set_file_name("schema-compare.html").save_file()
         {
             let src = self.source.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_default();
@@ -343,7 +356,7 @@ impl SchemaCompareTab {
                 cx.toasts.error(tr("Cannot write the file"), Some(e.to_string()));
             }
         }
-        if look::small(ui, kit::Kind::Ghost, icon::FILE_CODE, tr("Liquibase changelog…")).clicked()
+        if look::small(ui, kit::Kind::Ghost, icon::FILE, tr("Liquibase changelog…")).clicked()
             && let (Some(d), Some((a, b))) = (self.selected_diff(), self.snapshots.clone())
             && let Some(path) = rfd::FileDialog::new().set_file_name("changelog.xml").save_file()
         {
@@ -433,10 +446,7 @@ impl SchemaCompareTab {
     /// Select the first modified object (its property changes are shown).
     #[doc(hidden)]
     pub fn select_first_modified(&mut self) {
-        fn first(items: &[DiffItem]) -> Option<&DiffItem> {
-            items.iter().find_map(|i| if i.status == DiffStatus::Modified && !i.changes.is_empty() { Some(i) } else { first(&i.children) })
-        }
-        self.selected = self.diff.as_ref().and_then(|d| first(&d.items)).map(key);
+        self.selected = self.diff.as_ref().and_then(|d| d.items.iter().find(|i| i.status == DiffStatus::Modified)).map(key);
     }
 
     /// Ask to apply the script (the confirmation opens).
@@ -451,7 +461,7 @@ impl TabView for SchemaCompareTab {
         tr("Schema compare").to_string()
     }
     fn icon(&self) -> &'static str {
-        icon::GIT_DIFF
+        icon::ARROWS_DOWN_UP
     }
     fn connection_id(&self) -> Option<&str> {
         self.target.conn.as_deref()
@@ -490,9 +500,10 @@ impl TabView for SchemaCompareTab {
         }
         let p = style::pal(ui);
         ui.spacing_mut().item_spacing.y = 0.0;
-        // Source and target.
+        // Source and target (28 px pickers), straight above the toolbar.
         egui::Frame::new().inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
-            egui::Grid::new(("cmp_sides", self.uid)).num_columns(2).spacing([12.0, 8.0]).min_col_width(58.0).show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = 28.0;
+            egui::Grid::new(("cmp_sides", self.uid)).num_columns(2).spacing([12.0, 8.0]).min_col_width(70.0).show(ui, |ui| {
                 look::muted(ui, tr("Source"));
                 ui.horizontal(|ui| Self::side_ui(ui, cx, "src", &mut self.source));
                 ui.end_row();
@@ -501,14 +512,13 @@ impl TabView for SchemaCompareTab {
                 ui.end_row();
             });
         });
-        parts::hline(ui);
         let diff = self.diff.clone();
         parts::toolbar(ui, |ui| {
             let busy = self.job.is_some();
-            if ui.add_enabled_ui(!busy, |ui| look::small(ui, kit::Kind::Primary, icon::GIT_DIFF, tr("Compare"))).inner.clicked() {
+            if ui.add_enabled_ui(!busy, |ui| look::small(ui, kit::Kind::Primary, icon::ARROWS_DOWN_UP, tr("Compare"))).inner.clicked() {
                 self.start(cx);
             }
-            if look::small(ui, kit::Kind::Ghost, icon::ARROWS_LEFT_RIGHT, tr("Swap")).clicked() {
+            if look::small(ui, kit::Kind::Ghost, icon::REPEAT, tr("Swap")).clicked() {
                 std::mem::swap(&mut self.source, &mut self.target);
                 self.diff = None;
                 self.script = None;
@@ -517,7 +527,6 @@ impl TabView for SchemaCompareTab {
                 parts::spinner_label(ui, tr("Reading both schemas…"));
             }
             kit::vdivider(ui, 18.0);
-            ui.spacing_mut().item_spacing.x = 14.0;
             look::checkbox(ui, &mut self.show_unchanged, tr("Show unchanged"));
             if look::checkbox(ui, &mut self.drop_removed, tr("Drop objects missing in the source")).changed() {
                 self.script = None;
@@ -534,7 +543,7 @@ impl TabView for SchemaCompareTab {
         }
         let Some(diff) = diff else {
             if self.job.is_none() && self.error.is_none() {
-                kit::empty_state(ui, icon::GIT_DIFF, tr("Schema compare"), tr("Choose the source and the target schema, then Compare."), |_| {});
+                kit::empty_state(ui, icon::ARROWS_DOWN_UP, tr("Schema compare"), tr("Choose the source and the target schema, then Compare."), |_| {});
             }
             return;
         };
