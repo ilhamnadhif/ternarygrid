@@ -3,6 +3,12 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.5.2 — 2026-11-02
+
+### Changed
+- DBiji is now TernaryGrid, one of the Ternary family with TernaryWire (API client) and TernaryShell (SSH and SFTP client). The app, its files and its downloads carry the new name, and it has a new icon: the 3 × 3 lattice the three apps share, joined up into a table.
+- Settings, connections, scripts and saved passwords are kept under the new name (`~/Library/Application Support/dev.ternarygrid.TernaryGrid` on macOS); nothing is read from DBiji's folders or Keychain entries.
+
 ## 0.5.1 — 2026-11-02
 
 ### Fixed
