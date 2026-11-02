@@ -232,7 +232,7 @@ pub(crate) fn detached_menu(
     if acting {
         if let Some(resp) = resp {
             egui::Popup::context_menu(resp).show(|ui| {
-                ui.set_min_width(220.0);
+                ternarygrid_ui::kit::menu_look(ui, 268.0);
                 own(ui);
                 f.menu_items(ui);
             });

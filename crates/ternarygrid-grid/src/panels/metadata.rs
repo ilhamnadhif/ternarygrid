@@ -31,7 +31,7 @@ pub fn metadata_rows(model: &ResultModel) -> Vec<[String; 7]> {
                     };
                     [
                         name,
-                        m.type_name.clone(),
+                        m.type_name.to_lowercase(),
                         format!("{:?}", m.kind),
                         match m.nullable {
                             Some(true) => tr("yes").to_string(),

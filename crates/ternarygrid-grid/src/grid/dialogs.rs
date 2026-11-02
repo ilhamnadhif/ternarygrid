@@ -115,8 +115,11 @@ impl GridFrame<'_> {
             |ui| {
                 form_row(ui, tr("Format"), lw, |ui| {
                     ComboBox::from_id_salt(id.with("copy_format")).icon(ternarygrid_ui::kit::combo_caret).width(220.0).selected_text(opts.format.label()).show_ui(ui, |ui| {
+                        ternarygrid_ui::kit::menu_look(ui, 220.0);
                         for f in CopyFormat::ALL {
-                            ui.selectable_value(&mut opts.format, f, f.label());
+                            if ternarygrid_ui::kit::menu_check(ui, &mut (opts.format == f), f.label()).clicked() {
+                                opts.format = f;
+                            }
                         }
                     });
                 });

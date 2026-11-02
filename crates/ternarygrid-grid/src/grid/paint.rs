@@ -142,7 +142,7 @@ impl GridFrame<'_> {
                     fk: model.foreign_key_for_column(col).is_some(),
                     dict: options.show_descriptions && model.dictionary(col).is_some(),
                     mono: matches!(model.column_kind(col), DataKind::Uuid | DataKind::Json | DataKind::Xml | DataKind::Network | DataKind::Array | DataKind::Range),
-                    fmt: PreparedFormat::new(fmt, self.state.columns.get(col).and_then(|c| c.format.as_ref())),
+                    fmt: PreparedFormat::new(fmt, crate::format::cell_format(model, col, self.state.columns.get(col).and_then(|c| c.format.as_ref()))),
                 }
             })
             .collect();
@@ -568,7 +568,8 @@ impl GridFrame<'_> {
             let name_g = painter.layout_no_wrap(name.to_string(), name_font.clone(), theme.header_text);
             let ty = self.model.column_meta(col).map(|m| m.type_name.as_str()).unwrap_or_default();
             let show_menu = menu_open || header_hover;
-            let type_g = (!ty.is_empty() && !show_menu).then(|| painter.layout_no_wrap(ty.to_string(), type_font.clone(), theme.weak));
+            // In lower case, as the mockups write every type (SQLite and MySQL report TEXT, VARCHAR).
+            let type_g = (!ty.is_empty() && !show_menu).then(|| painter.layout_no_wrap(ty.to_ascii_lowercase(), type_font.clone(), theme.weak));
             let right_w = if show_menu { MENU_ZONE - PAD + 6.0 } else { type_g.as_ref().map_or(0.0, |g| g.size().x + 8.0) };
             let type_fits = type_g.is_some() && name_g.size().x + icons_w + right_w <= inner_w;
             let name_max = (inner_w - icons_w - if type_fits || show_menu { right_w } else { 0.0 }).max(0.0);
@@ -584,7 +585,8 @@ impl GridFrame<'_> {
                     painter.layout_job(job)
                 };
                 let w = g.size().x;
-                painter.galley(pos2(left, r.center().y - g.size().y / 2.0), g, theme.header_text);
+                // The name in the mockups' semibold.
+                ternarygrid_ui::kit::paint_semibold(&painter, pos2(left, r.center().y - g.size().y / 2.0), g, theme.header_text);
                 left += w + 6.0;
             }
             for (icon, color) in icons.into_iter().flatten() {

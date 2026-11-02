@@ -593,72 +593,49 @@ fn column_name(columns: &[ColumnMeta], i: Option<usize>, none: &str) -> String {
     }
 }
 
+/// A column of a drop-down in the kit's menu look: a check mark on the chosen one.
+fn choice(ui: &mut Ui, current: &mut Option<usize>, value: Option<usize>, label: &str) {
+    if ternarygrid_ui::kit::menu_check(ui, &mut (*current == value), label).clicked() {
+        *current = value;
+    }
+}
+
 /// Chart configuration editor (type, X, Y, series, aggregate, options).
 /// Returns true when something changed.
 pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartConfig) -> bool {
     use ternarygrid_ui::{kit, parts};
     let before = config.clone();
     ui.spacing_mut().item_spacing.y = 10.0;
-    // The chart type: one pill of icons, the chosen one raised.
+    // The chart type: the kit's pill of icons, the chosen one raised.
+    let segments: Vec<kit::Segment> = ChartKind::ALL
+        .iter()
+        .map(|k| kit::Segment {
+            icon: k.icon(),
+            tooltip: tr(k.label()),
+            on: config.kind == *k,
+        })
+        .collect();
+    if let Some(i) = kit::button_group(ui, &segments)
+        .iter()
+        .position(|r| r.clicked())
     {
-        let p = ternarygrid_ui::pal(ui);
-        let (bw, bh, pad, gap) = (30.0, 24.0, 2.0, 2.0);
-        let n = ChartKind::ALL.len() as f32;
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(n * bw + (n - 1.0) * gap + 2.0 * pad, bh + 2.0 * pad),
-            egui::Sense::hover(),
-        );
-        ui.painter().rect_filled(rect, 7, p.subtle);
-        for (i, k) in ChartKind::ALL.iter().enumerate() {
-            let r = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + pad + i as f32 * (bw + gap), rect.top() + pad),
-                egui::vec2(bw, bh),
-            );
-            let resp = ui.interact(r, ui.id().with(("chart_kind", i)), egui::Sense::click());
-            let on = config.kind == *k;
-            resp.widget_info(|| {
-                egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, tr(k.label()))
-            });
-            let resp = resp.on_hover_text(tr(k.label()));
-            if on {
-                ui.painter().rect(
-                    r,
-                    5,
-                    p.surface,
-                    egui::Stroke::new(1.0, p.border),
-                    egui::StrokeKind::Inside,
-                );
-            } else if resp.hovered() {
-                ui.painter().rect_filled(r, 5, p.hover);
-            }
-            let color = if on || resp.hovered() {
-                p.text
-            } else {
-                p.text_muted
-            };
-            ui.painter().text(
-                r.center(),
-                egui::Align2::CENTER_CENTER,
-                k.icon(),
-                ternarygrid_ui::style::icon_font(15.0),
-                color,
-            );
-            if resp.clicked() {
-                config.kind = *k;
-            }
-        }
+        config.kind = ChartKind::ALL[i];
     }
-    let lw = 74.0;
-    let width = (ui.available_width() - lw - 8.0).max(80.0);
+
+    // The mockup's rows: labels 60 wide, 16 from drop-downs 28 high that take the rest.
+    let lw = 60.0;
+    ui.spacing_mut().interact_size.y = 28.0;
+    let width = (ui.available_width() - lw - 16.0).max(80.0);
     parts::form_row(ui, tr("X"), lw, |ui| {
         egui::ComboBox::from_id_salt("ternarygrid_chart_x")
             .icon(kit::combo_caret)
             .width(width)
             .selected_text(column_name(columns, config.x_column, tr("(row number)")))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut config.x_column, None, tr("(row number)"));
+                kit::menu_look(ui, width);
+                choice(ui, &mut config.x_column, None, tr("(row number)"));
                 for (i, c) in columns.iter().enumerate() {
-                    ui.selectable_value(&mut config.x_column, Some(i), c.name.as_str());
+                    choice(ui, &mut config.x_column, Some(i), c.name.as_str());
                 }
             });
     });
@@ -674,17 +651,17 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
             .join(", ")
     };
     parts::form_row(ui, tr("Y"), lw, |ui| {
-        ui.menu_button(
-            format!("{y_text} {}", egui_phosphor::regular::CARET_DOWN),
-            |ui| {
+        // Several columns: it stays open while they are ticked.
+        egui::ComboBox::from_id_salt("ternarygrid_chart_y")
+            .icon(kit::combo_caret)
+            .width(width)
+            .selected_text(y_text)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                kit::menu_look(ui, width);
                 for (i, c) in columns.iter().enumerate() {
                     let mut on = config.y_columns.contains(&i);
-                    let label = if c.kind.is_numeric() {
-                        RichText::new(c.name.as_str())
-                    } else {
-                        RichText::new(c.name.as_str()).weak()
-                    };
-                    if ternarygrid_ui::kit::checkbox(ui, &mut on, label).changed() {
+                    if kit::menu_check(ui, &mut on, c.name.as_str()).changed() {
                         if on {
                             config.y_columns.push(i);
                             config.y_columns.sort_unstable();
@@ -693,8 +670,7 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
                         }
                     }
                 }
-            },
-        );
+            });
     });
     parts::form_row(ui, tr("Series"), lw, |ui| {
         egui::ComboBox::from_id_salt("ternarygrid_chart_series")
@@ -702,9 +678,10 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
             .width(width)
             .selected_text(column_name(columns, config.series_column, tr("(none)")))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut config.series_column, None, tr("(none)"));
+                kit::menu_look(ui, width);
+                choice(ui, &mut config.series_column, None, tr("(none)"));
                 for (i, c) in columns.iter().enumerate() {
-                    ui.selectable_value(&mut config.series_column, Some(i), c.name.as_str());
+                    choice(ui, &mut config.series_column, Some(i), c.name.as_str());
                 }
             });
     });
@@ -714,8 +691,11 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
             .width(width)
             .selected_text(tr(config.aggregate.label()))
             .show_ui(ui, |ui| {
+                kit::menu_look(ui, width);
                 for a in ChartAggregate::ALL {
-                    ui.selectable_value(&mut config.aggregate, a, tr(a.label()));
+                    if kit::menu_check(ui, &mut (config.aggregate == a), tr(a.label())).clicked() {
+                        config.aggregate = a;
+                    }
                 }
             });
     });
@@ -726,7 +706,7 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
     if config.kind == ChartKind::Pie {
         ternarygrid_ui::kit::checkbox(ui, &mut config.donut, tr("Donut"));
     }
-    parts::form_row(ui, tr("Max points"), lw, |ui| {
+    parts::form_row(ui, tr("Max points"), 80.0, |ui| {
         ui.add(
             egui::DragValue::new(&mut config.max_points)
                 .range(10..=1_000_000)
