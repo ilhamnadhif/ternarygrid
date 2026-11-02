@@ -14,7 +14,8 @@ pub const TIPS: &[&str] = &[
     "The search box in the top bar (⌘⇧P / Ctrl+Shift+P) runs any command and opens tables, views, routines and scripts by name.",
     "Click the connection or schema in the top bar to switch the SQL editor's, or to find it in the navigator.",
     "The status bar shows the transaction mode; in manual commit mode, click it to see the pending transactions.",
-    "A table's filter runs in the database (WHERE) or over the rows already fetched (FILTER): switch it in the filter bar's ⋯ menu.",
+    // U+E1FE: the ⋯ of the More buttons (Phosphor's; the text font has no ⋯).
+    "A table's filter runs in the database (WHERE) or over the rows already fetched (FILTER): switch it in the filter bar's \u{E1FE} menu.",
     "Open Database Object (⌘⇧D / Ctrl+Shift+D) finds a table or routine by name in every connected database.",
     "Use :name or ${name} in a script: TernaryGrid asks for the values when it runs.",
     "Double-click a cell in the results to edit it; changes are saved with ⌘S / Ctrl+S or the Save button.",
@@ -58,9 +59,7 @@ impl TipWindow {
                 crate::dialogs::label_lh(ui, RichText::new(tip).color(p.text), egui::FontId::proportional(14.5), 1.55, false);
             },
             Some(&mut |ui: &mut egui::Ui| {
-                crate::dialogs::row_lead(ui, &mut |ui| {
-                    ternarygrid_ui::kit::checkbox(ui, show_on_start, tr("Show tips on start"));
-                });
+                ternarygrid_ui::kit::checkbox(ui, show_on_start, tr("Show tips on start"));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if kit::button_ex(ui, Kind::Ghost, None, tr("Close"), false).clicked() {
                         close.set(true);
@@ -68,7 +67,7 @@ impl TipWindow {
                     if kit::button_ex(ui, Kind::Secondary, Some(icon::ARROW_RIGHT), tr("Next tip"), false).clicked() {
                         step.set(1);
                     }
-                    if kit::icon_button(ui, icon::ARROW_LEFT, tr("Previous tip")).clicked() {
+                    if kit::icon_button_sized(ui, icon::ARROW_LEFT, tr("Previous tip"), false, 28.0, 14.0).clicked() {
                         step.set(-1);
                     }
                     ui.label(RichText::new(&position).size(12.0).color(style::pal(ui).text_faint));

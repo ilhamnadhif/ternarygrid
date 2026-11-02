@@ -19,7 +19,7 @@ use ternarygrid_core::config::NavigatorView;
 use ternarygrid_core::value::FormatOptions;
 
 /// Current schema version written to `settings.json`.
-pub const SETTINGS_VERSION: u32 = 2;
+pub const SETTINGS_VERSION: u32 = 3;
 
 /// Deserializes a value, falling back to its default when it is invalid
 /// (e.g. an enum variant written by a newer version).
@@ -815,6 +815,10 @@ fn migrate(settings: &mut AppSettings) {
     if settings.version < 2 && settings.results.format.null_text == "[NULL]" {
         settings.results.format.null_text = "NULL".into();
     }
+    // Versions 1 and 2 shipped numbers without thousands separators; they are on now.
+    if settings.version < 3 && !settings.results.format.thousands_separator {
+        settings.results.format.thousands_separator = true;
+    }
 }
 
 /// Typed parse with per-section fallback.
@@ -1000,6 +1004,25 @@ mod tests {
             "chosen after the change"
         );
         assert_eq!(AppSettings::default().results.format.null_text, "NULL");
+    }
+
+    #[test]
+    fn the_old_default_thousands_separator_follows_the_new_default() {
+        let (_d, p) = paths();
+        std::fs::create_dir_all(p.config_dir()).unwrap();
+        let file = |version: u32, on: bool| {
+            format!(
+                r#"{{"version": {version}, "results": {{"format": {{"thousands_separator": {on}}}}}}}"#
+            )
+        };
+        std::fs::write(p.settings_file(), file(2, false)).unwrap();
+        assert!(load(&p).results.format.thousands_separator);
+        std::fs::write(p.settings_file(), file(3, false)).unwrap();
+        assert!(
+            !load(&p).results.format.thousands_separator,
+            "turned off after the change"
+        );
+        assert!(AppSettings::default().results.format.thousands_separator);
     }
 
     #[test]

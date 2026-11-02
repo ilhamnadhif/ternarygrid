@@ -70,11 +70,11 @@ impl GridTheme {
             Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
         };
         let bg = p.surface;
-        let sel = rgb(0x224444, 0xd4e7e4);
+        let sel = p.sel;
         GridTheme {
             bg,
-            stripe: rgb(0x262830, 0xfafafb),
-            line: rgb(0x33353e, 0xededf2),
+            stripe: p.stripe,
+            line: p.line,
             border: p.border,
             header_bg: p.header,
             header_text: p.text,
@@ -86,7 +86,7 @@ impl GridTheme {
             null: p.text_faint,
             selection: sel,
             active_border: p.accent,
-            modified: rgb(0x4b443b, 0xf3ead6),
+            modified: p.modified,
             inserted: rgb(0x1f3a2b, 0xe6f4ea),
             deleted: rgb(0x43282b, 0xfbe9e7),
             link: p.accent_text,

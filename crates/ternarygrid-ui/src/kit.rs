@@ -70,7 +70,7 @@ fn button_impl(ui: &mut Ui, kind: Kind, icon: Option<&str>, text: &str, keys: Op
     // A lone icon is muted until hovered (an icon button); beside a text it takes the text's colour.
     let icon_color = if galley.is_none() && matches!(kind, Kind::Secondary | Kind::Ghost) && !on { p.text_muted } else { text_color };
     let icon_galley = icon.map(|i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size + 1.0), Color32::PLACEHOLDER));
-    let keys_galley = keys.map(|k| ui.painter().layout_no_wrap(k.to_string(), FontId::proportional(size - 2.0), Color32::PLACEHOLDER));
+    let keys_galley = keys.map(|k| ui.painter().layout_no_wrap(k.to_string(), FontId::proportional(size - 1.5), Color32::PLACEHOLDER));
     let gap = 6.0;
     let parts = [galley.as_ref().map(|g| g.size().x), icon_galley.as_ref().map(|g| g.size().x), keys_galley.as_ref().map(|g| g.size().x)];
     let content_w = parts.iter().flatten().sum::<f32>() + gap * (parts.iter().flatten().count().saturating_sub(1)) as f32;
@@ -809,8 +809,7 @@ fn menu_item_ex(ui: &mut Ui, icon: Option<&str>, text: &str, keys: &str, danger:
     let p = style::pal(ui);
     let size = style::body_size(ui.ctx());
     let (icon_color, text_color) = if danger { (p.err, p.err) } else { (p.text_muted, p.text) };
-    let lead =
-        RichText::new(icon.unwrap_or(egui_phosphor::regular::SQUARE)).font(style::icon_font(size + 1.0)).color(if icon.is_some() { icon_color } else { Color32::TRANSPARENT });
+    let lead = menu_icon(icon.unwrap_or(egui_phosphor::regular::SQUARE), size, if icon.is_some() { icon_color } else { Color32::TRANSPARENT });
     let mut b = egui::Button::new((lead, RichText::new(text).color(text_color)));
     if !keys.is_empty() {
         b = b.shortcut_text(RichText::new(keys).size(size - 1.5).color(p.text_faint));
@@ -818,12 +817,18 @@ fn menu_item_ex(ui: &mut Ui, icon: Option<&str>, text: &str, keys: &str, danger:
     ui.add(b)
 }
 
+/// A menu item's icon in the design's 14 point slot (the text 10 points after it).
+fn menu_icon(glyph: &str, size: f32, color: Color32) -> egui::Atom<'static> {
+    use egui::AtomExt as _;
+    RichText::new(glyph).font(style::icon_font(size + 1.0)).color(color).atom_size(vec2(14.0, size))
+}
+
 /// A menu item with a check mark in the icon's place when `on` (Properties panel, Link with
 /// editor); a click flips `on`.
 pub fn menu_check(ui: &mut Ui, on: &mut bool, text: &str) -> Response {
     let p = style::pal(ui);
     let size = style::body_size(ui.ctx());
-    let lead = RichText::new(egui_phosphor::regular::CHECK).font(style::icon_font(size + 1.0)).color(if *on { p.accent_text } else { Color32::TRANSPARENT });
+    let lead = menu_icon(egui_phosphor::regular::CHECK, size, if *on { p.accent_text } else { Color32::TRANSPARENT });
     let mut resp = ui.add(egui::Button::new((lead, RichText::new(text).color(p.text))));
     resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, *on, text));
     if resp.clicked() {
@@ -837,8 +842,7 @@ pub fn menu_check(ui: &mut Ui, on: &mut bool, text: &str) -> Response {
 pub fn submenu(ui: &mut Ui, icon: Option<&str>, text: &str, width: f32, add: &mut dyn FnMut(&mut Ui)) -> Response {
     let p = style::pal(ui);
     let size = style::body_size(ui.ctx());
-    let lead =
-        RichText::new(icon.unwrap_or(egui_phosphor::regular::SQUARE)).font(style::icon_font(size + 1.0)).color(if icon.is_some() { p.text_muted } else { Color32::TRANSPARENT });
+    let lead = menu_icon(icon.unwrap_or(egui_phosphor::regular::SQUARE), size, if icon.is_some() { p.text_muted } else { Color32::TRANSPARENT });
     let chevron = RichText::new(egui_phosphor::regular::CARET_RIGHT).font(style::icon_font(size - 1.0)).color(p.text_faint);
     let button = egui::Button::new((lead, RichText::new(text).color(p.text))).right_text(chevron);
     egui::containers::menu::SubMenuButton::from_button(button)

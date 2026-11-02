@@ -96,6 +96,9 @@ pub struct ResultPanel {
     next_layout: Option<DataGridState>,
     /// Back / forward are in the host's header (the object editor's), not in a row of their own.
     pub history_in_header: bool,
+    /// The SQL editor's filter bar and footer (see `GridOptions::full_bars`); a table's data
+    /// page has the shorter ones.
+    pub full_bars: bool,
     /// Last status message (`true` = error).
     pub status: Option<(String, bool)>,
     executed: Instant,
@@ -212,6 +215,7 @@ impl ResultPanel {
             forward: Vec::new(),
             next_layout: None,
             history_in_header: false,
+            full_bars: false,
             status: None,
             executed: Instant::now(),
             dict_jobs: Vec::new(),
@@ -1136,8 +1140,10 @@ impl ResultPanel {
                 self.mode = Mode::Grid;
             }
             egui::ComboBox::from_id_salt("spatial_col").icon(ternarygrid_ui::kit::combo_caret).selected_text(names.get(sv.column).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+                kit::menu_look(ui, 180.0);
                 for c in &cols {
-                    if ui.selectable_value(&mut sv.column, *c, names.get(*c).cloned().unwrap_or_default()).changed() {
+                    if kit::menu_check(ui, &mut (sv.column == *c), names.get(*c).map_or("", String::as_str)).clicked() {
+                        sv.column = *c;
                         rebuild = true;
                     }
                 }
@@ -1331,6 +1337,7 @@ impl ResultPanel {
                     // Not while a save runs: edits made then would be marked saved with it.
                     allow_editing: !cx.conns.config(&self.conn).is_some_and(|c| c.read_only) && self.save_job.is_none(),
                     record_hide_empty: cx.settings.results.record_hide_empty,
+                    full_bars: self.full_bars,
                     ..Default::default()
                 };
                 // Messages appear in the toolbar next to the status.

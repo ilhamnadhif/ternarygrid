@@ -801,7 +801,7 @@ fn settings_grid_menu_and_editor_helpers() {
     open(&mut h);
     frames(&mut h, 2);
     click(&mut h, "Filter by value");
-    let eq = labels(&h).into_iter().find(|l| l.starts_with("id = ")).unwrap_or_else(|| panic!("{:?}", labels(&h)));
+    let eq = labels(&h).into_iter().find(|l| l.trim_start_matches(egui_phosphor::regular::SQUARE).trim_start().starts_with("id = ")).unwrap_or_else(|| panic!("{:?}", labels(&h)));
     click(&mut h, &eq);
     // The menu sweep left pending edits: reloading asks first, and discarding them
     // drops the new row the filter may name.
@@ -857,7 +857,10 @@ fn settings_grid_menu_and_editor_helpers() {
     click(&mut h, "Disable order by id");
     wait(&mut h, "order removed", |h| first_id(h) == ascending);
     column_menu(&mut h);
-    let eq = labels(&h).into_iter().find(|l| l.starts_with("id = '")).unwrap_or_else(|| panic!("cell value filters: {:?}", labels(&h)));
+    let eq = labels(&h)
+        .into_iter()
+        .find(|l| l.trim_start_matches(egui_phosphor::regular::SQUARE).trim_start().starts_with("id = '"))
+        .unwrap_or_else(|| panic!("cell value filters: {:?}", labels(&h)));
     click(&mut h, &eq);
     wait(&mut h, "filtered by the cell value", |h| rows_label(h).starts_with("Data grid, 1 rows"));
     column_menu(&mut h);

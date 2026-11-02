@@ -180,6 +180,7 @@ pub(crate) fn value_list(model: &ResultModel, dd: &mut Dropdown, id: Id, ui: &Ui
         .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
         .width(cell.width().clamp(240.0, 420.0))
         .show(|ui| {
+            ternarygrid_ui::kit::menu_look(ui, cell.width().clamp(240.0, 420.0));
             let te = ui.add(TextEdit::singleline(&mut dd.search).id(search_id).hint_text(tr("Search…")).return_key(None).desired_width(f32::INFINITY));
             if just_opened {
                 te.request_focus();
@@ -192,9 +193,9 @@ pub(crate) fn value_list(model: &ResultModel, dd: &mut Dropdown, id: Id, ui: &Ui
             {
                 chosen = Some(Some(k.clone()));
             }
-            ui.separator();
+            ternarygrid_ui::kit::menu_separator(ui);
             ScrollArea::vertical().max_height(280.0).auto_shrink([false, true]).show(ui, |ui| {
-                if nullable && ui.selectable_label(false, egui::RichText::new(tr("[NULL]")).weak()).clicked() {
+                if nullable && ternarygrid_ui::kit::menu_item(ui, None, "NULL", "").clicked() {
                     chosen = Some(None);
                 }
                 for (k, d) in &filtered {
@@ -202,7 +203,7 @@ pub(crate) fn value_list(model: &ResultModel, dd: &mut Dropdown, id: Id, ui: &Ui
                         Some(d) => format!("{k} — {d}"),
                         None => k.clone(),
                     };
-                    if ui.selectable_label(*k == current, label).clicked() {
+                    if ternarygrid_ui::kit::menu_check(ui, &mut (*k == current), &label).clicked() {
                         chosen = Some(Some(k.clone()));
                     }
                 }
