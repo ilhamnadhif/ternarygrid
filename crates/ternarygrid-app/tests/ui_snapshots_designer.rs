@@ -160,7 +160,7 @@ impl Shots {
         let services = Services::ephemeral(&home.join("home"));
         let conns = ConnectionManager::new(ternarygrid_app::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
         let h = Harness::builder()
-            .with_size(egui::vec2(1400.0, 900.0))
+            .with_size(egui::vec2(1440.0, 900.0))
             .with_pixels_per_point(PPP)
             .with_max_steps(400)
             .with_step_dt(1.0 / 60.0)

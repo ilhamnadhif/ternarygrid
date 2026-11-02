@@ -34,13 +34,6 @@ use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------- pickers
 
-/// Selector over all configured connections; choosing a closed connection
-/// connects it. `none` adds an entry for "no connection". Returns true when
-/// the selection changed.
-pub(crate) fn connection_combo(ui: &mut Ui, cx: &mut AppContext, id: impl Hash + std::fmt::Debug, conn: &mut Option<String>, none: Option<&str>) -> bool {
-    connection_combo_ex(ui, cx, id, conn, none, 190.0, true)
-}
-
 /// [`connection_combo`] `width` wide; `glyph` puts the plug icon before the name.
 pub(crate) fn connection_combo_ex(
     ui: &mut Ui,
@@ -92,13 +85,6 @@ pub(crate) fn default_schema(cx: &AppContext, conn: &str) -> Option<SchemaRef> {
     let live = cx.conns.live(conn)?;
     let name = live.current_schema.clone().or_else(|| live.current_database.clone())?;
     Some(SchemaRef::new(None, Some(name)))
-}
-
-/// Schema selector of a connected connection (non-system schemas, or the
-/// current schema when the database has none). Selects the current schema
-/// when nothing is chosen. Returns true when the selection changed.
-pub(crate) fn schema_combo(ui: &mut Ui, cx: &mut AppContext, id: impl Hash + std::fmt::Debug, conn: &str, schema: &mut Option<SchemaRef>) -> bool {
-    schema_combo_ex(ui, cx, id, conn, schema, 150.0, true)
 }
 
 /// [`schema_combo`] `width` wide; `glyph` puts the schema icon before the name.

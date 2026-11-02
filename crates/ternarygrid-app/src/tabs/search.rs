@@ -13,7 +13,7 @@ use crate::command::{AppCommand, ObjectPage};
 use crate::conn::session::SessionHandle;
 use crate::cx::AppContext;
 use crate::tabs::TabView;
-use crate::tabs::data_compare::{DedicatedSession, SessionState, connection_combo, schema_combo};
+use crate::tabs::data_compare::{DedicatedSession, SessionState, connection_combo_ex, schema_combo_ex};
 use crate::tabs::tasks::look;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
@@ -385,13 +385,13 @@ impl SearchTab {
         Self::form(ui, |ui| {
             ui.horizontal(|ui| {
                 self.mode_switch(ui);
-                let r = ternarygrid_ui::kit::search_field(ui, egui::Id::new(("ms_pattern", self.uid)), &mut self.pattern, tr("Name or pattern, e.g. cust* or *_id"), 320.0);
+                let r = ternarygrid_ui::kit::search_field(ui, egui::Id::new(("ms_pattern", self.uid)), &mut self.pattern, tr("Name or pattern, e.g. cust* or *_id"), 340.0);
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     go = true;
                 }
                 ui.label(RichText::new(tr("in")).color(pal.text_muted));
                 let mut conn = self.conn.clone();
-                if connection_combo(ui, cx, ("ms_conn", self.uid), &mut conn, Some(tr("All connected connections"))) {
+                if connection_combo_ex(ui, cx, ("ms_conn", self.uid), &mut conn, Some(tr("All connected connections")), 230.0, false) {
                     self.conn = conn;
                     self.schemas.clear();
                 }
@@ -407,19 +407,32 @@ impl SearchTab {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 look::checkbox(ui, &mut self.case_sensitive, tr("Case sensitive"));
                 look::checkbox(ui, &mut self.search_comments, tr("Search comments"));
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(tr("Limit")).color(pal.text_muted));
-                    ui.add_sized(egui::vec2(70.0, 24.0), egui::DragValue::new(&mut self.limit).range(1..=100_000));
-                });
+                ui.label(RichText::new(tr("Limit")).size(12.5).color(pal.text_muted));
+                look::number_h(ui, &mut self.limit, 1..=100_000, 70.0, 26.0);
                 ternarygrid_ui::kit::vdivider(ui, 18.0);
                 ui.horizontal(|ui| self.schema_filter_ui(ui, cx));
             });
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                ui.label(RichText::new(tr("Kinds")).color(pal.text_muted));
-                for k in KINDS {
+                ui.label(RichText::new(tr("Kinds")).size(12.5).color(pal.text_muted));
+                // When the kinds do not fit on the line, the longest label wraps (as a flex row
+                // shrinks it) before the line breaks.
+                let font = egui::FontId::proportional(13.0);
+                let widths: Vec<f32> =
+                    KINDS.iter().map(|k| ui.painter().layout_no_wrap(tr(k.plural_label()).to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x + 26.0).collect();
+                let need = widths.iter().sum::<f32>() + 12.0 * KINDS.len() as f32;
+                let over = need - ui.available_width();
+                let longest = widths.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+                for (i, k) in KINDS.iter().enumerate() {
                     let mut on = self.kinds.contains(k);
-                    if look::checkbox(ui, &mut on, tr(k.plural_label())).changed() {
+                    let squeeze = (i == longest && over > 0.0).then(|| (widths[i] - over).max(widths[i] * 0.55));
+                    let r = match squeeze {
+                        Some(w) => {
+                            ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| look::checkbox(ui, &mut on, tr(k.plural_label()))).inner
+                        }
+                        None => look::checkbox(ui, &mut on, tr(k.plural_label())),
+                    };
+                    if r.changed() {
                         if on {
                             self.kinds.insert(*k);
                         } else {
@@ -451,7 +464,7 @@ impl SearchTab {
                     let count = if n >= self.limit { trf("{} objects (limit reached)", &[&n]) } else { trf("{} objects", &[&n]) };
                     ui.label(RichText::new(count).size(12.0).color(pal.text_faint));
                     let sel = self.meta_selected.and_then(|i| self.meta_hits.get(i).cloned());
-                    if ui.add_enabled_ui(sel.is_some(), |ui| ternarygrid_ui::kit::button_ex(ui, Kind::Secondary, Some(icon::ARROW_SQUARE_OUT), tr("Open"), true)).inner.clicked()
+                    if ui.add_enabled_ui(sel.is_some(), |ui| ternarygrid_ui::kit::button_ex(ui, Kind::Secondary, None, tr("Open"), true)).inner.clicked()
                         && let Some(h) = sel
                     {
                         Self::open_hit(cx, &h);
@@ -462,12 +475,14 @@ impl SearchTab {
             if self.meta_hits.is_empty() {
                 return;
             }
+            // Object, details and comment share the rest 1.6 : 1 : 1.
+            let fr = ((ui.available_width() - 252.0) / 3.6).max(60.0);
             let cols = [
                 look::Col::new(tr("Connection"), look::Width::Initial(130.0)),
-                look::Col::new(tr("Kind"), look::Width::Initial(130.0)),
-                look::Col::new(tr("Object"), look::Width::Initial(320.0)),
-                look::Col::new(tr("Details"), look::Width::Initial(200.0)),
-                look::Col::new(tr("Comment"), look::Width::Rest(120.0)),
+                look::Col::new(tr("Kind"), look::Width::Initial(120.0)),
+                look::Col::new(tr("Object"), look::Width::Initial((fr * 1.6).floor())),
+                look::Col::new(tr("Details"), look::Width::Initial(fr.floor())),
+                look::Col::new(tr("Comment"), look::Width::Rest(60.0)),
             ];
             let (mut clicked, mut open) = (None, None);
             let selected = self.meta_selected;
@@ -512,9 +527,9 @@ impl SearchTab {
 
     fn schema_filter_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let pal = ternarygrid_ui::pal(ui);
-        ui.label(RichText::new(tr("Schemas")).color(pal.text_muted));
+        ui.label(RichText::new(tr("Schemas")).size(12.5).color(pal.text_muted));
         let Some(conn) = self.conn.clone().filter(|c| cx.conns.is_connected(c)) else {
-            look::text_field(ui, &mut self.schema_text, 200.0, tr("all (or a, b, c)"), false);
+            look::text_field_h(ui, &mut self.schema_text, 200.0, 26.0, tr("all (or a, b, c)"));
             return;
         };
         let backend = cx.backend;
@@ -677,16 +692,23 @@ impl SearchTab {
         let mut stop = false;
         Self::form(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.spacing_mut().interact_size.y = look::FIELD_H;
                 self.mode_switch(ui);
+                // The database's logo, the connection (180) and the schema (140).
+                if let Some(kind) = self.conn.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.kind)
+                    && let Some(img) = crate::dblogo::image(ui.ctx(), kind, 15.0, crate::theme::logo_color(kind, ui.visuals().dark_mode))
+                {
+                    ui.add(img);
+                }
                 let mut conn = self.conn.clone();
-                if connection_combo(ui, cx, ("ds_conn", self.uid), &mut conn, None) {
+                if connection_combo_ex(ui, cx, ("ds_conn", self.uid), &mut conn, None, 180.0, false) {
                     self.conn = conn;
                     self.data_schema = None;
                     self.chosen = None;
                 }
                 if let Some(c) = self.conn.clone().filter(|c| cx.conns.is_connected(c)) {
                     let mut schema = self.data_schema.clone();
-                    if schema_combo(ui, cx, ("ds_schema", self.uid), &c, &mut schema) {
+                    if schema_combo_ex(ui, cx, ("ds_schema", self.uid), &c, &mut schema, 140.0, false) {
                         self.data_schema = schema;
                         self.chosen = None;
                     }
@@ -694,16 +716,14 @@ impl SearchTab {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(RichText::new(tr("Find")).color(pal.text_muted));
+                ui.label(RichText::new(tr("Find")).size(12.5).color(pal.text_muted));
                 let r = look::text_field(ui, &mut self.text, 320.0, tr("Text to find in text columns"), false);
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     go = true;
                 }
                 look::checkbox(ui, &mut self.data_case_sensitive, tr("Case sensitive"));
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(tr("Rows per table")).color(pal.text_muted));
-                    ui.add_sized(egui::vec2(80.0, 24.0), egui::DragValue::new(&mut self.row_limit).range(1..=10_000_000));
-                });
+                ui.label(RichText::new(tr("Rows per table")).size(12.5).color(pal.text_muted));
+                look::number_h(ui, &mut self.row_limit, 1..=10_000_000, 80.0, 26.0);
                 if busy {
                     stop = ternarygrid_ui::kit::button_ex(ui, Kind::Danger, Some(icon::STOP), tr("Stop"), false).clicked();
                 } else if ternarygrid_ui::kit::button_ex(ui, Kind::Primary, Some(icon::MAGNIFYING_GLASS), tr("Search"), false).clicked() {
@@ -765,8 +785,10 @@ impl SearchTab {
         });
         ui.horizontal(|ui| {
             ui.add_space(12.0);
-            let w = (ui.available_width() - 110.0).max(80.0);
-            ternarygrid_ui::kit::search_field(ui, egui::Id::new(("ds_filter", self.uid)), &mut self.table_filter, tr("Filter…"), w);
+            let w =
+                (ui.available_width() - 12.0 - ternarygrid_ui::kit::button_width(ui, None, tr("All"), true) - ternarygrid_ui::kit::button_width(ui, None, tr("None"), true) - 16.0)
+                    .max(80.0);
+            look::text_field_h(ui, &mut self.table_filter, w, 26.0, tr("Filter…"));
             if ternarygrid_ui::kit::ghost(ui, None, tr("All")).clicked() {
                 self.chosen = None;
             }
@@ -776,7 +798,8 @@ impl SearchTab {
         });
         let filter = self.table_filter.to_lowercase();
         egui::ScrollArea::vertical().id_salt(("ds_tables", self.uid)).auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
+            // Rows of 28, 6 apart.
+            ui.spacing_mut().item_spacing.y = 6.0;
             for (t, cols) in &tables {
                 if !filter.is_empty() && !t.name.to_lowercase().contains(&filter) {
                     continue;
@@ -790,14 +813,14 @@ impl SearchTab {
                 let cy = rect.center().y;
                 look::paint_box(ui, egui::Rect::from_center_size(egui::pos2(rect.left() + 20.0, cy), egui::vec2(15.0, 15.0)), on, resp.hovered());
                 ui.painter().text(
-                    egui::pos2(rect.left() + 44.0, cy),
+                    egui::pos2(rect.left() + 42.0, cy),
                     egui::Align2::CENTER_CENTER,
                     crate::nav::kind_icon(t.kind),
                     ternarygrid_ui::style::icon_font(14.0),
                     pal.text_muted,
                 );
                 ui.painter().text(
-                    egui::pos2(rect.left() + 58.0, cy),
+                    egui::pos2(rect.left() + 57.0, cy),
                     egui::Align2::LEFT_CENTER,
                     &t.name,
                     egui::FontId::proportional(ternarygrid_ui::style::body_size(ui.ctx())),
@@ -849,13 +872,14 @@ impl SearchTab {
         }
         let conn = self.data_run.as_ref().map(|r| r.conn.clone()).or_else(|| self.hits_conn.clone()).unwrap_or_default();
         let cols = [
-            look::Col::new(tr("Table"), look::Width::Initial(320.0)),
+            look::Col::new(tr("Table"), look::Width::Initial((ui.available_width() - 262.0).max(160.0))),
             look::Col::new(tr("Matching rows"), look::Width::Initial(140.0)).right(),
             look::Col::new("", look::Width::Rest(120.0)),
         ];
         let hits = &self.data_hits;
         let mut open = None;
-        look::table(ui, ("ds_hits", self.uid), &cols, hits.len(), |row, i| {
+        // Rows of 40 (their buttons inside).
+        look::table_h(ui, ("ds_hits", self.uid), &cols, hits.len(), 41.0, |row, i| {
             let h = &hits[i];
             look::cell(row, false, |ui| {
                 ui.label(RichText::new(crate::nav::kind_icon(h.table.kind)).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.text_muted));
@@ -873,7 +897,7 @@ impl SearchTab {
                         look::cell_text(ui, if h.limited { trf("{} or more", &[&h.count]) } else { h.count.to_string() });
                     });
                     look::cell(row, false, |ui| {
-                        if ternarygrid_ui::kit::button_ex(ui, Kind::Secondary, Some(icon::TABLE), tr("Show rows"), true).clicked() {
+                        if ternarygrid_ui::kit::button_ex(ui, Kind::Secondary, None, tr("Show rows"), true).clicked() {
                             open = Some(i);
                         }
                     });

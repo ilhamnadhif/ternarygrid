@@ -70,10 +70,10 @@ impl Section {
     fn icon(self) -> &'static str {
         match self {
             Section::General => icon::GEAR,
-            Section::Editor => icon::FILE_SQL,
+            Section::Editor => icon::FILE_CODE,
             Section::Results => icon::TABLE,
             Section::Execution => icon::PLAY,
-            Section::History => icon::CLOCK_COUNTER_CLOCKWISE,
+            Section::History => icon::CLOCK,
             Section::Navigator => icon::TREE_STRUCTURE,
             Section::Keyboard => icon::KEYBOARD,
             Section::ConnectionTypes => icon::TAG,
@@ -218,6 +218,8 @@ pub struct SettingsTab {
     secrets_job: Option<crate::backend::Job<Result<(String, Option<SecretBackend>), String>>>,
     /// Asking whether to reset every setting.
     confirm_reset: bool,
+    /// The network profile's SSH options the design leaves out are shown.
+    ssh_more: bool,
 }
 
 /// Every setting back to its default, except the state of the update
@@ -250,6 +252,7 @@ impl Default for SettingsTab {
             message: None,
             secrets_job: None,
             confirm_reset: false,
+            ssh_more: false,
         }
     }
 }
@@ -302,44 +305,68 @@ fn found_dyn(ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui) -> bool) -> 
     r.inner
 }
 
-/// A setting: its label in the label column, then the control.
+/// A setting: its label in the label column, then the control (30 points high) 16 points
+/// further.
 fn row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
-    let w = label_w(ui);
-    found(ui, label, |ui| parts::form_row(ui, label, w, add))
+    let mut add = Some(add);
+    row_dyn(ui, label, None, look::FIELD_H, &mut |ui| add.take().is_some_and(|a| a(ui)))
+}
+
+/// [`row`] for a control `h` high (segmented 28, radio buttons 16): the row is as tall as
+/// that, or as its label.
+fn row_h(ui: &mut Ui, label: &str, h: f32, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let mut add = Some(add);
+    row_dyn(ui, label, None, h, &mut |ui| add.take().is_some_and(|a| a(ui)))
 }
 
 /// [`row`] with a muted line of explanation under the control.
 fn row_sub(ui: &mut Ui, label: &str, sub: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
     let mut add = Some(add);
-    row_sub_dyn(ui, label, sub, &mut |ui| add.take().is_some_and(|a| a(ui)))
+    row_dyn(ui, label, Some(sub), look::FIELD_H, &mut |ui| add.take().is_some_and(|a| a(ui)))
 }
 
-fn row_sub_dyn(ui: &mut Ui, label: &str, sub: &str, add: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
+// Not generic: compiled once for the hundred settings that use it.
+fn row_dyn(ui: &mut Ui, label: &str, sub: Option<&str>, h: f32, add: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
     let w = label_w(ui);
+    found_dyn(ui, label, &mut |ui| form_row(ui, label, w, sub, h, add))
+}
+
+/// The form row of the mockups: a grid of `label_w` and the rest, 16 points apart, the label
+/// muted on the line of a 30 point control, the control's explanation 4 points under it.
+fn form_row(ui: &mut Ui, label: &str, label_w: f32, sub: Option<&str>, h: f32, add: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
     let p = ternarygrid_ui::pal(ui);
-    found(ui, label, |ui| {
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(egui::vec2(w, ternarygrid_ui::style::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.set_min_width(w);
-                ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
-            });
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-                let c = ui.horizontal(|ui| add(ui)).inner;
-                ui.label(RichText::new(sub).size(12.0).color(p.text_muted));
-                c
-            })
-            .inner
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 16.0;
+        // The label 6 points down (on the line of a 30 point field), its cell as tall as that.
+        ui.allocate_ui_with_layout(egui::vec2(label_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_width(label_w);
+            ui.add_space(6.0);
+            if !label.is_empty() {
+                ui.add(egui::Label::new(RichText::new(label).size(13.0).color(p.text_muted)).truncate());
+            }
+        });
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+            // The controls centred on a line `h` high (not egui's 30 point rows).
+            let w = ui.available_width();
+            let c = ui.allocate_ui_with_layout(egui::vec2(w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| add(ui)).inner;
+            if let Some(sub) = sub {
+                // 4 points under the control, on a line 1.4 times its size.
+                ui.add_space(1.0);
+                ui.add(egui::Label::new(RichText::new(sub).size(12.0).line_height(Some(16.8)).color(p.text_muted)).wrap());
+            }
+            c
         })
         .inner
     })
+    .inner
 }
 
 /// Content indented to the controls' column (check boxes under the fields).
 fn indented(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> bool) -> bool {
     let w = label_w(ui);
     ui.horizontal_top(|ui| {
-        ui.add_space(w + ui.spacing().item_spacing.x);
+        ui.add_space(w + 16.0 - ui.spacing().item_spacing.x);
         ui.vertical(add).inner
     })
     .inner
@@ -349,13 +376,42 @@ fn check(ui: &mut Ui, value: &mut bool, label: &str) -> bool {
     found(ui, label, |ui| look::checkbox(ui, value, label).changed())
 }
 
-/// Check boxes in a column, 10 points apart.
+/// Check boxes in a column, 12 points apart.
 fn checks(ui: &mut Ui, items: Vec<(&mut bool, &str)>) -> bool {
+    checks_gap(ui, items, 12.0)
+}
+
+/// Check boxes in a column, `gap` points apart.
+fn checks_gap(ui: &mut Ui, items: Vec<(&mut bool, &str)>, gap: f32) -> bool {
     let mut c = false;
     ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 10.0;
+        ui.spacing_mut().item_spacing.y = gap;
         for (v, l) in items {
             c |= check(ui, v, l);
+        }
+    });
+    c
+}
+
+/// Two columns of check boxes `gap` apart, each as wide as its longest label when they fit,
+/// both narrowed in proportion to it when they do not (as flex boxes shrink).
+fn check_columns(ui: &mut Ui, left: Vec<(&mut bool, &str)>, right: Vec<(&mut bool, &str)>, gap: f32, row_gap: f32) -> bool {
+    let font = egui::FontId::proportional(13.0);
+    let natural = |items: &Vec<(&mut bool, &str)>| {
+        items.iter().map(|(_, l)| ui.painter().layout_no_wrap(l.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x + 26.0).fold(0.0, f32::max)
+    };
+    let (lw, rw) = (natural(&left), natural(&right));
+    let room = (ui.available_width() - gap).max(120.0);
+    let scale = (room / (lw + rw)).min(1.0);
+    let (lw, rw) = ((lw * scale).floor(), (rw * scale).floor());
+    let mut c = false;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for (items, w) in [(left, lw), (right, rw)] {
+            ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(w);
+                c |= checks_gap(ui, items, row_gap);
+            });
         }
     });
     c
@@ -382,36 +438,106 @@ fn text(ui: &mut Ui, value: &mut String, width: f32, mono: bool) -> bool {
     look::text_field(ui, value, width, "", mono).changed()
 }
 
-/// Two groups side by side (equal widths, 14 points apart).
-fn two(ui: &mut Ui, left: impl FnOnce(&mut Ui) -> bool, right: impl FnOnce(&mut Ui) -> bool) -> bool {
+/// Two groups side by side, 14 points apart, the left one taking `share` of the width (the
+/// mockups' boxes share the row by their contents).
+fn two(ui: &mut Ui, share: f32, left: impl FnOnce(&mut Ui) -> bool, right: impl FnOnce(&mut Ui) -> bool) -> bool {
     let (mut left, mut right) = (Some(left), Some(right));
-    two_dyn(ui, &mut |ui| left.take().is_some_and(|f| f(ui)), &mut |ui| right.take().is_some_and(|f| f(ui)))
+    two_dyn(ui, share, &mut |ui| left.take().is_some_and(|f| f(ui)), &mut |ui| right.take().is_some_and(|f| f(ui)))
 }
 
-fn two_dyn(ui: &mut Ui, left: &mut dyn FnMut(&mut Ui) -> bool, right: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
+fn two_dyn(ui: &mut Ui, share: f32, left: &mut dyn FnMut(&mut Ui) -> bool, right: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
     let mut c = false;
     let gap = 14.0;
-    let w = ((ui.available_width() - gap) / 2.0).floor();
+    let lw = ((ui.available_width() - gap) * share).floor();
+    let rw = (ui.available_width() - gap - lw).floor();
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
-        ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_width(w);
+        ui.allocate_ui_with_layout(egui::vec2(lw, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(lw);
             c |= left(ui);
         });
-        ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_width(w);
+        ui.allocate_ui_with_layout(egui::vec2(rw, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(rw);
             c |= right(ui);
         });
     });
     c
 }
 
+/// A titled group of settings on a card (18 × 20 points of padding, 14 between its rows).
 fn group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
-    parts::group(ui, (!title.is_empty()).then_some(title), None, add)
+    let mut add = Some(add);
+    group_dyn(ui, (!title.is_empty()).then_some(title), None, None, &mut |ui| add.take().is_some_and(|a| a(ui)))
 }
 
+/// [`group`] with a muted line under its title.
 fn group_sub(ui: &mut Ui, title: &str, sub: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
-    parts::group(ui, Some(title), Some(sub), add)
+    let mut add = Some(add);
+    group_dyn(ui, Some(title), Some(sub), None, &mut |ui| add.take().is_some_and(|a| a(ui)))
+}
+
+/// [`group`] with a small text toggle at the right of its title (on the title's line, so the
+/// group keeps the height of the design): "More options".
+fn group_more(ui: &mut Ui, title: &str, more: &std::cell::Cell<bool>, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let mut add = Some(add);
+    group_dyn(ui, Some(title), None, Some(more), &mut |ui| add.take().is_some_and(|a| a(ui)))
+}
+
+/// The "More options" toggle of [`group_more`] at the right end of `line`, not taking room.
+fn more_toggle(ui: &mut Ui, line: egui::Rect, more: &std::cell::Cell<bool>) {
+    let p = ternarygrid_ui::pal(ui);
+    let label = if more.get() { tr("Fewer options") } else { tr("More options") };
+    let caret = if more.get() { icon::CARET_UP } else { icon::CARET_DOWN };
+    let g = ui.painter().layout_no_wrap(label.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.5), p.text_muted);
+    let w = g.size().x + 14.0 + 6.0 + 20.0;
+    let rect = egui::Rect::from_center_size(egui::pos2(line.right() - w / 2.0 + 10.0, line.center().y), egui::vec2(w, 26.0));
+    let resp = ui.interact(rect, ui.id().with("settings_more"), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, p.hover);
+    }
+    ui.painter().text(egui::pos2(rect.left() + 17.0, rect.center().y), egui::Align2::CENTER_CENTER, caret, ternarygrid_ui::style::icon_font(14.0), p.text_muted);
+    ui.painter().galley(egui::pos2(rect.left() + 30.0, rect.center().y - g.size().y / 2.0), g, p.text_muted);
+    if resp.clicked() {
+        more.set(!more.get());
+    }
+}
+
+fn group_dyn(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, more: Option<&std::cell::Cell<bool>>, add: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
+    let p = ternarygrid_ui::pal(ui);
+    let frame =
+        egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(ternarygrid_ui::style::RADIUS_LG).inner_margin(egui::Margin::symmetric(20, 18));
+    frame
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 14.0;
+            if title.is_some() || sub.is_some() {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    if let Some(t) = title {
+                        let r = ui.label(RichText::new(t).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.5)).color(p.text)).rect;
+                        if let Some(m) = more {
+                            let line = egui::Rect::from_x_y_ranges(r.left()..=ui.max_rect().right(), r.y_range());
+                            more_toggle(ui, line, m);
+                        }
+                    }
+                    if let Some(s) = sub {
+                        ui.add(egui::Label::new(RichText::new(s).size(12.5).color(p.text_muted)).wrap());
+                    }
+                });
+            }
+            add(ui)
+        })
+        .inner
+}
+
+/// A chip of the mockups at 12 points: semibold text on a soft fill, 18 points high.
+fn chip(ui: &mut Ui, text: &str, color: egui::Color32, fill: egui::Color32) -> egui::Response {
+    let g = ui.painter().layout_no_wrap(text.to_string(), ternarygrid_ui::style::semibold(ui.ctx(), 12.0), color);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 14.0, 18.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 9, fill);
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, color);
+    resp
 }
 
 /// A small colour square (connection types).
@@ -423,9 +549,10 @@ fn swatch(ui: &mut Ui, color: egui::Color32, side: f32) -> egui::Response {
     resp
 }
 
-/// A row of a list at the left of a section (connection types, network profiles): 32 points,
-/// the selected one on the soft accent.
-fn list_item(ui: &mut Ui, selected: bool, label: &str, lead: impl FnOnce(&mut Ui, egui::Rect), right: Option<&str>) -> egui::Response {
+/// A row of a list at the left of a section (the sections, connection types, network
+/// profiles): 32 points, 10 of padding, a lead `lead_w` wide and the label 10 points after it,
+/// the selected row on the soft accent (its label in medium with `bold`).
+fn list_item(ui: &mut Ui, selected: bool, label: &str, lead: &mut dyn FnMut(&mut Ui, egui::Rect), lead_w: f32, bold: bool, right: Option<&str>) -> egui::Response {
     let p = ternarygrid_ui::pal(ui);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label));
@@ -434,9 +561,12 @@ fn list_item(ui: &mut Ui, selected: bool, label: &str, lead: impl FnOnce(&mut Ui
     } else if resp.hovered() {
         ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, p.hover);
     }
-    lead(ui, egui::Rect::from_min_size(egui::pos2(rect.left() + 10.0, rect.center().y - 8.0), egui::vec2(16.0, 16.0)));
-    let size = ternarygrid_ui::style::body_size(ui.ctx());
-    ui.painter().text(egui::pos2(rect.left() + 36.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(size), p.text);
+    if resp.has_focus() {
+        ui.painter().rect_stroke(rect, ternarygrid_ui::style::RADIUS, egui::Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
+    }
+    lead(ui, egui::Rect::from_min_size(egui::pos2(rect.left() + 10.0, rect.center().y - lead_w / 2.0), egui::vec2(lead_w, lead_w)));
+    let font = if selected && bold { ternarygrid_ui::style::medium(ui.ctx(), 13.0) } else { egui::FontId::proportional(13.0) };
+    ui.painter().text(egui::pos2(rect.left() + 20.0 + lead_w, rect.center().y), egui::Align2::LEFT_CENTER, label, font, p.text);
     if let Some(r) = right {
         ui.painter().text(egui::pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, r, egui::FontId::proportional(11.5), p.text_faint);
     }
@@ -448,7 +578,7 @@ impl SettingsTab {
         let s = &mut cx.settings.general;
         let mut c = group(ui, tr("Appearance"), |ui| {
             let mut c = false;
-            c |= row(ui, tr("Theme"), |ui| parts::segmented(ui, &mut s.theme, &[(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))]));
+            c |= row_h(ui, tr("Theme"), 28.0, |ui| parts::segmented(ui, &mut s.theme, &[(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))]));
             c |= row(ui, tr("Font size"), |ui| num(ui, &mut s.ui_font_size, 8.0..=32.0, tr("pt")));
             c |= row(ui, tr("Zoom"), |ui| {
                 let mut pct = (s.ui_scale * 100.0).round();
@@ -468,16 +598,17 @@ impl SettingsTab {
         c |= group(ui, tr("Start and quit"), |ui| {
             let u = &mut cx.settings.updates;
             let mut auto = u.check_automatically == Some(true);
-            let mut c = checks(
+            let was = auto;
+            let c = checks(
                 ui,
                 vec![
                     (&mut s.restore_session, tr("Reopen the editors of the last session on start")),
                     (&mut s.confirm_exit_with_unsaved, tr("Ask before quitting with unsaved changes")),
+                    (&mut auto, tr("Check for updates automatically (at start and every few hours)")),
                 ],
             );
-            if check(ui, &mut auto, tr("Check for updates automatically (at start and every few hours)")) {
+            if auto != was {
                 u.check_automatically = Some(auto);
-                c = true;
             }
             c
         });
@@ -489,14 +620,16 @@ impl SettingsTab {
         let case_opts = [(KeywordCase::Upper, tr("UPPER")), (KeywordCase::Lower, tr("lower")), (KeywordCase::Preserve, tr("As typed"))];
         let mut c = group(ui, tr("Editing"), |ui| {
             let mut c = false;
-            ui.horizontal(|ui| {
+            // Two settings on a line, 24 points apart.
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 let w = label_w(ui);
-                c |= parts::form_row(ui, tr("Font size"), w, |ui| num(ui, &mut e.font_size, 8.0..=40.0, tr("pt")));
-                ui.add_space(16.0);
-                c |= parts::form_row(ui, tr("Tab size"), 80.0, |ui| num(ui, &mut e.tab_size, 1..=16, ""));
+                c |= form_row(ui, tr("Font size"), w, None, look::FIELD_H, &mut |ui| num(ui, &mut e.font_size, 8.0..=40.0, tr("pt")));
+                ui.add_space(24.0);
+                c |= form_row(ui, tr("Tab size"), w, None, look::FIELD_H, &mut |ui| num(ui, &mut e.tab_size, 1..=16, ""));
             });
-            c |= row(ui, tr("Statement delimiter"), |ui| text(ui, &mut e.statement_delimiter, 60.0, true));
-            c |= row(ui, tr("Blank line ends a statement"), |ui| {
+            c |= row(ui, tr("Statement delimiter"), |ui| text(ui, &mut e.statement_delimiter, 80.0, true));
+            c |= row_h(ui, tr("Blank line ends a statement"), 28.0, |ui| {
                 parts::segmented(
                     ui,
                     &mut e.blank_line_delimiter,
@@ -505,35 +638,24 @@ impl SettingsTab {
             });
             c |= row(ui, tr("Auto-save interval"), |ui| num(ui, &mut e.auto_save_interval_secs, 0..=3600, "s"));
             c |= indented(ui, |ui| {
-                let mut c = false;
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 40.0;
-                    let w = ((ui.available_width() - 40.0) / 2.0).max(120.0);
-                    ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                        c |= checks(
-                            ui,
-                            vec![
-                                (&mut e.insert_spaces, tr("Insert spaces instead of tabs")),
-                                (&mut e.line_numbers, tr("Show line numbers")),
-                                (&mut e.folding, tr("Code folding (statements, block comments)")),
-                                (&mut e.mark_occurrences, tr("Highlight occurrences of the word under the cursor")),
-                                (&mut e.highlight_current_line, tr("Highlight the current line")),
-                            ],
-                        );
-                    });
-                    ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                        c |= checks(
-                            ui,
-                            vec![
-                                (&mut e.word_wrap, tr("Wrap long lines")),
-                                (&mut e.auto_close_quotes, tr("Close quotes automatically")),
-                                (&mut e.auto_close_brackets, tr("Close brackets automatically")),
-                                (&mut e.spell_check, tr("Check spelling in comments and strings")),
-                            ],
-                        );
-                    });
-                });
-                c
+                check_columns(
+                    ui,
+                    vec![
+                        (&mut e.insert_spaces, tr("Insert spaces instead of tabs")),
+                        (&mut e.line_numbers, tr("Show line numbers")),
+                        (&mut e.folding, tr("Code folding (statements, block comments)")),
+                        (&mut e.mark_occurrences, tr("Highlight occurrences of the word under the cursor")),
+                        (&mut e.highlight_current_line, tr("Highlight the current line")),
+                    ],
+                    vec![
+                        (&mut e.word_wrap, tr("Wrap long lines")),
+                        (&mut e.auto_close_quotes, tr("Close quotes automatically")),
+                        (&mut e.auto_close_brackets, tr("Close brackets automatically")),
+                        (&mut e.spell_check, tr("Check spelling in comments and strings")),
+                    ],
+                    40.0,
+                    10.0,
+                )
             });
             c
         });
@@ -541,6 +663,7 @@ impl SettingsTab {
         let f = &mut e.format;
         c |= two(
             ui,
+            0.5,
             |ui| {
                 group(ui, tr("Autocomplete"), |ui| {
                     let mut c = checks(
@@ -554,7 +677,7 @@ impl SettingsTab {
                     c |= row(ui, tr("Delay"), |ui| num(ui, &mut a.delay_ms, 0..=2000, "ms"));
                     c |= row(ui, tr("Minimum characters"), |ui| num(ui, &mut a.min_chars, 0..=5, ""));
                     c |= row(ui, tr("Maximum proposals"), |ui| num(ui, &mut a.max_items, 10..=1000, ""));
-                    c |= row(ui, tr("Keyword case"), |ui| parts::segmented_small(ui, &mut a.keyword_case, &case_opts));
+                    c |= row_h(ui, tr("Keyword case"), 28.0, |ui| parts::segmented(ui, &mut a.keyword_case, &case_opts));
                     c
                 })
             },
@@ -564,7 +687,13 @@ impl SettingsTab {
                     {
                         use ternarygrid_config::settings::FormatterKind as K;
                         c |= row(ui, tr("Formatter"), |ui| {
-                            combo(ui, "set_fmt_kind", &mut f.formatter, &[(K::Default, tr("Default")), (K::Compact, tr("Compact")), (K::External, tr("External command"))], 180.0)
+                            combo(
+                                ui,
+                                "set_fmt_kind",
+                                &mut f.formatter,
+                                &[(K::Default, tr("Default")), (K::Compact, tr("Compact")), (K::External, tr("External command"))],
+                                ui.available_width().min(200.0),
+                            )
                         });
                         if f.formatter == K::External {
                             c |= row(ui, tr("Command"), |ui| {
@@ -574,7 +703,7 @@ impl SettingsTab {
                             });
                         }
                     }
-                    c |= row(ui, tr("Keyword case"), |ui| parts::segmented_small(ui, &mut f.keyword_case, &case_opts));
+                    c |= row_h(ui, tr("Keyword case"), 28.0, |ui| parts::segmented(ui, &mut f.keyword_case, &case_opts));
                     c |= row(ui, tr("Indent width"), |ui| num(ui, &mut f.indent_width, 1..=8, ""));
                     c |= row(ui, tr("Lines between statements"), |ui| num(ui, &mut f.lines_between_statements, 0..=4, ""));
                     c |= row(ui, tr("Maximum line length"), |ui| num(ui, &mut f.max_line_length, 40..=400, ""));
@@ -609,7 +738,7 @@ impl SettingsTab {
         let mut c = group(ui, tr("Fetching"), |ui| {
             let mut c = false;
             c |= row(ui, tr("Rows fetched per page"), |ui| num(ui, &mut r.fetch_size, 10..=100_000, ""));
-            c |= row(ui, tr("Sorting and filtering"), |ui| {
+            c |= row_h(ui, tr("Sorting and filtering"), 28.0, |ui| {
                 parts::segmented(ui, &mut r.sort_filter_mode, &[(SortFilterMode::Server, tr("On the server (re-query)")), (SortFilterMode::Client, tr("On fetched rows"))])
             });
             c |= row(ui, tr("Confirm \"fetch all\" above"), |ui| num(ui, &mut r.confirm_fetch_all_above, 0..=100_000_000, tr(" rows")));
@@ -618,10 +747,10 @@ impl SettingsTab {
         });
         c |= group(ui, tr("Layout"), |ui| {
             let mut c = false;
-            c |= row(ui, tr("Results position"), |ui| {
+            c |= row_h(ui, tr("Results position"), 28.0, |ui| {
                 parts::segmented(ui, &mut r.layout, &[(ResultsLayout::Bottom, tr("Below the editor")), (ResultsLayout::Right, tr("Right of the editor"))])
             });
-            c |= row(ui, tr("Row height"), |ui| parts::segmented(ui, &mut r.row_density, &[(RowDensity::Compact, tr("Compact")), (RowDensity::Normal, tr("Normal"))]));
+            c |= row_h(ui, tr("Row height"), 28.0, |ui| parts::segmented(ui, &mut r.row_density, &[(RowDensity::Compact, tr("Compact")), (RowDensity::Normal, tr("Normal"))]));
             c |= row(ui, tr("Maximum result tabs"), |ui| num(ui, &mut r.max_result_tabs, 1..=100, ""));
             c |= checks(ui, vec![(&mut r.open_each_query_in_new_tab, tr("Open each query in a new result tab")), (&mut r.show_row_numbers, tr("Show row numbers"))]);
             c
@@ -630,6 +759,7 @@ impl SettingsTab {
         let f = &mut r.format;
         c |= two(
             ui,
+            0.427,
             |ui| {
                 group(ui, tr("Memory"), |ui| {
                     let mut c = false;
@@ -642,8 +772,20 @@ impl SettingsTab {
             |ui| {
                 group(ui, tr("Value formats"), |ui| {
                     let mut c = false;
-                    let field_w = |ui: &Ui| ui.available_width().min(220.0);
-                    c |= row(ui, tr("NULL text"), |ui| text(ui, &mut f.null_text, 120.0, true));
+                    // The format fields fill the control column.
+                    let field_w = |ui: &Ui| ui.available_width();
+                    c |= row(ui, tr("NULL text"), |ui| text(ui, &mut f.null_text, 140.0, true));
+                    c |= row(ui, tr("Timestamp format"), |ui| {
+                        let w = field_w(ui);
+                        text(ui, &mut f.datetime_format, w, true)
+                    });
+                    c |= row_h(ui, tr("Binary values"), 28.0, |ui| {
+                        parts::segmented(ui, &mut f.binary_format, &[(BinaryFormat::Hex, tr("Hexadecimal")), (BinaryFormat::Base64, "Base64"), (BinaryFormat::Text, tr("Text"))])
+                    });
+                    c |= row_h(ui, tr("Booleans"), 28.0, |ui| {
+                        parts::segmented(ui, &mut f.bool_style, &[(BoolStyle::TrueFalse, "true / false"), (BoolStyle::Checkbox, "☑ / ☐"), (BoolStyle::OneZero, "1 / 0")])
+                    });
+                    // Not in the design, kept after its rows.
                     c |= row(ui, tr("Date format"), |ui| {
                         let w = field_w(ui);
                         text(ui, &mut f.date_format, w, true)
@@ -651,20 +793,6 @@ impl SettingsTab {
                     c |= row(ui, tr("Time format"), |ui| {
                         let w = field_w(ui);
                         text(ui, &mut f.time_format, w, true)
-                    });
-                    c |= row(ui, tr("Timestamp format"), |ui| {
-                        let w = field_w(ui);
-                        text(ui, &mut f.datetime_format, w, true)
-                    });
-                    c |= row(ui, tr("Binary values"), |ui| {
-                        parts::segmented_small(
-                            ui,
-                            &mut f.binary_format,
-                            &[(BinaryFormat::Hex, tr("Hexadecimal")), (BinaryFormat::Base64, "Base64"), (BinaryFormat::Text, tr("Text"))],
-                        )
-                    });
-                    c |= row(ui, tr("Booleans"), |ui| {
-                        parts::segmented_small(ui, &mut f.bool_style, &[(BoolStyle::TrueFalse, "true / false"), (BoolStyle::Checkbox, "☑ / ☐"), (BoolStyle::OneZero, "1 / 0")])
                     });
                     c |= row(ui, tr("Float decimals"), |ui| {
                         let mut on = f.float_max_decimals.is_some();
@@ -728,10 +856,10 @@ impl SettingsTab {
         let n = &mut cx.settings.navigator;
         group(ui, "", |ui| {
             let mut c = false;
-            c |= row(ui, tr("Order"), |ui| {
+            c |= row_h(ui, tr("Order"), 28.0, |ui| {
                 parts::segmented(ui, &mut n.sort, &[(NavigatorSort::Alphabetical, tr("Alphabetical")), (NavigatorSort::Natural, tr("As reported by the database"))])
             });
-            c |= row(ui, tr("Default view of new connections"), |ui| {
+            c |= row_h(ui, tr("Default view of new connections"), 28.0, |ui| {
                 parts::segmented(ui, &mut n.default_view, &[(NavigatorView::Simple, tr("Simple")), (NavigatorView::Advanced, tr("Advanced"))])
             });
             c |= checks(
@@ -762,7 +890,7 @@ impl SettingsTab {
                 changed = true;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                kit::search_field(ui, egui::Id::new("set_keys_filter"), &mut self.key_filter, tr("Filter…"), 240.0);
+                kit::search_field(ui, egui::Id::new("set_keys_filter"), &mut self.key_filter, tr("Filter…"), 260.0);
             });
         });
         let conflicts = km.conflicts();
@@ -772,7 +900,12 @@ impl SettingsTab {
                 .take(5)
                 .map(|cf| {
                     let names: Vec<&str> = cf.actions.iter().map(|a| crate::keys::action_label(*a)).collect();
-                    trf("{} is bound to several actions: {}.", &[&cf.shortcut.format(IS_MAC), &names.join(", ")])
+                    let key = cf.shortcut.format(IS_MAC);
+                    if names.len() == 2 {
+                        trf("{} is bound twice: {}. Only the first one runs.", &[&key, &names.join(", ")])
+                    } else {
+                        trf("{} is bound {} times: {}. Only the first one runs.", &[&key, &names.len(), &names.join(", ")])
+                    }
                 })
                 .collect();
             look::callout(ui, Tone::Warning, None, &lines.join("\n"), |_| {});
@@ -806,11 +939,13 @@ impl SettingsTab {
                 filter.is_empty() || label.to_lowercase().contains(&filter) || keys.join(" ").to_lowercase().contains(&filter)
             })
             .collect();
+        // Action and Shortcut share what the fixed columns leave (150 and 100 points).
+        let fr = ((ui.available_width() - 252.0) / 2.0).floor().max(120.0);
         let cols = [
-            look::Col::new(tr("Action"), look::Width::Initial(260.0)),
+            look::Col::new(tr("Action"), look::Width::Initial(fr)),
             look::Col::new(tr("Category"), look::Width::Initial(150.0)),
-            look::Col::new(tr("Shortcut"), look::Width::Initial(260.0)),
-            look::Col::new("", look::Width::Rest(96.0)),
+            look::Col::new(tr("Shortcut"), look::Width::Initial(fr)),
+            look::Col::new("", look::Width::Rest(100.0)),
         ];
         let recording = self.recording;
         let mut record = None;
@@ -835,10 +970,10 @@ impl SettingsTab {
             });
             look::cell(row, false, |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if kit::icon_button_ex(ui, icon::RECORD, tr("Record a shortcut"), recording == Some(a), 24.0).clicked() {
+                if kit::icon_button_ex(ui, icon::ROWS, tr("Record a shortcut"), recording == Some(a), 24.0).clicked() {
                     record = Some(a);
                 }
-                if kit::icon_button_ex(ui, icon::ARROW_COUNTER_CLOCKWISE, tr("Reset to default"), false, 24.0).clicked() {
+                if kit::icon_button_ex(ui, icon::REPEAT, tr("Reset to default"), false, 24.0).clicked() {
                     km.reset(a);
                     changed = true;
                 }
@@ -868,18 +1003,10 @@ impl SettingsTab {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 for (i, t) in types.iter().enumerate() {
                     let color = crate::theme::rgb(t.color);
-                    if list_item(
-                        ui,
-                        self.selected_type == i,
-                        &t.name,
-                        |ui, r| {
-                            let sq = egui::Rect::from_center_size(r.center(), egui::vec2(12.0, 12.0));
-                            ui.painter().rect_filled(sq, 3, color);
-                        },
-                        None,
-                    )
-                    .clicked()
-                    {
+                    let mut lead = |ui: &mut Ui, r: egui::Rect| {
+                        ui.painter().rect_filled(r, 3, color);
+                    };
+                    if list_item(ui, self.selected_type == i, &t.name, &mut lead, 12.0, false, None).clicked() {
                         self.selected_type = i;
                     }
                 }
@@ -925,11 +1052,13 @@ impl SettingsTab {
                         ],
                     );
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         let label = if builtin { tr("Reset to default") } else { tr("Delete type") };
                         let kind = if builtin { Kind::Secondary } else { Kind::Danger };
                         reset = kit::button_ex(ui, kind, None, label, true).clicked();
-                        let note = if builtin { trf("Built-in type: {} connection(s) use it.", &[&used]) } else { trf("{} connection(s) use it.", &[&used]) };
-                        ui.label(RichText::new(note).color(pal.text_muted));
+                        let uses = if used == 1 { tr("1 connection uses it.").to_string() } else { trf("{} connections use it.", &[&used]) };
+                        let note = if builtin { trf("Built-in type: {}", &[&uses]) } else { uses };
+                        ui.label(RichText::new(note).size(12.5).color(pal.text_muted));
                     });
                     c
                 });
@@ -952,7 +1081,7 @@ impl SettingsTab {
                 let sample_kind = sample.as_ref().map(|s| s.1);
                 group(ui, tr("How it looks"), |ui| {
                     preview_row(ui, sample.as_ref().map_or(tr("connection"), |s| s.0.as_str()), sample_kind, marker);
-                    preview_tab(ui, "script.sql", marker);
+                    preview_tab(ui, "report.sql", marker);
                     match marker {
                         Some(m) => {
                             kit::pill(ui, &t.name.to_uppercase(), m);
@@ -980,7 +1109,7 @@ impl SettingsTab {
                 for p in &profiles {
                     let used = cx.conns.configs().iter().filter(|c| c.network_profile.as_deref() == Some(p.id.as_str())).count();
                     let sel = self.profile.as_ref().is_some_and(|x| x.id == p.id);
-                    let lead = |ui: &mut Ui, r: egui::Rect| {
+                    let mut lead = |ui: &mut Ui, r: egui::Rect| {
                         ui.painter().text(
                             r.center(),
                             egui::Align2::CENTER_CENTER,
@@ -989,7 +1118,7 @@ impl SettingsTab {
                             if sel { pal.accent_text } else { pal.text_muted },
                         );
                     };
-                    if list_item(ui, sel, &p.name, lead, Some(trf("{} used", &[&used]).as_str())).clicked() {
+                    if list_item(ui, sel, &p.name, &mut lead, 15.0, false, Some(trf("{} used", &[&used]).as_str())).clicked() {
                         self.profile = Some(p.clone());
                         self.profile_ssh_password.clear();
                         self.profile_ssh_passphrase.clear();
@@ -1014,17 +1143,27 @@ impl SettingsTab {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 14.0;
                 row(ui, tr("Name"), |ui| text(ui, &mut p.name, 300.0, false));
-                group(ui, "SSH", |ui| {
-                    let ssh = p.ssh.get_or_insert_with(SshConfig::default);
-                    crate::dialogs::connection::ssh_form(ui, "profile_ssh", ssh, &mut self.profile_ssh_password, &mut self.profile_ssh_passphrase);
-                    false
-                });
+                let more = std::cell::Cell::new(self.ssh_more);
+                let ssh = p.ssh.get_or_insert_with(SshConfig::default);
+                if ssh.enabled {
+                    group_more(ui, "SSH", &more, |ui| {
+                        profile_ssh_form(ui, ssh, &mut self.profile_ssh_password, &mut self.profile_ssh_passphrase, more.get());
+                        false
+                    });
+                } else {
+                    group(ui, "SSH", |ui| {
+                        profile_ssh_form(ui, ssh, &mut self.profile_ssh_password, &mut self.profile_ssh_passphrase, false);
+                        false
+                    });
+                }
+                self.ssh_more = more.get();
                 group(ui, tr("Proxy"), |ui| {
                     let proxy = p.proxy.get_or_insert_with(ProxyConfig::default);
-                    crate::dialogs::connection::proxy_form(ui, "profile_proxy", proxy, &mut self.profile_proxy_password);
+                    profile_proxy_form(ui, proxy, &mut self.profile_proxy_password);
                     false
                 });
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     if kit::button_ex(ui, Kind::Primary, None, tr("Save profile"), false).clicked() {
                         let id = p.id.clone();
                         let ssh_save = p.ssh.as_ref().is_some_and(|s| s.enabled && s.save_credentials);
@@ -1083,7 +1222,7 @@ impl SettingsTab {
         let a = &mut cx.settings.ai;
         let mut c = group(ui, "", |ui| {
             let mut c = parts::switch(ui, &mut a.enabled, tr("Enable the AI assistant"), None).changed();
-            c |= row(ui, tr("Provider"), |ui| {
+            c |= row_h(ui, tr("Provider"), 28.0, |ui| {
                 parts::segmented(ui, &mut a.provider, &[(AiProvider::Anthropic, "Anthropic Claude"), (AiProvider::OpenAiCompatible, tr("OpenAI-compatible server"))])
             });
             c |= row(ui, tr("Model"), |ui| text(ui, &mut a.model, 300.0, true));
@@ -1094,7 +1233,7 @@ impl SettingsTab {
                 ch
             });
             c |= row(ui, tr("Maximum answer length"), |ui| num(ui, &mut a.max_tokens, 256..=128_000, tr(" tokens")));
-            c |= row(ui, tr("Effort"), |ui| {
+            c |= row_h(ui, tr("Effort"), 28.0, |ui| {
                 parts::segmented(
                     ui,
                     &mut a.effort,
@@ -1171,15 +1310,12 @@ impl SettingsTab {
         let current = cx.services.secrets.read().backend();
         let pal = ternarygrid_ui::pal(ui);
         let changed = group(ui, tr("Secret storage"), |ui| {
-            row(ui, tr("Secret storage"), |ui| {
-                kit::pill(
-                    ui,
-                    match current {
-                        SecretBackend::Keychain => tr("Operating system keychain"),
-                        SecretBackend::EncryptedFile => tr("Encrypted file with master password"),
-                    },
-                    pal.accent_text,
-                );
+            row_h(ui, tr("Secret storage"), 18.0, |ui| {
+                let label = match current {
+                    SecretBackend::Keychain => tr("Operating system keychain"),
+                    SecretBackend::EncryptedFile => tr("Encrypted file with master password"),
+                };
+                chip(ui, label, pal.accent_text, pal.accent_soft);
                 false
             });
             row(ui, tr("Lock the vault after"), |ui| num(ui, &mut cx.settings.security.auto_lock_minutes, 0..=1440, tr(" min idle (0 = never)")))
@@ -1311,8 +1447,14 @@ impl SettingsTab {
             ui.add_space(4.0);
             ui.label(RichText::new(tr("No setting matches.")).color(p.text_muted));
         }
+        let p = ternarygrid_ui::pal(ui);
         for s in shown {
-            let item = kit::nav_item(ui, s.icon(), s.label(), self.section == s);
+            let on = self.section == s;
+            let mut lead = |ui: &mut Ui, r: egui::Rect| {
+                let color = if on { p.accent_text } else { p.text_muted };
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, s.icon(), ternarygrid_ui::style::icon_font(15.0), color);
+            };
+            let item = list_item(ui, on, s.label(), &mut lead, 15.0, true, None);
             // While searching: how many of the section's settings match.
             let hits = s.hits(&query);
             if hits > 0 {
@@ -1329,7 +1471,7 @@ impl SettingsTab {
         }
         ui.add_space(12.0);
         let dir = cx.services.paths.config_dir().to_path_buf();
-        if kit::ghost(ui, Some(icon::FOLDER_OPEN), tr("Open settings folder")).on_hover_text(dir.display().to_string()).clicked() {
+        if kit::button_ex(ui, Kind::Ghost, Some(icon::FOLDER_OPEN), tr("Open settings folder"), true).on_hover_text(dir.display().to_string()).clicked() {
             let _ = open::that_detached(&dir);
         }
         if self.confirm_reset {
@@ -1349,11 +1491,125 @@ impl SettingsTab {
                     self.confirm_reset = false;
                 }
             });
-        } else if kit::ghost(ui, Some(icon::ARROW_COUNTER_CLOCKWISE), tr("Reset all settings…")).clicked() {
+        } else if kit::button_ex(ui, Kind::Ghost, Some(icon::REPEAT), tr("Reset all settings…"), true).clicked() {
             self.confirm_reset = true;
         }
         changed
     }
+}
+
+/// A host field filling the row, "Port" and the port (80 points).
+fn host_port(ui: &mut Ui, host: &mut String, port: &mut u16) {
+    let p = ternarygrid_ui::pal(ui);
+    let port_label = ui.painter().layout_no_wrap(tr("Port").to_string(), egui::FontId::proportional(13.0), p.text_muted).size().x;
+    let w = (ui.available_width() - port_label - 80.0 - 2.0 * ui.spacing().item_spacing.x).max(120.0);
+    look::text_field(ui, host, w, "", false);
+    ui.label(RichText::new(tr("Port")).size(13.0).color(p.text_muted));
+    look::port(ui, port);
+}
+
+/// The SSH group of a network profile as designed: host and port, user, authentication, its
+/// key file or password and the host key check. The other options (passphrase, saved
+/// credentials, local port, keep-alive, switching the tunnel off) are under "More options".
+fn profile_ssh_form(ui: &mut Ui, ssh: &mut ternarygrid_core::config::SshConfig, password: &mut String, passphrase: &mut String, more: bool) {
+    use ternarygrid_core::config::{HostKeyPolicy, SshAuth};
+    if !ssh.enabled {
+        check(ui, &mut ssh.enabled, tr("Use SSH tunnel"));
+        return;
+    }
+    row(ui, tr("SSH host"), |ui| {
+        host_port(ui, &mut ssh.host, &mut ssh.port);
+        false
+    });
+    row(ui, tr("User"), |ui| text(ui, &mut ssh.user, 260.0, false));
+    row_h(ui, tr("Authentication"), 16.0, |ui| {
+        ui.spacing_mut().item_spacing.x = 16.0;
+        let (pw, key, agent) = (matches!(ssh.auth, SshAuth::Password), matches!(ssh.auth, SshAuth::PublicKey { .. }), matches!(ssh.auth, SshAuth::Agent));
+        if look::radio(ui, pw, tr("Password")).clicked() {
+            ssh.auth = SshAuth::Password;
+        }
+        if look::radio(ui, key, tr("Private key")).clicked() && !key {
+            let home = std::env::var("HOME").unwrap_or_default();
+            ssh.auth = SshAuth::PublicKey { key_path: format!("{home}/.ssh/id_ed25519") };
+        }
+        if look::radio(ui, agent, tr("SSH agent")).clicked() {
+            ssh.auth = SshAuth::Agent;
+        }
+        false
+    });
+    match &mut ssh.auth {
+        SshAuth::Password => {
+            row(ui, tr("Password"), |ui| look::password_field(ui, password, 260.0, "").changed());
+        }
+        SshAuth::PublicKey { key_path } => {
+            row(ui, tr("Private key file"), |ui| {
+                let w = (ui.available_width() - 28.0 - ui.spacing().item_spacing.x).max(120.0);
+                look::text_field(ui, key_path, w, "", true);
+                if kit::icon_button_ex(ui, icon::FOLDER_OPEN, tr("Choose file"), false, 28.0).clicked()
+                    && let Some(f) = rfd::FileDialog::new().pick_file()
+                {
+                    *key_path = f.display().to_string();
+                }
+                false
+            });
+        }
+        SshAuth::Agent => {}
+    }
+    row(ui, tr("Host key check"), |ui| {
+        let label = |p: HostKeyPolicy| match p {
+            HostKeyPolicy::AcceptNew => tr("Trust on first use"),
+            HostKeyPolicy::Strict => tr("Only known hosts"),
+            HostKeyPolicy::AcceptAll => tr("Accept any key (insecure)"),
+        };
+        let opts = [HostKeyPolicy::AcceptNew, HostKeyPolicy::Strict, HostKeyPolicy::AcceptAll].map(|p| (p, label(p)));
+        combo(ui, "profile_hostkey", &mut ssh.host_key_policy, &opts, 240.0)
+    });
+    if more {
+        if matches!(ssh.auth, SshAuth::PublicKey { .. }) {
+            row(ui, tr("Passphrase"), |ui| look::password_field(ui, passphrase, 260.0, "").changed());
+        }
+        row(ui, tr("Local port"), |ui| {
+            let mut lp = ssh.local_port.map(|p| p.to_string()).unwrap_or_default();
+            if look::text_field(ui, &mut lp, 140.0, tr("automatic"), false).changed() {
+                ssh.local_port = lp.trim().parse().ok();
+            }
+            false
+        });
+        row(ui, tr("Keep-alive (s)"), |ui| num(ui, &mut ssh.keepalive_secs, 0..=3600, ""));
+        checks(ui, vec![(&mut ssh.save_credentials, tr("Save credentials")), (&mut ssh.enabled, tr("Use SSH tunnel"))]);
+    }
+}
+
+/// The proxy group of a network profile: "Use proxy", then its type, host, user, password.
+fn profile_proxy_form(ui: &mut Ui, proxy: &mut ternarygrid_core::config::ProxyConfig, password: &mut String) {
+    use ternarygrid_core::config::ProxyKind;
+    check(ui, &mut proxy.enabled, tr("Use proxy"));
+    if !proxy.enabled {
+        return;
+    }
+    row_h(ui, tr("Type"), 16.0, |ui| {
+        ui.spacing_mut().item_spacing.x = 16.0;
+        for (k, l) in [(ProxyKind::Socks5, "SOCKS5"), (ProxyKind::Http, "HTTP CONNECT")] {
+            if look::radio(ui, proxy.kind == k, l).clicked() {
+                proxy.kind = k;
+            }
+        }
+        false
+    });
+    row(ui, tr("Proxy host"), |ui| {
+        host_port(ui, &mut proxy.host, &mut proxy.port);
+        false
+    });
+    row(ui, tr("User"), |ui| {
+        let mut u = proxy.user.clone().unwrap_or_default();
+        let ch = text(ui, &mut u, 260.0, false);
+        if ch {
+            proxy.user = Some(u.trim().to_string()).filter(|u| !u.is_empty());
+        }
+        ch
+    });
+    row(ui, tr("Password"), |ui| look::password_field(ui, password, 260.0, "").changed());
+    check(ui, &mut proxy.save_credentials, tr("Save credentials"));
 }
 
 /// A navigator row as it looks for a connection of the type (its stripe).
@@ -1386,7 +1642,7 @@ fn preview_tab(ui: &mut Ui, label: &str, marker: Option<egui::Color32>) {
     ui.painter().rect(rect, top, p.canvas, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
     let line = marker.unwrap_or(p.accent);
     ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left() + 8.0, rect.top()), egui::pos2(rect.right() - 8.0, rect.top() + 3.0)), 1, line);
-    ui.painter().text(egui::pos2(rect.left() + 22.0, rect.center().y), egui::Align2::CENTER_CENTER, icon::FILE_SQL, ternarygrid_ui::style::icon_font(14.0), p.text_muted);
+    ui.painter().text(egui::pos2(rect.left() + 21.0, rect.center().y), egui::Align2::CENTER_CENTER, icon::FILE_CODE, ternarygrid_ui::style::icon_font(14.0), p.text_muted);
     ui.painter().galley(egui::pos2(rect.left() + 36.0, rect.center().y - g.size().y / 2.0), g, p.text);
 }
 
@@ -1418,11 +1674,18 @@ impl TabView for SettingsTab {
         egui::CentralPanel::default().frame(content_frame).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ternarygrid_ui::style::form_spacing(ui);
+                // Selects and fields are 30 points high in the settings.
+                ui.spacing_mut().interact_size.y = look::FIELD_H;
                 ui.set_max_width((ui.available_width() - 16.0).min(860.0));
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.label(RichText::new(self.section.label()).font(ternarygrid_ui::style::semibold(ui.ctx(), 19.0)).color(p.text));
                 if let Some(intro) = self.section.intro() {
-                    ui.add(egui::Label::new(RichText::new(intro).color(p.text_muted)).wrap());
+                    ui.add_space(1.0);
+                    let w = ui.available_width().min(680.0);
+                    ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.set_max_width(w);
+                        ui.add(egui::Label::new(RichText::new(intro).size(13.0).line_height(Some(19.5)).color(p.text_muted)).wrap());
+                    });
                 }
                 ui.add_space(10.0);
                 ui.spacing_mut().item_spacing.y = 14.0;

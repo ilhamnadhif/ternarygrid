@@ -104,6 +104,19 @@ impl HistoryTab {
     }
 }
 
+/// `n` with thousands separators ("2,914").
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn status_color(s: QueryStatus, p: &ternarygrid_ui::Palette) -> egui::Color32 {
     match s {
         QueryStatus::Ok => p.ok,
@@ -144,16 +157,18 @@ impl TabView for HistoryTab {
         let pal = ternarygrid_ui::pal(ui);
         ui.spacing_mut().item_spacing.y = 0.0;
         ternarygrid_ui::parts::toolbar(ui, |ui| {
-            changed |= ternarygrid_ui::kit::search_field(ui, egui::Id::new("hist_search"), &mut self.text, tr("Search SQL text…"), 300.0).changed();
+            // The selects at the height of the design's fields.
+            ui.spacing_mut().interact_size.y = look::FIELD_H;
+            changed |= ternarygrid_ui::kit::search_field(ui, egui::Id::new("hist_search"), &mut self.text, tr("Search SQL text…"), 320.0).changed();
             let conn_name = self.connection.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("All connections").to_string());
-            egui::ComboBox::from_id_salt("hist_conn").icon(ternarygrid_ui::kit::combo_caret).width(170.0).selected_text(conn_name).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("hist_conn").icon(ternarygrid_ui::kit::combo_caret).width(180.0).selected_text(conn_name).show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut self.connection, None, tr("All connections")).changed();
                 for c in cx.conns.configs() {
                     changed |= ui.selectable_value(&mut self.connection, Some(c.id.clone()), &c.name).changed();
                 }
             });
             let st = self.status.map(status_label).unwrap_or(tr("Any status"));
-            egui::ComboBox::from_id_salt("hist_status").icon(ternarygrid_ui::kit::combo_caret).width(130.0).selected_text(st).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("hist_status").icon(ternarygrid_ui::kit::combo_caret).width(140.0).selected_text(st).show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut self.status, None, tr("Any status")).changed();
                 for s in [QueryStatus::Ok, QueryStatus::Error, QueryStatus::Cancelled] {
                     changed |= ui.selectable_value(&mut self.status, Some(s), status_label(s)).changed();
@@ -178,11 +193,13 @@ impl TabView for HistoryTab {
             if let Some(e) = &self.error {
                 look::error(ui, e);
             }
-            ui.label(RichText::new(trf("{} of {} entries", &[&self.entries.len(), &self.total])).size(12.0).color(pal.text_faint));
+            let (shown, total) = (grouped(self.entries.len() as u64), grouped(self.total));
+            ui.label(RichText::new(trf("{} of {} entries", &[&shown, &total])).size(12.0).color(pal.text_faint));
         });
         let sel_entry = self.selected.and_then(|i| self.entries.get(i).cloned());
         let names: std::collections::HashMap<String, String> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
-        let detail_h = if sel_entry.is_some() { 170.0 } else { 0.0 };
+        // The details: 12 of margin, 12 of padding, the buttons, 10, the statement's lines.
+        let detail_h = sel_entry.as_ref().map_or(0.0, |e| 12.0 * 2.0 + 12.0 * 2.0 + 2.0 + 26.0 + 10.0 + e.sql.lines().count().clamp(1, 6) as f32 * 20.0 + 8.0);
         let avail = (ui.available_height() - detail_h).max(80.0);
         let cols = [
             look::Col::new(tr("Time"), look::Width::Initial(170.0)),
@@ -259,7 +276,7 @@ impl TabView for HistoryTab {
                 ui.spacing_mut().item_spacing.y = 10.0;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Secondary, Some(icon::FILE_SQL), tr("Open in SQL editor"), true).clicked() {
+                    if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Secondary, Some(icon::FILE_CODE), tr("Open in SQL editor"), true).clicked() {
                         self.open_in_editor(cx, &e);
                     }
                     if ternarygrid_ui::kit::ghost(ui, Some(icon::COPY), tr("Copy")).clicked() {
@@ -274,14 +291,26 @@ impl TabView for HistoryTab {
                     }
                     if let Some(err) = &e.error_message {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add(egui::Label::new(RichText::new(err.lines().next().unwrap_or("")).color(pal.err)).truncate());
+                            ui.add(egui::Label::new(RichText::new(err.lines().next().unwrap_or("")).size(12.5).color(pal.err)).truncate());
                         });
                     }
                 });
+                // The statement as plain highlighted text (20 points a line, at most six shown).
                 let conn = e.connection_id.clone().filter(|c| cx.conns.is_connected(c));
-                ui.allocate_ui(egui::vec2(ui.available_width(), 96.0), |ui| match conn {
-                    Some(conn) => crate::tabs::code(ui, cx, &conn, ("hist_sql", e.id), &e.sql),
-                    None => crate::widgets::code_view(ui, ("hist_sql", e.id), &e.sql, &[]),
+                let lines = e.sql.lines().count().clamp(1, 6) as f32;
+                ui.allocate_ui(egui::vec2(ui.available_width(), lines * 20.0 + 8.0), |ui| {
+                    ui.set_height(lines * 20.0 + 8.0);
+                    ui.style_mut().text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(12.5));
+                    let v = ui.visuals_mut();
+                    v.extreme_bg_color = pal.surface;
+                    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+                        w.bg_stroke = egui::Stroke::NONE;
+                    }
+                    v.selection.stroke = egui::Stroke::NONE;
+                    match conn {
+                        Some(conn) => crate::tabs::code(ui, cx, &conn, ("hist_sql", e.id), &e.sql),
+                        None => crate::widgets::code_view(ui, ("hist_sql", e.id), &e.sql, &[]),
+                    }
                 });
             });
         }
