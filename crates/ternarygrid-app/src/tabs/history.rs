@@ -10,6 +10,7 @@ use egui_phosphor::regular as icon;
 use std::time::{Duration, Instant};
 use ternarygrid_config::{HistoryEntry, HistoryQuery, QueryStatus};
 use ternarygrid_core::{tr, trf};
+use ternarygrid_ui::kit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Period {
@@ -31,6 +32,8 @@ pub struct HistoryTab {
     loaded: bool,
     error: Option<String>,
     limit: usize,
+    /// The highlighting of the selected entry's statement (its id).
+    tokens: Option<(i64, Vec<(std::ops::Range<usize>, ternarygrid_editor::TokenStyle)>)>,
 }
 
 impl Default for HistoryTab {
@@ -47,6 +50,7 @@ impl Default for HistoryTab {
             loaded: false,
             error: None,
             limit: 500,
+            tokens: None,
         }
     }
 }
@@ -144,30 +148,50 @@ impl TabView for HistoryTab {
         let pal = ternarygrid_ui::pal(ui);
         ui.spacing_mut().item_spacing.y = 0.0;
         ternarygrid_ui::parts::toolbar(ui, |ui| {
-            // The selects at the height of the design's fields.
+            // The selects at the height of the design's fields, their text 11 points in.
             ui.spacing_mut().interact_size.y = look::FIELD_H;
-            changed |= ternarygrid_ui::kit::search_field(ui, egui::Id::new("hist_search"), &mut self.text, tr("Search SQL text…"), 320.0).changed();
+            ui.spacing_mut().button_padding = egui::vec2(11.0, 5.0);
+            changed |= kit::search_field(ui, egui::Id::new("hist_search"), &mut self.text, tr("Search SQL text…"), 320.0).changed();
             let conn_name = self.connection.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("All connections").to_string());
-            egui::ComboBox::from_id_salt("hist_conn").icon(ternarygrid_ui::kit::combo_caret).width(180.0).selected_text(conn_name).show_ui(ui, |ui| {
-                changed |= ui.selectable_value(&mut self.connection, None, tr("All connections")).changed();
-                for c in cx.conns.configs() {
-                    changed |= ui.selectable_value(&mut self.connection, Some(c.id.clone()), &c.name).changed();
-                }
-            });
+            egui::ComboBox::from_id_salt("hist_conn").icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).width(180.0).selected_text(conn_name).show_ui(
+                ui,
+                |ui| {
+                    kit::menu_look(ui, 180.0);
+                    let mut on = self.connection.is_none();
+                    if kit::menu_check(ui, &mut on, tr("All connections")).clicked() && self.connection.is_some() {
+                        self.connection = None;
+                        changed = true;
+                    }
+                    for c in cx.conns.configs() {
+                        let mut on = self.connection.as_deref() == Some(c.id.as_str());
+                        if kit::menu_check(ui, &mut on, &c.name).clicked() && on {
+                            self.connection = Some(c.id.clone());
+                            changed = true;
+                        }
+                    }
+                },
+            );
             let st = self.status.map(status_label).unwrap_or(tr("Any status"));
-            egui::ComboBox::from_id_salt("hist_status").icon(ternarygrid_ui::kit::combo_caret).width(140.0).selected_text(st).show_ui(ui, |ui| {
-                changed |= ui.selectable_value(&mut self.status, None, tr("Any status")).changed();
-                for s in [QueryStatus::Ok, QueryStatus::Error, QueryStatus::Cancelled] {
-                    changed |= ui.selectable_value(&mut self.status, Some(s), status_label(s)).changed();
-                }
-            });
+            egui::ComboBox::from_id_salt("hist_status").icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).width(140.0).selected_text(st).show_ui(
+                ui,
+                |ui| {
+                    kit::menu_look(ui, 140.0);
+                    for s in [None, Some(QueryStatus::Ok), Some(QueryStatus::Error), Some(QueryStatus::Cancelled)] {
+                        let mut on = self.status == s;
+                        if kit::menu_check(ui, &mut on, s.map(status_label).unwrap_or(tr("Any status"))).clicked() && on {
+                            self.status = s;
+                            changed = true;
+                        }
+                    }
+                },
+            );
             changed |= ternarygrid_ui::parts::segmented(
                 ui,
                 &mut self.period,
                 &[(Period::Day, tr("24 hours")), (Period::Week, tr("7 days")), (Period::Month, tr("30 days")), (Period::All, tr("All"))],
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ternarygrid_ui::kit::icon_button(ui, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked() {
+                if kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 28.0, 15.0).clicked() {
                     self.reload(cx);
                 }
             });
@@ -181,7 +205,12 @@ impl TabView for HistoryTab {
                 look::error(ui, e);
             }
             let (shown, total) = (look::grouped_number(self.entries.len() as f64, true), look::grouped_number(self.total as f64, true));
-            ui.label(RichText::new(trf("{} of {} entries", &[&shown, &total])).size(12.0).color(pal.text_faint));
+            // On the design's line of 19.5 (its text on the baseline of a 16 point line box).
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 19.5), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_min_height(19.5);
+                ui.add_space(3.5);
+                ui.label(RichText::new(trf("{} of {} entries", &[&shown, &total])).size(12.0).color(pal.text_faint));
+            });
         });
         let sel_entry = self.selected.and_then(|i| self.entries.get(i).cloned());
         let names: std::collections::HashMap<String, String> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
@@ -262,14 +291,14 @@ impl TabView for HistoryTab {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 10.0;
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Secondary, Some(icon::FILE_CODE), tr("Open in SQL editor"), true).clicked() {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::FILE_CODE), tr("Open in SQL editor"), true).clicked() {
                         self.open_in_editor(cx, &e);
                     }
-                    if ternarygrid_ui::kit::ghost(ui, Some(icon::COPY), tr("Copy")).clicked() {
+                    if kit::ghost(ui, Some(icon::COPY), tr("Copy")).clicked() {
                         ui.ctx().copy_text(e.sql.clone());
                     }
-                    if ternarygrid_ui::kit::ghost(ui, Some(icon::TRASH), tr("Delete")).clicked() {
+                    if kit::ghost(ui, Some(icon::TRASH), tr("Delete")).clicked() {
                         if let Some(store) = cx.services.history.clone() {
                             let _ = store.lock().delete(&[e.id]);
                         }
@@ -282,23 +311,31 @@ impl TabView for HistoryTab {
                         });
                     }
                 });
-                // The statement as plain highlighted text (20 points a line, at most six shown).
-                let conn = e.connection_id.clone().filter(|c| cx.conns.is_connected(c));
-                let lines = e.sql.lines().count().clamp(1, 6) as f32;
-                ui.allocate_ui(egui::vec2(ui.available_width(), lines * 20.0 + 8.0), |ui| {
-                    ui.set_height(lines * 20.0 + 8.0);
-                    ui.style_mut().text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(12.5));
-                    let v = ui.visuals_mut();
-                    v.extreme_bg_color = pal.surface;
-                    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
-                        w.bg_stroke = egui::Stroke::NONE;
-                    }
-                    v.selection.stroke = egui::Stroke::NONE;
-                    match conn {
-                        Some(conn) => crate::tabs::code(ui, cx, &conn, ("hist_sql", e.id), &e.sql),
-                        None => crate::widgets::code_view(ui, ("hist_sql", e.id), &e.sql, &[]),
-                    }
-                });
+                // The statement highlighted as the design's code block: lines of 20, 4 above and
+                // below, at most six lines shown.
+                if self.tokens.as_ref().is_none_or(|(id, _)| *id != e.id) {
+                    use ternarygrid_editor::EditorLanguage;
+                    let kind = e.connection_id.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.kind);
+                    let dialect = match kind {
+                        Some(k) => cx.conns.registry.dialect(k),
+                        None => std::sync::Arc::new(ternarygrid_core::dialect::GenericDialect::new()),
+                    };
+                    self.tokens = Some((e.id, crate::sqllang::SqlLanguage::new(dialect).highlight(&e.sql)));
+                }
+                let tokens = self.tokens.as_ref().map(|(_, t)| t.as_slice()).unwrap_or_default();
+                let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
+                let shown: String = e.sql.lines().take(6).collect::<Vec<_>>().join("\n");
+                let mut job = crate::sqllang::highlight_job(&shown, tokens, &theme, egui::FontId::monospace(12.5));
+                for s in &mut job.sections {
+                    s.format.line_height = Some(20.0);
+                }
+                job.wrap.max_width = ui.available_width();
+                job.wrap.max_rows = 6;
+                let galley = ui.fonts_mut(|f| f.layout_job(job));
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(egui::WidgetText::Galley(galley)));
+                ui.add_space(4.0);
             });
         }
     }

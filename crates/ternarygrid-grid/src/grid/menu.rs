@@ -24,11 +24,11 @@ fn submenu(ui: &mut Ui, icon: Option<&str>, text: &str, add: &mut dyn FnMut(&mut
     kit::submenu(ui, icon, text, SUBMENU_W, add);
 }
 
-/// Widths of the menus' contents (the mockups' menus less the frame's margin and line):
-/// the body's menu 280, the header's 300, the submenus 230.
-const CELL_MENU_W: f32 = 268.0;
-const HEAD_MENU_W: f32 = 288.0;
-const SUBMENU_W: f32 = 218.0;
+/// Widths of the menus, as in the mockups: the body's menu 280, the header's 300, the
+/// submenus 230.
+const CELL_MENU_W: f32 = 280.0;
+const HEAD_MENU_W: f32 = 300.0;
+const SUBMENU_W: f32 = 230.0;
 
 fn short_value(v: &Value) -> String {
     if v.is_null() {

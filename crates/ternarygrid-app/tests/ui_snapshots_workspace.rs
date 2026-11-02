@@ -174,7 +174,12 @@ impl Shots {
             .build_eframe(move |cc| {
                 ternarygrid_app::theme::setup_fonts(&cc.egui_ctx);
                 backend.set_context(cc.egui_ctx.clone());
-                TernaryGridApp::new(backend, conns, services, settings)
+                let mut app = TernaryGridApp::new(backend, conns, services, settings);
+                // As on macOS (the mockups): the menus in the system's menu bar, the window
+                // buttons at the left of the top bar (painted by `shot`).
+                app.native_menu_bar = true;
+                app.titlebar_inset = ternarygrid_app::app::MAC_TITLEBAR_INSET;
+                app
             });
         ternarygrid_app::theme::apply_settings(&h.ctx, &h.state().settings);
         let theme = if theme == Theme::Dark { "dark" } else { "light" };
@@ -222,7 +227,8 @@ impl Shots {
         let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
         let size = self.h.ctx.content_rect().size() * ppp();
         let bg = self.h.ctx.global_style().visuals.panel_fill;
-        let img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        let mut img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        traffic_lights(&mut img, ppp());
         let path = self.dir.join(format!("{name}-{}.png", self.theme));
         img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
@@ -296,6 +302,25 @@ impl Shots {
     fn close_tabs(&mut self) {
         self.command(AppCommand::CloseAllTabs);
         self.frames(4);
+    }
+}
+
+/// The macOS window buttons, as the system paints them over the top bar's left end.
+fn traffic_lights(img: &mut image::RgbaImage, ppp: f32) {
+    for (i, c) in [[0xff, 0x5f, 0x57], [0xfe, 0xbc, 0x2e], [0x28, 0xc8, 0x40]].iter().enumerate() {
+        let (cx, cy, r) = ((16.0 + 6.0 + 20.0 * i as f32) * ppp, 22.0 * ppp, 6.0 * ppp);
+        for y in (cy - r - 2.0) as u32..=(cy + r + 2.0) as u32 {
+            for x in (cx - r - 2.0) as u32..=(cx + r + 2.0) as u32 {
+                let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                let a = (r + 0.5 - d).clamp(0.0, 1.0);
+                if a > 0.0 {
+                    let px = img.get_pixel_mut(x, y);
+                    for k in 0..3 {
+                        px[k] = (c[k] as f32 * a + px[k] as f32 * (1.0 - a)).round() as u8;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -457,6 +482,7 @@ fn shots(s: &mut Shots) {
         st.results.global_memory_limit_mb = 2048;
         st.results.max_text_length = 1_000_000;
         st.results.format.null_text = "NULL".into();
+        st.results.format.bool_style = ternarygrid_core::value::BoolStyle::TrueFalse;
         st.history.max_entries = 100_000;
         st.ai.enabled = true;
         st.ai.max_tokens = 8192;
@@ -507,6 +533,16 @@ fn shots(s: &mut Shots) {
             s.shot("set_network_form");
         }
     }
+    // A select open (the menu look of the drop-downs): the formatter of the SQL editor.
+    s.click("SQL editor");
+    s.frames(3);
+    let found = s.h.query_all_by_role(egui::accesskit::Role::ComboBox).next().map(|n| n.click()).is_some();
+    if found {
+        s.frames(6);
+        s.shot("set_select");
+        s.h.key_press(egui::Key::Escape);
+        s.frames(3);
+    }
     // "Search settings": the sections with a match and their counts, the matches marked.
     {
         // The settings' own search: the text field at the top of their side navigation (right
@@ -535,29 +571,41 @@ fn shots(s: &mut Shots) {
         stop_on_error: true,
         commit_at_end: true,
     };
-    store.create_folder("exports").unwrap();
-    store.create_folder("exports/nightly").unwrap();
-    store.create_folder("maintenance").unwrap();
-    let mut t1 = TaskDef::new("refresh rollups", sql_task("select count(*) from customer;"));
-    t1.folder = Some("maintenance".into());
+    // The mockup's tasks: a backup, an export, a SQL script, a schema compare that failed, a
+    // disabled shell command and a composite task.
+    for f in ["exports", "exports/nightly", "backups", "maintenance"] {
+        store.create_folder(f).unwrap();
+    }
+    let in_folder = |mut t: TaskDef, f: &str| {
+        t.folder = Some(f.into());
+        t
+    };
+    let daily = |at: &str| Schedule::Daily { at: at.into(), weekdays: vec![] };
+    let tb = store
+        .create(in_folder(TaskDef::new("bantuin nightly", TaskKind::Backup { connection_id: conn.clone(), options: Default::default() }), "backups").with_schedule(daily("02:00")))
+        .unwrap();
+    let te = store
+        .create(
+            in_folder(TaskDef::new("orders to CSV", TaskKind::Export { connection_id: conn.clone(), config: serde_json::json!({}) }), "exports/nightly")
+                .with_schedule(daily("01:30")),
+        )
+        .unwrap();
+    let mut t1 = in_folder(TaskDef::new("refresh rollups", sql_task("select count(*) from customer;")), "maintenance");
     t1.description = Some("Rebuilds the daily and weekly rollup tables".into());
     t1 = t1.with_schedule(Schedule::Daily { at: "06:30".into(), weekdays: vec![1, 2, 3, 4, 5] });
     let t1 = store.create(t1).unwrap();
-    let mut t2 = TaskDef::new("broken report", sql_task("select * from nope;"));
-    t2.folder = Some("exports/nightly".into());
-    t2 = t2.with_schedule(Schedule::Cron("0 9 * * 1-5".into()));
-    let t2 = store.create(t2).unwrap();
-    let mut t3 = TaskDef::new("rotate logs", TaskKind::Shell { command: "echo rotated".into() });
-    t3.folder = Some("maintenance".into());
+    let t2 = store
+        .create(TaskDef::new("staging vs prod schema", TaskKind::SchemaCompare { config: serde_json::json!({}) }).with_schedule(Schedule::Cron("0 9 * * 1-5".into())))
+        .unwrap();
+    let mut t3 = in_folder(TaskDef::new("rotate logs", TaskKind::Shell { command: "echo rotated".into() }), "maintenance");
     t3.enabled = false;
     let t3 = store.create(t3).unwrap();
+    // Its steps as in the mockup (without its deleted one: the store does not keep those).
+    let steps = vec![tb.id.clone(), te.id.clone(), t1.id.clone()];
     let t4 = store
-        .create(
-            TaskDef::new("Nightly chain", TaskKind::Composite { steps: vec![t1.id.clone(), t2.id.clone(), t3.id.clone()], stop_on_error: true, parallel: false })
-                .with_schedule(Schedule::Cron("30 3 * * *".into())),
-        )
+        .create(TaskDef::new("Nightly chain", TaskKind::Composite { steps, stop_on_error: true, parallel: false }).with_schedule(Schedule::Cron("30 3 * * *".into())))
         .unwrap();
-    // Runs in the run log: the last one of "broken report" failed.
+    // Runs in the run log: the last one of the schema compare failed.
     let log = s.h.state().services.runlog.clone().unwrap();
     let now = chrono::Utc::now();
     let record = |task: &TaskDef,
@@ -578,11 +626,14 @@ fn shots(s: &mut Shots) {
         log.record(&r).unwrap();
     };
     use ternarygrid_tasks::{MessageLevel as L, RunStatus as R, Trigger as T};
+    record(&tb, 330, 41, R::Succeeded, T::Schedule, None, &[]);
+    record(&te, 360, 6, R::Succeeded, T::Schedule, None, &[]);
     record(&t1, 300, 41, R::Succeeded, T::Schedule, None, &[(0, L::Info, "Connecting to ternarygrid-sample.db…"), (41, L::Info, "1 statement(s) run")]);
-    record(&t2, 2900, 4, R::Succeeded, T::Manual, None, &[]);
-    record(&t2, 1460, 3, R::Succeeded, T::Schedule, None, &[]);
-    record(&t2, 20, 2, R::Failed, T::Schedule, Some("no such table: nope"), &[(0, L::Info, "Connecting to ternarygrid-sample.db…"), (2, L::Error, "no such table: nope")]);
-    record(&t4, 600, 72, R::Succeeded, T::Schedule, None, &[]);
+    record(&t2, 2900, 3, R::Succeeded, T::Manual, None, &[(3, L::Info, "12 differences")]);
+    record(&t2, 1460, 4, R::Succeeded, T::Schedule, None, &[(4, L::Info, "14 differences")]);
+    let refused = "connection refused (os error 61): tplus-staging:3306";
+    record(&t2, 20, 2, R::Failed, T::Schedule, Some(refused), &[(0, L::Info, "Connecting to tplus-staging…"), (2, L::Error, "connection refused (os error 61)")]);
+    record(&t4, 240, 72, R::Succeeded, T::Schedule, None, &[]);
     // Scheduled runs off: the tab says so at its top.
     s.h.state_mut().settings.tasks.scheduler_enabled = false;
     s.command(AppCommand::OpenTasks);
@@ -606,7 +657,10 @@ fn shots(s: &mut Shots) {
     s.shot("task_composite");
     s.click("Cancel");
     s.frames(10);
-    // Delete (asks first), a new folder.
+    // Delete (asks first: two tasks, as the mockup), a new folder.
+    s.focused::<ternarygrid_app::tabs::tasks::TasksTab>().select_task(&t3.id);
+    s.focused::<ternarygrid_app::tabs::tasks::TasksTab>().add_to_selection(&t2.id);
+    s.frames(3);
     s.click("Delete");
     s.frames(20);
     s.shot("task_delete");
@@ -620,7 +674,8 @@ fn shots(s: &mut Shots) {
 
     // Search metadata, then data.
     s.command(AppCommand::OpenSearch { connection: None, data: false });
-    s.focused::<ternarygrid_app::tabs::search::SearchTab>().set_pattern("*o*");
+    s.focused::<ternarygrid_app::tabs::search::SearchTab>().set_pattern("*order*");
+    s.click("Search comments");
     s.click("Search");
     s.wait("metadata results", |h| {
         let (_, tab) = h.state_mut().dock.find_active_focused().unwrap();
@@ -628,6 +683,8 @@ fn shots(s: &mut Shots) {
         !t.is_busy()
     });
     s.frames(4);
+    // The first result selected, as in the mockup.
+    s.click("main.order");
     s.shot("search");
     s.close_tabs();
     s.command(AppCommand::OpenSearch { connection: Some(conn.clone()), data: true });
@@ -644,11 +701,14 @@ fn shots(s: &mut Shots) {
     s.close_tabs();
 
     // The error log.
+    // Oldest first: the log shows the newest at the top, as the mockup.
     for (l, m) in [
-        (tracing::Level::ERROR, "slypee-prod: column statuss does not exist (SQLSTATE 42703)"),
-        (tracing::Level::WARN, "tplus-staging: the keep-alive ping took 2.4 s"),
-        (tracing::Level::WARN, "Import into customer: 3 rows had dates in another format; read as text"),
+        (tracing::Level::ERROR, "Task \"staging vs prod schema\" failed: connection refused"),
+        (tracing::Level::WARN, "Spill file grew to 512 MB for result 'select * from product_events'"),
         (tracing::Level::ERROR, "Cannot connect to slypee-prod: connection refused (os error 61)"),
+        (tracing::Level::WARN, "Import into customer: 3 rows had dates in another format; read as text"),
+        (tracing::Level::WARN, "tplus-staging: the keep-alive ping took 2.4 s"),
+        (tracing::Level::ERROR, "slypee-prod: column statuss does not exist (SQLSTATE 42703)"),
     ] {
         ternarygrid_app::applog::push(l, "ternarygrid::shots", m);
     }

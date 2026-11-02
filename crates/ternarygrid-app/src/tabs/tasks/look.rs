@@ -1,11 +1,10 @@
 //! Pieces of the workspace screens drawn as in the redesign mockups (settings, tasks, the
-//! query history, search, the projects view): check boxes and radio buttons, number fields
-//! with their unit, text fields at the form height, bordered tables with styled cells, tree
-//! rows and weekday toggles. They use the tokens of `ternarygrid_ui::style`.
+//! query history, search, the projects view): check boxes that wrap, number fields with
+//! their unit, text fields at the form height, bordered tables with styled cells and weekday
+//! toggles. They use the tokens of `ternarygrid_ui::style`.
 
 use egui::{Align2, Color32, CornerRadius, FontId, Rect, Response, RichText, Sense, Stroke, StrokeKind, TextStyle, Ui, WidgetInfo, WidgetType, vec2};
 use egui_extras::{Column, TableBuilder, TableRow};
-use egui_phosphor::regular as icon;
 use ternarygrid_ui::style::{self, RADIUS};
 
 /// Height of a table row: 30 points and its hairline (the header: 32 and its line).
@@ -69,43 +68,13 @@ pub fn paint_box(ui: &Ui, b: Rect, on: bool, hovered: bool) {
     let painter = ui.painter();
     if on {
         painter.rect_filled(b, CornerRadius::same(4), fade(ui, if hovered && ui.is_enabled() { p.accent_hover } else { p.accent }));
-        let pts = vec![egui::pos2(b.left() + 4.0, b.top() + 8.3), egui::pos2(b.left() + 6.8, b.top() + 11.0), egui::pos2(b.left() + 12.0, b.top() + 5.2)];
-        painter.add(egui::Shape::line(pts, Stroke::new(1.9, fade(ui, p.on_accent))));
+        // The design's check (as `kit::checkbox`): an 11-point mark, 2.8 on 24.
+        let pts = vec![egui::pos2(b.left() + 5.0, b.top() + 8.2), egui::pos2(b.left() + 6.9, b.top() + 10.1), egui::pos2(b.left() + 11.0, b.top() + 6.2)];
+        painter.add(egui::Shape::line(pts, Stroke::new(1.3, fade(ui, p.on_accent))));
     } else {
-        let stroke = if hovered && ui.is_enabled() { p.text_muted } else { p.border_strong };
+        let stroke = if hovered && ui.is_enabled() { p.accent } else { p.border_strong };
         painter.rect(b, CornerRadius::same(4), p.surface, Stroke::new(1.5, fade(ui, stroke)), StrokeKind::Inside);
     }
-}
-
-/// A radio button: a 16 point ring (with an accent dot when on) and its label. Returns the
-/// response; the caller sets the value when it is clicked.
-pub fn radio(ui: &mut Ui, on: bool, label: &str) -> Response {
-    let p = ternarygrid_ui::pal(ui);
-    let max_w = (ui.available_width() - 24.0).max(60.0);
-    let (title, _) = label_galleys(ui, label, None, max_w);
-    let line_h = ui.text_style_height(&TextStyle::Body);
-    let (rect, resp) = ui.allocate_exact_size(vec2(24.0 + title.size().x, title.size().y.max(18.0)), Sense::click());
-    let enabled = ui.is_enabled();
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, enabled, on, label));
-    if ui.is_rect_visible(rect) {
-        let c = egui::pos2(rect.left() + 8.0, rect.top() + (line_h / 2.0).max(8.0));
-        let ring = if on {
-            p.accent
-        } else if resp.hovered() && enabled {
-            p.text_muted
-        } else {
-            p.border_strong
-        };
-        ui.painter().circle(c, 7.25, p.surface, Stroke::new(1.5, fade(ui, ring)));
-        if on {
-            ui.painter().circle_filled(c, 4.0, fade(ui, p.accent));
-        }
-        if resp.has_focus() {
-            style::focus_halo(ui, Rect::from_center_size(c, vec2(16.0, 16.0)), 8);
-        }
-        ui.painter().galley(egui::pos2(rect.left() + 24.0, rect.top()), title, fade(ui, p.text));
-    }
-    resp
 }
 
 /// Radio buttons for `value` in a row (16 points apart).
@@ -114,7 +83,7 @@ pub fn radios<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, items: &[(T, &str
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
         for (v, l) in items {
-            if radio(ui, *value == *v, l).clicked() && *value != *v {
+            if ternarygrid_ui::kit::radio(ui, *value == *v, *l).clicked() && *value != *v {
                 *value = *v;
                 changed = true;
             }
@@ -125,6 +94,10 @@ pub fn radios<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, items: &[(T, &str
 
 /// Height of the mockups' fields (text, number and select boxes).
 pub const FIELD_H: f32 = 30.0;
+
+/// The text of the mockups' inputs is 13 from their left edge (10 of padding, the border and
+/// the 2 of an HTML input's own padding).
+const FIELD_MARGIN: egui::Margin = egui::Margin { left: 13, right: 10, top: 0, bottom: 0 };
 
 /// A number field 30 points high and at least 64 wide, its value left-aligned (thousands
 /// grouped while it is not edited), followed 6 points further by its unit in muted text.
@@ -225,7 +198,7 @@ pub fn text_field(ui: &mut Ui, value: &mut String, width: f32, hint: &str, mono:
     let p = ternarygrid_ui::pal(ui);
     let mut edit = egui::TextEdit::singleline(value)
         .desired_width(width)
-        .margin(egui::Margin::symmetric(10, 0))
+        .margin(FIELD_MARGIN)
         .min_size(vec2(0.0, FIELD_H))
         .vertical_align(egui::Align::Center)
         .hint_text(RichText::new(hint).color(p.text_faint));
@@ -241,7 +214,7 @@ pub fn text_field_h(ui: &mut Ui, value: &mut String, width: f32, h: f32, hint: &
     ui.add(
         egui::TextEdit::singleline(value)
             .desired_width(width)
-            .margin(egui::Margin::symmetric(10, 0))
+            .margin(FIELD_MARGIN)
             .min_size(vec2(0.0, h))
             .vertical_align(egui::Align::Center)
             .hint_text(RichText::new(hint).color(p.text_faint)),
@@ -255,7 +228,7 @@ pub fn password_field(ui: &mut Ui, value: &mut String, width: f32, hint: &str) -
         egui::TextEdit::singleline(value)
             .password(true)
             .desired_width(width)
-            .margin(egui::Margin::symmetric(10, 0))
+            .margin(FIELD_MARGIN)
             .min_size(vec2(0.0, FIELD_H))
             .vertical_align(egui::Align::Center)
             .hint_text(RichText::new(hint).color(p.text_faint)),
@@ -311,11 +284,15 @@ pub fn table_h(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, cols: &[
 // The table code is compiled once, not once per caller.
 fn table_dyn(ui: &mut Ui, id: egui::Id, cols: &[Col], rows: usize, row_h: f32, body: &mut dyn FnMut(&mut TableRow<'_, '_>, usize)) {
     let pal = ternarygrid_ui::pal(ui);
-    ternarygrid_ui::parts::bordered(ui).show(ui, |ui| {
+    // The design stripes the second, fourth… row; egui the first, third…: the frame shows the
+    // stripe through the rows egui leaves bare, and egui's stripes are the surface.
+    ternarygrid_ui::parts::bordered(ui).fill(pal.stripe).show(ui, |ui| {
         ui.scope(|ui| {
             // Cells edge to edge: the stripes, the hairlines and the header have no gaps
             // (egui also puts the vertical spacing between rows).
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            ui.visuals_mut().faint_bg_color = pal.surface;
+            ui.visuals_mut().selection.bg_fill = pal.sel;
             // No column lines at rest: they show while the pointer is on a column's edge.
             ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
             let mut tb = TableBuilder::new(ui)
@@ -367,7 +344,7 @@ pub fn cell(row: &mut TableRow<'_, '_>, right: bool, add: impl FnOnce(&mut Ui)) 
     row.col(|ui| {
         let p = ternarygrid_ui::pal(ui);
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, ternarygrid_ui::soft(p.border, 0.75)));
+        ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.line));
         ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
         // Selected rows keep their text colours (only the fill shows the selection).
         ui.visuals_mut().override_text_color = None;
@@ -395,66 +372,8 @@ pub fn mono(ui: &Ui, text: &str, color: Color32) -> RichText {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Trees, toggles
+// Toggles
 // ---------------------------------------------------------------------------------------------
-
-/// What a [`tree_row`] reports.
-pub struct TreeRow {
-    pub resp: Response,
-    /// The caret (fold / unfold) was clicked.
-    pub caret: bool,
-}
-
-/// A row of a side tree (folders, scripts): 26 points high, indented by `depth`, an optional
-/// caret (`Some(open)`), an icon, the label and a faint count or detail at the right; the
-/// selected row on the soft accent.
-#[allow(clippy::too_many_arguments)]
-pub fn tree_row(ui: &mut Ui, depth: usize, caret: Option<bool>, glyph: &str, label: &str, right: Option<&str>, selected: bool, weak: bool) -> TreeRow {
-    let p = ternarygrid_ui::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
-    let inner = rect.shrink2(vec2(6.0, 0.0));
-    let mut x = inner.left() + 8.0 + depth as f32 * 14.0;
-    let caret_rect = Rect::from_min_size(egui::pos2(x - 2.0, inner.top()), vec2(16.0, inner.height()));
-    let caret_clicked = caret.is_some() && resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| caret_rect.contains(q));
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        if selected {
-            painter.rect_filled(inner, CornerRadius::same(RADIUS), p.accent_soft);
-        } else if resp.hovered() {
-            painter.rect_filled(inner, CornerRadius::same(RADIUS), p.hover);
-        }
-        if resp.has_focus() {
-            painter.rect_stroke(inner, CornerRadius::same(RADIUS), Stroke::new(1.5, p.accent), StrokeKind::Inside);
-        }
-        let cy = inner.center().y;
-        if let Some(open) = caret {
-            painter.text(egui::pos2(x + 6.0, cy), Align2::CENTER_CENTER, if open { icon::CARET_DOWN } else { icon::CARET_RIGHT }, style::icon_font(11.0), p.text_faint);
-        }
-        x += 18.0;
-        painter.text(egui::pos2(x + 7.5, cy), Align2::CENTER_CENTER, glyph, style::icon_font(15.0), if selected { p.accent_text } else { p.text_muted });
-        x += 21.0;
-        let size = style::body_size(ui.ctx());
-        let mut right_x = inner.right() - 10.0;
-        if let Some(r) = right {
-            let g = painter.layout_no_wrap(r.to_string(), FontId::proportional(11.5), p.text_faint);
-            right_x -= g.size().x;
-            painter.galley(egui::pos2(right_x, cy - g.size().y / 2.0), g, p.text_faint);
-            right_x -= 8.0;
-        }
-        let font = if selected || depth == 0 { style::medium(ui.ctx(), size) } else { FontId::proportional(size) };
-        let color = if selected {
-            p.accent_text
-        } else if weak {
-            p.text_faint
-        } else {
-            p.text
-        };
-        let g = egui::WidgetText::from(RichText::new(label).font(font).color(color)).into_galley(ui, Some(egui::TextWrapMode::Truncate), (right_x - x).max(20.0), TextStyle::Body);
-        ui.painter().galley(egui::pos2(x, cy - g.size().y / 2.0), g, color);
-    }
-    TreeRow { resp, caret: caret_clicked }
-}
 
 /// A day of the week that can be switched on (36 × 26, the soft accent when on).
 pub fn day_toggle(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
@@ -493,38 +412,12 @@ pub fn error(ui: &mut Ui, text: &str) {
 /// A small muted heading (a panel's title: "Folders", "Messages").
 pub fn small_heading(ui: &mut Ui, text: &str) -> Response {
     let p = ternarygrid_ui::pal(ui);
-    ui.label(RichText::new(text).font(style::semibold(ui.ctx(), 12.0)).color(p.text_muted))
+    ternarygrid_ui::kit::semibold_label(ui, text, 12.0, p.text_muted)
 }
 
 // ---------------------------------------------------------------------------------------------
 // Dialogs
 // ---------------------------------------------------------------------------------------------
-
-/// A destructive confirmation: white text on a red fill (the main action of a "Delete …?"
-/// dialog).
-pub fn danger_button(ui: &mut Ui, glyph: Option<&str>, text: &str) -> Response {
-    let p = ternarygrid_ui::pal(ui);
-    let dark = ui.visuals().dark_mode;
-    let size = style::body_size(ui.ctx());
-    let label = match glyph {
-        Some(g) => format!("{g}  {text}"),
-        None => text.to_string(),
-    };
-    let g = ui.painter().layout_no_wrap(label, style::medium(ui.ctx(), size), Color32::WHITE);
-    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 24.0, style::CONTROL_H), Sense::click());
-    let enabled = ui.is_enabled();
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, text));
-    if ui.is_rect_visible(rect) {
-        let base = if dark { Color32::from_rgb(0xc4, 0x35, 0x2b) } else { p.err };
-        let fill = if resp.hovered() && enabled { base.gamma_multiply(0.88) } else { base };
-        ui.painter().rect_filled(rect, CornerRadius::same(RADIUS), fade(ui, fill));
-        if resp.has_focus() {
-            ui.painter().rect_stroke(rect.expand(2.0), CornerRadius::same(RADIUS + 2), Stroke::new(1.5, p.accent), StrokeKind::Outside);
-        }
-        ui.painter().galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
-    }
-    resp
-}
 
 /// A modal [`ternarygrid_ui::parts::Dialog`] that only closes by its × (the first value) or
 /// the caller's buttons: a click beside it or Escape do not throw a form away.

@@ -232,6 +232,14 @@ pub struct SearchTab {
     notice: Option<String>,
 }
 
+/// A vertical hairline between groups of a form row, as the design's: 1 point wide, the row's
+/// spacing on each side (the kit's divider brings its own room).
+fn divider(ui: &mut Ui) {
+    let p = ternarygrid_ui::pal(ui);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, 18.0), egui::Sense::hover());
+    ui.painter().vline(r.center().x, r.y_range(), egui::Stroke::new(1.0, p.border));
+}
+
 impl SearchTab {
     /// Metadata search, or the data search when `data`.
     pub fn new(conn: Option<String>, data: bool) -> Self {
@@ -384,6 +392,9 @@ impl SearchTab {
         let mut go = false;
         Self::form(ui, |ui| {
             ui.horizontal(|ui| {
+                // The select at the height of the design's fields, its text 11 points in.
+                ui.spacing_mut().interact_size.y = look::FIELD_H;
+                ui.spacing_mut().button_padding = egui::vec2(11.0, 5.0);
                 self.mode_switch(ui);
                 let r = ternarygrid_ui::kit::search_field(ui, egui::Id::new(("ms_pattern", self.uid)), &mut self.pattern, tr("Name or pattern, e.g. cust* or *_id"), 340.0);
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -403,44 +414,62 @@ impl SearchTab {
                     ui.add(egui::Spinner::new().size(14.0).color(pal.accent_text));
                 }
             });
+            // A line as tall as its 26 point fields (its first row starts at that height, so
+            // the check boxes are centred on them).
+            ui.spacing_mut().interact_size.y = 26.0;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 look::checkbox(ui, &mut self.case_sensitive, tr("Case sensitive"));
                 look::checkbox(ui, &mut self.search_comments, tr("Search comments"));
                 ui.label(RichText::new(tr("Limit")).size(12.5).color(pal.text_muted));
                 look::number_h(ui, &mut self.limit, 1..=100_000, 70.0, 26.0);
-                ternarygrid_ui::kit::vdivider(ui, 18.0);
+                divider(ui);
                 ui.horizontal(|ui| self.schema_filter_ui(ui, cx));
             });
-            ui.horizontal_wrapped(|ui| {
+            // When the kinds do not fit on the line, the longest label wraps (as a flex row
+            // shrinks it) before the line breaks; the row is then as tall as that label and the
+            // others are centred on it.
+            let font = egui::FontId::proportional(13.0);
+            let label = ui.painter().layout_no_wrap(tr("Kinds").to_string(), egui::FontId::proportional(12.5), egui::Color32::PLACEHOLDER).size().x;
+            let widths: Vec<f32> =
+                KINDS.iter().map(|k| ui.painter().layout_no_wrap(tr(k.plural_label()).to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x + 26.0).collect();
+            let need = label + widths.iter().sum::<f32>() + 12.0 * KINDS.len() as f32;
+            let over = need - ui.available_width();
+            let longest = widths.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+            // Squeezing the longest label to 55 % at most; past that the line breaks.
+            let fits = over <= widths[longest] * 0.45;
+            let squeezed = (over > 0.0 && fits).then(|| widths[longest] - over);
+            let row_h = squeezed.map_or(17.0, |w| {
+                let text = tr(KINDS[longest].plural_label()).to_string();
+                ui.painter().layout(text, font.clone(), egui::Color32::PLACEHOLDER, w - 26.0).size().y.max(17.0)
+            });
+            let kinds = &mut self.kinds;
+            let mut kinds_row = |ui: &mut Ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 ui.label(RichText::new(tr("Kinds")).size(12.5).color(pal.text_muted));
-                // When the kinds do not fit on the line, the longest label wraps (as a flex row
-                // shrinks it) before the line breaks.
-                let font = egui::FontId::proportional(13.0);
-                let widths: Vec<f32> =
-                    KINDS.iter().map(|k| ui.painter().layout_no_wrap(tr(k.plural_label()).to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x + 26.0).collect();
-                let need = widths.iter().sum::<f32>() + 12.0 * KINDS.len() as f32;
-                let over = need - ui.available_width();
-                let longest = widths.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
                 for (i, k) in KINDS.iter().enumerate() {
-                    let mut on = self.kinds.contains(k);
-                    let squeeze = (i == longest && over > 0.0).then(|| (widths[i] - over).max(widths[i] * 0.55));
-                    let r = match squeeze {
+                    let mut on = kinds.contains(k);
+                    let r = match squeezed.filter(|_| i == longest) {
                         Some(w) => {
-                            ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| look::checkbox(ui, &mut on, tr(k.plural_label()))).inner
+                            ui.allocate_ui_with_layout(egui::vec2(w, row_h), egui::Layout::top_down(egui::Align::Min), |ui| look::checkbox(ui, &mut on, tr(k.plural_label()))).inner
                         }
                         None => look::checkbox(ui, &mut on, tr(k.plural_label())),
                     };
                     if r.changed() {
                         if on {
-                            self.kinds.insert(*k);
+                            kinds.insert(*k);
                         } else {
-                            self.kinds.remove(k);
+                            kinds.remove(k);
                         }
                     }
                 }
-            });
+            };
+            if fits {
+                // One line as tall as its tallest label, the others centred on it.
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), row_h), egui::Layout::left_to_right(egui::Align::Center), |ui| kinds_row(ui));
+            } else {
+                ui.horizontal_wrapped(|ui| kinds_row(ui));
+            }
         });
         if go {
             self.start_metadata(cx);
@@ -461,6 +490,8 @@ impl SearchTab {
                 }
                 let n = self.meta_hits.len();
                 ui.horizontal(|ui| {
+                    // The row as tall as its button, the texts centred on it.
+                    ui.set_min_height(ternarygrid_ui::style::SMALL_H);
                     let count = if n >= self.limit { trf("{} objects (limit reached)", &[&n]) } else { trf("{} objects", &[&n]) };
                     ui.label(RichText::new(count).size(12.0).color(pal.text_faint));
                     let sel = self.meta_selected.and_then(|i| self.meta_hits.get(i).cloned());
@@ -540,14 +571,16 @@ impl SearchTab {
         let label = if self.schemas.is_empty() { tr("All").to_string() } else { self.schemas.iter().cloned().collect::<Vec<_>>().join(", ") };
         let b = ternarygrid_ui::kit::button_ex(ui, Kind::Secondary, Some(icon::STACK), &label, true);
         egui::Popup::menu(&b).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            if ui.selectable_label(self.schemas.is_empty(), tr("All")).clicked() {
+            ternarygrid_ui::kit::menu_look(ui, 220.0);
+            let mut all = self.schemas.is_empty();
+            if ternarygrid_ui::kit::menu_check(ui, &mut all, tr("All")).clicked() {
                 self.schemas.clear();
             }
-            ui.separator();
+            ternarygrid_ui::kit::menu_separator(ui);
             egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                 for n in &names {
                     let mut on = self.schemas.contains(n);
-                    if look::checkbox(ui, &mut on, n).changed() {
+                    if ternarygrid_ui::kit::menu_check(ui, &mut on, n).changed() {
                         if on {
                             self.schemas.insert(n.clone());
                         } else {
@@ -691,8 +724,11 @@ impl SearchTab {
         let mut go = false;
         let mut stop = false;
         Self::form(ui, |ui| {
+            // The data search's rows are 10 apart (the metadata search's 12).
+            ui.spacing_mut().item_spacing.y = 10.0;
             ui.horizontal(|ui| {
                 ui.spacing_mut().interact_size.y = look::FIELD_H;
+                ui.spacing_mut().button_padding = egui::vec2(11.0, 5.0);
                 self.mode_switch(ui);
                 // The database's logo, the connection (180) and the schema (140).
                 if let Some(kind) = self.conn.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.kind)
@@ -778,10 +814,14 @@ impl SearchTab {
         let tables = text_columns(snap);
         let chosen_count = tables.iter().filter(|(t, _)| self.chosen.as_ref().is_none_or(|c| c.contains(&t.name))).count();
         ui.spacing_mut().item_spacing.y = 6.0;
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            let text = trf("Tables ({} of {} with text columns)", &[&chosen_count, &tables.len()]);
-            ui.label(RichText::new(text).font(ternarygrid_ui::style::semibold(ui.ctx(), 12.5)).color(pal.text));
+        ui.scope(|ui| {
+            // A line as tall as its text.
+            ui.spacing_mut().interact_size.y = 0.0;
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                let text = trf("Tables ({} of {} with text columns)", &[&chosen_count, &tables.len()]);
+                ternarygrid_ui::kit::semibold_label(ui, &text, 12.5, pal.text);
+            });
         });
         ui.horizontal(|ui| {
             ui.add_space(12.0);

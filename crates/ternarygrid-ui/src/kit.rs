@@ -576,6 +576,20 @@ pub fn section_title(ui: &Ui, text: &str) -> RichText {
     RichText::new(text).font(style::semibold(ui.ctx(), 13.0))
 }
 
+/// A wrapping label in `font` whose lines are `factor` times its size apart with the text in
+/// the middle of each line, like CSS `line-height` (egui puts the extra space under it).
+pub fn label_lh(ui: &mut Ui, text: RichText, font: FontId, factor: f32, selectable: bool) -> Response {
+    let lh = (font.size * factor * 2.0).floor() / 2.0;
+    let row = ui.fonts_mut(|f| f.row_height(&font));
+    let half = ((lh - row) / 2.0).max(0.0);
+    // Room for the lines; the text drawn half the extra height lower, inside it.
+    let text = egui::WidgetText::from(text.font(font).line_height(Some(lh)));
+    let galley = text.into_galley(ui, Some(egui::TextWrapMode::Wrap), ui.available_width(), egui::TextStyle::Body);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.translate(vec2(0.0, half))).layout(egui::Layout::top_down(egui::Align::Min)));
+    child.add(egui::Label::new(galley).selectable(selectable))
+}
+
 /// An icon on its own, as a label.
 pub fn icon(ui: &mut Ui, icon: &str, size: f32, color: Color32) -> Response {
     ui.add(egui::Label::new(RichText::new(icon).font(style::icon_font(size)).color(color)).selectable(false))
@@ -650,7 +664,9 @@ pub fn field_with_icon(ui: &mut Ui, id: egui::Id, text: &mut String, hint_text: 
         .fill(p.surface)
         .stroke(Stroke::new(1.0, if hovered { p.border_strong } else { p.border }))
         .corner_radius(CornerRadius::same(RADIUS))
-        .inner_margin(egui::Margin { left: 32, right: if clear { 28 } else { 10 }, top: 0, bottom: 0 });
+        // The design's input: the icon's centre 18 in, the text 35 in (border, 10 padding,
+        // 14 icon, 8 gap and the input's own 2).
+        .inner_margin(egui::Margin { left: 34, right: if clear { 28 } else { 10 }, top: 0, bottom: 0 });
     let edit = egui::TextEdit::singleline(text)
         .id(id)
         .hint_text(RichText::new(hint_text).color(p.text_faint))
@@ -663,7 +679,7 @@ pub fn field_with_icon(ui: &mut Ui, id: egui::Id, text: &mut String, hint_text: 
     if resp.has_focus() {
         style::focus_halo(ui, r, RADIUS);
     }
-    ui.painter().text(egui::pos2(r.left() + 17.0, r.center().y), Align2::CENTER_CENTER, icon, style::icon_font(14.0), p.text_faint);
+    ui.painter().text(egui::pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, icon, style::icon_font(14.0), p.text_faint);
     if clear && !text.is_empty() {
         let x_rect = Rect::from_center_size(egui::pos2(r.right() - 15.0, r.center().y), Vec2::splat(18.0));
         let x = ui.interact(x_rect, resp.id.with("clear"), Sense::click());
@@ -779,7 +795,7 @@ pub fn tree_section(ui: &mut Ui, open: &mut bool, glyph: &str, title: &str) -> R
 /// The design's menu look for the `ui` of a context menu or a pop-up menu (call it first in
 /// the menu's closure): items 28 points high padded by 10, the icon 10 points from the text,
 /// no gap between items, hovered items on the hover fill with a radius of 5, the menu
-/// `min_width` wide (shortcuts at its right edge). Items added with `ui.button` get the height and padding; for the
+/// `min_width` wide outside (shortcuts at its right edge). Items added with `ui.button` get the height and padding; for the
 /// muted icon and the faint shortcut use [`menu_item`].
 pub fn menu_look(ui: &mut Ui, min_width: f32) {
     let p = style::pal(ui);
@@ -795,8 +811,11 @@ pub fn menu_look(ui: &mut Ui, min_width: f32) {
     w.hovered.weak_bg_fill = p.hover;
     w.active.weak_bg_fill = p.subtle;
     w.open.weak_bg_fill = p.hover;
-    ui.set_min_width(min_width);
-    ui.set_max_width(min_width);
+    // `min_width` is the menu's outer width, as the design gives it (border-box): its 5 point
+    // margin and its 1 point border on both sides come off for the items.
+    let inner = (min_width - 12.0).max(0.0);
+    ui.set_min_width(inner);
+    ui.set_max_width(inner);
 }
 
 /// A menu item as in the design: a muted icon (or the room of one), the text, and the

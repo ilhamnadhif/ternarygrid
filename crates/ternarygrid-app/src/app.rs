@@ -1817,10 +1817,15 @@ impl eframe::App for TernaryGridApp {
             let max = (ui.available_width() - 640.0).clamp(320.0, 720.0);
             let pal = ternarygrid_ui::pal(ui);
             let frame = egui::Frame::new().fill(pal.canvas);
-            egui::Panel::right("ternarygrid_ai").resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
-                // Header: the sparkle, the name and ×, over a hairline.
+            // 460 points as in the design, plus the panel's 1 point edge.
+            egui::Panel::right("ternarygrid_ai").resizable(true).default_size(461.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
+                // Header: the sparkle, the name and ×, 40 points over a hairline (no item gap
+                // between them).
+                let spacing = ui.spacing().item_spacing.y;
+                ui.spacing_mut().item_spacing.y = 0.0;
                 egui::Frame::new().inner_margin(egui::Margin { left: 14, right: 8, top: 6, bottom: 6 }).show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         ui.set_min_height(28.0);
                         ui.label(RichText::new(icon::SPARKLE).font(ternarygrid_ui::style::icon_font(16.0)).color(pal.accent_text));
                         ui.label(RichText::new(tr("AI assistant")).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.5)).color(pal.text));
@@ -1832,6 +1837,7 @@ impl eframe::App for TernaryGridApp {
                     });
                 });
                 ternarygrid_ui::parts::hline(ui);
+                ui.spacing_mut().item_spacing.y = spacing;
                 crate::tabs::TabView::ui(ai, ui, &mut cx);
             });
         }
