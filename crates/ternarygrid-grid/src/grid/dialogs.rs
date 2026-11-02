@@ -47,9 +47,9 @@ impl GridFrame<'_> {
                     });
                 });
                 form_row(ui, tr("Options"), lw, |ui| {
-                    ui.checkbox(&mut opts.include_header, tr("Column names"));
-                    ui.checkbox(&mut opts.include_row_numbers, tr("Row numbers"));
-                    ui.checkbox(&mut opts.formatted, tr("Formatted values"));
+                    ternarygrid_ui::kit::checkbox(ui, &mut opts.include_header, tr("Column names"));
+                    ternarygrid_ui::kit::checkbox(ui, &mut opts.include_row_numbers, tr("Row numbers"));
+                    ternarygrid_ui::kit::checkbox(ui, &mut opts.formatted, tr("Formatted values"));
                 });
                 if opts.format.is_delimited() {
                     form_row(ui, tr("Delimiter"), lw, |ui| {

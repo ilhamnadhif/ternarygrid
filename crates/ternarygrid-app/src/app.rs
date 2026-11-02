@@ -1507,7 +1507,7 @@ impl TernaryGridApp {
             ui.menu_button(tr("View"), |ui| {
                 item(ui, true, None, tr("Toggle navigator"), M::ToggleNavigator);
                 let mut props = state.properties;
-                if ui.checkbox(&mut props, tr("Properties panel")).clicked() {
+                if ternarygrid_ui::kit::checkbox(ui, &mut props, tr("Properties panel")).clicked() {
                     chosen.set(Some(M::PropertiesPanel));
                     ui.close();
                 }

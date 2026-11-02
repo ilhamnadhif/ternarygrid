@@ -195,7 +195,7 @@ impl ImportDialog {
                         }
                         find |= kit::primary_icon(ui, icon::MAGNIFYING_GLASS, tr("Find connections")).clicked();
                     });
-                    ui.checkbox(&mut self.pgpass_store_passwords, tr("Copy the passwords into the secure store (otherwise the connections read .pgpass)"));
+                    ternarygrid_ui::kit::checkbox(ui, &mut self.pgpass_store_passwords, tr("Copy the passwords into the secure store (otherwise the connections read .pgpass)"));
                 }
                 Source::Url => {
                     parts::form_row(ui, tr("URL"), 80.0, |ui| {
@@ -296,7 +296,7 @@ impl ImportDialog {
                 ui.radio_value(&mut self.policy, DuplicatePolicy::KeepBoth, tr("Keep both"));
             });
             parts::form_row(ui, tr("Put into folder"), LABEL_W, |ui| add_field(ui, text_field(&mut self.folder_prefix, 260.0).hint_text(hint(ui, tr("(top level)")))));
-            parts::form_row(ui, "", LABEL_W, |ui| ui.checkbox(&mut self.keep_shell_commands, tr("Keep shell commands that run on connect / disconnect")));
+            parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.keep_shell_commands, tr("Keep shell commands that run on connect / disconnect")));
         });
     }
 }

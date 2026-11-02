@@ -648,7 +648,7 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
                     } else {
                         RichText::new(c.name.as_str()).weak()
                     };
-                    if ui.checkbox(&mut on, label).changed() {
+                    if ternarygrid_ui::kit::checkbox(ui, &mut on, label).changed() {
                         if on {
                             config.y_columns.push(i);
                             config.y_columns.sort_unstable();
@@ -683,12 +683,12 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
                 }
             });
     });
-    ui.checkbox(&mut config.sort_x, tr("Sort X"));
+    ternarygrid_ui::kit::checkbox(ui, &mut config.sort_x, tr("Sort X"));
     if config.kind.can_stack() {
-        ui.checkbox(&mut config.stacked, tr("Stacked"));
+        ternarygrid_ui::kit::checkbox(ui, &mut config.stacked, tr("Stacked"));
     }
     if config.kind == ChartKind::Pie {
-        ui.checkbox(&mut config.donut, tr("Donut"));
+        ternarygrid_ui::kit::checkbox(ui, &mut config.donut, tr("Donut"));
     }
     parts::form_row(ui, tr("Max points"), lw, |ui| {
         ui.add(

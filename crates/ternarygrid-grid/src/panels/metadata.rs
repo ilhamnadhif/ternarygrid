@@ -93,7 +93,7 @@ impl<'a> MetadataPanel<'a> {
                 ui.end_row();
                 for (c, r) in rows.iter().enumerate() {
                     let mut visible = self.grid.columns.get(c).is_some_and(|s| s.visible);
-                    if ui.checkbox(&mut visible, "").on_hover_text(tr("Show column")).changed() {
+                    if ternarygrid_ui::kit::checkbox(ui, &mut visible, "").on_hover_text(tr("Show column")).changed() {
                         self.grid.set_column_visible(c, visible);
                     }
                     let name = if self.model.is_virtual_column(c) { RichText::new(&r[0]).italics() } else { RichText::new(&r[0]) };

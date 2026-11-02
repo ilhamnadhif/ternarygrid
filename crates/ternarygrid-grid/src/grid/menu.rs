@@ -456,7 +456,7 @@ impl GridFrame<'_> {
                 for i in 0..self.state.order.len() {
                     let c = self.state.order[i];
                     let mut visible = self.state.columns.get(c).is_some_and(|s| s.visible);
-                    if ui.checkbox(&mut visible, self.model.column_name(c)).changed() {
+                    if ternarygrid_ui::kit::checkbox(ui, &mut visible, self.model.column_name(c)).changed() {
                         self.state.set_column_visible(c, visible);
                     }
                 }
@@ -520,7 +520,7 @@ impl GridFrame<'_> {
                     }
                 });
                 let mut grouped = f.thousands_separator.unwrap_or(self.options.format.thousands_separator);
-                if ui.checkbox(&mut grouped, tr("Thousands separator")).changed() {
+                if ternarygrid_ui::kit::checkbox(ui, &mut grouped, tr("Thousands separator")).changed() {
                     f.thousands_separator = Some(grouped);
                     changed = true;
                 }

@@ -148,7 +148,7 @@ fn keys_hint(ui: &mut Ui, text: &str, more: &str) {
 /// The "Hide empty" toggle; true when it changed.
 fn hide_empty_toggle(ui: &mut Ui, state: &mut RecordViewState, options: &GridOptions, tip: &str) -> bool {
     let mut hide = state.hide_empty.unwrap_or(options.record_hide_empty);
-    let changed = ui.checkbox(&mut hide, tr("Hide empty")).on_hover_text(tip).changed();
+    let changed = ternarygrid_ui::kit::checkbox(ui, &mut hide, tr("Hide empty")).on_hover_text(tip).changed();
     if changed {
         state.hide_empty = Some(hide);
     }

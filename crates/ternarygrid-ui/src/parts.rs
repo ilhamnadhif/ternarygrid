@@ -91,13 +91,20 @@ impl<'a> Dialog<'a> {
                     ui.painter().rect_filled(r, CornerRadius::same(RADIUS_LG), p.accent_soft);
                     ui.painter().text(r.center(), Align2::CENTER_CENTER, icon, style::icon_font(19.0), p.accent_text);
                 }
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new(self.title).font(style::semibold(ui.ctx(), 15.0)).color(p.text));
-                    if let Some(s) = self.subtitle {
-                        ui.label(RichText::new(s).size(12.5).color(p.text_muted));
+                let title = RichText::new(self.title).font(style::semibold(ui.ctx(), 15.0)).color(p.text);
+                match self.subtitle {
+                    // Title over subtitle; a lone title stays centred on the row.
+                    Some(s) => {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(title);
+                            ui.label(RichText::new(s).size(12.5).color(p.text_muted));
+                        });
                     }
-                });
+                    None => {
+                        ui.label(title);
+                    }
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if kit::icon_button(ui, egui_phosphor::regular::X, crate_close_label()).clicked() {
                         close = true;

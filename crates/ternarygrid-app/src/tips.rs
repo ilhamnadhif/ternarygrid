@@ -58,7 +58,7 @@ impl TipWindow {
                 ui.add(egui::Label::new(RichText::new(tip).size(14.5).color(p.text)).wrap());
             },
             Some(&mut |ui: &mut egui::Ui| {
-                ui.checkbox(show_on_start, tr("Show tips on start"));
+                ternarygrid_ui::kit::checkbox(ui, show_on_start, tr("Show tips on start"));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if kit::button_ex(ui, Kind::Ghost, None, tr("Close"), false).clicked() {
                         close.set(true);

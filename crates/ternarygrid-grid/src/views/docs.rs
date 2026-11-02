@@ -99,7 +99,7 @@ impl<'a> DocumentView<'a> {
             if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy"), true, false).clicked() {
                 ui.ctx().copy_text(state.text.as_str().to_string());
             }
-            ui.checkbox(&mut state.selected_only, tr("Selected rows only"));
+            ternarygrid_ui::kit::checkbox(ui, &mut state.selected_only, tr("Selected rows only"));
             if state.truncated {
                 ui.weak(trf("Showing the first {} rows", &[&crate::format::group_thousands(&MAX_DOCUMENT_ROWS.to_string())]));
             }

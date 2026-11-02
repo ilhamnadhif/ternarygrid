@@ -305,7 +305,7 @@ impl ObjectEditorTab {
                         let mut keys = vt.virtual_key.clone().unwrap_or_default();
                         for c in &t.columns {
                             let mut on = keys.contains(&c.name);
-                            if ui.checkbox(&mut on, &c.name).changed() {
+                            if ternarygrid_ui::kit::checkbox(ui, &mut on, &c.name).changed() {
                                 if on {
                                     keys.push(c.name.clone());
                                 } else {
@@ -322,7 +322,7 @@ impl ObjectEditorTab {
                         let mut cols = vt.dictionary.clone().map(|d| d.description_columns).unwrap_or_default();
                         for c in &t.columns {
                             let mut on = cols.contains(&c.name);
-                            if ui.checkbox(&mut on, &c.name).changed() {
+                            if ternarygrid_ui::kit::checkbox(ui, &mut on, &c.name).changed() {
                                 if on {
                                     cols.push(c.name.clone());
                                 } else {

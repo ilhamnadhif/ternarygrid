@@ -132,7 +132,7 @@ impl AlterDatabaseDialog {
                 }
                 if postgres && (renamed || moved) {
                     parts::form_row(ui, "", LABEL_W, |ui| {
-                        ui.checkbox(&mut self.disconnect_others, tr("Disconnect the other sessions on this database first"))
+                        ternarygrid_ui::kit::checkbox(ui, &mut self.disconnect_others, tr("Disconnect the other sessions on this database first"))
                             .on_hover_text(tr("PostgreSQL renames or moves a database only while nobody is connected to it."))
                     });
                 }
@@ -230,12 +230,12 @@ impl AlterDatabaseDialog {
         if edits.allow_connections
             && let Some(b) = self.edited.allow_connections.as_mut()
         {
-            parts::form_row(ui, tr("Connections"), LABEL_W, |ui| ui.checkbox(b, tr("Allow connections")));
+            parts::form_row(ui, tr("Connections"), LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, b, tr("Allow connections")));
         }
         if edits.is_template
             && let Some(b) = self.edited.is_template.as_mut()
         {
-            parts::form_row(ui, tr("Template"), LABEL_W, |ui| ui.checkbox(b, tr("Others can be created from it (CREATE DATABASE … TEMPLATE)")));
+            parts::form_row(ui, tr("Template"), LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, b, tr("Others can be created from it (CREATE DATABASE … TEMPLATE)")));
         }
         if edits.comment || original.comment.is_some() {
             ui.horizontal_top(|ui| {

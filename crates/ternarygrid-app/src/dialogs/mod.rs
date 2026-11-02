@@ -290,7 +290,7 @@ impl Dialogs {
                             first = false;
                         }
                     }
-                    parts::form_row(ui, "", LABEL_W, |ui| ui.checkbox(&mut p.save, tr("Save password")));
+                    parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut p.save, tr("Save password")));
                 },
                 Some(&mut |ui: &mut Ui| {
                     right(ui, |ui| {

@@ -162,7 +162,7 @@ impl<'a> ValuePanel<'a> {
         ui.horizontal(|ui| {
             ternarygrid_ui::parts::segmented_small(ui, &mut state.mode, &modes);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut state.wrap, tr("Wrap"));
+                ternarygrid_ui::kit::checkbox(ui, &mut state.wrap, tr("Wrap"));
             });
         });
         ui.add_space(4.0);

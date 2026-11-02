@@ -1104,12 +1104,12 @@ impl Navigator {
                 }
                 ui.separator();
                 let mut props = cx.settings.navigator.show_properties;
-                if ui.checkbox(&mut props, tr("Properties panel")).changed() {
+                if ternarygrid_ui::kit::checkbox(ui, &mut props, tr("Properties panel")).changed() {
                     cx.settings.navigator.show_properties = props;
                     cx.push(AppCommand::SettingsChanged);
                 }
                 let mut link = cx.settings.navigator.link_with_editor;
-                if ui.checkbox(&mut link, tr("Link with editor")).on_hover_text(tr("Link with editor: select the object of the active tab")).changed() {
+                if ternarygrid_ui::kit::checkbox(ui, &mut link, tr("Link with editor")).on_hover_text(tr("Link with editor: select the object of the active tab")).changed() {
                     cx.settings.navigator.link_with_editor = link;
                     cx.push(AppCommand::SettingsChanged);
                 }

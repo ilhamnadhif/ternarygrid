@@ -525,7 +525,7 @@ impl ConnectionDialog {
                 // Atlas and other hosted clusters: `mongodb+srv://` (hosts from DNS, port unused).
                 let mut srv = self.cfg.properties.get("srv").is_some_and(|v| v == "true");
                 parts::form_row(ui, "", LABEL_W, |ui| {
-                    if ui.checkbox(&mut srv, tr("DNS seed list (mongodb+srv, Atlas)")).changed() {
+                    if ternarygrid_ui::kit::checkbox(ui, &mut srv, tr("DNS seed list (mongodb+srv, Atlas)")).changed() {
                         if srv {
                             self.cfg.properties.insert("srv".into(), "true".into());
                         } else {
@@ -573,7 +573,7 @@ impl ConnectionDialog {
                     parts::form_row(ui, tr("Password"), LABEL_W, |ui| {
                         let w = rest(ui, text_width(ui, tr("Save password")) + 34.0);
                         add_field(ui, text_field(password, w).password(true));
-                        ui.checkbox(save, tr("Save password"));
+                        ternarygrid_ui::kit::checkbox(ui, save, tr("Save password"));
                     });
                 }
                 AuthMethod::Command { command } => {
@@ -587,7 +587,7 @@ impl ConnectionDialog {
                 _ => {}
             }
             if cx.conns.registry.get(kind).is_some_and(|d| d.info().capabilities.multiple_databases) {
-                parts::form_row(ui, "", LABEL_W, |ui| ui.checkbox(&mut self.cfg.init.show_all_databases, tr("Show all databases")));
+                parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.cfg.init.show_all_databases, tr("Show all databases")));
             }
         }
         parts::form_row(ui, tr("Connection type"), LABEL_W, |ui| {
@@ -603,7 +603,7 @@ impl ConnectionDialog {
                 }
             });
             ui.add_space(4.0);
-            ui.checkbox(&mut self.cfg.read_only, tr("Read-only"));
+            ternarygrid_ui::kit::checkbox(ui, &mut self.cfg.read_only, tr("Read-only"));
         });
         parts::form_row(ui, tr("Auto-commit"), LABEL_W, |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
@@ -743,7 +743,7 @@ impl ConnectionDialog {
                 }
             });
         }
-        parts::form_row(ui, "", LABEL_W, |ui| ui.checkbox(&mut ssl.only_custom_ca, tr("Trust only this CA (ignore system certificates)")));
+        parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut ssl.only_custom_ca, tr("Trust only this CA (ignore system certificates)")));
     }
 
     fn init_page(&mut self, ui: &mut Ui) {
@@ -775,8 +775,8 @@ impl ConnectionDialog {
             ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(col_w);
                 ui.spacing_mut().item_spacing.y = 12.0;
-                ui.checkbox(&mut init.separate_editor_connection, tr("Separate connection for each SQL editor"));
-                ui.checkbox(&mut init.show_system_objects, tr("Show system objects"));
+                ternarygrid_ui::kit::checkbox(ui, &mut init.separate_editor_connection, tr("Separate connection for each SQL editor"));
+                ternarygrid_ui::kit::checkbox(ui, &mut init.show_system_objects, tr("Show system objects"));
                 parts::form_row(ui, tr("Before connect"), 110.0, |ui| {
                     opt_field(ui, &mut init.shell_before_connect, tr("Shell command"), f32::INFINITY, true).on_hover_text(tr("Shell command before connect"))
                 });
@@ -924,7 +924,7 @@ impl ConnectionDialog {
         });
         parts::form_row(ui, tr("Colour"), LABEL_W, |ui| {
             let mut use_color = self.cfg.color.is_some();
-            if ui.checkbox(&mut use_color, tr("Custom colour")).changed() {
+            if ternarygrid_ui::kit::checkbox(ui, &mut use_color, tr("Custom colour")).changed() {
                 self.cfg.color = if use_color { Some([120, 160, 220]) } else { None };
             }
             if let Some(c) = &mut self.cfg.color {
@@ -1089,7 +1089,7 @@ pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut Strin
             }
             SshAuth::Agent => {}
         }
-        parts::form_row(ui, "", LABEL_W, |ui| ui.checkbox(&mut ssh.save_credentials, tr("Save credentials")));
+        parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut ssh.save_credentials, tr("Save credentials")));
         parts::form_row(ui, tr("Local port"), LABEL_W, |ui| {
             let mut lp = ssh.local_port.map(|p| p.to_string()).unwrap_or_default();
             if add_field(ui, text_field(&mut lp, 140.0).hint_text(hint(ui, tr("automatic")))).changed() {
@@ -1126,7 +1126,7 @@ pub fn proxy_form(ui: &mut Ui, id: &str, proxy: &mut ProxyConfig, password: &mut
             let w = narrow(ui);
             add_field(ui, text_field(password, w).password(true))
         });
-        parts::form_row(ui, "", LABEL_W, |ui| ui.checkbox(&mut proxy.save_credentials, tr("Save credentials")));
+        parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut proxy.save_credentials, tr("Save credentials")));
     });
 }
 

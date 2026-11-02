@@ -1238,7 +1238,7 @@ impl ResultPanel {
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                         for (i, n) in names.iter().enumerate() {
                             if let Some(s) = selected.get_mut(i) {
-                                ui.checkbox(s, n);
+                                ternarygrid_ui::kit::checkbox(ui, s, n);
                             }
                         }
                     });

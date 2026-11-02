@@ -130,7 +130,7 @@ impl<'a> GroupingPanel<'a> {
                     }
                 }
             });
-            ui.checkbox(&mut state.live, tr("Live"));
+            ternarygrid_ui::kit::checkbox(ui, &mut state.live, tr("Live"));
             if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::ARROWS_CLOCKWISE), tr("Refresh"), true, false).clicked() {
                 changed = true;
             }

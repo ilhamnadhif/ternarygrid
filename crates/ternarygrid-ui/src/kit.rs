@@ -297,6 +297,44 @@ pub fn tab_strip<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T,
     out
 }
 
+/// A check box as in the design: 16 px, radius 4, filled with the accent and a white check
+/// when on. `label` is plain or rich text. Use instead of `ui.checkbox`.
+pub fn checkbox(ui: &mut Ui, on: &mut bool, label: impl Into<egui::WidgetText>) -> Response {
+    let p = style::pal(ui);
+    let enabled = ui.is_enabled();
+    let text: egui::WidgetText = label.into();
+    let label_text = text.text().to_string();
+    let galley = (!label_text.is_empty()).then(|| text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body));
+    let w = 16.0 + galley.as_ref().map_or(0.0, |g| 9.0 + g.size().x);
+    let h = galley.as_ref().map_or(18.0, |g| g.size().y.max(18.0));
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, *on, &label_text));
+    if ui.is_rect_visible(rect) {
+        let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+        let b = Rect::from_center_size(egui::pos2(rect.left() + 8.0, rect.center().y), vec2(16.0, 16.0));
+        let hovered = enabled && resp.hovered();
+        let painter = ui.painter();
+        if *on {
+            painter.rect_filled(b, CornerRadius::same(4), fade(if hovered { p.accent_hover } else { p.accent }));
+            let pts = vec![egui::pos2(b.left() + 4.0, b.center().y + 0.2), egui::pos2(b.left() + 6.9, b.center().y + 3.0), egui::pos2(b.right() - 3.8, b.center().y - 2.8)];
+            painter.add(egui::Shape::line(pts, Stroke::new(1.9, fade(p.on_accent))));
+        } else {
+            painter.rect(b, CornerRadius::same(4), p.surface, Stroke::new(1.5, fade(if hovered { p.accent } else { p.border_strong })), StrokeKind::Inside);
+        }
+        if resp.has_focus() {
+            style::focus_halo(ui, b, 4);
+        }
+        if let Some(g) = galley {
+            ui.painter().galley(egui::pos2(b.right() + 9.0, rect.center().y - g.size().y / 2.0), g, fade(p.text));
+        }
+    }
+    resp
+}
+
 /// A full-width row of a side navigation (settings sections, panels): its icon and name, the
 /// selected one on a soft accent.
 pub fn nav_item(ui: &mut Ui, icon: &str, text: &str, selected: bool) -> Response {

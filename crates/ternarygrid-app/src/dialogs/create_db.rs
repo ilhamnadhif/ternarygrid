@@ -120,7 +120,7 @@ impl CreateDatabaseDialog {
                 }
                 if offer_show_all {
                     parts::form_row(ui, "", LABEL_W, |ui| {
-                        ui.checkbox(&mut self.show_all, tr("Show all databases in the navigator"))
+                        ternarygrid_ui::kit::checkbox(ui, &mut self.show_all, tr("Show all databases in the navigator"))
                             .on_hover_text(tr("The navigator lists only the connection's database; the new one appears when all databases are shown."))
                     });
                 }

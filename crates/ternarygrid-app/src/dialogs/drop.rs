@@ -129,7 +129,7 @@ impl DropDialog {
             |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
                 ui.add(egui::Label::new(RichText::new(trf("Drop {} object(s)? This cannot be undone.", &[&count])).font(style::medium(ui.ctx(), 13.5))).wrap());
-                ui.checkbox(cascade, tr("Cascade (also drop dependent objects)"));
+                ternarygrid_ui::kit::checkbox(ui, cascade, tr("Cascade (also drop dependent objects)"));
                 super::sql_preview(ui, "drop_sql", Some(dialect.clone()), script.trim_end(), 240.0);
                 if read_only {
                     crate::dialogs::error_note(ui, tr("The connection is read-only."));
