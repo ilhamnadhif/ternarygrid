@@ -53,8 +53,6 @@ pub struct AppSettings {
     /// Keymap preset and overrides; stored in `keymap.json`.
     #[serde(skip)]
     pub keymap: KeymapConfig,
-    /// Main toolbar.
-    pub toolbar: ToolbarSettings,
     /// AI assistant.
     pub ai: AiSettings,
     /// Secret storage.
@@ -78,7 +76,6 @@ impl Default for AppSettings {
             history: HistorySettings::default(),
             navigator: NavigatorSettings::default(),
             keymap: KeymapConfig::default(),
-            toolbar: ToolbarSettings::default(),
             ai: AiSettings::default(),
             security: SecuritySettings::default(),
             tasks: TaskSettings::default(),
@@ -140,9 +137,6 @@ pub struct GeneralSettings {
     /// The first-start setup (import from DBeaver, keyboard, look) was
     /// finished or skipped. Installs from before it existed count as done.
     pub onboarding_done: bool,
-    /// Coloured icons (the classic look) instead of monochrome ones; unset
-    /// follows the look's default (monochrome).
-    pub colored_icons: Option<bool>,
 }
 
 impl Default for GeneralSettings {
@@ -157,7 +151,6 @@ impl Default for GeneralSettings {
             show_tips: true,
             next_tip: 0,
             onboarding_done: false,
-            colored_icons: None,
         }
     }
 }
@@ -597,99 +590,6 @@ impl Default for NavigatorSettings {
     }
 }
 
-/// Main toolbar configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ToolbarSettings {
-    /// Ordered action ids ([`crate::actions::Action::id`]); `"|"` is a separator.
-    pub items: Vec<String>,
-    /// Action ids hidden from the toolbar.
-    pub hidden: Vec<String>,
-}
-
-impl Default for ToolbarSettings {
-    fn default() -> Self {
-        use crate::actions::Action as A;
-        // Global actions only: running, explaining, transactions and the
-        // active connection / schema belong to the SQL editor's own toolbar.
-        let groups: [&[A]; 4] = [
-            &[A::NewConnection, A::NewSqlEditor, A::AiAssistant],
-            &[
-                A::Export,
-                A::Import,
-                A::OpenErDiagram,
-                A::OpenSessionManager,
-            ],
-            &[A::OpenHistory, A::PendingTransactions, A::OpenTasks],
-            &[A::CommandPalette],
-        ];
-        ToolbarSettings {
-            items: grouped(&groups),
-            hidden: Vec::new(),
-        }
-    }
-}
-
-/// Action ids of `groups` separated by `"|"`.
-fn grouped(groups: &[&[crate::actions::Action]]) -> Vec<String> {
-    let mut items = Vec::new();
-    for (i, g) in groups.iter().enumerate() {
-        if i > 0 {
-            items.push("|".to_string());
-        }
-        items.extend(g.iter().map(|a| a.id().to_string()));
-    }
-    items
-}
-
-impl ToolbarSettings {
-    /// Earlier defaults: the SQL editor's toolbar repeated (without and with
-    /// group separators), and the global actions before AI, export / import,
-    /// ER diagram and sessions joined them.
-    fn previous_defaults() -> Vec<Vec<String>> {
-        use crate::actions::Action as A;
-        let flat: Vec<String> = A::default_toolbar()
-            .iter()
-            .map(|a| a.id().to_string())
-            .collect();
-        let grouped_v3 = grouped(&[
-            &[A::NewConnection, A::NewSqlEditor],
-            &[A::SelectConnection, A::SelectSchema],
-            &[
-                A::ExecuteStatement,
-                A::ExecuteScript,
-                A::ExplainPlan,
-                A::CancelQuery,
-            ],
-            &[A::Commit, A::Rollback, A::ToggleAutoCommit],
-            &[A::FormatSql, A::OpenHistory],
-        ]);
-        let global_v4 = grouped(&[
-            &[A::NewConnection, A::NewSqlEditor],
-            &[A::OpenHistory, A::PendingTransactions, A::OpenTasks],
-            &[A::CommandPalette],
-        ]);
-        vec![flat, grouped_v3, global_v4]
-    }
-
-    /// Settings saved with an earlier default get the current one;
-    /// customised toolbars are kept.
-    pub fn upgrade_default(&mut self) {
-        if Self::previous_defaults().contains(&self.items) {
-            self.items = ToolbarSettings::default().items;
-        }
-    }
-
-    /// Visible actions in order (unknown ids and separators skipped).
-    pub fn visible_actions(&self) -> Vec<crate::actions::Action> {
-        self.items
-            .iter()
-            .filter(|id| !self.hidden.contains(id))
-            .filter_map(|id| crate::actions::Action::from_id(id))
-            .collect()
-    }
-}
-
 /// AI provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -899,7 +799,6 @@ pub fn load_with_warnings(paths: &AppPaths) -> (AppSettings, Vec<String>) {
             }
         },
     };
-    settings.toolbar.upgrade_default();
     let (keymap, kw) = keymap::load_config(paths);
     settings.keymap = keymap;
     warnings.extend(kw);
@@ -965,35 +864,6 @@ pub fn save(paths: &AppPaths, settings: &AppSettings) -> DbResult<()> {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn toolbar_upgrade() {
-        for old in ToolbarSettings::previous_defaults() {
-            let mut t = ToolbarSettings {
-                items: old,
-                hidden: Vec::new(),
-            };
-            t.upgrade_default();
-            assert_eq!(t.items, ToolbarSettings::default().items);
-        }
-        let custom = vec![
-            "sql.execute_statement".to_string(),
-            "tools.query_history".to_string(),
-        ];
-        let mut t = ToolbarSettings {
-            items: custom.clone(),
-            hidden: Vec::new(),
-        };
-        t.upgrade_default();
-        assert_eq!(t.items, custom, "a customised toolbar is kept");
-        assert!(
-            !ToolbarSettings::default()
-                .items
-                .iter()
-                .any(|i| i.starts_with("sql.execute")),
-            "no editor actions by default"
-        );
-    }
 
     use super::*;
     use crate::keymap::KeymapPreset;
@@ -1141,12 +1011,6 @@ mod tests {
         assert_eq!(s.results.store_budget_bytes(), 48 * 1024 * 1024);
         assert_eq!(s.ai.effort.as_str(), "high");
         assert_eq!(AiProvider::OpenAiCompatible.id(), "openai-compatible");
-        let visible = s.toolbar.visible_actions();
-        assert!(visible.contains(&crate::actions::Action::NewSqlEditor));
-        assert!(
-            !visible.contains(&crate::actions::Action::ExecuteStatement),
-            "running is in the SQL editor's toolbar"
-        );
         let r = s.history.retention();
         assert_eq!(r.max_entries, Some(50_000));
         assert_eq!(r.max_age_days, Some(90));

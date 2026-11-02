@@ -76,6 +76,11 @@ pub trait TabView: Any {
         None
     }
 
+    /// The result the tab shows, for the status bar ("1,204 rows · 42 ms").
+    fn status_summary(&self) -> Option<String> {
+        None
+    }
+
     /// Unsaved changes (editor text, pending data edits).
     fn is_dirty(&self) -> bool {
         false

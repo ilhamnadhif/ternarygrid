@@ -89,10 +89,10 @@ fn in_top_chrome(h: &H, n: &egui_kittest::Node<'_>) -> bool {
     n.rect().center().y < h.state().chrome.top_bottom()
 }
 
-/// Whether `n` is a button of the main toolbar (its icon and short label).
+/// Whether `n` is in the window's chrome: the top bar or the icon rail (their
+/// buttons repeat items found elsewhere: Settings, AI assistant …).
 fn on_toolbar(h: &H, n: &egui_kittest::Node<'_>) -> bool {
-    let label = n.accesskit_node().label().unwrap_or_default();
-    in_top_chrome(h, n) && Action::ALL.iter().any(|&a| label == format!("{} {}", ternarygrid_app::keys::action_icon(a), ternarygrid_app::keys::toolbar_label(a)))
+    in_top_chrome(h, n) || h.state().chrome.rail.is_some_and(|r| r.contains(n.rect().center()))
 }
 
 /// Whether `n` lies in the navigator panel.
@@ -729,7 +729,6 @@ fn settings_grid_menu_and_editor_helpers() {
         "Query history",
         "Navigator",
         "Keyboard shortcuts",
-        "Toolbar",
         "Connection types",
         "Network profiles",
         "AI",
@@ -1134,9 +1133,9 @@ fn themes_whats_new_and_updates() {
     pause(&mut h);
     h.key_press(Key::Escape);
     frames(&mut h, 2);
-    click(&mut h, egui_phosphor::regular::SUN);
+    click(&mut h, "Switch to the light theme");
     assert_eq!(h.ctx.theme(), egui::Theme::Light);
-    click(&mut h, egui_phosphor::regular::MOON);
+    click(&mut h, "Switch to the dark theme");
     assert_eq!(h.ctx.theme(), egui::Theme::Dark);
     pause(&mut h);
     h.key_press_modifiers(CMD | Modifiers::SHIFT, Key::P);
@@ -1549,30 +1548,32 @@ fn workspace_from_dbeaver() {
     settle(&mut h, "tip of the day");
     assert!(h.state().tip.is_none());
 
-    // Main toolbar: SQL editor actions are disabled without an editor.
-    let toolbar_enabled = |h: &H, icon: &str| -> bool {
-        // Icon and short label, or the icon alone.
-        let n = h.query_all_by_label_contains(icon).find(|n| in_top_chrome(h, n)).unwrap_or_else(|| panic!("toolbar {icon:?}: {:?}", labels(h)));
-        !n.accesskit_node().is_disabled()
-    };
+    // The top bar and the rail.
     // No tab is open: the start page fills the editor area.
     assert_eq!(h.state().dock.iter_all_tabs().count(), 0);
     assert!(has(&h, "Create sample database"));
-    // The default toolbar has global actions only (run, commit … are in the editor).
-    assert!(h.query_all_by_label_contains(egui_phosphor::regular::PLAY).all(|n| !in_top_chrome(&h, &n)), "no Run in the main toolbar by default");
-    // A customised toolbar with editor actions: disabled without an editor.
-    h.state_mut().settings.toolbar.items = ["sql.new_editor", "sql.execute_statement", "tx.commit"].map(String::from).to_vec();
-    frames(&mut h, 2);
-    assert!(!toolbar_enabled(&h, egui_phosphor::regular::PLAY), "Run needs a SQL editor");
-    assert!(toolbar_enabled(&h, egui_phosphor::regular::FILE_SQL), "New SQL editor is always available");
-    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: None });
+    // Running, explaining, transactions are the SQL editor's own commands.
+    assert!(h.query_all_by_label_contains(egui_phosphor::regular::PLAY).all(|n| !in_top_chrome(&h, &n)), "no Run in the top bar");
+    // The search box opens the command palette.
+    click(&mut h, "Search or run a command");
+    assert!(h.state().dialogs.palette_open, "the search box opens the command palette");
+    settle(&mut h, "search box");
+    // The rail shows the projects, then the navigator again.
+    click(&mut h, "Projects and scripts");
+    assert!(has(&h, "Scripts"), "the projects view: {:?}", labels(&h));
+    click(&mut h, "Database Navigator");
+    wait(&mut h, "the navigator", |h| nav_row(h, "Tables").is_some() || has(h, "Database Navigator"));
+    // A SQL editor: its connection in the top bar, its transaction mode and result in the status bar.
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: Some("select * from customer".into()) });
     frames(&mut h, 3);
     wait(&mut h, "editor session", |h| focused_editor(h).session_ready());
+    let ctx = h.ctx.clone();
+    h.state_mut().dispatch_action(&ctx, Action::ExecuteStatement);
+    wait(&mut h, "the result", |h| !focused_editor(h).is_running() && focused_editor(h).result_count() > 0);
     frames(&mut h, 2);
-    assert!(toolbar_enabled(&h, egui_phosphor::regular::PLAY), "Run in a SQL editor");
-    assert!(!toolbar_enabled(&h, egui_phosphor::regular::CHECK_CIRCLE), "nothing to commit in auto-commit mode");
-    h.state_mut().settings.toolbar = Default::default();
-    settle(&mut h, "toolbar states");
+    assert!(has(&h, "Auto-commit"), "transaction mode in the status bar: {:?}", labels(&h));
+    assert!(labels(&h).iter().any(|l| l.contains(" rows")), "the result in the status bar: {:?}", labels(&h));
+    settle(&mut h, "top bar, rail and status bar");
 
     // Production: reading runs without a question, changing data asks.
     {

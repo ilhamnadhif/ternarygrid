@@ -1,4 +1,6 @@
-//! Main window: menu bar, toolbar, navigator, dock area, status bar, dialogs.
+//! Main window: top bar, icon rail, navigator, dock area, status bar, dialogs.
+
+mod shell;
 
 use crate::backend::Backend;
 use crate::command::AppCommand;
@@ -25,9 +27,9 @@ const SETTINGS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_milli
 /// layout can change without them.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ChromeRects {
-    /// In-window menu bar (absent with the native macOS menu).
+    /// In-window menu bar (the menus are in the top bar now: unused).
     pub menu: Option<egui::Rect>,
-    /// The main toolbar row.
+    /// The top bar.
     pub toolbar: Option<egui::Rect>,
     /// Left icon rail.
     pub rail: Option<egui::Rect>,
@@ -132,6 +134,9 @@ pub struct TernaryGridApp {
     diagnostics: Option<crate::backend::Job<ternarygrid_core::DbResult<std::path::PathBuf>>>,
     /// Where the chrome was drawn in the last frame.
     pub chrome: ChromeRects,
+    /// Width kept free at the left of the top bar for the window buttons
+    /// (macOS, where the top bar is the title bar).
+    pub titlebar_inset: f32,
 }
 
 impl TernaryGridApp {
@@ -188,6 +193,7 @@ impl TernaryGridApp {
             pending_tx: Default::default(),
             diagnostics: None,
             chrome: ChromeRects::default(),
+            titlebar_inset: 0.0,
         };
         app.existing_install = crate::updates::is_existing_install(&app.services.paths);
         app.updates.data_dir = Some(app.services.paths.data_dir().to_path_buf());
@@ -1508,226 +1514,6 @@ impl TernaryGridApp {
             self.run_menu_action(ui.ctx(), a);
         }
     }
-
-    /// Whether a toolbar action can run now, with the reason when not.
-    fn toolbar_action_state(&self, action: crate::keys::Action) -> Result<(), &'static str> {
-        use crate::keys::Action as A;
-        let tab = self.active_tab.and_then(|id| self.dock.iter_all_tabs().find(|(_, t)| t.id == id)).map(|(_, t)| t);
-        if let Some(enabled) = tab.and_then(|t| t.view.action_enabled(action)) {
-            return if enabled {
-                Ok(())
-            } else {
-                match action {
-                    A::CancelQuery => Err(tr("No query is running.")),
-                    A::Commit | A::Rollback => Err(tr("Auto-commit is on: every statement is committed already.")),
-                    _ => Err(tr("Not available right now.")),
-                }
-            };
-        }
-        let editor_only = matches!(action, A::CancelQuery | A::Commit | A::Rollback | A::ToggleAutoCommit | A::SelectConnection | A::SelectSchema)
-            || action.context() == crate::keys::ActionContext::SqlEditor;
-        if editor_only {
-            return Err(tr("Available in a SQL editor: open one with New SQL editor."));
-        }
-        let needs_connection = matches!(
-            action,
-            A::EditConnection | A::Connect | A::Disconnect | A::Reconnect | A::OpenSqlConsole | A::OpenSessionManager | A::OpenErDiagram | A::NewDatabase | A::Export | A::Import
-        );
-        if needs_connection && self.selected_connection().is_none() {
-            return Err(tr("Select a connection in the navigator first."));
-        }
-        Ok(())
-    }
-
-    /// Main toolbar (customisable in the settings): its groups' buttons with
-    /// short labels, as the grid's toolbar; when the window is too narrow for
-    /// them all, the last ones show their icon only.
-    fn toolbar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let hidden = &self.settings.toolbar.hidden;
-            let items: Vec<Option<crate::keys::Action>> = self
-                .settings
-                .toolbar
-                .items
-                .iter()
-                .filter(|id| !hidden.contains(id))
-                .filter_map(|id| if id == "|" { Some(None) } else { crate::keys::Action::from_id(id).map(Some) })
-                .collect();
-            // Labels from the first button on, as many as fit next to the connection and schema.
-            let font = egui::TextStyle::Button.resolve(ui.style());
-            let pad = 2.0 * ui.spacing().button_padding.x + ui.spacing().item_spacing.x;
-            let icon_w = 16.0 + pad;
-            let label_w = |a: crate::keys::Action| {
-                ui.fonts_mut(|f| f.layout_no_wrap(crate::keys::toolbar_label(a).to_string(), font.clone(), egui::Color32::WHITE).size().x) + ui.spacing().icon_spacing + 4.0
-            };
-            let actions: Vec<crate::keys::Action> = items.iter().flatten().copied().collect();
-            let widths: Vec<f32> = actions.iter().map(|&a| label_w(a)).collect();
-            let separators = items.iter().filter(|i| i.is_none()).count() as f32 * 8.0;
-            let budget = ui.available_width() - 300.0 - separators - icon_w * actions.len() as f32;
-            let mut labelled = 0;
-            let mut used = 0.0;
-            for w in &widths {
-                if used + w > budget {
-                    break;
-                }
-                used += w;
-                labelled += 1;
-            }
-            let mut index = 0;
-            for item in items {
-                let Some(action) = item else {
-                    ui.separator();
-                    continue;
-                };
-                let with_label = index < labelled;
-                index += 1;
-                let keys = crate::keys::label(&self.keymap, action);
-                let name = crate::keys::action_label(action);
-                let tip = if keys.is_empty() { name.to_string() } else { format!("{name}  ({keys})") };
-                let state = self.toolbar_action_state(action);
-                let mut icon = RichText::new(crate::keys::action_icon(action)).size(16.0);
-                if let Some(c) = crate::keys::action_color(action, ui.visuals().dark_mode).filter(|_| state.is_ok()) {
-                    icon = icon.color(c);
-                }
-                // The AI assistant's button shows whether its panel is open.
-                let open = action == crate::keys::Action::AiAssistant && self.ai_open;
-                let b = if with_label { egui::Button::new((icon, crate::keys::toolbar_label(action))) } else { egui::Button::new(icon) };
-                let b = b.selected(open).min_size(egui::vec2(26.0, 22.0));
-                let resp = ui.add_enabled(state.is_ok(), b).on_hover_text(&tip);
-                let resp = match state {
-                    Err(why) => resp.on_disabled_hover_text(format!("{tip}\n{why}")),
-                    Ok(()) => resp,
-                };
-                if resp.clicked() {
-                    self.commands.push(AppCommand::Action(action));
-                }
-            }
-            self.toolbar_location(ui);
-            // An update to install.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.updates.toolbar_button(ui));
-        });
-    }
-
-    /// Connection (logo, name, type colour) and schema@database of the
-    /// focused tab; a click shows it in the navigator.
-    fn toolbar_location(&mut self, ui: &mut Ui) {
-        let Some((_, tab)) = self.dock.find_active_focused() else { return };
-        let Some(loc) = crate::tabs::tab_location(tab.view.as_ref(), &self.conns) else { return };
-        let object = tab.view.navigator_object();
-        ui.separator();
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let dark = ui.visuals().dark_mode;
-        let color = crate::theme::logo_color(loc.kind, dark);
-        let name = RichText::new(&loc.name).strong();
-        let mut button = match crate::dblogo::image(ui.ctx(), loc.kind, 16.0, color) {
-            Some(logo) => egui::Button::new((logo, name)),
-            None => egui::Button::new((RichText::new(crate::nav::db_icon(loc.kind)).color(color), name)),
-        };
-        let ty = self.conns.type_of(&loc.conn);
-        if let Some(c) = crate::theme::connection_marker(ty.color) {
-            button = button.fill(crate::theme::tint(c, dark));
-        }
-        let tip = format!("{}: {} ({})\n{}", tr("Connection"), loc.name, ty.name, tr("Show in the navigator"));
-        let mut reveal = ui.add(button).on_hover_text(&tip).clicked();
-        if let Some(place) = &loc.place {
-            let text = (ternarygrid_icons::ic(icon::STACK), place.as_str());
-            reveal |= ui.add(egui::Button::new(text)).on_hover_text(format!("{}\n{}", tr("Schema"), tr("Show in the navigator"))).clicked();
-        }
-        if reveal {
-            self.show_nav = true;
-            self.show_project = false;
-            match object {
-                Some((conn, obj)) => self.nav.reveal(&conn, &obj, &self.conns),
-                None => self.nav.select(crate::nav::NavNode::Connection(loc.conn)),
-            }
-        }
-    }
-
-    fn status_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            // Where the active tab works, as DBeaver's status bar:
-            // connection › database › schema › object.
-            let active = self.dock.find_active_focused();
-            let location = active.as_ref().and_then(|(_, t)| crate::tabs::tab_location(t.view.as_ref(), &self.conns));
-            let object = active.as_ref().and_then(|(_, t)| t.view.navigator_object());
-            match location {
-                Some(loc) => {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let ty = self.conns.type_of(&loc.conn);
-                    if let Some(color) = crate::theme::connection_marker(ty.color) {
-                        ui.label(RichText::new(format!("■ {}", ty.name)).color(color)).on_hover_text(tr("Connection type"));
-                        ui.separator();
-                    }
-                    let dark = ui.visuals().dark_mode;
-                    match crate::dblogo::image(ui.ctx(), loc.kind, 14.0, crate::theme::logo_color(loc.kind, dark)) {
-                        Some(img) => ui.add(img),
-                        None => ui.label(ternarygrid_icons::ic(crate::nav::db_icon(loc.kind))),
-                    };
-                    let server = match self.conns.live(&loc.conn) {
-                        // `version()` texts repeat the product ("PostgreSQL 16.4 on …"): show the number.
-                        Some(live) => {
-                            let number = live.server.version.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit())).unwrap_or("");
-                            format!("{} {number}", live.server.product)
-                        }
-                        None => tr("not connected").to_string(),
-                    };
-                    ui.label(&loc.name).on_hover_text(server);
-                    let crumb = |ui: &mut Ui, kind: ternarygrid_core::meta::ObjectKind, name: &str| {
-                        ui.weak(icon::CARET_RIGHT);
-                        ui.label(ternarygrid_icons::ic(crate::nav::kind_icon(kind)));
-                        ui.label(name);
-                    };
-                    if self.conns.is_connected(&loc.conn) {
-                        if let Some(d) = &loc.database {
-                            crumb(ui, ternarygrid_core::meta::ObjectKind::Database, d);
-                        }
-                        if let Some(s) = &loc.schema {
-                            crumb(ui, ternarygrid_core::meta::ObjectKind::Schema, s);
-                        }
-                    }
-                    if let Some((_, obj)) = object.filter(|(c, _)| *c == loc.conn) {
-                        crumb(ui, obj.kind, &obj.name);
-                    }
-                }
-                None => {
-                    ui.weak(tr("No active connection"));
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let running = self.ops.running();
-                let label = if running > 0 { format!("{} {running}", icon::HOURGLASS) } else { icon::HOURGLASS.to_string() };
-                if ui.small_button(label).on_hover_text(tr("Background operations")).clicked() {
-                    self.ops.panel_open = !self.ops.panel_open;
-                }
-                let dark = ui.visuals().dark_mode;
-                let (theme_icon, tip) = if dark { (icon::SUN, tr("Switch to the light theme")) } else { (icon::MOON, tr("Switch to the dark theme")) };
-                if ui.small_button(theme_icon).on_hover_text(tip).clicked() {
-                    self.toggle_theme(ui.ctx());
-                }
-                let mem = ternarygrid_core::rowstore::global_resident_bytes();
-                ui.weak(format!("{} {}", icon::MEMORY, crate::widgets::format_bytes(mem as i64))).on_hover_text(tr("Memory used by result sets"));
-                ui.separator();
-                // Time zone, as in DBeaver ("WIB"): a click chooses another.
-                let mut changed = false;
-                let tz = self.settings.general.time_zone;
-                let tz_button = ui.add(egui::Button::new(crate::conn::time_zone_label(tz)).frame_when_inactive(false));
-                let tz_tip = crate::conn::time_zone_choices().into_iter().find(|(c, _)| *c == tz).map(|(_, l)| l).unwrap_or_default();
-                let tz_button = tz_button.on_hover_text(format!("{}: {tz_tip}", tr("Time zone")));
-                egui::Popup::menu(&tz_button).show(|ui| {
-                    let mut v = tz;
-                    for (choice, label) in crate::conn::time_zone_choices() {
-                        changed |= ui.radio_value(&mut v, choice, label).changed();
-                    }
-                    self.settings.general.time_zone = v;
-                });
-                if changed {
-                    self.commands.push(AppCommand::SettingsChanged);
-                    self.save_settings();
-                }
-            });
-        });
-    }
 }
 
 impl eframe::App for TernaryGridApp {
@@ -1864,17 +1650,19 @@ impl eframe::App for TernaryGridApp {
         }
 
         let mut chrome = ChromeRects::default();
-        // On macOS the menus are in the system's menu bar (as in DBeaver).
+        // On macOS the menus are in the system's menu bar; elsewhere at the left of the top bar.
         #[cfg(target_os = "macos")]
         let native_menu = self.app_menu.is_some();
         #[cfg(not(target_os = "macos"))]
         let native_menu = false;
-        if !native_menu {
-            chrome.menu = Some(egui::Panel::top("ternarygrid_menu").frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.menu_bar(ui)).response.rect);
-        }
-        chrome.toolbar = Some(egui::Panel::top("ternarygrid_toolbar").frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.toolbar(ui)).response.rect);
-        chrome.status =
-            Some(egui::Panel::bottom("ternarygrid_status").exact_size(24.0).frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.status_bar(ui)).response.rect);
+        // The window buttons of a macOS window whose title bar is the top bar (none in full screen).
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let inset = if fullscreen { 0.0 } else { self.titlebar_inset };
+        let bar = |style: &egui::Style, x: i8| egui::Frame::new().fill(crate::theme::chrome(&style.visuals)).inner_margin(egui::Margin::symmetric(x, 0));
+        chrome.toolbar =
+            Some(egui::Panel::top("ternarygrid_topbar").exact_size(shell::TOP_BAR_H).frame(bar(ui.style(), 10)).show(ui, |ui| self.top_bar(ui, inset, !native_menu)).response.rect);
+        chrome.status = Some(egui::Panel::bottom("ternarygrid_status").exact_size(shell::STATUS_H).frame(bar(ui.style(), 12)).show(ui, |ui| self.status_bar(ui)).response.rect);
+        chrome.rail = Some(egui::Panel::left("ternarygrid_rail").exact_size(shell::RAIL_W).resizable(false).frame(bar(ui.style(), 0)).show(ui, |ui| self.rail(ui)).response.rect);
 
         let mut cx = AppContext {
             backend: &self.backend,
@@ -1890,28 +1678,20 @@ impl eframe::App for TernaryGridApp {
             popup: false,
         };
         if self.show_nav {
-            let nav_panel = egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(280.0).size_range(160.0..=600.0).show(ui, |ui| {
-                // The tree's toolbar on the switch's row (as in DBeaver); below it
-                // when the panel is too narrow for both.
-                let mut toolbar_below = false;
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(!self.show_project, (ternarygrid_icons::ic(icon::DATABASE), tr("Database"))).clicked() {
-                        self.show_project = false;
-                    }
-                    if ui.selectable_label(self.show_project, (ternarygrid_icons::ic(icon::FOLDER_SIMPLE), tr("Project"))).clicked() {
-                        self.show_project = true;
-                    }
+            let nav_panel = egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(280.0).size_range(180.0..=600.0).show(ui, |ui| {
+                // The view's title and its buttons, as tall as the tab bar beside it.
+                let title = if self.show_project { tr("Projects") } else { tr("Database Navigator") };
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(title).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)));
                     if !self.show_project {
-                        if ui.available_width() >= crate::nav::Navigator::TOOLBAR_WIDTH {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             self.nav.toolbar_ui(ui, &mut cx);
-                        } else {
-                            toolbar_below = true;
-                        }
+                            if ternarygrid_ui::kit::icon_button_ex(ui, icon::PLUS, tr("New connection"), false, 22.0).clicked() {
+                                cx.commands.push(AppCommand::Action(crate::keys::Action::NewConnection));
+                            }
+                        });
                     }
                 });
-                if toolbar_below {
-                    ui.horizontal(|ui| self.nav.toolbar_ui(ui, &mut cx));
-                }
                 ui.separator();
                 if self.show_project {
                     self.project.ui(ui, &mut cx);
@@ -2033,7 +1813,14 @@ impl eframe::App for TernaryGridApp {
         self.dialogs.show(&ctx, &mut cx);
         if self.ops.panel_open {
             let mut open = true;
-            egui::Window::new(format!("{} {}", icon::HOURGLASS, tr("Background operations"))).open(&mut open).default_width(360.0).show(&ctx, |ui| self.ops.ui(ui));
+            // Beside its button at the bottom of the rail, above the status bar.
+            let at = egui::pos2(shell::RAIL_W + 8.0, ctx.content_rect().bottom() - shell::STATUS_H - 8.0);
+            egui::Window::new(format!("{} {}", icon::HOURGLASS, tr("Background operations")))
+                .open(&mut open)
+                .default_width(360.0)
+                .pivot(egui::Align2::LEFT_BOTTOM)
+                .default_pos(at)
+                .show(&ctx, |ui| self.ops.ui(ui));
             self.ops.panel_open = open;
         }
         if self.updates.ui(&ctx, &self.backend, &mut self.settings, &mut self.toasts) {

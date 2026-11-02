@@ -1824,6 +1824,21 @@ fn result_title(sql: &str, n: usize) -> String {
 }
 
 impl TabView for SqlEditorTab {
+    fn status_summary(&self) -> Option<String> {
+        let rows = match self.bottom {
+            Bottom::Result(i) => self.result_rows(i),
+            _ => None,
+        };
+        let mut parts = Vec::new();
+        if let Some(n) = rows {
+            parts.push(ternarygrid_core::trf("{} rows", &[&ternarygrid_grid::format::group_thousands(&n.to_string())]));
+        }
+        if let Some((_, d)) = self.last_run {
+            parts.push(ternarygrid_grid::toolbar::duration_text(d));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     fn title(&self) -> String {
         self.title.clone()
     }

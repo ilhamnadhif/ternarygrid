@@ -73,7 +73,8 @@ pub fn sync_fonts(ctx: &Context) {
 
 /// Apply the appearance preferences: theme, contrast, zoom and UI font size.
 pub fn apply_settings(ctx: &Context, settings: &ternarygrid_config::AppSettings) {
-    ternarygrid_icons::set_colored(settings.general.colored_icons.unwrap_or(false));
+    // Monochrome icons: colour only where it means something (ternarygrid_icons).
+    ternarygrid_icons::set_colored(false);
     apply_theme(ctx, settings.general.theme, settings.accessibility.high_contrast);
     let scale = settings.general.ui_scale.clamp(0.5, 3.0);
     if (ctx.zoom_factor() - scale).abs() > f32::EPSILON {

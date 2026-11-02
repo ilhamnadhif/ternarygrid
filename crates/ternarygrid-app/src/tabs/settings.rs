@@ -1,5 +1,5 @@
 //! Preferences tab: every section of `settings.json`, the keymap editor,
-//! toolbar customisation, connection types, AI and secret storage.
+//! connection types, AI and secret storage.
 
 use crate::command::AppCommand;
 use crate::cx::AppContext;
@@ -22,7 +22,6 @@ enum Section {
     History,
     Navigator,
     Keyboard,
-    Toolbar,
     ConnectionTypes,
     NetworkProfiles,
     Ai,
@@ -31,7 +30,7 @@ enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 13] = [
+    const ALL: [Section; 12] = [
         Section::General,
         Section::Editor,
         Section::Results,
@@ -39,7 +38,6 @@ impl Section {
         Section::History,
         Section::Navigator,
         Section::Keyboard,
-        Section::Toolbar,
         Section::ConnectionTypes,
         Section::NetworkProfiles,
         Section::Ai,
@@ -56,7 +54,6 @@ impl Section {
             Section::History => tr("Query history"),
             Section::Navigator => tr("Navigator"),
             Section::Keyboard => tr("Keyboard shortcuts"),
-            Section::Toolbar => tr("Toolbar"),
             Section::ConnectionTypes => tr("Connection types"),
             Section::NetworkProfiles => tr("Network profiles"),
             Section::Ai => tr("AI assistant"),
@@ -74,7 +71,6 @@ impl Section {
             Section::History => icon::CLOCK_COUNTER_CLOCKWISE,
             Section::Navigator => icon::TREE_STRUCTURE,
             Section::Keyboard => icon::KEYBOARD,
-            Section::Toolbar => icon::TOOLBOX,
             Section::ConnectionTypes => icon::TAG,
             Section::NetworkProfiles => icon::SHARE_NETWORK,
             Section::Ai => icon::SPARKLE,
@@ -201,12 +197,6 @@ impl SettingsTab {
                 combo(ui, "set_time_zone", &mut s.time_zone, &items)
             });
             c |= row(ui, tr("Theme"), |ui| combo(ui, "set_theme", &mut s.theme, &[(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))]));
-            ui.label("");
-            let mut colored = s.colored_icons.unwrap_or(false);
-            if check(ui, &mut colored, tr("Coloured icons (the classic look)")) {
-                s.colored_icons = Some(colored);
-                c = true;
-            }
             c |= row(ui, tr("Font size"), |ui| num(ui, &mut s.ui_font_size, 8.0..=32.0, " pt"));
             c |= row(ui, tr("Zoom"), |ui| {
                 let mut pct = (s.ui_scale * 100.0).round();
@@ -529,71 +519,6 @@ impl SettingsTab {
             cx.settings.keymap = km.to_config();
         }
         let _ = Shortcut::parse;
-        changed
-    }
-
-    fn toolbar(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
-        let t = &mut cx.settings.toolbar;
-        let mut changed = false;
-        ui.label(tr("Choose and order the actions shown in the main toolbar."));
-        let mut swap: Option<(usize, usize)> = None;
-        let mut remove: Option<usize> = None;
-        egui::Grid::new("set_toolbar").num_columns(3).striped(true).show(ui, |ui| {
-            for (i, id) in t.items.iter().enumerate() {
-                let label =
-                    if id == "|" { tr("Separator").to_string() } else { Action::from_id(id).map(|a| crate::keys::action_label(a).to_string()).unwrap_or_else(|| id.clone()) };
-                let mut visible = !t.hidden.contains(id);
-                if ui.checkbox(&mut visible, label).changed() {
-                    if visible {
-                        t.hidden.retain(|h| h != id);
-                    } else {
-                        t.hidden.push(id.clone());
-                    }
-                    changed = true;
-                }
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(i > 0, egui::Button::new(ternarygrid_icons::ic(icon::ARROW_UP)).small()).clicked() {
-                        swap = Some((i, i - 1));
-                    }
-                    if ui.add_enabled(i + 1 < t.items.len(), egui::Button::new(ternarygrid_icons::ic(icon::ARROW_DOWN)).small()).clicked() {
-                        swap = Some((i, i + 1));
-                    }
-                    if ui.small_button(ternarygrid_icons::ic(icon::TRASH)).clicked() {
-                        remove = Some(i);
-                    }
-                });
-                ui.end_row();
-            }
-        });
-        if let Some((a, b)) = swap {
-            t.items.swap(a, b);
-            changed = true;
-        }
-        if let Some(i) = remove {
-            t.items.remove(i);
-            changed = true;
-        }
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("set_tb_add").selected_text(tr("Add…")).show_ui(ui, |ui| {
-                if ui.selectable_label(false, tr("Separator")).clicked() {
-                    t.items.push("|".into());
-                    changed = true;
-                }
-                for a in Action::ALL {
-                    if t.items.iter().any(|i| i == a.id()) {
-                        continue;
-                    }
-                    if ui.selectable_label(false, crate::keys::action_label(*a)).clicked() {
-                        t.items.push(a.id().to_string());
-                        changed = true;
-                    }
-                }
-            });
-            if ui.button(tr("Reset")).clicked() {
-                *t = Default::default();
-                changed = true;
-            }
-        });
         changed
     }
 
@@ -1034,7 +959,6 @@ impl TabView for SettingsTab {
                     Section::History => self.history(ui, cx),
                     Section::Navigator => self.navigator(ui, cx),
                     Section::Keyboard => self.keyboard(ui, cx),
-                    Section::Toolbar => self.toolbar(ui, cx),
                     Section::ConnectionTypes => self.connection_types(ui, cx),
                     Section::NetworkProfiles => self.network_profiles(ui, cx),
                     Section::Ai => self.ai(ui, cx),
