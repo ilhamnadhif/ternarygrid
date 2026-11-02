@@ -108,6 +108,12 @@ pub trait TabView: Any {
         None
     }
 
+    /// The connection a pop-up writes to, when it is not its own (a migration's target): the
+    /// header then reads "source → target".
+    fn popup_target(&self) -> Option<&str> {
+        None
+    }
+
     /// True once after its job finished successfully: a pop-up then closes
     /// (the result was reported by a toast). Failures keep it open.
     fn take_done(&mut self) -> bool {

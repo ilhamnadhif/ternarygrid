@@ -925,6 +925,9 @@ impl TabView for MigrationTab {
         std::mem::take(&mut self.done)
     }
 
+    fn popup_target(&self) -> Option<&str> {
+        self.target_conn.as_deref()
+    }
     fn popup_size(&self) -> Option<egui::Vec2> {
         Some(wizard::WINDOW)
     }

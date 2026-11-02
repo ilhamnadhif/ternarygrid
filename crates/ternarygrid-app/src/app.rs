@@ -1921,7 +1921,11 @@ impl eframe::App for TernaryGridApp {
             // width and height, header included), as `Dialog::width`; the window adds the border.
             let size = tab.view.popup_size().unwrap_or(egui::vec2(720.0, 520.0)) + egui::vec2(2.0, 2.0);
             let title = tab.view.title();
-            let subtitle = tab.view.connection_id().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_default();
+            let name = |id: Option<&str>| id.and_then(|c| cx.conns.config(c)).map(|c| c.name.clone());
+            let subtitle = match (name(tab.view.connection_id()), name(tab.view.popup_target())) {
+                (Some(source), Some(target)) => format!("{source} → {target}"),
+                (source, _) => source.unwrap_or_default(),
+            };
             let tab_icon = tab.view.icon();
             let shown = egui::Window::new(&title)
                 .id(egui::Id::new(("ternarygrid_popup", tab.id)))
