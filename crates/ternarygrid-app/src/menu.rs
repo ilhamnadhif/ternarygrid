@@ -23,6 +23,11 @@ pub enum MenuAction {
     Tasks,
     AiAssistant,
     BackgroundOperations,
+    /// Data transfer and diagram tools of the selected object (also on its context menu).
+    ExportData,
+    ImportData,
+    ErDiagram,
+    SessionManager,
     ToggleNavigator,
     PropertiesPanel,
     Theme(Theme),

@@ -97,6 +97,11 @@ impl AppMenu {
                 &item(tr("Tasks"), None, M::Tasks),
                 &item(tr("AI assistant"), None, M::AiAssistant),
                 &item(tr("Background operations"), None, M::BackgroundOperations),
+                &sep(),
+                &item(tr("Export data…"), None, M::ExportData),
+                &item(tr("Import data…"), None, M::ImportData),
+                &item(tr("ER diagram"), None, M::ErDiagram),
+                &item(tr("Session manager"), None, M::SessionManager),
             ],
         )
         .ok()?;

@@ -1390,6 +1390,10 @@ impl TernaryGridApp {
             M::Tasks => Some(AppCommand::OpenTasks),
             M::AiAssistant => Some(AppCommand::OpenAiAssistant { connection: self.nav.selected.as_ref().and_then(|n| n.connection()).map(str::to_string) }),
             M::BackgroundOperations => Some(AppCommand::ToggleOperations),
+            M::ExportData => Some(AppCommand::Action(crate::keys::Action::Export)),
+            M::ImportData => Some(AppCommand::Action(crate::keys::Action::Import)),
+            M::ErDiagram => Some(AppCommand::Action(crate::keys::Action::OpenErDiagram)),
+            M::SessionManager => Some(AppCommand::Action(crate::keys::Action::OpenSessionManager)),
             M::ToggleNavigator => Some(AppCommand::ToggleNavigator),
             M::PropertiesPanel => {
                 self.settings.navigator.show_properties = !self.settings.navigator.show_properties;
@@ -1477,6 +1481,11 @@ impl TernaryGridApp {
                 item(ui, true, Some(icon::LIST_CHECKS), tr("Tasks"), M::Tasks);
                 item(ui, true, Some(icon::SPARKLE), tr("AI assistant"), M::AiAssistant);
                 item(ui, true, Some(icon::HOURGLASS), tr("Background operations"), M::BackgroundOperations);
+                ui.separator();
+                item(ui, true, Some(icon::EXPORT), tr("Export data…"), M::ExportData);
+                item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import data…"), M::ImportData);
+                item(ui, true, Some(icon::GRAPH), tr("ER diagram"), M::ErDiagram);
+                item(ui, true, Some(icon::USERS), tr("Session manager"), M::SessionManager);
             });
             ui.menu_button(tr("View"), |ui| {
                 item(ui, true, None, tr("Toggle navigator"), M::ToggleNavigator);
