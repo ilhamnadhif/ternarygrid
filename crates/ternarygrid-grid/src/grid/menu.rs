@@ -60,10 +60,8 @@ impl GridFrame<'_> {
                 ui.close();
             }
             if item(ui, icon::COPY, tr("Copy column values"), None).clicked() {
-                let nrows = self.geo.nrows;
                 if let Some(pos) = self.pos_of(col) {
                     self.state.rt.selection.select_columns(pos, pos, false);
-                    let _ = nrows;
                     self.copy_selection(&CopyOptions::plain());
                 }
                 ui.close();
@@ -130,8 +128,10 @@ impl GridFrame<'_> {
         let server = self.state.mode == super::DataMode::Server;
         let filterable = !(self.model.is_virtual_column(col) && server);
         let row = self.active().map(|(r, _)| r).or((self.geo.nrows > 0).then_some(0));
-        if filterable && let Some(row) = row {
-            let value = self.model.cell(row, col).unwrap_or_default();
+        if filterable
+            && let Some(row) = row
+            && let Some(value) = self.menu_value(row, col)
+        {
             ui.separator();
             ui.label(RichText::new(tr("Cell value")).weak().small());
             let v = short_value(&value);
@@ -139,7 +139,7 @@ impl GridFrame<'_> {
             for &op in ops {
                 let label = if value.is_null() { format!("{name} {}", if op == FilterOp::Eq { "IS NULL" } else { "IS NOT NULL" }) } else { format!("{name} {} '{v}'", op.sql()) };
                 if ui.button(label).clicked() {
-                    apply_value_filter(self.model, self.state.mode, self.options, (col, op, &value), &self.ctx, &mut self.actions);
+                    apply_value_filter(self.model, self.state, self.options, (col, op, &value), &self.ctx, &mut self.actions);
                     ui.close();
                 }
             }
@@ -156,7 +156,7 @@ impl GridFrame<'_> {
             }
             for op in [FilterOp::IsNull, FilterOp::IsNotNull] {
                 if ui.button(format!("{name} {}", op.sql())).clicked() {
-                    apply_value_filter(self.model, self.state.mode, self.options, (col, op, &Value::Null), &self.ctx, &mut self.actions);
+                    apply_value_filter(self.model, self.state, self.options, (col, op, &Value::Null), &self.ctx, &mut self.actions);
                     ui.close();
                 }
             }
@@ -280,10 +280,12 @@ impl GridFrame<'_> {
         ui.separator();
         // --- filtering / ordering / columns
         if let Some((row, col)) = active {
-            let value = self.model.cell(row, col).unwrap_or_default();
+            // While the store is busy and the value was not read before: its items are disabled.
+            let known = self.menu_value(row, col);
+            let value = known.clone().unwrap_or_default();
             let name = self.model.column_name(col).to_string();
             let virtual_server = self.model.is_virtual_column(col) && self.state.mode == super::DataMode::Server;
-            ui.add_enabled_ui(!virtual_server, |ui| {
+            ui.add_enabled_ui(!virtual_server && known.is_some(), |ui| {
                 ui.menu_button(format!("{}  {}", icon::FUNNEL, tr("Filter by value")), |ui| {
                     let v = short_value(&value);
                     for op in FilterOp::ALL {
@@ -299,30 +301,32 @@ impl GridFrame<'_> {
                             _ => format!("{name} {} '{v}'", op.sql()),
                         };
                         if ui.button(label).clicked() {
-                            apply_value_filter(self.model, self.state.mode, self.options, (col, op, &value), &self.ctx, &mut self.actions);
+                            apply_value_filter(self.model, self.state, self.options, (col, op, &value), &self.ctx, &mut self.actions);
                             ui.close();
                         }
                     }
                 });
             });
-            ui.menu_button(format!("{}  {}", icon::PAINT_BUCKET, tr("Highlight rows with this value")), |ui| {
-                let text = (!value.is_null()).then(|| value.to_text().into_owned());
-                for (label, rgb) in super::state::HIGHLIGHT_COLORS {
-                    let swatch = egui::RichText::new("■").color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
-                    if ui.button(egui::WidgetText::from(swatch)).on_hover_text(tr(label)).clicked() {
-                        self.state.set_highlight(&name, text.clone(), Some(rgb));
+            ui.add_enabled_ui(known.is_some(), |ui| {
+                ui.menu_button(format!("{}  {}", icon::PAINT_BUCKET, tr("Highlight rows with this value")), |ui| {
+                    let text = (!value.is_null()).then(|| value.to_text().into_owned());
+                    for (label, rgb) in super::state::HIGHLIGHT_COLORS {
+                        let swatch = egui::RichText::new("■").color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                        if ui.button(egui::WidgetText::from(swatch)).on_hover_text(tr(label)).clicked() {
+                            self.state.set_highlight(&name, text.clone(), Some(rgb));
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button(tr("Remove this highlight")).clicked() {
+                        self.state.set_highlight(&name, text.clone(), None);
                         ui.close();
                     }
-                }
-                ui.separator();
-                if ui.button(tr("Remove this highlight")).clicked() {
-                    self.state.set_highlight(&name, text.clone(), None);
-                    ui.close();
-                }
-                if !self.state.highlights.is_empty() && ui.button(tr("Remove all highlights")).clicked() {
-                    self.state.highlights.clear();
-                    ui.close();
-                }
+                    if !self.state.highlights.is_empty() && ui.button(tr("Remove all highlights")).clicked() {
+                        self.state.highlights.clear();
+                        ui.close();
+                    }
+                });
             });
             let has_filter = self.model.requested_view_spec().filter.is_some();
             if has_filter && item(ui, icon::FUNNEL_X, tr("Clear client filter"), None).clicked() {
@@ -369,6 +373,8 @@ impl GridFrame<'_> {
                 }
                 if ui.button(tr("Remove virtual column")).clicked() {
                     self.model.remove_virtual_column(idx);
+                    // The columns after it move: widths, order and sort follow them.
+                    self.state.sync_columns(self.model);
                     ui.close();
                 }
             }
@@ -544,6 +550,24 @@ impl GridFrame<'_> {
                 self.state.set_column_format(col, Some(f));
             }
         });
+    }
+
+    /// The value of a cell for a menu, shown every frame while it is open: never
+    /// waits long for the row store; while the fetch task holds it, the value
+    /// read before (`None` when there is none: the items using it are disabled).
+    fn menu_value(&mut self, row: usize, col: usize) -> Option<Value> {
+        let key = (self.model.content_generation(), row, col);
+        match self.model.try_cell(row, col, super::STORE_WAIT) {
+            Some(v) => {
+                let v = v.unwrap_or_default();
+                self.state.rt.menu_value = Some((key, v.clone()));
+                Some(v)
+            }
+            None => {
+                self.ctx.request_repaint_after(std::time::Duration::from_millis(10));
+                self.state.rt.menu_value.as_ref().filter(|(k, _)| *k == key).map(|(_, v)| v.clone())
+            }
+        }
     }
 
     /// Auto-size `col` using a painter for measurement: it fits the longest

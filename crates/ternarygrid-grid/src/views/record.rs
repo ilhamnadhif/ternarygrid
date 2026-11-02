@@ -92,7 +92,8 @@ pub struct RecordViewState {
     /// The list of values of an enum / dictionary field, as in the grid.
     dropdown: Option<Dropdown>,
     error: Option<String>,
-    /// Last shown values: ((generation, row, columns), values) for frames where the store is busy.
+    /// Last values read: ((content generation, rows, columns), values), shown
+    /// in frames where the store is busy (instead of NULLs).
     cache: Option<RecordCache>,
     /// Take the keyboard focus on the next frame (opened with Tab).
     focus_request: bool,
@@ -119,7 +120,7 @@ impl RecordViewState {
         self.error = None;
         if !typed && (model.dictionary(c).is_some() || model.enum_values(c).is_some()) {
             self.editing = None;
-            self.dropdown = Some(Dropdown { row: r, anchor: model.row_anchor(r), col: c, search: String::new(), just_opened: true });
+            self.dropdown = Some(Dropdown { row: r, anchor: model.row_anchor(r), col: c, search: String::new(), just_opened: true, current: None });
         } else {
             self.dropdown = None;
             self.editing = Some((r, c, text, original));
@@ -174,7 +175,7 @@ impl RecordViewState {
 /// A shown value: (value, is default, modified).
 type Shown = (Value, bool, bool);
 
-type RecordCache = ((u64, usize, Vec<usize>), Vec<Shown>);
+type RecordCache = ((u64, Vec<usize>, Vec<usize>), Vec<Vec<Shown>>);
 
 /// Single record view. The shown row is the grid's active row.
 pub struct RecordView<'a> {
@@ -420,9 +421,19 @@ fn rows_table(
     let single = rows.len() == 1;
     let needle = state.column_filter.to_lowercase();
     let named: Vec<usize> = grid.visible_columns().into_iter().filter(|&c| needle.is_empty() || model.column_name(c).to_lowercase().contains(&needle)).collect();
-    let (all_values, fresh) = row_values(model, rows, &named);
-    if !fresh {
+    let (mut all_values, fresh) = row_values(model, rows, &named);
+    // While the fetch task holds the store: the values read before, not NULLs (that
+    // would flicker, and "Hide empty" would hide the columns).
+    let key = (model.content_generation(), rows.to_vec(), named.clone());
+    if fresh {
+        if state.cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            state.cache = Some((key, all_values.clone()));
+        }
+    } else {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));
+        if let Some((_, cached)) = state.cache.as_ref().filter(|(k, _)| *k == key) {
+            all_values = cached.clone();
+        }
     }
     // "Hide empty": columns NULL or empty in every row go (key columns stay).
     let key_cols: Vec<usize> = model.editability().as_ref().map(|t| t.key_columns.clone()).unwrap_or_default();

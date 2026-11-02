@@ -326,6 +326,8 @@ impl<'a> ResultViewer<'a> {
         Panel::top(id.with("filter_bar")).frame(bar_frame).show(ui, |ui| {
             actions.extend(FilterBar::new(model, &mut state.grid, &mut state.toolbar).dialect(options.dialect.clone()).show(ui));
         });
+        // "Filter by value" in server mode adds to the WHERE the filter box shows.
+        state.grid.set_server_filter(&state.toolbar.filter_text);
         Panel::bottom(id.with("toolbar")).frame(bar_frame).show(ui, |ui| {
             actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).show(ui));
         });
@@ -479,12 +481,10 @@ impl<'a> ResultViewer<'a> {
                     state.open_panel(PanelKind::Value);
                 }
                 GridAction::ServerQueryChanged { where_clause, order_by } => {
-                    if let Some(w) = where_clause
-                        && !w.is_empty()
-                        && !state.toolbar.filter_text.contains(w.as_str())
-                    {
-                        state.toolbar.filter_text =
-                            if state.toolbar.filter_text.trim().is_empty() { w.clone() } else { format!("({}) AND ({w})", state.toolbar.filter_text.trim()) };
+                    // The whole new WHERE (a filter by value includes the one before): the
+                    // filter box shows what the application runs.
+                    if let Some(w) = where_clause {
+                        state.toolbar.filter_text = w.clone();
                     }
                     if let Some(o) = order_by {
                         state.toolbar.order_text = o.clone();

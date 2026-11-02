@@ -12,7 +12,10 @@ pub const MAX_CALC_CELLS: usize = 500_000;
 /// Cached statistics of the selection.
 #[derive(Debug, Clone, Default)]
 pub struct CalcPanelState {
-    key: Option<(u64, Selection, Vec<usize>)>,
+    /// Content generation, selection, visible columns and the selected rows that exist.
+    key: Option<(u64, Selection, Vec<usize>, usize)>,
+    /// When the statistics were computed (`ui` time).
+    built_at: f64,
     stats: CalcStats,
     /// Selected rows of the table (by function), for ⌘C.
     selected: Vec<String>,
@@ -76,10 +79,16 @@ impl<'a> CalcPanel<'a> {
 
     /// Show the panel.
     pub fn show(self, ui: &mut Ui) {
-        let key = (self.model.generation(), self.grid.selection().clone(), self.grid.visible_columns());
-        if self.state.key.as_ref() != Some(&key) {
+        let sel = self.grid.selection();
+        // Rows fetched below the selection change nothing; a selection to the end
+        // (columns, all) grows with a streaming fetch: computed at most every half second.
+        let extent = sel.ranges().iter().map(|r| r.r1.saturating_add(1)).max().unwrap_or(0).min(self.model.row_count());
+        let key = (self.model.content_generation(), sel.clone(), self.grid.visible_columns(), extent);
+        let more_rows_only = self.state.key.as_ref().is_some_and(|k| (k.0, &k.1, &k.2) == (key.0, &key.1, &key.2));
+        if self.state.key.as_ref() != Some(&key) && crate::views::rebuild_due(ui.ctx(), more_rows_only, self.state.built_at) {
             self.state.stats = selection_stats(self.model, self.grid, MAX_CALC_CELLS);
             self.state.key = Some(key);
+            self.state.built_at = ui.input(|i| i.time);
             // Other cells: other rows (the mode, lengths come and go).
             self.state.anchor = None;
         }

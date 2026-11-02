@@ -31,6 +31,11 @@ pub(crate) mod text;
 pub(crate) use editor::{ListChoice, value_list};
 pub(crate) use frame::detached_menu;
 pub(crate) use paint::{CANCEL_AFTER, kind_icon};
+
+/// How long the UI thread waits at most for the row store when it reads a few
+/// cells: the fetch task may hold it while spilling pages to disk. The value
+/// read before, or nothing, is shown meanwhile and read again on a later frame.
+pub(crate) const STORE_WAIT: Duration = Duration::from_millis(4);
 pub use selection::{CellPos, CellRange, Selection};
 pub use state::{ColumnState, DataGridState, DataMode};
 
@@ -221,7 +226,9 @@ pub enum GridAction {
     /// Pending changes were discarded (informational).
     ChangesDiscarded,
     /// Server side mode: re-run the query with this `WHERE` / `ORDER BY`
-    /// (`None` = unchanged, empty string = remove).
+    /// (`None` = unchanged, empty string = remove). Each is the whole new
+    /// clause: a filter by value adds its condition to the current filter
+    /// ([`DataGridState::set_server_filter`]), `(current) AND (new)`.
     ServerQueryChanged {
         /// New WHERE condition (without `WHERE`).
         where_clause: Option<String>,
@@ -411,6 +418,16 @@ pub fn duplicate_selected(model: &mut ResultModel, state: &mut DataGridState) ->
         state.select_cell(first, col);
     }
     Ok(new.len())
+}
+
+/// [`GridAction::SaveChanges`], or the error that keeps the pending changes
+/// from being saved ([`ResultModel::checked_change_set`]: a changed row that
+/// cannot be identified), shown instead of asking the application to save.
+pub(crate) fn save_action(model: &ResultModel) -> GridAction {
+    match model.checked_change_set() {
+        Err(message) if model.is_editable() && model.has_changes() => GridAction::Notify { message, error: true },
+        _ => GridAction::SaveChanges,
+    }
 }
 
 /// Mark the selected rows for deletion. Returns the number of rows.
@@ -627,19 +644,28 @@ pub(crate) fn apply_sort(model: &mut ResultModel, state: &mut DataGridState, opt
     }
 }
 
-/// Apply "filter by value" (`col op value`) in `mode`.
+/// `(current) AND (cond)`: a condition added to the server side `WHERE` (as
+/// [`ClientFilter::and`] writes client filters).
+pub(crate) fn and_where(current: &str, cond: &str) -> String {
+    let current = current.trim();
+    if current.is_empty() || current == cond { cond.to_string() } else { format!("({current}) AND ({cond})") }
+}
+
+/// Apply "filter by value" (`col op value`) in the grid's mode: added to the
+/// current filter (the server side one is [`DataGridState::server_filter`]).
 pub(crate) fn apply_value_filter(
     model: &mut ResultModel,
-    mode: DataMode,
+    state: &DataGridState,
     options: &GridOptions,
     (col, op, value): (usize, FilterOp, &Value),
     ctx: &egui::Context,
     actions: &mut Vec<GridAction>,
 ) {
-    match mode {
+    match state.mode {
         DataMode::Server => {
+            // The whole new WHERE: the application runs what the filter box then shows.
             let cond = server_condition(model, options, col, op, value);
-            actions.push(GridAction::ServerQueryChanged { where_clause: Some(cond), order_by: None });
+            actions.push(GridAction::ServerQueryChanged { where_clause: Some(and_where(state.server_filter(), &cond)), order_by: None });
         }
         DataMode::Client => {
             let cond = ClientFilter::condition(col, model.column_name(col), op, value);

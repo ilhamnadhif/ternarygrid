@@ -259,6 +259,8 @@ pub struct ResultModel {
     enum_values: HashMap<usize, Vec<String>>,
     foreign_keys: Vec<ForeignKeyLink>,
     generation: u64,
+    /// Generations that only appended fetched rows (see [`ResultModel::content_generation`]).
+    appended: u64,
     /// Fetch progress, updated by the application.
     pub fetch: FetchState,
 }
@@ -296,6 +298,7 @@ impl ResultModel {
             enum_values: HashMap::new(),
             foreign_keys: Vec::new(),
             generation: 1,
+            appended: 0,
             fetch: FetchState::default(),
         }
     }
@@ -308,7 +311,16 @@ impl ResultModel {
     }
 
     /// Replace columns and rows (e.g. after re-running the query). Pending
-    /// edits, the client view and virtual columns referencing missing columns are dropped.
+    /// edits, their undo history, foreign keys and enum values are dropped;
+    /// the fetch state is kept.
+    ///
+    /// When the new columns have the same names as before (a refresh), the
+    /// virtual columns, dictionaries and the client sort / filter stay (the
+    /// view is recomputed once the new rows are fetched), and so does the
+    /// editability if the columns come from the same table columns. Other
+    /// columns (another query or table, a changed table) drop all of them,
+    /// virtual columns included: the application sets them up again for the
+    /// new columns, as for a new model.
     pub fn reset(&mut self, columns: Vec<ColumnMeta>, store: SharedRowStore) {
         let virtuals = std::mem::take(&mut self.virtual_columns);
         let dictionaries = std::mem::take(&mut self.dictionaries);
@@ -415,16 +427,22 @@ impl ResultModel {
     }
 
     /// Remove virtual column `index` (0-based among virtual columns). A client
-    /// view sorting/filtering by virtual columns is reset.
+    /// view sorting/filtering by virtual columns is reset, and one being
+    /// computed for them is cancelled (the columns after it move). The grid's
+    /// header follows ([`DataGridState::sync_columns`](crate::DataGridState::sync_columns)).
     pub fn remove_virtual_column(&mut self, index: usize) {
         if index < self.virtual_columns.len() {
             self.virtual_columns.remove(index);
-            if let ViewKind::Client(spec) = &self.view_kind {
-                let base = self.columns.len();
-                let uses_virtual = spec.sort.iter().any(|k| k.column >= base) || spec.filter.as_ref().is_some_and(|f| f.expr().referenced_columns().iter().any(|c| *c >= base));
-                if uses_virtual {
-                    self.clear_view();
-                }
+            let base = self.columns.len();
+            let uses_virtual =
+                |spec: &ViewSpec| spec.sort.iter().any(|k| k.column >= base) || spec.filter.as_ref().is_some_and(|f| f.expr().referenced_columns().iter().any(|c| *c >= base));
+            if self.pending_view_spec().is_some_and(uses_virtual) {
+                self.cancel_view_job();
+            }
+            if let ViewKind::Client(spec) = &self.view_kind
+                && uses_virtual(spec)
+            {
+                self.clear_view();
             }
             self.generation += 1;
         }
@@ -506,6 +524,16 @@ impl ResultModel {
         self.generation
     }
 
+    /// Like [`generation`](Self::generation), but rows the fetch task appended
+    /// do not count: they come after the rows displayed before (in store order,
+    /// after pending new rows placed among them; a client view does not show
+    /// them until it is recomputed), which stay as they were. A cache of the
+    /// first rows keys on this and on how many rows it covers, instead of
+    /// being rebuilt for every batch of a streaming fetch.
+    pub fn content_generation(&self) -> u64 {
+        self.generation - self.appended
+    }
+
     /// Pick up rows appended by the fetch task. Call once per frame (the grid
     /// does). Returns true when the row count changed.
     pub fn sync(&mut self) -> bool {
@@ -551,6 +579,7 @@ impl ResultModel {
             self.view_source_len = len;
         }
         self.generation += 1;
+        self.appended += 1;
         true
     }
 
@@ -1434,33 +1463,54 @@ impl ResultModel {
         self.generation += 1;
     }
 
-    /// The pending changes, or `None` when the result is read-only.
+    /// The pending changes, or `None` when the result is read-only or a
+    /// changed row cannot be identified (see [`ResultModel::checked_change_set`]).
     pub fn change_set(&self) -> Option<ChangeSet> {
-        let target = self.editability.as_ref().ok()?;
+        self.checked_change_set().ok()
+    }
+
+    /// The pending changes, or why they cannot be saved. An `UPDATE` / `DELETE`
+    /// identifies its row by the key's original values, so they are refused,
+    /// all of them, when the result is read-only, has no key, a key column is
+    /// not a column of the table, or a changed row could not be read back from
+    /// the disk cache (its key is unknown): never a statement whose `WHERE`
+    /// would miss its row or match others.
+    pub fn checked_change_set(&self) -> Result<ChangeSet, String> {
+        let target = self.target()?;
         let col_info = |c: usize| -> Option<(String, String)> {
             let name = target.column_names.get(c)?.clone()?;
             Some((name, self.columns.get(c)?.type_name.clone()))
         };
         let mut deletes = Vec::new();
         let mut updates = Vec::new();
+        if !self.deleted.is_empty() || !self.updates.is_empty() {
+            if target.key_columns.is_empty() {
+                return Err(ReadOnlyReason::NoKey.message());
+            }
+            if let Some(&k) = target.key_columns.iter().find(|&&k| col_info(k).is_none()) {
+                return Err(trf("The key column '{}' is not a column of {}: the changed rows cannot be identified", &[&self.column_name(k), &target.table.display_path()]));
+            }
+        }
         {
             let mut guard = self.store.lock();
-            let mut key_of = |s: u32| -> Vec<KeyValue> {
-                let row = guard.get(s as usize);
+            // The original key values of a stored row (all of them, or none).
+            let mut key_of = |s: u32| -> Result<Vec<KeyValue>, String> {
+                let unreadable = || trf("Row {} could not be read back from the disk cache, so it cannot be identified; refresh the result", &[&(s as usize + 1)]);
+                let row = guard.get(s as usize).ok_or_else(unreadable)?;
                 target
                     .key_columns
                     .iter()
-                    .filter_map(|&k| {
-                        let (name, type_name) = col_info(k)?;
-                        let value = row.and_then(|r| r.get(k)).cloned().unwrap_or(Value::Null);
-                        Some(KeyValue { column: k, name, type_name, value })
+                    .map(|&k| {
+                        let (name, type_name) = col_info(k).ok_or_else(unreadable)?;
+                        let value = row.get(k).cloned().ok_or_else(unreadable)?;
+                        Ok(KeyValue { column: k, name, type_name, value })
                     })
                     .collect()
             };
             let mut del: Vec<u32> = self.deleted.iter().copied().collect();
             del.sort_unstable();
             for s in del {
-                deletes.push(RowDelete { row: s, key: key_of(s) });
+                deletes.push(RowDelete { row: s, key: key_of(s)? });
             }
             let mut upd: Vec<u32> = self.updates.keys().copied().filter(|s| !self.deleted.contains(s)).collect();
             upd.sort_unstable();
@@ -1474,7 +1524,7 @@ impl ResultModel {
                     .collect();
                 changes.sort_by_key(|c| c.column);
                 if !changes.is_empty() {
-                    updates.push(RowUpdate { row: s, key: key_of(s), changes });
+                    updates.push(RowUpdate { row: s, key: key_of(s)?, changes });
                 }
             }
         }
@@ -1496,11 +1546,12 @@ impl ResultModel {
             })
             .collect();
         let columns = (0..self.columns.len()).filter_map(|c| col_info(c).map(|(n, t)| (c, n, t))).collect();
-        Some(ChangeSet { table: target.table.clone(), deletes, updates, inserts, columns, key_columns: target.key_columns.clone() })
+        Ok(ChangeSet { table: target.table.clone(), deletes, updates, inserts, columns, key_columns: target.key_columns.clone() })
     }
 
     /// Parameterised statements saving the pending changes (deletes, updates,
-    /// inserts) using [`Dialect::placeholder`]. Empty when read-only.
+    /// inserts) using [`Dialect::placeholder`]. Empty when read-only or when
+    /// they cannot be saved ([`ResultModel::checked_change_set`] says why).
     pub fn change_statements(&self, dialect: &dyn Dialect) -> Vec<(String, Vec<Value>)> {
         self.change_set().map(|c| c.statements(dialect)).unwrap_or_default()
     }

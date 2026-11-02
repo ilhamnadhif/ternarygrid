@@ -581,3 +581,133 @@ fn enter_and_f2_open_the_editor_and_keep_it_open() {
     assert!(!h.state.is_editing());
     assert_eq!(h.model.cell(1, 1), Some(Value::text("x")));
 }
+
+/// Run `f` while another thread (the fetch task, spilling pages) holds the row
+/// store's lock; returns how long `f` took.
+fn while_store_busy(h: &mut GridHarness, f: impl FnOnce(&mut GridHarness)) -> std::time::Duration {
+    let store = h.model.store().clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let guard = store.lock();
+        let _ = locked_tx.send(());
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+    });
+    locked_rx.recv().unwrap();
+    let start = std::time::Instant::now();
+    f(h);
+    let elapsed = start.elapsed();
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    elapsed
+}
+
+#[test]
+fn menus_lists_and_commands_do_not_wait_for_a_busy_store() {
+    let mut m = editable_model(50);
+    m.set_foreign_keys(vec![ForeignKeyLink {
+        name: None,
+        columns: vec![3],
+        ref_table: ternarygrid_core::ObjectRef::table(Some("app".into()), "categories"),
+        ref_columns: vec!["id".into()],
+    }]);
+    m.set_dictionary(3, std::collections::HashMap::from([("1".to_string(), "Books".to_string()), ("2".to_string(), "Music".to_string())]));
+    let mut h = GridHarness::new(m);
+    let fast = std::time::Duration::from_millis(1500);
+    // The context menu (filter by value, highlight) open while the store is busy.
+    h.click_at(h.cell_center(10, 1), PointerButton::Secondary, Modifiers::NONE);
+    assert!(egui::Popup::is_any_open(&h.ui.ctx));
+    let t = while_store_busy(&mut h, |h| {
+        for _ in 0..5 {
+            h.frame(vec![]);
+        }
+    });
+    assert!(t < fast, "context menu: {t:?}");
+    assert!(egui::Popup::is_any_open(&h.ui.ctx), "still open");
+    h.key(Key::Escape, Modifiers::NONE);
+    // The column menu (filter by the cell value).
+    h.state.select_cell(3, 1);
+    h.state.rt.header_popup = Some((1, egui::Rect::from_min_size(egui::pos2(300.0, 40.0), egui::vec2(16.0, 20.0)), true));
+    h.frame(vec![]);
+    let t = while_store_busy(&mut h, |h| {
+        for _ in 0..5 {
+            h.frame(vec![]);
+        }
+    });
+    assert!(t < fast, "column menu: {t:?}");
+    assert!(h.state.rt.header_popup.is_some());
+    h.state.rt.header_popup = None;
+    // The list of values of a dictionary column.
+    h.click_at(h.cell_center(2, 3), PointerButton::Primary, Modifiers::NONE);
+    h.key(Key::Enter, Modifiers::NONE);
+    assert!(h.state.rt.dropdown.is_some());
+    let t = while_store_busy(&mut h, |h| {
+        for _ in 0..5 {
+            h.frame(vec![]);
+        }
+    });
+    assert!(t < fast, "list of values: {t:?}");
+    assert!(h.state.rt.dropdown.is_some(), "still open");
+    h.key(Key::Escape, Modifiers::NONE);
+    h.frame(vec![]);
+    // The pointer over a foreign key button.
+    let c = h.cell_center(2, 3);
+    let w = h.state.column_width(h.state.visible_columns()[3]);
+    let p = egui::pos2(c.x + w / 2.0 - super::frame::PAD - super::frame::FK_BUTTON / 2.0, c.y);
+    let t = while_store_busy(&mut h, |h| {
+        for _ in 0..5 {
+            h.frame(vec![Event::PointerMoved(p)]);
+        }
+    });
+    assert!(t < fast, "foreign key button: {t:?}");
+    // Hide columns without data: refused for now, nothing hidden.
+    let visible = h.state.visible_columns();
+    let t = while_store_busy(&mut h, |h| {
+        h.state.request(GridCommand::HideEmptyColumns);
+        h.frame(vec![]);
+    });
+    assert!(t < fast, "hide columns without data: {t:?}");
+    assert_eq!(h.state.visible_columns(), visible);
+    assert!(h.actions.iter().any(|a| matches!(a, GridAction::Notify { error: false, .. })), "{:?}", h.actions);
+    // Initial widths: fitted once the store is free again.
+    h.state.rt.columns_fitted = 0;
+    let t = while_store_busy(&mut h, |h| {
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        assert_eq!(h.state.rt.columns_fitted, 0, "not fitted without the first values");
+    });
+    assert!(t < fast, "fit columns: {t:?}");
+    h.frame(vec![]);
+    assert_ne!(h.state.rt.columns_fitted, 0);
+}
+
+#[test]
+fn cut_copies_and_sets_the_editable_cells_to_null() {
+    let mut h = GridHarness::new(editable_model(5));
+    // name and flag of rows 1-2.
+    h.click_at(h.cell_center(1, 1), PointerButton::Primary, Modifiers::NONE);
+    h.key(Key::ArrowDown, Modifiers::SHIFT);
+    h.key(Key::ArrowRight, Modifiers::SHIFT);
+    h.frame(vec![Event::Cut]);
+    assert_eq!(h.copied().as_deref(), Some("name 1\tfalse\nname 2\ttrue"));
+    for r in [1, 2] {
+        assert_eq!(h.model.cell(r, 1), Some(Value::Null));
+        assert_eq!(h.model.cell(r, 2), Some(Value::Null));
+    }
+    assert_eq!(h.model.cell(0, 1), Some(Value::text("name 0")));
+    // One undo step.
+    h.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!(h.model.cell(1, 1), Some(Value::text("name 1")));
+    assert!(!h.model.has_changes());
+    // A read-only result is only copied.
+    let mut m = editable_model(5);
+    m.set_editability(Err(ReadOnlyReason::NoKey));
+    let mut h = GridHarness::new(m);
+    h.click_at(h.cell_center(1, 1), PointerButton::Primary, Modifiers::NONE);
+    h.frame(vec![Event::Cut]);
+    assert_eq!(h.copied().as_deref(), Some("name 1"));
+    assert_eq!(h.model.cell(1, 1), Some(Value::text("name 1")));
+    assert!(!h.actions.iter().any(|a| matches!(a, GridAction::Notify { error: true, .. })));
+}

@@ -695,3 +695,105 @@ fn the_panel_tab_x_closes_it() {
     v.frame(vec![]);
     assert!(!v.state.toolbar.is_panel_open(PanelKind::Grouping), "× closes the panel");
 }
+
+#[test]
+fn filter_by_value_runs_the_filter_the_box_shows() {
+    // Server mode: the action carries the whole WHERE, the one before included,
+    // and the filter box shows exactly that (the application runs it as it is).
+    let mut v = Viewer::new(editable_model(10));
+    v.state.grid.mode = crate::grid::DataMode::Server;
+    v.state.toolbar.filter_text = "id > 1".into();
+    let by_value = |v: &mut Viewer, value: &str| {
+        v.state.grid.select_cell(2, 1);
+        v.state.grid.rt.header_popup = Some((1, egui::Rect::from_min_size(egui::pos2(300.0, 40.0), egui::vec2(16.0, 20.0)), true));
+        v.frame(vec![]);
+        v.frame(vec![]);
+        let item = v.find(&format!("name = '{value}'")).expect("the column menu's filter by the cell value");
+        v.click(item);
+    };
+    by_value(&mut v, "name 2");
+    let sent: Vec<Option<String>> = v
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            GridAction::ServerQueryChanged { where_clause, .. } => Some(where_clause.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent.len(), 1, "{:?}", v.actions);
+    let sent = sent[0].clone().unwrap();
+    assert!(sent.starts_with("(id > 1) AND (") && sent.contains("name") && sent.ends_with("'name 2')"), "{sent}");
+    assert_eq!(v.state.toolbar.filter_text, sent, "the box shows what runs");
+    // Applied again from the box: the same condition, not doubled.
+    v.frame(vec![]);
+    assert_eq!(v.state.toolbar.filter_text, sent);
+    // Client mode combines the same way: (filter before) AND (new condition).
+    let mut v = Viewer::new(editable_model(10));
+    v.state.toolbar.filter_text = "id > 1".into();
+    let apply = v.find(egui_phosphor::regular::PLAY).expect("apply button");
+    v.click(apply);
+    v.wait_jobs();
+    assert_eq!(v.model.row_count(), 8);
+    by_value(&mut v, "name 4");
+    v.wait_jobs();
+    assert_eq!(v.state.toolbar.filter_text, "(id > 1) AND (name = 'name 4')");
+    assert_eq!(v.model.row_count(), 1);
+}
+
+#[test]
+fn nothing_to_copy_is_a_note_not_an_error_pop_up() {
+    let mut v = Viewer::new(editable_model(5));
+    v.state.grid.request_focus();
+    v.frame(vec![]);
+    v.state.grid.selection_mut().clear();
+    v.frame(vec![Event::Copy]);
+    v.frame(vec![]);
+    assert_eq!(v.state.toolbar.notice, Some(("Nothing is selected".to_string(), false)));
+    assert!(v.state.toolbar.error_popup.is_none(), "no modal for it");
+    // Typing while editing is disabled (a save runs) says so, without a pop-up per key.
+    v.options.allow_editing = false;
+    v.state.grid.select_cell(1, 1);
+    v.frame(vec![]);
+    v.frame(vec![Event::Text("x".into())]);
+    v.frame(vec![]);
+    assert!(!v.state.grid.is_editing());
+    assert_eq!(v.state.toolbar.notice, Some(("Editing is disabled".to_string(), false)));
+    assert!(v.state.toolbar.error_popup.is_none());
+    // A real error still pops up.
+    v.options.allow_editing = true;
+    v.model.set_editability(Err(crate::model::ReadOnlyReason::ConnectionReadOnly));
+    v.frame(vec![Event::Text("x".into())]);
+    v.frame(vec![]);
+    assert!(v.state.toolbar.error_popup.is_some());
+}
+
+#[test]
+fn record_view_keeps_its_values_while_the_store_is_busy() {
+    let mut v = Viewer::new(editable_model(5));
+    v.state.grid.select_cell(2, 1);
+    v.state.toolbar.view = ResultViewKind::Record;
+    v.frame(vec![]);
+    v.frame(vec![]);
+    // The check box of `flag` (true in row 3) says what it shows.
+    let flag = |v: &Viewer| {
+        let update = v.output.accesskit_update.as_ref()?;
+        update.nodes.iter().filter(|(_, n)| n.role() == egui::accesskit::Role::CheckBox).find_map(|(_, n)| n.label().filter(|l| *l != "Hide empty").map(str::to_string))
+    };
+    assert_eq!(flag(&v).as_deref(), Some("true"));
+    let store = v.model.store().clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let guard = store.lock();
+        let _ = locked_tx.send(());
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+    });
+    locked_rx.recv().unwrap();
+    v.frame(vec![]);
+    v.frame(vec![]);
+    let busy = flag(&v);
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    assert_eq!(busy.as_deref(), Some("true"), "the values read before, not NULL, while the fetch task holds the store");
+}

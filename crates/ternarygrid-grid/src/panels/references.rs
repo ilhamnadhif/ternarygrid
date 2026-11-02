@@ -45,6 +45,9 @@ pub struct ReferencesPanelState {
     selected: Option<usize>,
     requested: Option<(usize, Vec<Value>)>,
     related: Option<(usize, Related)>,
+    /// The key last read: ((content generation, row, relation), values), for
+    /// frames where the row store is busy.
+    key: Option<((u64, usize, usize), Vec<Value>)>,
     options: GridOptions,
 }
 
@@ -132,7 +135,24 @@ impl<'a> ReferencesPanel<'a> {
             return actions;
         };
         let rel = state.relations[sel].clone();
-        let key: Vec<Value> = rel.key_columns.iter().map(|&c| model.cell(row, c).unwrap_or_default()).collect();
+        // Read every frame: never waits long for the row store (the key read before
+        // meanwhile; nothing until there is one).
+        let cache = (model.content_generation(), row, sel);
+        let mut key = vec![Value::Null; rel.key_columns.len()];
+        let read = model.visit_rows_for(row..row + 1, crate::grid::STORE_WAIT, |_, cells| {
+            for (k, &c) in key.iter_mut().zip(&rel.key_columns) {
+                *k = cells.value_of(c).unwrap_or_default();
+            }
+        });
+        if read {
+            state.key = Some((cache, key.clone()));
+        } else {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));
+            match state.key.as_ref().filter(|(k, _)| *k == cache) {
+                Some((_, k)) => key = k.clone(),
+                None => return actions,
+            }
+        }
         ui.horizontal(|ui| {
             let desc =
                 rel.columns.iter().zip(&key).map(|(c, v)| format!("{c} = {}", if v.is_null() { "NULL".into() } else { v.to_text().into_owned() })).collect::<Vec<_>>().join(", ");

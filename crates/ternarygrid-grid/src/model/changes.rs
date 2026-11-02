@@ -204,8 +204,13 @@ impl Builder<'_> {
         }
     }
 
-    /// `col = value` or `col IS NULL` (NULL-safe key comparison).
+    /// `col = value` or `col IS NULL` (NULL-safe key comparison). Without a
+    /// key (a change set built by hand) a condition no row meets: an `UPDATE`
+    /// or `DELETE` never goes to every row of the table.
     fn key_condition(&mut self, keys: &[KeyValue]) -> String {
+        if keys.is_empty() {
+            return "1 = 0".to_string();
+        }
         let parts: Vec<String> = keys
             .iter()
             .map(|k| {

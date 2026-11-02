@@ -137,8 +137,8 @@ pub(crate) struct Runtime {
     /// Widths set by fitting, by column name: a column still at it was not sized by the user.
     pub auto_widths: std::collections::HashMap<String, f32>,
     /// Summary of a column's loaded values for its header's tooltip: the
-    /// column, the model generation it was computed for, and the text.
-    pub column_summary: Option<(usize, u64, String)>,
+    /// column, what it was computed for, and the text.
+    pub column_summary: Option<(usize, SummaryOf, String)>,
     pub last_selection_label: String,
     /// Geometry of the last frame: body, header, row numbers, row height.
     pub last_geometry: Option<(egui::Rect, egui::Rect, egui::Rect, f32)>,
@@ -149,7 +149,16 @@ pub(crate) struct Runtime {
     pub header_popup: Option<(usize, egui::Rect, bool)>,
     /// Take the keyboard focus on the next frame.
     pub focus_request: bool,
+    /// The server side `WHERE` shown to the user (see [`DataGridState::set_server_filter`]).
+    pub server_filter: String,
+    /// The value an open menu shows for a cell: ((content generation, row,
+    /// column), value), for frames where the row store is busy.
+    pub menu_value: Option<((u64, usize, usize), ternarygrid_core::Value)>,
 }
+
+/// What a column summary was computed for: the model's content generation, the
+/// rows summarised, whether there were more, and when (`ui` time).
+pub(crate) type SummaryOf = (u64, usize, bool, f64);
 
 /// What the last plain copy put on the clipboard. Pasted back, the cells are
 /// the copied ones (their line breaks, tabs and quotes are part of the values,
@@ -200,6 +209,8 @@ pub(crate) struct Dropdown {
     pub col: usize,
     pub search: String,
     pub just_opened: bool,
+    /// The cell's value as text, last read (for frames where the row store is busy).
+    pub current: Option<String>,
 }
 
 /// State of the "add virtual column" dialog.
@@ -260,6 +271,9 @@ impl DataGridState {
     /// Adapt to the model's columns: keeps widths, visibility and order of
     /// columns with the same names, adds new columns at the end. Columns
     /// nobody moved take the model's order (another query, another table).
+    /// The sort follows its columns by name (server mode); in client mode it
+    /// is the model's client sort (dropped with the client view, e.g. when
+    /// the result has other columns or a sorted virtual column was removed).
     pub fn sync_columns(&mut self, model: &ResultModel) {
         let n = model.column_count();
         let same = self.columns.len() == n && (0..n).all(|c| self.columns[c].name == model.column_name(c));
@@ -301,7 +315,11 @@ impl DataGridState {
             }
         }
         self.order = order;
-        self.sort.retain(|k| k.column < n);
+        // Sort keys are model column indices: they move with their columns.
+        self.sort = match self.mode {
+            DataMode::Client => model.requested_view_spec().sort,
+            DataMode::Server => self.sort.iter().filter_map(|k| Some(SortKey { column: mapping.iter().position(|m| *m == Some(k.column))?, ..*k })).collect(),
+        };
         self.rt.editing = None;
         self.rt.dropdown = None;
     }
@@ -447,6 +465,22 @@ impl DataGridState {
     pub fn show_message(&mut self, text: impl Into<String>, error: bool) {
         self.rt.message = Some((text.into(), error, 0.0));
     }
+
+    /// The `WHERE` condition of the server side query, as shown to the user (the
+    /// filter box). "Filter by value" in server mode adds its condition to it:
+    /// [`GridAction::ServerQueryChanged`](super::GridAction::ServerQueryChanged)
+    /// carries both. [`ResultViewer`](crate::ResultViewer) sets it every frame;
+    /// a host showing [`DataGrid`](super::DataGrid) alone sets it when its filter changes.
+    pub fn set_server_filter(&mut self, where_clause: &str) {
+        if self.rt.server_filter != where_clause.trim() {
+            self.rt.server_filter = where_clause.trim().to_string();
+        }
+    }
+
+    /// The `WHERE` condition set with [`DataGridState::set_server_filter`].
+    pub fn server_filter(&self) -> &str {
+        &self.rt.server_filter
+    }
 }
 
 fn is_permutation(order: &[usize], n: usize) -> bool {
@@ -498,6 +532,41 @@ mod tests {
         let mut s = DataGridState::for_model(&model(&["id", "name", "status", "created_at"]));
         s.sync_columns(&model(&["id", "user_id", "text", "status", "created_at"]));
         assert_eq!(s.order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn sort_keys_follow_their_columns() {
+        // Server mode: the ORDER BY is the application's; the arrows move with the columns.
+        let mut s = DataGridState::for_model(&model(&["a", "b", "c"]));
+        s.mode = DataMode::Server;
+        s.sort = vec![SortKey::desc(2), SortKey::asc(0)];
+        s.sync_columns(&model(&["c", "b", "d"]));
+        assert_eq!(s.sort, vec![SortKey::desc(0)], "c moved to 0, a is gone");
+        // Client mode: the arrows are the model's client sort, gone with its view.
+        let mut s = DataGridState::for_model(&model(&["a", "b", "c"]));
+        s.sort = vec![SortKey::desc(2)];
+        s.sync_columns(&model(&["c", "b", "d"]));
+        assert!(s.sort.is_empty(), "the new result is not sorted");
+        // A sorted virtual column is removed: its arrow goes, a sort by a result column stays.
+        let mut m = model(&["a", "b"]);
+        m.add_virtual_column("twice", "a").unwrap();
+        m.add_virtual_column("again", "b").unwrap();
+        let mut s = DataGridState::for_model(&m);
+        let spec = crate::view::ViewSpec { sort: vec![SortKey::desc(3)], filter: None };
+        m.set_view_index(crate::view::ViewIndex { rows: vec![0], source_len: 1 }, spec);
+        s.sync_columns(&m);
+        s.sort = vec![SortKey::desc(3)];
+        m.remove_virtual_column(0);
+        s.sync_columns(&m);
+        assert!(s.sort.is_empty(), "{:?}", s.sort);
+        assert_eq!(s.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["a", "b", "again"]);
+        let spec = crate::view::ViewSpec { sort: vec![SortKey::asc(1)], filter: None };
+        m.set_view_index(crate::view::ViewIndex { rows: vec![0], source_len: 1 }, spec);
+        s.sort = vec![SortKey::asc(1)];
+        m.remove_virtual_column(0);
+        s.sync_columns(&m);
+        assert_eq!(s.sort, vec![SortKey::asc(1)]);
+        assert!(m.has_client_view());
     }
 
     #[test]

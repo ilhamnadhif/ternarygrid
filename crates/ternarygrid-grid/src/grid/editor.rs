@@ -156,7 +156,15 @@ pub(crate) fn value_list(model: &ResultModel, dd: &mut Dropdown, id: Id, ui: &Ui
         (None, Some(e)) => e.iter().map(|v| (v.clone(), None)).collect(),
         (None, None) => Vec::new(),
     };
-    let current = model.cell(dd.row, dd.col).map(|v| v.to_text().into_owned()).unwrap_or_default();
+    // Shown every frame while the list is open: never waits long for the store
+    // (the value read before meanwhile).
+    let current = match model.try_cell(dd.row, dd.col, super::STORE_WAIT) {
+        Some(v) => dd.current.insert(v.map(|v| v.to_text().into_owned()).unwrap_or_default()).clone(),
+        None => {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));
+            dd.current.clone().unwrap_or_default()
+        }
+    };
     let nullable = model.column_meta(dd.col).is_none_or(|m| m.nullable != Some(false));
     let mut chosen: Option<Option<String>> = None;
     let search_id = id.with("dropdown_search");

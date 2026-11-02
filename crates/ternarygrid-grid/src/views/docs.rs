@@ -19,7 +19,7 @@ pub enum DocumentKind {
     Xml,
 }
 
-/// Cache key: model generation, kind, selected-only flag, columns, rows.
+/// Cache key: model content generation, kind, selected-only flag, columns, rows.
 type DocumentKey = (u64, DocumentKind, bool, Vec<usize>, Vec<usize>);
 
 /// Cached rendering of a document view.
@@ -28,6 +28,8 @@ pub struct DocumentViewState {
     /// Render only the selected rows.
     pub selected_only: bool,
     key: Option<DocumentKey>,
+    /// When it was rendered (`ui` time).
+    built_at: f64,
     lines: Arc<Vec<String>>,
     text: Arc<String>,
     max_chars: usize,
@@ -78,8 +80,10 @@ impl<'a> DocumentView<'a> {
             if state.selected_only { grid.selected_rows(model.row_count(), MAX_DOCUMENT_ROWS + 1) } else { (0..model.row_count().min(MAX_DOCUMENT_ROWS + 1)).collect() };
         let truncated = rows.len() > MAX_DOCUMENT_ROWS;
         let rows: Vec<usize> = rows.into_iter().take(MAX_DOCUMENT_ROWS).collect();
-        let key = (model.generation(), kind, state.selected_only, columns.clone(), if state.selected_only { rows.clone() } else { vec![rows.len()] });
-        if state.key.as_ref() != Some(&key) {
+        let key = (model.content_generation(), kind, state.selected_only, columns.clone(), if state.selected_only { rows.clone() } else { vec![rows.len()] });
+        // Only more rows (a streaming fetch): rendered again at most every half second.
+        let more_rows_only = state.key.as_ref().is_some_and(|k| (k.0, k.1, k.2, &k.3) == (key.0, key.1, key.2, &key.3));
+        if state.key.as_ref() != Some(&key) && super::rebuild_due(ui.ctx(), more_rows_only, state.built_at) {
             let text = Self::render_text(model, &columns, &rows, kind, options);
             let lines: Vec<String> = text.lines().map(str::to_string).collect();
             state.max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
@@ -87,6 +91,7 @@ impl<'a> DocumentView<'a> {
             state.text = Arc::new(text);
             state.truncated = truncated;
             state.key = Some(key);
+            state.built_at = ui.input(|i| i.time);
         }
         ui.horizontal(|ui| {
             if ui.button(format!("{}  {}", egui_phosphor::regular::COPY, tr("Copy"))).clicked() {

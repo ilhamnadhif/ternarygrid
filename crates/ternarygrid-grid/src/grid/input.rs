@@ -487,7 +487,9 @@ impl GridFrame<'_> {
         let (row, pos) = (self.geo.row_at(p.y, sy, false)?, self.geo.col_at(p.x, sx, false)?);
         let col = *self.geo.cols.get(pos)?;
         let button = self.fk_button_rect_of(row, col)?;
-        (button.contains(p) && self.model.cell(row, col).is_some_and(|v| !v.is_null())).then_some((row, col))
+        // Asked every frame the pointer is over the button: never waits long for the
+        // store (no button while the fetch task holds it).
+        (button.contains(p) && self.model.try_cell(row, col, super::STORE_WAIT).flatten().is_some_and(|v| !v.is_null())).then_some((row, col))
     }
 
     /// Screen rectangle of the foreign key button of a cell.
@@ -574,7 +576,7 @@ impl GridFrame<'_> {
                                 self.notify(tr("Nothing to undo"), false);
                             }
                         }
-                        Key::S if m.command => self.actions.push(GridAction::SaveChanges),
+                        Key::S if m.command => self.request_save(),
                         Key::R if m.command => self.actions.push(GridAction::Refresh),
                         Key::F5 => self.actions.push(GridAction::Refresh),
                         Key::D if m.command => self.duplicate_selected(),
@@ -626,6 +628,8 @@ impl GridFrame<'_> {
                 Event::Copy | Event::Cut => {
                     if shift_now {
                         self.state.rt.copy_dialog = true;
+                    } else if matches!(ev, Event::Cut) {
+                        self.cut_selection();
                     } else {
                         self.copy_selection(&CopyOptions::plain());
                     }
@@ -651,7 +655,7 @@ impl GridFrame<'_> {
                             self.notify(tr("Nothing to undo"), false);
                         }
                     }
-                    Key::S if m.command => self.actions.push(GridAction::SaveChanges),
+                    Key::S if m.command => self.request_save(),
                     Key::R if m.command => self.actions.push(GridAction::Refresh),
                     Key::F5 => self.actions.push(GridAction::Refresh),
                     Key::D if m.command => self.duplicate_selected(),
@@ -697,6 +701,11 @@ impl GridFrame<'_> {
 
     /// Copy the selection to the clipboard.
     pub fn copy_selection(&mut self, opts: &CopyOptions) {
+        // Nothing to copy is no error (no pop-up): a note in the status.
+        if self.state.rt.selection.is_empty() || self.geo.nrows == 0 || self.geo.cols.is_empty() {
+            self.notify(tr("Nothing is selected"), false);
+            return;
+        }
         match super::copy_text_and_nulls(self.model, self.state, self.options, opts) {
             Ok((text, cells, texts, nulls, gaps)) => {
                 let plain = opts.format == CopyFormat::Tsv && !opts.include_header && !opts.include_row_numbers;
@@ -714,10 +723,40 @@ impl GridFrame<'_> {
         }
     }
 
+    /// Cut (as in DBeaver): copy the selection, then set its cells that can be
+    /// edited to NULL (a pending change, undone with Cmd+Z). A read-only result
+    /// is only copied.
+    pub fn cut_selection(&mut self) {
+        let before = self.actions.len();
+        self.copy_selection(&CopyOptions::plain());
+        let copied = self.actions[before..].iter().any(|a| matches!(a, GridAction::Copied { .. }));
+        if !copied || !self.options.allow_editing || !self.model.is_editable() {
+            return;
+        }
+        let edits: Vec<_> = self
+            .selected_cells(100_000)
+            .into_iter()
+            .filter(|&(r, c)| self.model.can_edit_cell(r, c).is_ok())
+            .map(|(r, c)| (r, c, crate::model::CellValue::Value(Value::Null)))
+            .collect();
+        if let Err(e) = self.model.set_cells(edits) {
+            self.notify(e, true);
+        }
+    }
+
+    /// Save (Cmd+S): [`GridAction::SaveChanges`], or why the changes cannot be saved.
+    fn request_save(&mut self) {
+        match super::save_action(self.model) {
+            GridAction::Notify { message, error } => self.notify(message, error),
+            a => self.actions.push(a),
+        }
+    }
+
     /// Paste text at the active cell.
     pub fn paste(&mut self, text: &str) {
         if !self.options.allow_editing {
-            self.notify(tr("Editing is disabled"), true);
+            // A state (a save runs, a read-only connection), not an error: no pop-up per key.
+            self.notify(tr("Editing is disabled"), false);
             return;
         }
         match super::paste_into(self.model, self.state, text) {
@@ -729,7 +768,8 @@ impl GridFrame<'_> {
     /// Start editing a cell (or toggle / open a dropdown / the value panel).
     pub fn start_edit(&mut self, row: usize, col: usize, typed: Option<String>) {
         if !self.options.allow_editing {
-            self.notify(tr("Editing is disabled"), true);
+            // A state (a save runs, a read-only connection), not an error: no pop-up per key.
+            self.notify(tr("Editing is disabled"), false);
             return;
         }
         if let Err(e) = self.model.can_edit_cell(row, col) {
@@ -743,7 +783,7 @@ impl GridFrame<'_> {
             return;
         }
         if typed.is_none() && (self.model.dictionary(col).is_some() || self.model.enum_values(col).is_some()) {
-            self.state.rt.dropdown = Some(super::state::Dropdown { row, anchor: self.model.row_anchor(row), col, search: String::new(), just_opened: true });
+            self.state.rt.dropdown = Some(super::state::Dropdown { row, anchor: self.model.row_anchor(row), col, search: String::new(), just_opened: true, current: None });
             return;
         }
         let text = value.to_text().into_owned();
@@ -973,21 +1013,25 @@ impl GridFrame<'_> {
 
     /// Hide the columns whose fetched values are all NULL or empty.
     pub fn hide_empty_columns(&mut self) {
-        let cols = self.geo.cols.clone();
-        let mut has_data = vec![false; self.model.column_count()];
-        self.model.visit_rows(0..self.geo.nrows, |_, cells| {
-            for &c in &cols {
-                if !has_data[c] && cells.value_of(c).is_some_and(|v| !v.is_null() && !v.to_text().is_empty()) {
-                    has_data[c] = true;
-                }
+        // Columns not seen with data yet: the rows are read in chunks (the fetch task
+        // gets the store in between, and the UI never waits long for it) until every
+        // column has data or all rows were read.
+        let mut empty = self.geo.cols.clone();
+        let mut start = 0;
+        while start < self.geo.nrows && !empty.is_empty() {
+            let end = (start + HIDE_EMPTY_CHUNK).min(self.geo.nrows);
+            let read = self.model.visit_rows_for(start..end, HIDE_EMPTY_WAIT, |_, cells| {
+                empty.retain(|&c| !cells.value_of(c).is_some_and(|v| !v.is_null() && !v.to_text().is_empty()));
+            });
+            if !read {
+                self.notify(tr("The rows are being fetched: try again in a moment"), false);
+                return;
             }
-        });
-        let mut hidden = 0;
-        for c in cols {
-            if !has_data[c] {
-                self.state.set_column_visible(c, false);
-                hidden += 1;
-            }
+            start = end;
+        }
+        let hidden = empty.len();
+        for c in empty {
+            self.state.set_column_visible(c, false);
         }
         self.notify(trf("{} column(s) without data hidden", &[&hidden]), false);
     }
@@ -1021,15 +1065,17 @@ impl GridFrame<'_> {
     /// over the first [`SUMMARY_ROWS`] rows and kept until the data changes;
     /// `None` while the store is busy.
     fn column_summary(&mut self, col: usize) -> Option<String> {
-        let generation = self.model.generation();
-        if let Some((c, g, text)) = &self.state.rt.column_summary
+        let content = self.model.content_generation();
+        let total = self.model.row_count();
+        let n = total.min(SUMMARY_ROWS);
+        // Rows appended by a streaming fetch: computed again at most every half second.
+        if let Some((c, (g, rows, more, at), text)) = &self.state.rt.column_summary
             && *c == col
-            && *g == generation
+            && *g == content
+            && ((*rows, *more) == (n, n < total) || !crate::views::rebuild_due(&self.ctx, true, *at))
         {
             return Some(text.clone());
         }
-        let total = self.model.row_count();
-        let n = total.min(SUMMARY_ROWS);
         let mut values = Vec::with_capacity(n);
         if !self.model.visit_rows_for(0..n, std::time::Duration::from_millis(20), |_, cells| values.push(cells.value_of(col).unwrap_or(Value::Null))) {
             return None;
@@ -1047,7 +1093,8 @@ impl GridFrame<'_> {
             lines.push(trf("Of the first {} rows", &[&n]));
         }
         let text = lines.join("\n");
-        self.state.rt.column_summary = Some((col, generation, text.clone()));
+        let at = self.ctx.input(|i| i.time);
+        self.state.rt.column_summary = Some((col, (content, n, n < total, at), text.clone()));
         Some(text)
     }
 
@@ -1081,29 +1128,40 @@ impl GridFrame<'_> {
         if self.state.rt.columns_fitted == key {
             return;
         }
-        self.state.rt.columns_fitted = key;
         let sample = 0..self.geo.nrows.min(FIT_SAMPLE_ROWS);
         let fmt = self.options.format.clone();
-        for col in 0..ncols {
-            let name = self.model.column_name(col).to_string();
-            let kind = self.model.column_meta(col).map(|m| m.kind).unwrap_or(ternarygrid_core::DataKind::Other);
-            let current = self.state.column_width(col);
-            let auto = self.state.rt.auto_widths.get(&name).copied();
-            let untouched = (current - super::state::default_width(&name, kind)).abs() <= 0.5 || auto.is_some_and(|a| (current - a).abs() <= 0.5);
-            if !untouched {
-                continue;
-            }
-            let mut w = self.header_width(painter, col);
-            if has_rows {
-                let prepared = crate::format::PreparedFormat::new(&fmt, self.state.column_format(col));
-                let mut texts = Vec::new();
-                self.model.visit_rows(sample.clone(), |_, cells| {
-                    let v = cells.value_of(col).unwrap_or_default();
-                    texts.push(if v.is_null() { fmt.null_text.clone() } else { prepared.format(&v).into_owned() });
-                });
-                for t in &texts {
-                    w = w.max(self.measure(painter, t) + 2.0 * super::frame::PAD + 2.0);
+        // The columns nobody sized, and their first values read with one short wait
+        // for the store (runs on a frame, when the first rows arrive): while the
+        // fetch task holds it, they are fitted on a later frame.
+        let untouched: Vec<(usize, String, f32)> = (0..ncols)
+            .filter_map(|col| {
+                let name = self.model.column_name(col).to_string();
+                let kind = self.model.column_meta(col).map(|m| m.kind).unwrap_or(ternarygrid_core::DataKind::Other);
+                let current = self.state.column_width(col);
+                let auto = self.state.rt.auto_widths.get(&name).copied();
+                let untouched = (current - super::state::default_width(&name, kind)).abs() <= 0.5 || auto.is_some_and(|a| (current - a).abs() <= 0.5);
+                untouched.then_some((col, name, current))
+            })
+            .collect();
+        let mut texts: Vec<Vec<String>> = vec![Vec::new(); untouched.len()];
+        if has_rows && !untouched.is_empty() {
+            let prepared: Vec<_> = untouched.iter().map(|(col, ..)| crate::format::PreparedFormat::new(&fmt, self.state.column_format(*col))).collect();
+            let read = self.model.visit_rows_for(sample, super::STORE_WAIT, |_, cells| {
+                for (i, (col, ..)) in untouched.iter().enumerate() {
+                    let v = cells.value_of(*col).unwrap_or_default();
+                    texts[i].push(if v.is_null() { fmt.null_text.clone() } else { prepared[i].format(&v).into_owned() });
                 }
+            });
+            if !read {
+                self.ctx.request_repaint_after(std::time::Duration::from_millis(10));
+                return;
+            }
+        }
+        self.state.rt.columns_fitted = key;
+        for ((col, name, current), texts) in untouched.into_iter().zip(texts) {
+            let mut w = self.header_width(painter, col);
+            for t in &texts {
+                w = w.max(self.measure(painter, t) + 2.0 * super::frame::PAD + 2.0);
             }
             let w = w.clamp(super::state::MIN_COLUMN_WIDTH, super::state::MAX_INITIAL_WIDTH).round();
             if (w - current).abs() > 0.5 {
@@ -1126,6 +1184,11 @@ impl GridFrame<'_> {
 
 /// Rows whose values set the initial column widths.
 const FIT_SAMPLE_ROWS: usize = 100;
+
+/// Rows "hide columns without data" reads per lock of the row store, and how
+/// long it waits for each lock.
+const HIDE_EMPTY_CHUNK: usize = 4096;
+const HIDE_EMPTY_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Next sort keys after clicking the sort indicator of `col`:
 /// ascending → descending → none. `add` keeps other keys (multi-column sort).

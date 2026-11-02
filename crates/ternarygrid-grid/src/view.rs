@@ -339,6 +339,14 @@ pub struct ViewContext {
 /// Compute a view (filter, then stable sort) over the store. Returns `None`
 /// when `cancel` was set.
 pub fn compute_view(store: &SharedRowStore, spec: &ViewSpec, ctx: &ViewContext, cancel: &AtomicBool) -> Option<ViewIndex> {
+    compute_view_counting(store, spec, ctx, cancel).0
+}
+
+/// [`compute_view`] and how many spilled pages it could not read back (their
+/// rows are missing from the view). Counted while it holds the store's lock:
+/// pages other threads (the grid, an export) failed to read meanwhile are theirs.
+fn compute_view_counting(store: &SharedRowStore, spec: &ViewSpec, ctx: &ViewContext, cancel: &AtomicBool) -> (Option<ViewIndex>, u64) {
+    let mut lost = 0u64;
     let source_len = store.lock().len();
     // Which virtual columns must be computed per row.
     let mut needed: Vec<usize> = Vec::new();
@@ -360,10 +368,11 @@ pub fn compute_view(store: &SharedRowStore, spec: &ViewSpec, ctx: &ViewContext, 
     let mut start = 0usize;
     while start < source_len {
         if cancel.load(AtomicOrdering::Relaxed) {
-            return None;
+            return (None, lost);
         }
         let end = (start + CHUNK_ROWS).min(source_len);
         let mut guard = store.lock();
+        let failures = guard.read_failures();
         guard.for_each_in(start, end, |i, row| {
             let idx = i as u32;
             if ctx.removed.contains(idx) {
@@ -383,12 +392,13 @@ pub fn compute_view(store: &SharedRowStore, spec: &ViewSpec, ctx: &ViewContext, 
                 keys.push(ext.value(c).cloned().unwrap_or(Value::Null));
             }
         });
+        lost += guard.read_failures().saturating_sub(failures);
         drop(guard);
         start = end;
     }
     if !sort_cols.is_empty() {
         if cancel.load(AtomicOrdering::Relaxed) {
-            return None;
+            return (None, lost);
         }
         let n = sort_cols.len();
         let mut order: Vec<u32> = (0..rows.len() as u32).collect();
@@ -405,10 +415,12 @@ pub fn compute_view(store: &SharedRowStore, spec: &ViewSpec, ctx: &ViewContext, 
         });
         rows = order.into_iter().map(|i| rows[i as usize]).collect();
     }
-    Some(ViewIndex { rows, source_len })
+    (Some(ViewIndex { rows, source_len }), lost)
 }
 
-/// Total order for sorting: NULLs first, numbers numerically, text naturally.
+/// Total order for sorting: NULLs first, numbers numerically, text by its
+/// bytes (case-sensitive, as `ORDER BY` with a binary collation), other values
+/// by [`Value::cmp_for_sort`].
 pub fn sort_cmp(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
@@ -477,11 +489,9 @@ impl ViewJob {
         let job_spec = spec.clone();
         let flag = cancel.clone();
         let spawned = std::thread::Builder::new().name("ternarygrid-grid-view".into()).spawn(move || {
-            let before = store.lock().read_failures();
-            let result = compute_view(&store, &job_spec, &ctx, &flag);
-            // Rows of the disk cache that could not be read: the view would silently miss them.
-            let lost = store.lock().read_failures() != before;
-            let _ = tx.send(if lost { Err(tr("Some fetched rows could not be read back from the disk cache; refresh the result").to_string()) } else { Ok(result) });
+            let (result, lost) = compute_view_counting(&store, &job_spec, &ctx, &flag);
+            // Rows of the disk cache this job could not read: the view would silently miss them.
+            let _ = tx.send(if lost > 0 { Err(tr("Some fetched rows could not be read back from the disk cache; refresh the result").to_string()) } else { Ok(result) });
             on_done();
         });
         if let Err(e) = spawned {
@@ -630,6 +640,28 @@ mod tests {
         assert!(done.load(AtomicOrdering::SeqCst));
         let cancelled = compute_view(&s, &ViewSpec { sort: vec![SortKey::asc(0)], filter: None }, &ViewContext { base_columns: 3, ..Default::default() }, &AtomicBool::new(true));
         assert!(cancelled.is_none());
+    }
+
+    #[test]
+    fn spilled_rows_are_read_back_and_counted_per_job() {
+        // Pages spilled to disk are read back under the job's lock; a failure is
+        // counted only while it holds the lock (other readers' failures are theirs).
+        let s = RowStore::shared(64 * 1024);
+        {
+            let mut g = s.lock();
+            for i in 0..5_000i64 {
+                g.push(vec![Value::Int(i), Value::text(format!("row {i} {}", "x".repeat(40))), Value::Null]);
+            }
+            g.release_memory();
+        }
+        let spec = ViewSpec { sort: vec![SortKey::desc(0)], filter: None };
+        let (index, lost) = compute_view_counting(&s, &spec, &ViewContext { base_columns: 3, ..Default::default() }, &AtomicBool::new(false));
+        assert_eq!(lost, 0);
+        let index = index.unwrap();
+        assert_eq!(index.rows.len(), 5_000);
+        assert_eq!(index.rows[0], 4_999);
+        let job = ViewJob::spawn(s.clone(), spec, ViewContext { base_columns: 3, ..Default::default() }, Box::new(|| {}));
+        assert!(matches!(job.wait(), JobPoll::Done(v) if v.rows.len() == 5_000));
     }
 
     #[test]

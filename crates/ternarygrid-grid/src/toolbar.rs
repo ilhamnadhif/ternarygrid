@@ -456,7 +456,7 @@ impl<'a> ResultToolbar<'a> {
                 Button::new((ternarygrid_icons::ic(icon::FLOPPY_DISK), tr("Save")))
             };
             if ui.add_enabled(pending > 0, save).on_hover_text(trf("Save {} pending change(s) (Cmd+S)", &[&pending])).clicked() {
-                actions.push(GridAction::SaveChanges);
+                actions.push(grid::save_action(model));
             }
             // Cancel discards at once (as in DBeaver): the changes are only pending.
             if ui.add_enabled(pending > 0, Button::new((ternarygrid_icons::ic(icon::X_CIRCLE), tr("Cancel")))).on_hover_text(tr("Discard pending changes")).clicked() {

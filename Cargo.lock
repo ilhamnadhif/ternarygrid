@@ -6720,6 +6720,7 @@ version = "0.5.2"
 dependencies = [
  "async-trait",
  "redis",
+ "rustls",
  "serde_json",
  "ternarygrid-core",
  "tokio",
@@ -6767,9 +6768,7 @@ dependencies = [
  "egui",
  "egui-phosphor",
  "image",
- "parking_lot",
  "quick-xml 0.42.0",
- "regex",
  "serde",
  "serde_json",
  "ternarygrid-core",

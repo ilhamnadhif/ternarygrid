@@ -18,8 +18,6 @@ serde_json.workspace = true
 tracing.workspace = true
 image.workspace = true
 chrono.workspace = true
-regex.workspace = true
-parking_lot.workspace = true
 quick-xml.workspace = true
 
 [dev-dependencies]
