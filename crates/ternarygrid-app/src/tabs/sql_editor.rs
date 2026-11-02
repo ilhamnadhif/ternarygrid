@@ -26,6 +26,7 @@ use ternarygrid_core::meta::{ObjectRef, SchemaRef};
 use ternarygrid_core::plan::QueryPlan;
 use ternarygrid_core::{DbResult, tr, trf};
 use ternarygrid_editor::{ContextAction, EditorEvent, EditorOptions, EditorState, EditorTheme, SqlEditor};
+use ternarygrid_ui::kit;
 
 /// One entry of the results area.
 /// A saved plan: `{"ternarygrid_plan": 1, "sql": …, "plan": …}`.
@@ -1186,16 +1187,20 @@ impl SqlEditorTab {
     // ------------------------------------------------------------------ UI
 
     fn toolbar(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
+        // A picker: an icon, the current value and a caret, framed only when hovered.
+        let picker = |ui: &mut Ui, lead: RichText, text: &str, tip: String| -> egui::Response {
+            let caret = RichText::new(icon::CARET_DOWN).size(10.0).color(p.text_faint);
+            ui.add(egui::Button::new((lead, RichText::new(text).color(p.text), caret)).frame_when_inactive(false)).on_hover_text(tip)
+        };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
+            ui.set_min_height(30.0);
             // Connection selector.
             let conn_name = self.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("No connection").to_string());
             let marker = self.conn.as_ref().and_then(|c| cx.conns.color_of(c)).and_then(crate::theme::connection_marker);
-            let mut text = RichText::new(format!("{} {conn_name}", icon::PLUGS));
-            if let Some(m) = marker {
-                text = text.color(m);
-            }
-            let r = ui.button(text).on_hover_text(format!("{} ({})", tr("Active connection"), crate::keys::label(cx.keymap, Action::SelectConnection)));
+            let lead = RichText::new(icon::PLUGS).color(marker.unwrap_or(p.text_muted));
+            let r = picker(ui, lead, &conn_name, format!("{} ({})", tr("Active connection"), crate::keys::label(cx.keymap, Action::SelectConnection)));
             if r.clicked() {
                 self.select_conn_open = !self.select_conn_open;
             }
@@ -1231,8 +1236,8 @@ impl SqlEditorTab {
                 }
                 None => self.schema.as_ref().and_then(|s| s.schema.clone().or(s.database.clone())).unwrap_or_else(|| "—".into()),
             };
-            let r =
-                ui.button(format!("{} {schema_label}", icon::DATABASE)).on_hover_text(format!("{} ({})", tr("Active schema"), crate::keys::label(cx.keymap, Action::SelectSchema)));
+            let lead = RichText::new(crate::nav::kind_icon(ternarygrid_core::meta::ObjectKind::Schema)).color(p.text_muted);
+            let r = picker(ui, lead, &schema_label, format!("{} ({})", tr("Active schema"), crate::keys::label(cx.keymap, Action::SelectSchema)));
             if r.clicked() {
                 self.select_schema_open = !self.select_schema_open;
             }
@@ -1294,33 +1299,38 @@ impl SqlEditorTab {
                     self.catalog_generation = None;
                 }
             }
-            ui.separator();
+            kit::vdivider(ui, 18.0);
             let running = self.exec.is_some() || self.explain_job.is_some();
             let tip = |a: Action| format!("{} ({})", crate::keys::action_label(a), crate::keys::label(cx.keymap, a));
-            let go = crate::theme::success_color(ui.visuals().dark_mode);
-            if ui.add_enabled(!running, egui::Button::new(RichText::new(icon::PLAY).color(go))).on_hover_text(tip(Action::ExecuteStatement)).clicked() {
+            // Run, or Stop while a statement runs (the same place: the hand need not move).
+            if running {
+                if kit::button_full(ui, kit::Kind::Danger, Some(icon::STOP), tr("Stop"), true, false).on_hover_text(tip(Action::CancelQuery)).clicked() {
+                    self.cancel(cx);
+                }
+            } else if kit::button_full(ui, kit::Kind::Primary, Some(icon::PLAY), tr("Run"), true, false).on_hover_text(tip(Action::ExecuteStatement)).clicked() {
                 self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None });
             }
-            if ui.add_enabled(!running, egui::Button::new(ternarygrid_icons::ic(icon::PLUS_SQUARE))).on_hover_text(tip(Action::ExecuteInNewTab)).clicked() {
+            let explain = self.can_explain(cx);
+            let (mut new_tab, mut script, mut plan) = (false, false, false);
+            ui.add_enabled_ui(!running, |ui| {
+                new_tab = kit::icon_button_ex(ui, icon::PLUS_SQUARE, &tip(Action::ExecuteInNewTab), false, 26.0).clicked();
+                script = kit::icon_button_ex(ui, icon::FAST_FORWARD, &tip(Action::ExecuteScript), false, 26.0).clicked();
+                plan = explain && kit::icon_button_ex(ui, icon::TREE_VIEW, &tip(Action::ExplainPlan), false, 26.0).clicked();
+            });
+            if new_tab {
                 self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None });
             }
-            if ui.add_enabled(!running, egui::Button::new(RichText::new(icon::FAST_FORWARD).color(go))).on_hover_text(tip(Action::ExecuteScript)).clicked() {
+            if script {
                 self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None });
             }
-            if self.can_explain(cx) && ui.add_enabled(!running, egui::Button::new(ternarygrid_icons::ic(icon::TREE_VIEW))).on_hover_text(tip(Action::ExplainPlan)).clicked() {
+            if plan {
                 self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None });
             }
-            if ui
-                .add_enabled(running, egui::Button::new(RichText::new(icon::STOP).color(crate::theme::error_color(ui.visuals().dark_mode))))
-                .on_hover_text(tip(Action::CancelQuery))
-                .clicked()
-            {
-                self.cancel(cx);
-            }
-            if self.is_sql(cx) && ui.button(ternarygrid_icons::ic(icon::TEXT_INDENT)).on_hover_text(tip(Action::FormatSql)).clicked() {
+            if self.is_sql(cx) && kit::icon_button_ex(ui, icon::TEXT_INDENT, &tip(Action::FormatSql), false, 26.0).clicked() {
                 self.format(cx);
             }
-            ui.menu_button(icon::DOTS_THREE_VERTICAL, |ui| {
+            let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More editor commands"), false, 26.0);
+            egui::Popup::menu(&more).show(|ui| {
                 for a in [
                     Action::NextStatement,
                     Action::PreviousStatement,
@@ -1347,10 +1357,7 @@ impl SqlEditorTab {
                         self.editor_command(&ctx, cx, a);
                     }
                 }
-            })
-            .response
-            .on_hover_text(tr("More editor commands"));
-            ui.separator();
+            });
             // Transaction controls, for databases that have transactions.
             let transactions = self.has_transactions(cx);
             let tx = match &self.session {
@@ -1359,26 +1366,36 @@ impl SqlEditorTab {
             };
             let manual = tx.as_ref().is_some_and(|t| t.mode == TransactionMode::Manual);
             let pending = tx.as_ref().map(|t| t.log.len()).unwrap_or(0);
-            let label = if manual { format!("{} {}", icon::TOGGLE_LEFT, tr("Manual commit")) } else { format!("{} {}", icon::TOGGLE_RIGHT, tr("Auto-commit")) };
-            if transactions && ui.add_enabled(tx.is_some(), egui::Button::new(label)).on_hover_text(tip(Action::ToggleAutoCommit)).clicked() {
-                self.set_tx_mode(cx, if manual { TransactionMode::Auto } else { TransactionMode::Manual });
+            if transactions {
+                kit::vdivider(ui, 18.0);
+                let (ic, label) = if manual { (icon::TOGGLE_LEFT, tr("Manual commit")) } else { (icon::TOGGLE_RIGHT, tr("Auto-commit")) };
+                let toggled = ui
+                    .add_enabled_ui(tx.is_some(), |ui| kit::button_full(ui, kit::Kind::Ghost, Some(ic), label, true, manual).on_hover_text(tip(Action::ToggleAutoCommit)).clicked())
+                    .inner;
+                if toggled {
+                    self.set_tx_mode(cx, if manual { TransactionMode::Auto } else { TransactionMode::Manual });
+                }
             }
             if manual {
-                if ui.button((ternarygrid_icons::ic(icon::CHECK_CIRCLE), tr("Commit"))).on_hover_text(tip(Action::Commit)).clicked() {
+                if kit::button_full(ui, kit::Kind::Secondary, Some(icon::CHECK_CIRCLE), tr("Commit"), true, false).on_hover_text(tip(Action::Commit)).clicked() {
                     self.commit(cx, true);
                 }
-                if ui.button((ternarygrid_icons::ic(icon::ARROW_U_UP_LEFT), tr("Rollback"))).on_hover_text(tip(Action::Rollback)).clicked() {
+                if kit::button_full(ui, kit::Kind::Ghost, Some(icon::ARROW_U_UP_LEFT), tr("Rollback"), true, false).on_hover_text(tip(Action::Rollback)).clicked() {
                     self.commit(cx, false);
                 }
-                if pending > 0 && ui.small_button(trf("{} pending", &[&pending])).clicked() {
+                if pending > 0 && kit::button_full(ui, kit::Kind::Ghost, None, &trf("{} pending", &[&pending]), true, false).on_hover_text(tr("Transaction log")).clicked() {
                     self.bottom = Bottom::Transaction;
                     self.show_results = true;
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.toggle_value(&mut self.show_outline, ternarygrid_icons::ic(icon::LIST_BULLETS)).on_hover_text(tr("Outline"));
-                ui.toggle_value(&mut self.terminal, ternarygrid_icons::ic(icon::TERMINAL)).on_hover_text(tr("Terminal mode: print results as text"));
-                if ui.selectable_label(self.show_results, ternarygrid_icons::ic(icon::ROWS)).on_hover_text(tip(Action::ToggleResultsPanel)).clicked() {
+                if kit::icon_toggle(ui, icon::LIST_BULLETS, tr("Outline"), self.show_outline).clicked() {
+                    self.show_outline = !self.show_outline;
+                }
+                if kit::icon_toggle(ui, icon::TERMINAL, tr("Terminal mode: print results as text"), self.terminal).clicked() {
+                    self.terminal = !self.terminal;
+                }
+                if kit::icon_toggle(ui, icon::ROWS, &tip(Action::ToggleResultsPanel), self.show_results).clicked() {
                     self.show_results = !self.show_results;
                 }
                 if running {
@@ -1393,15 +1410,18 @@ impl SqlEditorTab {
 
     fn results_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let mut close: Option<usize> = None;
-        ui.horizontal(|ui| {
+        const TAB_H: f32 = 32.0;
+        let tabs = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
             for i in 0..self.results.len() {
-                let (label, dirty) = match &self.results[i] {
-                    ResultItem::Rows(p) => (format!("{} {}", icon::TABLE, p.title), p.has_changes()),
-                    ResultItem::Plan { .. } => (format!("{} {}", icon::TREE_VIEW, tr("Plan")), false),
-                    ResultItem::Error { .. } => (format!("{} {}", icon::WARNING_CIRCLE, tr("Error")), false),
+                let (ic, label, dirty) = match &self.results[i] {
+                    ResultItem::Rows(p) => (icon::TABLE, p.title.clone(), p.has_changes()),
+                    ResultItem::Plan { .. } => (icon::TREE_VIEW, tr("Plan").to_string(), false),
+                    ResultItem::Error { .. } => (icon::WARNING_CIRCLE, tr("Error").to_string(), false),
                 };
                 let label = if dirty { format!("● {label}") } else { label };
-                let r = ui.selectable_label(self.bottom == Bottom::Result(i), label);
+                let rows = self.result_rows(i).map(|n| ternarygrid_grid::format::group_thousands(&n.to_string()));
+                let r = kit::underline_tab(ui, Some(ic), &label, rows.as_deref(), self.bottom == Bottom::Result(i), TAB_H);
                 if r.clicked() {
                     self.bottom = Bottom::Result(i);
                 }
@@ -1415,34 +1435,37 @@ impl SqlEditorTab {
                     }
                 });
             }
-            if !self.stats.is_empty() && ui.selectable_label(self.bottom == Bottom::Statistics, (ternarygrid_icons::ic(icon::LIST_NUMBERS), tr("Statistics"))).clicked() {
+            if !self.stats.is_empty() && kit::underline_tab(ui, Some(icon::LIST_NUMBERS), tr("Statistics"), None, self.bottom == Bottom::Statistics, TAB_H).clicked() {
                 self.bottom = Bottom::Statistics;
             }
-            if ui.selectable_label(self.bottom == Bottom::Output, (ternarygrid_icons::ic(icon::TERMINAL_WINDOW), tr("Output"))).clicked() {
+            if kit::underline_tab(ui, Some(icon::TERMINAL_WINDOW), tr("Output"), None, self.bottom == Bottom::Output, TAB_H).clicked() {
                 self.bottom = Bottom::Output;
             }
-            if ui.selectable_label(self.bottom == Bottom::Transaction, (ternarygrid_icons::ic(icon::CLOCK), tr("Transaction log"))).clicked() {
+            if kit::underline_tab(ui, Some(icon::CLOCK), tr("Transaction log"), None, self.bottom == Bottom::Transaction, TAB_H).clicked() {
                 self.bottom = Bottom::Transaction;
             }
-            let vars = if self.variables.is_empty() { tr("Variables").to_string() } else { format!("{} ({})", tr("Variables"), self.variables.len()) };
-            if ui.selectable_label(self.bottom == Bottom::Variables, format!("{} {vars}", icon::BRACKETS_CURLY)).clicked() {
+            let vars = (!self.variables.is_empty()).then(|| self.variables.len().to_string());
+            if kit::underline_tab(ui, Some(icon::BRACKETS_CURLY), tr("Variables"), vars.as_deref(), self.bottom == Bottom::Variables, TAB_H).clicked() {
                 self.bottom = Bottom::Variables;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button(if self.maximized { icon::ARROWS_IN } else { icon::ARROWS_OUT }).on_hover_text(crate::keys::action_label(Action::MaximizeResults)).clicked() {
+                let (ic, on) = if self.maximized { (icon::ARROWS_IN, true) } else { (icon::ARROWS_OUT, false) };
+                if kit::icon_toggle(ui, ic, crate::keys::action_label(Action::MaximizeResults), on).clicked() {
                     self.maximized = !self.maximized;
                 }
             });
         });
+        // A hairline under the tabs, across the panel.
+        let bottom = tabs.response.rect.bottom();
+        ui.painter().hline(ui.max_rect().x_range(), bottom - 0.5, egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border));
         if let Some(i) = close {
             if self.result_has_changes(i) {
-                cx.toasts.info(tr("Save or cancel the data changes first."));
+                cx.toasts.info(tr("Save or discard the data changes first."));
             } else {
                 release_result(self.results.remove(i), cx);
                 self.bottom = if self.results.is_empty() { Bottom::Output } else { Bottom::Result(i.min(self.results.len() - 1)) };
             }
         }
-        ui.separator();
         // A running statement in the results, where one waits for it: what runs, for
         // how long, and Cancel.
         if let Some(e) = &self.exec {

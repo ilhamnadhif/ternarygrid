@@ -297,6 +297,54 @@ pub fn tab_strip<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T,
     out
 }
 
+/// One tab of a row of underlined tabs: an optional icon, its text and an optional count, the
+/// selected one underlined in the accent. Lay several out in a horizontal `ui` (the row's
+/// hairline is the caller's), so each tab keeps its own response for menus and middle clicks.
+pub fn underline_tab(ui: &mut Ui, icon: Option<&str>, text: &str, badge: Option<&str>, selected: bool, height: f32) -> Response {
+    let p = style::pal(ui);
+    let size = style::body_size(ui.ctx());
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(size), Color32::PLACEHOLDER);
+    let icon_galley = icon.map(|i| ui.painter().layout_no_wrap(i.to_string(), style::icon_font(size + 1.0), Color32::PLACEHOLDER));
+    let badge_galley = badge.map(|b| ui.painter().layout_no_wrap(b.to_string(), style::medium(ui.ctx(), style::SMALL), Color32::PLACEHOLDER));
+    let (pad, gap) = (8.0, 6.0);
+    let badge_w = |g: &std::sync::Arc<egui::Galley>| (g.size().x + 10.0).max(18.0);
+    let width = pad * 2.0 + galley.size().x + icon_galley.as_ref().map_or(0.0, |g| g.size().x + gap) + badge_galley.as_ref().map_or(0.0, |g| badge_w(g) + gap);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, text));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let hovered = resp.hovered();
+        if hovered && !selected {
+            painter.rect_filled(rect.shrink2(vec2(0.0, 4.0)), CornerRadius::same(RADIUS), p.hover);
+        }
+        let mut x = rect.left() + pad;
+        if let Some(g) = icon_galley {
+            let color = if selected { p.accent_text } else { p.text_muted };
+            let w = g.size().x;
+            painter.galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, color);
+            x += w + gap;
+        }
+        let color = if selected || hovered { p.text } else { p.text_muted };
+        let w = galley.size().x;
+        painter.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, color);
+        x += w + gap;
+        if let Some(g) = badge_galley {
+            let r = Rect::from_min_size(egui::pos2(x, rect.center().y - 8.0), vec2(badge_w(&g), 16.0));
+            let (fill, color) = if selected { (p.accent_soft, p.accent_text) } else { (p.subtle, p.text_muted) };
+            painter.rect_filled(r, CornerRadius::same(8), fill);
+            painter.galley(r.center() - g.size() / 2.0, g, color);
+        }
+        if selected {
+            let line = Rect::from_min_max(egui::pos2(rect.left() + pad - 2.0, rect.bottom() - 2.0), egui::pos2(rect.right() - pad + 2.0, rect.bottom()));
+            painter.rect_filled(line, CornerRadius::same(1), p.accent);
+        }
+        if resp.has_focus() {
+            painter.rect_stroke(rect.shrink(2.0), CornerRadius::same(RADIUS), Stroke::new(1.5, p.accent), StrokeKind::Inside);
+        }
+    }
+    resp
+}
+
 /// Covers `rect` with `color`, from clear to opaque towards the right (`to_right`) or the
 /// left: the edge of a strip that hides more.
 pub fn fade(painter: &egui::Painter, rect: Rect, color: Color32, to_right: bool) {
