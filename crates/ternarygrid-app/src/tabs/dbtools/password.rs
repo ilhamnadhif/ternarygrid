@@ -170,7 +170,8 @@ impl TabView for ChangePasswordTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(540.0, 350.0))
+        // The design's 542 × 366 with its border (the pop-up adds 30).
+        Some(egui::vec2(542.0, 336.0))
     }
 
     fn title(&self) -> String {
@@ -225,7 +226,7 @@ impl TabView for ChangePasswordTab {
                 ui.spacing_mut().item_spacing.y = 10.0;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(icon::CHECK_CIRCLE).font(ternarygrid_ui::style::icon_font(18.0)).color(p.ok));
-                    ui.label(RichText::new(tr("The password was changed.")).font(ternarygrid_ui::style::semibold(ui.ctx(), 14.0)).color(p.ok));
+                    ternarygrid_ui::kit::semibold_label(ui, tr("The password was changed."), 14.0, p.ok);
                 });
                 if c.saved_updated {
                     look::muted(ui, tr("The saved password was updated."));
@@ -265,7 +266,7 @@ impl TabView for ChangePasswordTab {
                 look::title(ui, tr("Change password"));
             }
             let lw = 150.0;
-            look::row(ui, tr("Connection"), lw, |ui| ui.label(RichText::new(&cfg.name).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(p.text)));
+            look::row(ui, tr("Connection"), lw, |ui| ternarygrid_ui::kit::semibold_label(ui, &cfg.name, 13.0, p.text));
             look::row(ui, tr("User"), lw, |ui| ui.label(cfg.user.clone().filter(|u| !u.is_empty()).unwrap_or_else(|| tr("(current user)").to_string())));
             look::divider(ui);
             if !connected {
@@ -279,7 +280,8 @@ impl TabView for ChangePasswordTab {
             ui.add_enabled_ui(!busy, |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
                 let field = |ui: &mut Ui, value: &mut String, show: bool| {
-                    let r = ui.add(egui::TextEdit::singleline(value).password(!show).desired_width(ui.available_width()).margin(egui::Margin::symmetric(8, 5)));
+                    let edit = crate::tabs::transfer::wizard::fit(egui::TextEdit::singleline(value).password(!show), ternarygrid_ui::style::CONTROL_H);
+                    let r = ui.add(edit.desired_width(ui.available_width()));
                     if r.has_focus() {
                         ternarygrid_ui::style::focus_halo(ui, r.rect, ternarygrid_ui::style::RADIUS);
                     }

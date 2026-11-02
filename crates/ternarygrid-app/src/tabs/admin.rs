@@ -103,9 +103,12 @@ impl Refresh {
             .width(120.0)
             .selected_text(if self.interval == 0 { tr("Auto-refresh off").to_string() } else { trf("Every {} s", &[&self.interval]) })
             .show_ui(ui, |ui| {
+                kit::menu_look(ui, 120.0);
                 for s in [0u32, 1, 2, 5, 10, 30, 60] {
                     let label = if s == 0 { tr("Off").to_string() } else { trf("{} s", &[&s]) };
-                    ui.selectable_value(&mut self.interval, s, label);
+                    if crate::tabs::transfer::wizard::choice(ui, self.interval == s, &label) {
+                        self.interval = s;
+                    }
                 }
             });
         if self.interval > 0 {
@@ -196,7 +199,7 @@ fn kill_dialog(ui: &Ui, id: egui::Id, session: &str, mode: KillMode) -> (bool, b
     };
     let question = trf("Session {} — continue?", &[&session]);
     let (mut yes, mut no) = (false, false);
-    let (resp, _) = parts::Dialog::new(title).icon(glyph).width(440.0).show_modal(
+    let (resp, _) = parts::Dialog::new(title).icon(glyph).width(440.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
         ui.ctx(),
         id,
         |ui| {
@@ -207,7 +210,7 @@ fn kill_dialog(ui: &Ui, id: egui::Id, session: &str, mode: KillMode) -> (bool, b
         },
         |ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if look::danger_solid(ui, None, tr("Yes")).clicked() {
+                if kit::button_ex(ui, kit::Kind::DangerFilled, None, tr("Yes"), false).clicked() {
                     yes = true;
                 }
                 if kit::button_ex(ui, kit::Kind::Ghost, None, tr("No"), false).clicked() {
@@ -306,7 +309,8 @@ impl TabView for SessionManagerTab {
             let filter = self.filter.to_lowercase();
             for (i, r) in cells(&list.data, &fmt).into_iter().enumerate() {
                 let matches = filter.is_empty() || r.iter().any(|c| c.to_lowercase().contains(&filter));
-                let idle = list.state_column.and_then(|c| r.get(c)).is_some_and(|s| s.to_lowercase().starts_with("idle") || s.eq_ignore_ascii_case("sleep"));
+                // As in the design, sessions idle in a transaction stay (they hold locks).
+                let idle = list.state_column.and_then(|c| r.get(c)).is_some_and(|s| s.eq_ignore_ascii_case("idle") || s.eq_ignore_ascii_case("sleep"));
                 if matches && !(self.hide_idle && idle) {
                     index.push(i);
                     rows.push(r);
@@ -333,7 +337,6 @@ impl TabView for SessionManagerTab {
                 self.data = Loadable::Loading(cx.backend.spawn(async move { s.lock().await.list_sessions().await }));
             }
             kit::search_field(ui, egui::Id::new(("sessions_filter", &self.conn)), &mut self.filter, tr("Filter…"), 200.0);
-            ui.add_space(4.0);
             look::checkbox(ui, &mut self.hide_idle, tr("Hide idle"));
             kit::vdivider(ui, 18.0);
             ui.add_enabled_ui(sel_id.is_some(), |ui| {
@@ -480,9 +483,7 @@ impl TabView for LockManagerTab {
                 let s = session.clone();
                 self.data = Loadable::Loading(cx.backend.spawn(async move { s.lock().await.list_locks().await }));
             }
-            ui.add_space(4.0);
             look::checkbox(ui, &mut self.only_waiting, tr("Only waiting locks"));
-            ui.add_space(4.0);
             if look::small(ui, kit::Kind::Ghost, icon::USERS, tr("Sessions")).clicked() {
                 cx.push(AppCommand::OpenSessionManager { connection: self.conn.clone() });
             }
@@ -616,12 +617,13 @@ impl TabView for DashboardTab {
             &self.layout,
             |ui| {
                 look::muted(ui, tr("Sample every"));
-                let mut secs = interval.as_secs_f32();
-                // "1 s", "0.5 s": no needless decimals.
-                let value = egui::DragValue::new(&mut secs).range(0.5..=60.0).speed(0.1).suffix(" s").custom_formatter(|v, _| format!("{}", (v * 10.0).round() / 10.0));
-                if ui.add_sized([70.0, 28.0], value).changed() {
-                    *interval = Duration::from_secs_f32(secs);
-                }
+                // "1 s", "0.5 s": no needless decimals; typed as "2" or "2 s".
+                let shown = format!("{} s", (interval.as_secs_f32() * 10.0).round() / 10.0);
+                crate::tabs::transfer::parsed_line(ui, shown, 70.0, 28.0, |t| {
+                    if let Ok(secs) = t.trim().trim_end_matches('s').trim().parse::<f32>() {
+                        *interval = Duration::from_secs_f32(secs.clamp(0.5, 60.0));
+                    }
+                });
                 kit::vdivider(ui, 18.0);
             },
             |ui| {

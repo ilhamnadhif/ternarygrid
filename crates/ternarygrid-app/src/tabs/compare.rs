@@ -10,7 +10,7 @@ use crate::cx::AppContext;
 use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
 use crate::tabs::dbtools::look::{self, Cell};
-use crate::tabs::transfer::wizard::W;
+use crate::tabs::transfer::wizard::{W, choice};
 use egui::{Align, Layout, Margin, RichText, Sense, Ui, UiBuilder, vec2};
 use egui_phosphor::regular as icon;
 use std::collections::BTreeSet;
@@ -155,10 +155,13 @@ impl SchemaCompareTab {
         let current = side.conn.as_ref().and_then(|c| names.iter().find(|(i, _)| i == c)).map(|(_, n)| n.clone()).unwrap_or_else(|| tr("Choose…").to_string());
         if let Some(kind) = side.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.kind) {
             look::logo(ui, kind, 15.0);
+            // 8 from the connection (the schema is 6 from it).
+            ui.add_space(2.0);
         }
         egui::ComboBox::from_id_salt((id, "conn")).icon(kit::combo_caret).selected_text(current).width(CONN_W).show_ui(ui, |ui| {
+            kit::menu_look(ui, CONN_W);
             for (cid, name) in &names {
-                if ui.selectable_label(side.conn.as_deref() == Some(cid), name).clicked() {
+                if choice(ui, side.conn.as_deref() == Some(cid), name) {
                     side.conn = Some(cid.clone());
                     side.schema = None;
                 }
@@ -179,15 +182,16 @@ impl SchemaCompareTab {
         let db = live.current_database.clone();
         let label = side.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
         egui::ComboBox::from_id_salt((id, "schema")).icon(kit::combo_caret).selected_text(label).width(SCHEMA_W).show_ui(ui, |ui| {
+            kit::menu_look(ui, SCHEMA_W);
             if schemas.is_empty() {
                 // Single-schema databases (SQLite, MySQL database = schema).
                 let cur = live.current_schema.clone().or(db.clone());
-                if ui.selectable_label(false, cur.clone().unwrap_or_else(|| tr("(default)").to_string())).clicked() {
+                if choice(ui, false, &cur.clone().unwrap_or_else(|| tr("(default)").to_string())) {
                     side.schema = Some(SchemaRef::new(None, cur));
                 }
             }
             for s in &schemas {
-                if ui.selectable_label(side.schema.as_ref().and_then(|x| x.schema.as_deref()) == Some(s.as_str()), s).clicked() {
+                if choice(ui, side.schema.as_ref().and_then(|x| x.schema.as_deref()) == Some(s.as_str()), s) {
                     side.schema = Some(SchemaRef::new(None, Some(s.clone())));
                 }
             }
@@ -300,8 +304,10 @@ impl SchemaCompareTab {
         if rows.is_empty() {
             return;
         }
-        ui.add_space(4.0);
+        // As in the design: 12 below the tree and above the table (the rows' spacing is 8).
+        ui.add_space(12.0);
         look::title(ui, &item.qualified_name());
+        ui.add_space(4.0);
         let widths = [W::Fr(1.0), W::Fr(1.0), W::Fr(1.0)];
         look::table_w(ui, ("cmp_changes", self.uid), &look::headers(&[tr("Property"), tr("Source"), tr("Target")]), &rows, None, &widths);
     }
@@ -378,7 +384,7 @@ impl SchemaCompareTab {
         let question = trf("Run {} statement(s) on \"{}\"?", &[&script.len(), &target_name]);
         let warning = trf("{} is a Production connection: the schema changes reach the live database.", &[&target_name]);
         let (mut run, mut cancel) = (false, false);
-        let (resp, _) = parts::Dialog::new(tr("Apply the migration")).icon(icon::PLAY).width(520.0).show_modal(
+        let (resp, _) = parts::Dialog::new(tr("Apply the migration")).icon(icon::PLAY).width(520.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
             ui.ctx(),
             egui::Id::new(("cmp_apply", self.uid)),
             |ui| {
@@ -390,7 +396,7 @@ impl SchemaCompareTab {
             },
             |ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if look::danger_solid(ui, Some(icon::PLAY), tr("Run")).clicked() {
+                    if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::PLAY), tr("Run"), false).clicked() {
                         run = true;
                     }
                     if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -552,18 +558,20 @@ impl TabView for SchemaCompareTab {
         }
         let script = self.script.clone().unwrap_or_default();
         parts::toolbar(ui, |ui| self.actions_ui(ui, cx, &diff, &script));
-        // The script on the right, the differences on the left.
+        // The script on the right, the differences on the left: 560 wide as in the design (the
+        // panel's size includes its separator).
         egui::Panel::right(egui::Id::new(("cmp_script_panel", self.uid)))
             .resizable(true)
-            .default_size(560.0)
+            .default_size(561.0)
             .size_range(240.0..=1200.0)
             .frame(egui::Frame::new().fill(p.surface))
             .show(ui, |ui| {
-                let text = script.iter().map(|s| format!("{s};\n")).collect::<String>();
+                let text = script.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
                 match &self.script_lang {
                     Some(lang) => {
                         let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-                        ternarygrid_editor::CodeView::new(&text, lang, &theme).id_salt(("cmp_script", self.uid)).show(ui);
+                        let options = look::code_options(13.0, 21.0);
+                        ternarygrid_editor::CodeView::new(&text, lang, &theme).options(&options).id_salt(("cmp_script", self.uid)).show(ui);
                     }
                     None => {
                         let mut t = text.as_str();

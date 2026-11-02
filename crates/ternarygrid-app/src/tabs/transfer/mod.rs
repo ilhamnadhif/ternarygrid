@@ -302,7 +302,7 @@ impl TaskSaver {
         let can_save = std::cell::Cell::new(false);
         let saving = self.job.is_some();
         let (name, folder, error) = (&mut self.name, &mut self.folder, &self.error);
-        let (resp, _) = parts::Dialog::new(tr("Save as task")).icon(icon::FLOPPY_DISK).width(480.0).show_modal(
+        let (resp, _) = parts::Dialog::new(tr("Save as task")).icon(icon::FLOPPY_DISK).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
             ctx,
             id,
             |ui| {
@@ -384,7 +384,7 @@ pub(crate) fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Hash 
     combo_w(ui, id, value, options, 0.0)
 }
 
-/// [`combo`] `width` wide (0: egui's default width).
+/// [`combo`] `width` wide (0: as wide as the chosen label, as the design's selects in a form).
 pub(crate) fn combo_w<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut T, options: &[(T, String)], width: f32) -> bool {
     let labels: Vec<&str> = options.iter().map(|(_, l)| l.as_str()).collect();
     let sel = options.iter().position(|(v, _)| v == value);
@@ -401,13 +401,16 @@ pub(crate) fn combo_w<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Has
 fn combo_idx(ui: &mut Ui, id: egui::Id, sel: Option<usize>, labels: &[&str], width: f32) -> Option<usize> {
     let current = sel.and_then(|i| labels.get(i)).copied().unwrap_or_default();
     let mut picked = None;
-    let mut combo = egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current);
-    if width > 0.0 {
-        combo = combo.width(width);
-    }
-    combo.show_ui(ui, |ui| {
+    // The text, 10 before it, 8 to the 13 pt chevron and 8 after it.
+    let text_w =
+        |ui: &Ui, s: &str| ui.painter().layout_no_wrap(s.to_string(), egui::FontId::proportional(ternarygrid_ui::style::body_size(ui.ctx())), egui::Color32::PLACEHOLDER).size().x;
+    let width = if width > 0.0 { width } else { text_w(ui, current) + 39.0 };
+    // The list as wide as its longest choice (with the check mark's room).
+    let menu_w = labels.iter().map(|l| text_w(ui, l) + 54.0).fold(width, f32::max);
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(current).width(width).show_ui(ui, |ui| {
+        kit::menu_look(ui, menu_w);
         for (i, label) in labels.iter().enumerate() {
-            if ui.selectable_label(sel == Some(i), *label).clicked() && sel != Some(i) {
+            if wizard::choice(ui, sel == Some(i), label) && sel != Some(i) {
                 picked = Some(i);
             }
         }
@@ -422,8 +425,21 @@ pub(crate) fn opt_text(ui: &mut Ui, value: &mut Option<String>, hint: &str, widt
 
 /// [`opt_text`] `h` high.
 pub(crate) fn opt_text_h(ui: &mut Ui, value: &mut Option<String>, hint: &str, width: f32, h: f32) -> bool {
+    opt_text_ex(ui, value, hint, width, h, false)
+}
+
+/// [`opt_text`] in the monospace font (format patterns).
+pub(crate) fn opt_mono(ui: &mut Ui, value: &mut Option<String>, hint: &str, width: f32) -> bool {
+    opt_text_ex(ui, value, hint, width, ternarygrid_ui::style::CONTROL_H, true)
+}
+
+fn opt_text_ex(ui: &mut Ui, value: &mut Option<String>, hint: &str, width: f32, h: f32, mono: bool) -> bool {
     let mut s = value.clone().unwrap_or_default();
-    let changed = ui.add(wizard::fit(egui::TextEdit::singleline(&mut s), h).hint_text(hint).desired_width(width)).changed();
+    let mut edit = wizard::fit(egui::TextEdit::singleline(&mut s), h).hint_text(hint).desired_width(width);
+    if mono {
+        edit = edit.font(egui::TextStyle::Monospace);
+    }
+    let changed = ui.add(edit).changed();
     if changed {
         *value = Some(s).filter(|s| !s.is_empty());
     }
@@ -437,7 +453,17 @@ pub(crate) fn parsed_edit(ui: &mut Ui, shown: String, hint: &str, width: f32, mu
     parsed_edit_ex(ui, shown, hint, width, multiline, false, apply)
 }
 
-/// [`parsed_edit`], in the monospace font with `mono`.
+/// A single-line [`parsed_edit`] `h` high (the toolbars' 28 pt fields).
+pub(crate) fn parsed_line(ui: &mut Ui, shown: String, width: f32, h: f32, apply: impl FnOnce(&str)) -> bool {
+    let h0 = ui.spacing().interact_size.y;
+    ui.spacing_mut().interact_size.y = h;
+    let changed = parsed_edit_ex(ui, shown, "", width, false, false, apply);
+    ui.spacing_mut().interact_size.y = h0;
+    changed
+}
+
+/// [`parsed_edit`], in the monospace font with `mono`; single-line fields are as high as the
+/// ui's controls.
 fn parsed_edit_ex(ui: &mut Ui, shown: String, hint: &str, width: f32, multiline: bool, mono: bool, apply: impl FnOnce(&str)) -> bool {
     let key = ui.next_auto_id().with("ternarygrid_parsed_edit");
     let mut text = ui.data(|d| d.get_temp::<String>(key)).unwrap_or(shown);
@@ -445,7 +471,7 @@ fn parsed_edit_ex(ui: &mut Ui, shown: String, hint: &str, width: f32, multiline:
     if mono {
         edit = edit.font(egui::TextStyle::Monospace);
     }
-    let edit = if multiline { edit.margin(wizard::INPUT_MARGIN) } else { wizard::fit(edit, ternarygrid_ui::style::CONTROL_H) };
+    let edit = if multiline { edit.margin(wizard::INPUT_MARGIN) } else { wizard::fit(edit, ui.spacing().interact_size.y.max(ternarygrid_ui::style::SMALL_H)) };
     let r = ui.add(edit.hint_text(hint).desired_width(width));
     let changed = r.changed();
     if changed {
@@ -653,8 +679,9 @@ pub(crate) fn schema_combo(ui: &mut Ui, cx: &mut AppContext, conn: &str, id: imp
     let names = schema_names(cx, conn);
     let label = value.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("(default)").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(width).show_ui(ui, |ui| {
-        if ui.selectable_label(value.as_ref().is_none_or(|v| v.schema.is_none()), tr("(default)")).clicked() {
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(label).width(width).show_ui(ui, |ui| {
+        kit::menu_look(ui, width);
+        if wizard::choice(ui, value.as_ref().is_none_or(|v| v.schema.is_none()), tr("(default)")) {
             *value = None;
             changed = true;
         }
@@ -668,7 +695,7 @@ pub(crate) fn schema_combo(ui: &mut Ui, cx: &mut AppContext, conn: &str, id: imp
             Some(names) => {
                 for n in names {
                     let selected = value.as_ref().and_then(|v| v.schema.as_deref()) == Some(n.as_str());
-                    if ui.selectable_label(selected, n).clicked() && !selected {
+                    if wizard::choice(ui, selected, n) && !selected {
                         let database = value.as_ref().and_then(|v| v.database.clone());
                         *value = Some(SchemaRef::new(database, Some(n.clone())));
                         changed = true;
@@ -730,11 +757,12 @@ pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash:
     let conns: Vec<(String, String)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
     let current = value.as_ref().and_then(|v| conns.iter().find(|(i, _)| i == v)).map(|(_, n)| n.clone()).unwrap_or_else(|| tr("Choose…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(width).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(current).width(width).show_ui(ui, |ui| {
+        kit::menu_look(ui, width);
         for (cid, name) in &conns {
             let glyph = if cx.conns.is_connected(cid) { icon::PLUGS_CONNECTED } else { icon::PLUGS };
             let selected = value.as_deref() == Some(cid.as_str());
-            if ui.selectable_label(selected, format!("{glyph} {name}")).clicked() && !selected {
+            if wizard::choice(ui, selected, &format!("{glyph} {name}")) && !selected {
                 *value = Some(cid.clone());
                 changed = true;
             }

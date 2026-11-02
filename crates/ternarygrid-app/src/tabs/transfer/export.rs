@@ -573,13 +573,8 @@ impl ExportTab {
                     });
                 }
                 // The query, highlighted in the connection's dialect (read-only, selectable).
-                use ternarygrid_editor::EditorLanguage;
-                let tokens = cx.conns.live(&self.conn).map(|l| crate::sqllang::SqlLanguage::new(l.dialect.clone()).highlight(&sql)).unwrap_or_default();
-                let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-                let job = crate::sqllang::highlight_job(&sql, &tokens, &theme, egui::FontId::monospace(12.5));
-                wizard::boxed(ui, Margin::symmetric(12, 10), |ui| {
-                    ui.add(egui::Label::new(job).wrap().selectable(true));
-                });
+                let lang = cx.conns.live(&self.conn).map(|l| crate::sqllang::SqlLanguage::new(l.dialect.clone()));
+                crate::tabs::dbtools::look::code_block(ui, lang.as_ref(), &sql, false);
             }
             _ => {
                 wizard::faint(ui, &trf("{} column(s); the rows are written from memory, without running the query again.", &[&columns]));
@@ -1045,7 +1040,7 @@ pub(crate) fn picker_list(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debu
         // Rows 28 high with a hairline under each (29 apart).
         egui::ScrollArea::vertical().id_salt(egui::Id::new(id)).max_height(29.0 * 8.0).auto_shrink([false, true]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            let line = crate::tabs::dbtools::look::line(ui);
+            let line = p.line;
             for (i, o) in shown.iter().enumerate() {
                 let already = added(o);
                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 29.0), egui::Sense::hover());
@@ -1131,14 +1126,14 @@ fn csv_ui(ui: &mut Ui, id: u64, o: &mut CsvOptions, tsv: bool) {
             });
         }
         f.row(tr("Quote character"), |ui| char_edit(ui, &mut o.quote_char));
-        f.row(tr("Quote values"), |ui| {
+        f.seg_row(tr("Quote values"), |ui| {
             parts::segmented(
                 ui,
                 &mut o.quote_mode,
                 &[(QuoteMode::Needed, tr("When needed")), (QuoteMode::Strings, tr("Text values")), (QuoteMode::Always, tr("Always")), (QuoteMode::Never, tr("Never"))],
             )
         });
-        f.row(tr("Quotes inside values"), |ui| {
+        f.seg_row(tr("Quotes inside values"), |ui| {
             parts::segmented(ui, &mut o.escape, &[(EscapeStyle::Doubled, tr("Doubled (\"\")")), (EscapeStyle::Backslash, tr("Backslash (\\\")"))])
         });
         f.row(tr("Header row"), |ui| {
@@ -1158,7 +1153,7 @@ fn csv_ui(ui: &mut Ui, id: u64, o: &mut CsvOptions, tsv: bool) {
             });
         });
         f.row(tr("NULL written as"), |ui| ui.add(line(&mut o.null_string).hint_text(tr("nothing")).desired_width(160.0)));
-        f.row(tr("Line ending"), |ui| {
+        f.seg_row(tr("Line ending"), |ui| {
             parts::segmented(ui, &mut o.line_ending, &[(LineEnding::Lf, tr("LF (macOS, Linux)")), (LineEnding::CrLf, tr("CRLF (Windows)")), (LineEnding::Cr, tr("CR"))])
         });
     });
@@ -1244,8 +1239,8 @@ fn xlsx_ui(ui: &mut Ui, id: u64, o: &mut XlsxOptions) {
         f.row(tr("Date format"), |ui| ui.add(line(&mut o.date_format).font(egui::TextStyle::Monospace).desired_width(200.0)));
         f.row(tr("Time format"), |ui| ui.add(line(&mut o.time_format).font(egui::TextStyle::Monospace).desired_width(200.0)));
         f.row(tr("Timestamp format"), |ui| ui.add(line(&mut o.datetime_format).font(egui::TextStyle::Monospace).desired_width(200.0)));
-        f.row(tr("Number format"), |ui| opt_text(ui, &mut o.number_format, tr("General"), 200.0));
-        f.row(tr("Integer format"), |ui| opt_text(ui, &mut o.integer_format, tr("General"), 200.0));
+        f.row(tr("Number format"), |ui| super::opt_mono(ui, &mut o.number_format, tr("General"), 200.0));
+        f.row(tr("Integer format"), |ui| super::opt_mono(ui, &mut o.integer_format, tr("General"), 200.0));
         f.row(tr("Rows per sheet"), |ui| wizard::number(ui, &mut o.max_rows_per_sheet, 1..=1_048_575, 140.0));
     });
 }
@@ -1375,13 +1370,7 @@ fn common_ui(ui: &mut Ui, id: u64, o: &mut ExportOptions, format: ExportFormat) 
     opts(ui, id, "common", |f| {
         if !format.is_binary() {
             f.row(tr("Encoding"), |ui| {
-                egui::ComboBox::from_id_salt(("exp_enc", id)).icon(ternarygrid_ui::kit::combo_caret).selected_text(o.encoding.clone()).width(160.0).show_ui(ui, |ui| {
-                    for e in ENCODINGS {
-                        if ui.selectable_label(o.encoding.eq_ignore_ascii_case(e), e).clicked() {
-                            o.encoding = e.to_string();
-                        }
-                    }
-                });
+                super::import::encoding_combo(ui, ("exp_enc", id), &mut o.encoding, &ENCODINGS);
                 let bom = o.encoding.to_ascii_uppercase().starts_with("UTF");
                 ui.add_enabled_ui(bom, |ui| wizard::check(ui, &mut o.insert_bom, tr("Byte order mark (BOM)")));
             });

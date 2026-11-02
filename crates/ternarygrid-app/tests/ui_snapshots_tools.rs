@@ -246,7 +246,12 @@ impl Shots {
             .build_eframe(move |cc| {
                 ternarygrid_app::theme::setup_fonts(&cc.egui_ctx);
                 backend.set_context(cc.egui_ctx.clone());
-                TernaryGridApp::new(backend, conns, services, settings)
+                let mut app = TernaryGridApp::new(backend, conns, services, settings);
+                // As on macOS (see `ui_snapshots_shell.rs`): the menus in the system's menu bar,
+                // the window buttons at the left of the top bar (painted by `shot`).
+                app.native_menu_bar = true;
+                app.titlebar_inset = ternarygrid_app::app::MAC_TITLEBAR_INSET;
+                app
             });
         ternarygrid_app::theme::apply_settings(&h.ctx, &h.state().settings);
         let theme = if theme == Theme::Dark { "dark" } else { "light" };
@@ -294,12 +299,15 @@ impl Shots {
 
     fn shot(&mut self, name: &str) {
         self.h.state_mut().toasts.clear();
+        // The pointer away from the content: no hover effects.
+        self.h.event(egui::Event::PointerMoved(egui::pos2(1439.0, 899.0)));
         self.frames(30);
         let out = self.h.output();
         let prims = self.h.ctx.tessellate(out.shapes.clone(), PPP);
         let size = self.h.ctx.content_rect().size() * PPP;
         let bg = self.h.ctx.global_style().visuals.panel_fill;
-        let img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        let mut img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        traffic_lights(&mut img);
         let path = self.dir.join(format!("{name}-{}.png", self.theme));
         img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
@@ -338,6 +346,25 @@ impl Shots {
             n.click();
         }
         self.frames(3);
+    }
+}
+
+/// The macOS window buttons, as the system paints them over the top bar's left end.
+fn traffic_lights(img: &mut image::RgbaImage) {
+    for (i, c) in [[0xff, 0x5f, 0x57], [0xfe, 0xbc, 0x2e], [0x28, 0xc8, 0x40]].iter().enumerate() {
+        let (cx, cy, r) = ((16.0 + 6.0 + 20.0 * i as f32) * PPP, 22.0 * PPP, 6.0 * PPP);
+        for y in (cy - r - 2.0) as u32..=(cy + r + 2.0) as u32 {
+            for x in (cx - r - 2.0) as u32..=(cx + r + 2.0) as u32 {
+                let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                let a = (r + 0.5 - d).clamp(0.0, 1.0);
+                if a > 0.0 {
+                    let px = img.get_pixel_mut(x, y);
+                    for k in 0..3 {
+                        px[k] = (c[k] as f32 * a + px[k] as f32 * (1.0 - a)).round() as u8;
+                    }
+                }
+            }
+        }
     }
 }
 

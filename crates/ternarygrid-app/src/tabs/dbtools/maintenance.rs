@@ -472,25 +472,7 @@ impl MaintenanceTab {
         {
             self.lang = Some(SqlLanguage::new(d));
         }
-        let p = ternarygrid_ui::pal(ui);
-        let lines = text.lines().count().max(1) as f32;
-        let h = (lines * 20.0 + 16.0).clamp(44.0, 160.0);
-        let (lang, conn) = (self.lang.as_ref(), self.conn.clone());
-        egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(8).inner_margin(egui::Margin::symmetric(if gutter { 0 } else { 6 }, 4)).show(
-            ui,
-            |ui| {
-                ui.allocate_ui(egui::vec2(ui.available_width(), h), |ui| match lang {
-                    Some(lang) => {
-                        let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-                        ternarygrid_editor::CodeView::new(&text, lang, &theme).id_salt(("maint_sql", &conn, gutter)).line_numbers(gutter).font_size(12.5).show(ui);
-                    }
-                    None => {
-                        let mut t = text.as_str();
-                        ui.add(egui::TextEdit::multiline(&mut t).code_editor().desired_width(f32::INFINITY));
-                    }
-                });
-            },
-        );
+        look::code_block(ui, self.lang.as_ref(), &text, gutter);
     }
 
     /// The result line of the last run (at the right of Run).
@@ -642,7 +624,7 @@ impl MaintenanceTab {
             self.open_in_editor(cx, &sql);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add_enabled_ui(!running && !sql.is_empty(), |ui| look::danger_solid(ui, Some(icon::TRASH), tr("Truncate"))).inner.clicked() {
+            if ui.add_enabled_ui(!running && !sql.is_empty(), |ui| kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::TRASH), tr("Truncate"), false)).inner.clicked() {
                 self.start(cx);
             }
             if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -663,7 +645,8 @@ impl TabView for MaintenanceTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(if self.is_truncate() { egui::vec2(620.0, 330.0) } else { egui::vec2(860.0, 580.0) })
+        // The design's 622 × 357 and 862 × 511 with their border (the pop-up adds 30).
+        Some(if self.is_truncate() { egui::vec2(622.0, 327.0) } else { egui::vec2(862.0, 481.0) })
     }
 
     fn title(&self) -> String {
@@ -702,19 +685,22 @@ impl TabView for MaintenanceTab {
             }
             self.objects_ui(ui, cx);
             let p = ternarygrid_ui::pal(ui);
+            // As in the design: the operations 300 wide, a hairline 18 to their right, the SQL 18
+            // further.
             let row = ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 let left = ui
                     .vertical(|ui| {
-                        ui.set_width(282.0);
+                        ui.set_width(300.0);
                         ui.add_enabled_ui(!self.is_running(), |ui| self.ops_ui(ui, cx));
                     })
                     .response
                     .rect;
-                ui.add_space(36.0);
+                ui.add_space(37.0);
                 ui.vertical(|ui| self.run_ui(ui, cx));
                 left
             });
-            let x = row.inner.right() + 26.0;
+            let x = row.inner.right() + 18.5;
             ui.painter().vline(x, row.response.rect.y_range(), egui::Stroke::new(1.0, p.border));
         });
     }

@@ -322,6 +322,9 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// A highlighted layout of the generated SQL (keywords, strings, numbers, comments).
+/// The height of a line of the SQL preview (the design's editor).
+const LINE_H: f32 = 21.0;
+
 fn sql_job(ui: &Ui, text: &str, font: egui::FontId) -> egui::text::LayoutJob {
     let p = style::pal(ui);
     let dark = ui.visuals().dark_mode;
@@ -341,10 +344,12 @@ fn sql_job(ui: &Ui, text: &str, font: egui::FontId) -> egui::text::LayoutJob {
         Color32::from_rgb(0x7a, 0x3f, 0xc4)
     };
     let mut job = egui::text::LayoutJob::default();
+    // 21 points a line, as the design's code.
     let fmt = |c: Color32, italics: bool| egui::TextFormat {
         font_id: font.clone(),
         color: c,
         italics,
+        line_height: Some(LINE_H),
         ..Default::default()
     };
     let bytes = text.as_bytes();
@@ -386,18 +391,15 @@ fn sql_preview(ui: &mut Ui, sql: &str, events: &mut Vec<QbEvent>) {
         .inner_margin(egui::Margin::symmetric(14, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(tr("SQL"))
-                        .font(style::semibold(ui.ctx(), 13.0))
-                        .color(p.text),
-                );
+                kit::semibold_label(ui, tr("SQL"), 13.0, p.text);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if kit::icon_button_ex(
+                    if kit::icon_button_sized(
                         ui,
                         icon::ARROW_SQUARE_OUT,
                         tr("Open in editor"),
                         false,
                         26.0,
+                        13.0,
                     )
                     .clicked()
                         && !sql.is_empty()
@@ -412,7 +414,6 @@ fn sql_preview(ui: &mut Ui, sql: &str, events: &mut Vec<QbEvent>) {
                 });
             });
         });
-    parts::hline(ui);
     let font = egui::FontId::monospace(13.0);
     egui::ScrollArea::both()
         .id_salt("ternarygrid_qb_sql")
@@ -431,14 +432,16 @@ fn sql_preview(ui: &mut Ui, sql: &str, events: &mut Vec<QbEvent>) {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
                 let lines = sql.lines().count().max(1);
+                // The numbers right-aligned 44 from the left, the text at 60, as the design's.
                 ui.vertical(|ui| {
-                    ui.set_width(44.0);
+                    ui.set_width(60.0);
                     for i in 1..=lines {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                             ui.add_space(16.0);
                             ui.label(
                                 egui::RichText::new(i.to_string())
                                     .font(font.clone())
+                                    .line_height(Some(LINE_H))
                                     .color(p.text_faint),
                             );
                         });
@@ -642,104 +645,95 @@ fn canvas(
     }
     if let Some(ctx_target) = state.context.clone() {
         let mut alias_edit = std::mem::take(&mut state.alias_edit);
-        let menu = response.context_menu(|ui| match &ctx_target {
-            QbContext::Join(i) => {
-                if let Some(j) = model.joins.get_mut(*i) {
-                    ui.label(
-                        RichText::new(format!(
-                            "{}.{} = {}.{}",
-                            j.left_alias, j.left_column, j.right_alias, j.right_column
-                        ))
-                        .strong(),
-                    );
-                    ui.separator();
-                    for k in JoinKind::ALL {
-                        if k == JoinKind::Full && !full_join && j.kind != k {
-                            continue;
+        let menu = response.context_menu(|ui| {
+            kit::menu_look(ui, 220.0);
+            match &ctx_target {
+                QbContext::Join(i) => {
+                    if let Some(j) = model.joins.get_mut(*i) {
+                        kit::menu_caption(
+                            ui,
+                            &format!(
+                                "{}.{} = {}.{}",
+                                j.left_alias, j.left_column, j.right_alias, j.right_column
+                            ),
+                        );
+                        kit::menu_separator(ui);
+                        for k in JoinKind::ALL {
+                            if k == JoinKind::Full && !full_join && j.kind != k {
+                                continue;
+                            }
+                            let mut on = j.kind == k;
+                            if kit::menu_check(ui, &mut on, tr(k.label())).clicked() {
+                                j.kind = k;
+                                ui.close();
+                            }
                         }
-                        if ternarygrid_ui::kit::radio(ui, j.kind == k, tr(k.label())).clicked() {
-                            j.kind = k;
+                        kit::menu_separator(ui);
+                        if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Remove join"), "")
+                            .clicked()
+                        {
+                            model.joins.remove(*i);
                             ui.close();
                         }
                     }
-                    ui.separator();
-                    if ui
-                        .button((ternarygrid_icons::ic(icon::TRASH), tr("Remove join")))
+                }
+                QbContext::Table(a) => {
+                    kit::menu_caption(ui, a.as_str());
+                    kit::menu_separator(ui);
+                    let select_all =
+                        kit::menu_item(ui, Some(icon::CHECK_SQUARE), tr("Select all columns"), "")
+                            .clicked();
+                    if select_all
+                        || kit::menu_item(ui, Some(icon::SQUARE), tr("Clear selection"), "")
+                            .clicked()
+                    {
+                        let cols: Vec<String> = model
+                            .table(a)
+                            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+                            .unwrap_or_default();
+                        for c in cols {
+                            model.set_column_selected(a, &c, select_all);
+                        }
+                        ui.close();
+                    }
+                    kit::menu_separator(ui);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(tr("Alias")).color(style::pal(ui).text_muted));
+                        let r = ui
+                            .add(egui::TextEdit::singleline(&mut alias_edit).desired_width(100.0));
+                        let apply = kit::icon_button_sized(
+                            ui,
+                            icon::CHECK,
+                            tr("Rename alias"),
+                            false,
+                            24.0,
+                            13.0,
+                        )
+                        .clicked()
+                            || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                        if apply && model.rename_alias(a, &alias_edit) {
+                            ui.close();
+                        }
+                    });
+                    kit::menu_separator(ui);
+                    if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Remove table"), "")
                         .clicked()
                     {
-                        model.joins.remove(*i);
+                        model.remove_table(a);
                         ui.close();
                     }
                 }
-            }
-            QbContext::Table(a) => {
-                ui.label(RichText::new(a.as_str()).strong());
-                ui.separator();
-                if ui
-                    .button(format!(
-                        "{} {}",
-                        icon::CHECK_SQUARE,
-                        tr("Select all columns")
-                    ))
-                    .clicked()
-                {
-                    let cols: Vec<String> = model
-                        .table(a)
-                        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-                        .unwrap_or_default();
-                    for c in cols {
-                        model.set_column_selected(a, &c, true);
-                    }
-                    ui.close();
-                }
-                if ui
-                    .button((ternarygrid_icons::ic(icon::SQUARE), tr("Clear selection")))
-                    .clicked()
-                {
-                    let cols: Vec<String> = model
-                        .table(a)
-                        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-                        .unwrap_or_default();
-                    for c in cols {
-                        model.set_column_selected(a, &c, false);
-                    }
-                    ui.close();
-                }
-                ui.horizontal(|ui| {
-                    ui.label(tr("Alias"));
-                    let r = ui.add(egui::TextEdit::singleline(&mut alias_edit).desired_width(90.0));
-                    let apply = ui
-                        .button(ternarygrid_icons::ic(icon::CHECK))
-                        .on_hover_text(tr("Rename alias"))
-                        .clicked()
-                        || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    if apply && model.rename_alias(a, &alias_edit) {
+                QbContext::Background => {
+                    if kit::menu_item(ui, Some(icon::PLUS), tr("Add table…"), "").clicked() {
+                        events.push(QbEvent::AddTableRequested);
                         ui.close();
                     }
-                });
-                if ui
-                    .button((ternarygrid_icons::ic(icon::TRASH), tr("Remove table")))
-                    .clicked()
-                {
-                    model.remove_table(a);
-                    ui.close();
-                }
-            }
-            QbContext::Background => {
-                if ui
-                    .button((ternarygrid_icons::ic(icon::PLUS), tr("Add table…")))
-                    .clicked()
-                {
-                    events.push(QbEvent::AddTableRequested);
-                    ui.close();
-                }
-                if ui
-                    .button((ternarygrid_icons::ic(icon::ARROWS_IN), tr("Reset view")))
-                    .clicked()
-                {
-                    state.zoom = 1.0;
-                    state.pan = vec2(10.0, 10.0);
-                    ui.close();
+                    if kit::menu_item(ui, Some(icon::ARROWS_IN), tr("Reset view"), "").clicked() {
+                        state.zoom = 1.0;
+                        state.pan = vec2(10.0, 10.0);
+                        ui.close();
+                    }
                 }
             }
         });
@@ -1037,11 +1031,15 @@ fn grid(
             );
             let mut x = head.left();
             for (i, name) in names.iter().enumerate() {
-                ui.painter().text(
-                    pos2(x + 10.0, head.center().y),
-                    Align2::LEFT_CENTER,
-                    *name,
+                let g = ui.painter().layout_no_wrap(
+                    name.to_string(),
                     style::semibold(ui.ctx(), 12.0),
+                    p.text_muted,
+                );
+                kit::paint_semibold(
+                    ui.painter(),
+                    pos2(x + 10.0, head.center().y - g.size().y / 2.0),
+                    g,
                     p.text_muted,
                 );
                 x += col_w(i);
@@ -1082,11 +1080,12 @@ fn expr_field(ui: &mut Ui, value: &mut String, refs: &[String], width: f32) {
             .hint_text(tr("column or expression")),
     );
     ui.menu_button(icon::LIST, |ui| {
+        kit::menu_look(ui, 220.0);
         egui::ScrollArea::vertical()
             .max_height(260.0)
             .show(ui, |ui| {
                 for r in refs {
-                    if ui.button(r.as_str()).clicked() {
+                    if kit::menu_item(ui, None, r, "").clicked() {
                         *value = r.clone();
                         ui.close();
                     }
@@ -1095,6 +1094,13 @@ fn expr_field(ui: &mut Ui, value: &mut String, refs: &[String], width: f32) {
     })
     .response
     .on_hover_text(tr("Pick a column"));
+}
+
+/// An item of a combo box's list in the menu look: a check mark at the selected one; true
+/// when it was clicked.
+fn choice(ui: &mut Ui, selected: bool, label: &str) -> bool {
+    let mut on = selected;
+    kit::menu_check(ui, &mut on, label).clicked()
 }
 
 /// A small text field of a grid cell.
@@ -1116,9 +1122,10 @@ fn add_button(ui: &mut Ui, label: &str) -> bool {
 
 fn tabs(ui: &mut Ui, model: &mut QueryModel, state: &mut QbViewState) {
     let p = style::pal(ui);
+    // As the design's underline tabs: 16 from the left, 18 apart, a hairline across the panel.
     let row = ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        ui.add_space(8.0);
+        ui.spacing_mut().item_spacing.x = 18.0;
+        ui.add_space(16.0);
         for t in QbTab::ALL {
             let count = match t {
                 QbTab::Columns => model.select.len(),
@@ -1203,9 +1210,13 @@ fn columns_grid(ui: &mut Ui, model: &mut QueryModel, refs: &[String]) {
                         .width(140.0)
                         .selected_text(item.aggregate.map(|a| a.label()).unwrap_or("–"))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut item.aggregate, None, "–");
-                            for a in Aggregate::ALL {
-                                ui.selectable_value(&mut item.aggregate, Some(a), a.label());
+                            kit::menu_look(ui, 140.0);
+                            for a in
+                                std::iter::once(None).chain(Aggregate::ALL.into_iter().map(Some))
+                            {
+                                if choice(ui, item.aggregate == a, a.map_or("–", |a| a.label())) {
+                                    item.aggregate = a;
+                                }
                             }
                         });
                 }
@@ -1245,8 +1256,12 @@ fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &
                         .width(66.0)
                         .selected_text(cond.connector.sql())
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut cond.connector, Connector::And, "AND");
-                            ui.selectable_value(&mut cond.connector, Connector::Or, "OR");
+                            kit::menu_look(ui, 90.0);
+                            for c in [Connector::And, Connector::Or] {
+                                if choice(ui, cond.connector == c, c.sql()) {
+                                    cond.connector = c;
+                                }
+                            }
                         });
                 }
                 1 => {
@@ -1263,13 +1278,16 @@ fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &
                             cond.operator.as_str()
                         })
                         .show_ui(ui, |ui| {
+                            kit::menu_look(ui, 140.0);
                             for op in OPERATORS {
                                 let label = if op.is_empty() {
                                     tr("(expression)")
                                 } else {
                                     op
                                 };
-                                ui.selectable_value(&mut cond.operator, op.to_string(), label);
+                                if choice(ui, cond.operator == op, label) {
+                                    cond.operator = op.to_string();
+                                }
                             }
                         });
                 }
@@ -1340,11 +1358,7 @@ fn grouping(ui: &mut Ui, model: &mut QueryModel, refs: &[String], dialect: &dyn 
         ui.label(egui::RichText::new(hint).size(12.0).color(p.text_faint));
     }
     ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(tr("Having"))
-            .font(style::semibold(ui.ctx(), 13.0))
-            .color(p.text),
-    );
+    kit::semibold_label(ui, tr("Having"), 13.0, p.text);
     conditions_grid(ui, "ternarygrid_qb_having", &mut model.having, refs);
 }
 

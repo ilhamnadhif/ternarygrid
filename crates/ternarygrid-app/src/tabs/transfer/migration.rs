@@ -529,7 +529,7 @@ impl MigrationTab {
             {
                 f.row(tr("Schema"), |ui| schema_combo(ui, cx, &t, ("mig_tschema", id), &mut self.target_schema, 200.0));
             }
-            f.row(tr("Names"), |ui| {
+            f.seg_row(tr("Names"), |ui| {
                 parts::segmented(
                     ui,
                     &mut self.options.name_case,
@@ -885,7 +885,7 @@ impl MigrationTab {
             trf("All rows of the existing target tables on \"{}\" are deleted first.", &[&target])
         };
         let (mut run, mut cancel) = (false, false);
-        let (resp, _) = parts::Dialog::new(tr("Replace the target data?")).icon(icon::WARNING).width(480.0).show_modal(
+        let (resp, _) = parts::Dialog::new(tr("Replace the target data?")).icon(icon::WARNING).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
             ctx,
             egui::Id::new(("mig_confirm", self.uid)),
             |ui| {
@@ -893,7 +893,7 @@ impl MigrationTab {
             },
             |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if wizard::danger_solid(ui, icon::PLAY, tr("Run")).clicked() {
+                    if kit::button_ex(ui, Kind::DangerFilled, Some(icon::PLAY), tr("Run"), false).clicked() {
                         run = true;
                     }
                     if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
