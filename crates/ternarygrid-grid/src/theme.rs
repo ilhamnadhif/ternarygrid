@@ -31,8 +31,10 @@ pub struct GridTheme {
     pub record_bg: Color32,
     /// Normal text.
     pub text: Color32,
-    /// Weak text (NULL, defaults, descriptions).
+    /// Weak text (defaults, descriptions, binary values).
     pub weak: Color32,
+    /// NULL (in italics).
+    pub null: Color32,
     /// Selected cells overlay.
     pub selection: Color32,
     /// Active cell border.
@@ -67,18 +69,19 @@ impl GridTheme {
         let header_base = v.widgets.noninteractive.weak_bg_fill;
         GridTheme {
             bg,
-            stripe: mix(bg, text, if dark { 0.053 } else { 0.03 }),
-            // Darker than the rows in the dark theme (as in DBeaver), else darker than white.
-            line: if dark { mix(bg, Color32::BLACK, 0.17) } else { mix(bg, text, 0.12) },
+            stripe: mix(bg, text, if dark { 0.035 } else { 0.022 }),
+            // Hairlines: a little off the rows, so the values stand out and not the lines.
+            line: mix(bg, text, if dark { 0.075 } else { 0.08 }),
             header_bg: mix(header_base, bg, 0.25),
             header_text: v.strong_text_color(),
             // Selected headers and the record view's field: the header tinted with the selection.
             header_selected_bg: mix(header_base, v.selection.bg_fill, if dark { 0.6 } else { 0.45 }),
-            // White on the dark blue-grey header (as in DBeaver), grey on the light one.
-            rownum_text: if dark { v.strong_text_color() } else { v.weak_text_color() },
+            // Row numbers recede: they locate, the values are read.
+            rownum_text: mix(v.weak_text_color(), bg, 0.15),
             record_bg: if dark { mix(bg, text, 0.053) } else { bg },
             text,
             weak: v.weak_text_color(),
+            null: mix(v.weak_text_color(), bg, 0.2),
             selection: v.selection.bg_fill.gamma_multiply(if dark { 0.55 } else { 0.45 }),
             active_border: v.selection.stroke.color,
             modified: mix(bg, v.warn_fg_color, if dark { 0.28 } else { 0.30 }),

@@ -24,7 +24,6 @@ struct ColInfo<'o> {
     col: usize,
     x0: f32,
     x1: f32,
-    kind: DataKind,
     is_virtual: bool,
     fk: bool,
     dict: bool,
@@ -80,22 +79,6 @@ struct CellLook<'v> {
     badge: Option<&'static str>,
     suffix: Option<&'v str>,
     checkbox: Option<bool>,
-}
-
-/// Badge label for special values.
-fn badge_for(v: &Value, kind: DataKind) -> Option<&'static str> {
-    match v {
-        Value::Bytes(b) => Some(if detect_image(b).is_some() { "IMG" } else { "BIN" }),
-        Value::Json(_) => Some("JSON"),
-        Value::Array(_) => Some("ARR"),
-        _ => match kind {
-            DataKind::Json => Some("JSON"),
-            DataKind::Xml => Some("XML"),
-            DataKind::Geometry => Some("GEO"),
-            DataKind::Binary => Some("BIN"),
-            _ => None,
-        },
-    }
 }
 
 fn is_number(v: &Value) -> bool {
@@ -154,7 +137,6 @@ impl GridFrame<'_> {
                     col,
                     x0: geo.col_left(pos, sx),
                     x1: geo.col_left(pos + 1, sx),
-                    kind: model.column_kind(col),
                     is_virtual: model.is_virtual_column(col),
                     fk: model.foreign_key_for_column(col).is_some(),
                     dict: options.show_descriptions && model.dictionary(col).is_some(),
@@ -163,6 +145,11 @@ impl GridFrame<'_> {
             })
             .collect();
         let null_text = fmt.null_text.as_str();
+        // NULL in faint italics: laid out once per frame, placed in each NULL cell.
+        let null_galley = (!null_text.is_empty()).then(|| {
+            let format = TextFormat { font_id: font.clone(), color: theme.null, italics: true, ..Default::default() };
+            painter.layout_job(LayoutJob::single_section(null_text.to_string(), format))
+        });
         let default_text = tr("[DEFAULT]");
         let checkbox_style = fmt.bool_style == BoolStyle::Checkbox;
         let selection = &self.state.rt.selection;
@@ -279,21 +266,17 @@ impl GridFrame<'_> {
                         let color = if deleted { theme.weak } else { theme.text };
                         match v {
                             Value::Bool(b) if checkbox_style => CellLook { text: "".into(), color, align: Align::Center, badge: None, suffix: None, checkbox: Some(*b) },
+                            // Images and other bytes read as a quiet summary; the header's icon tells the type.
                             Value::Bytes(b) if detect_image(b).is_some() => {
                                 let kind = detect_image(b).map_or("", |k| k.label());
-                                CellLook { text: format!("{kind} {}", byte_size_text(b.len())).into(), color, align: Align::Min, badge: Some("IMG"), suffix: None, checkbox: None }
+                                let text = trf("‹{} image · {}›", &[&kind, &byte_size_text(b.len())]);
+                                CellLook { text: text.into(), color: theme.weak, align: Align::Min, badge: None, suffix: None, checkbox: None }
                             }
+                            Value::Bytes(_) => CellLook { text: info.fmt.format(v), color: theme.weak, align: Align::Min, badge: None, suffix: None, checkbox: None },
                             _ => {
                                 let text = info.fmt.format(v);
                                 let suffix = if info.dict { model.describe_value(info.col, v) } else { None };
-                                CellLook {
-                                    text,
-                                    color,
-                                    align: if is_number(v) && suffix.is_none() { Align::Max } else { Align::Min },
-                                    badge: badge_for(v, info.kind),
-                                    suffix,
-                                    checkbox: None,
-                                }
+                                CellLook { text, color, align: if is_number(v) && suffix.is_none() { Align::Max } else { Align::Min }, badge: None, suffix, checkbox: None }
                             }
                         }
                     }
@@ -330,6 +313,7 @@ impl GridFrame<'_> {
                     && matches!(cell, CellRef::Value(v) if !v.is_null())
                     && let Some(b) = fk_button_rect(inner)
                 {
+                    // Its room is kept (the text does not move); the icon shows on the hovered row.
                     text_rect.max.x = b.left() - 2.0;
                     let hot = pointer.is_some_and(|p| b.contains(p));
                     if hot {
@@ -337,11 +321,20 @@ impl GridFrame<'_> {
                         sink.rect_filled(bg, CornerRadius::same(3), mix(theme.bg, theme.text, 0.12));
                         fk_hover = Some(b);
                     }
-                    let g = if hot { fk_hot.clone() } else { fk_idle.clone() };
-                    let color = if hot { theme.link } else { theme.weak };
-                    sink.galley(b.center() - g.rect.size() / 2.0, g, color);
+                    if hover.is_some_and(|h| h.row == row) {
+                        let g = if hot { fk_hot.clone() } else { fk_idle.clone() };
+                        let color = if hot { theme.link } else { theme.weak };
+                        sink.galley(b.center() - g.rect.size() / 2.0, g, color);
+                    }
                 }
-                let placed = place_text(glyphs, &mut sink, &mut batch, &font, &look.text, text_rect, look.align, look.color);
+                let null = matches!(cell, CellRef::Value(v) if v.is_null());
+                let placed = match &null_galley {
+                    Some(g) if null && g.size().x <= text_rect.width() => {
+                        sink.galley(pos2(text_rect.left(), text_rect.center().y - g.size().y / 2.0), g.clone(), theme.null);
+                        Placed { elided: false, width: g.size().x, left: text_rect.left() }
+                    }
+                    _ => place_text(glyphs, &mut sink, &mut batch, &font, &look.text, text_rect, look.align, look.color),
+                };
                 let mut elided = placed.elided || look.text.contains('¶');
                 if let Some(desc) = look.suffix {
                     let start = placed.left + placed.width + 6.0;
