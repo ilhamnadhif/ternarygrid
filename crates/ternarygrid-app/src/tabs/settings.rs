@@ -273,7 +273,7 @@ fn label_w(ui: &Ui) -> f32 {
     // does.
     let w = ui.available_width();
     let controls = ui.data(|d| d.get_temp::<f32>(narrow_controls_id())).unwrap_or(196.0);
-    if w < 600.0 { (w - 16.0 - controls).clamp(110.0, 165.0) } else { 220.0 }
+    if w < 480.0 { (w - 16.0 - controls).clamp(110.0, 165.0) } else { 220.0 }
 }
 
 /// The room a narrow group's rows keep for their controls (see [`label_w`]).
@@ -375,7 +375,8 @@ fn form_row(ui: &mut Ui, label: &str, label_w: f32, sub: Option<&str>, h: f32, a
 fn indented(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> bool) -> bool {
     let w = label_w(ui);
     ui.horizontal_top(|ui| {
-        ui.add_space(w + 16.0 - ui.spacing().item_spacing.x);
+        // (`add_space` brings no item spacing of its own.)
+        ui.add_space(w + 16.0);
         ui.vertical(add).inner
     })
     .inner
@@ -427,11 +428,25 @@ fn check_columns(ui: &mut Ui, left: Vec<(&mut bool, &str)>, right: Vec<(&mut boo
 }
 
 fn combo<T: PartialEq + Copy>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, &str)], width: f32) -> bool {
+    let labels: Vec<&str> = options.iter().map(|(_, l)| *l).collect();
+    let mut current = options.iter().position(|(v, _)| v == value);
+    let changed = combo_dyn(ui, id, &mut current, &labels, width);
+    if changed && let Some(i) = current {
+        *value = options[i].0;
+    }
+    changed
+}
+
+/// A select of `labels` (`current` is the chosen one), its drop-down in the design's menu look.
+fn combo_dyn(ui: &mut Ui, id: &str, current: &mut Option<usize>, labels: &[&str], width: f32) -> bool {
     let mut changed = false;
-    let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| *l).unwrap_or("");
-    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).width(width).selected_text(current).show_ui(ui, |ui| {
-        for (v, l) in options {
-            if ui.selectable_value(value, *v, *l).changed() {
+    let text = current.and_then(|i| labels.get(i).copied()).unwrap_or("");
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).width(width).selected_text(text).show_ui(ui, |ui| {
+        kit::menu_look(ui, width);
+        for (i, l) in labels.iter().enumerate() {
+            let mut on = *current == Some(i);
+            if kit::menu_check(ui, &mut on, l).clicked() && *current != Some(i) {
+                *current = Some(i);
                 changed = true;
             }
         }
@@ -473,23 +488,26 @@ fn two_dyn(ui: &mut Ui, share: f32, left: &mut dyn FnMut(&mut Ui) -> bool, right
     c
 }
 
-/// A titled group of settings on a card (18 × 20 points of padding, 14 between its rows).
+/// A titled group of settings on a card ([`parts::group`]: 18 × 20 points of padding, 14
+/// between its rows).
 fn group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
-    let mut add = Some(add);
-    group_dyn(ui, (!title.is_empty()).then_some(title), None, None, &mut |ui| add.take().is_some_and(|a| a(ui)))
+    parts::group(ui, (!title.is_empty()).then_some(title), None, add)
 }
 
 /// [`group`] with a muted line under its title.
 fn group_sub(ui: &mut Ui, title: &str, sub: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
-    let mut add = Some(add);
-    group_dyn(ui, Some(title), Some(sub), None, &mut |ui| add.take().is_some_and(|a| a(ui)))
+    parts::group(ui, Some(title), Some(sub), add)
 }
 
 /// [`group`] with a small text toggle at the right of its title (on the title's line, so the
 /// group keeps the height of the design): "More options".
 fn group_more(ui: &mut Ui, title: &str, more: &std::cell::Cell<bool>, add: impl FnOnce(&mut Ui) -> bool) -> bool {
-    let mut add = Some(add);
-    group_dyn(ui, Some(title), None, Some(more), &mut |ui| add.take().is_some_and(|a| a(ui)))
+    parts::group(ui, Some(title), None, |ui| {
+        // So far the group holds its title only: the toggle goes at the right of that line.
+        let r = ui.min_rect();
+        more_toggle(ui, egui::Rect::from_x_y_ranges(r.left()..=ui.max_rect().right(), r.y_range()), more);
+        add(ui)
+    })
 }
 
 /// The "More options" toggle of [`group_more`] at the right end of `line`, not taking room.
@@ -512,40 +530,12 @@ fn more_toggle(ui: &mut Ui, line: egui::Rect, more: &std::cell::Cell<bool>) {
     }
 }
 
-fn group_dyn(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, more: Option<&std::cell::Cell<bool>>, add: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
-    let p = ternarygrid_ui::pal(ui);
-    let frame =
-        egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(ternarygrid_ui::style::RADIUS_LG).inner_margin(egui::Margin::symmetric(20, 18));
-    frame
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 14.0;
-            if title.is_some() || sub.is_some() {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    if let Some(t) = title {
-                        let r = ui.label(RichText::new(t).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.5)).color(p.text)).rect;
-                        if let Some(m) = more {
-                            let line = egui::Rect::from_x_y_ranges(r.left()..=ui.max_rect().right(), r.y_range());
-                            more_toggle(ui, line, m);
-                        }
-                    }
-                    if let Some(s) = sub {
-                        ui.add(egui::Label::new(RichText::new(s).size(12.5).color(p.text_muted)).wrap());
-                    }
-                });
-            }
-            add(ui)
-        })
-        .inner
-}
-
 /// A chip of the mockups at 12 points: semibold text on a soft fill, 18 points high.
 fn chip(ui: &mut Ui, text: &str, color: egui::Color32, fill: egui::Color32) -> egui::Response {
-    let g = ui.painter().layout_no_wrap(text.to_string(), ternarygrid_ui::style::semibold(ui.ctx(), 12.0), color);
+    let g = ui.painter().layout_no_wrap(text.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.0), color);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 14.0, 18.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 9, fill);
-    ui.painter().galley(rect.center() - g.size() / 2.0, g, color);
+    kit::paint_semibold(ui.painter(), rect.center() - g.size() / 2.0, g, color);
     resp
 }
 
@@ -1537,14 +1527,14 @@ fn profile_ssh_form(ui: &mut Ui, ssh: &mut ternarygrid_core::config::SshConfig, 
     row_h(ui, tr("Authentication"), 16.0, |ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
         let (pw, key, agent) = (matches!(ssh.auth, SshAuth::Password), matches!(ssh.auth, SshAuth::PublicKey { .. }), matches!(ssh.auth, SshAuth::Agent));
-        if look::radio(ui, pw, tr("Password")).clicked() {
+        if kit::radio(ui, pw, tr("Password")).clicked() {
             ssh.auth = SshAuth::Password;
         }
-        if look::radio(ui, key, tr("Private key")).clicked() && !key {
+        if kit::radio(ui, key, tr("Private key")).clicked() && !key {
             let home = std::env::var("HOME").unwrap_or_default();
             ssh.auth = SshAuth::PublicKey { key_path: format!("{home}/.ssh/id_ed25519") };
         }
-        if look::radio(ui, agent, tr("SSH agent")).clicked() {
+        if kit::radio(ui, agent, tr("SSH agent")).clicked() {
             ssh.auth = SshAuth::Agent;
         }
         false
@@ -1602,7 +1592,7 @@ fn profile_proxy_form(ui: &mut Ui, proxy: &mut ternarygrid_core::config::ProxyCo
     row_h(ui, tr("Type"), 16.0, |ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
         for (k, l) in [(ProxyKind::Socks5, "SOCKS5"), (ProxyKind::Http, "HTTP CONNECT")] {
-            if look::radio(ui, proxy.kind == k, l).clicked() {
+            if kit::radio(ui, proxy.kind == k, l).clicked() {
                 proxy.kind = k;
             }
         }
@@ -1690,7 +1680,7 @@ impl TabView for SettingsTab {
                 ui.spacing_mut().interact_size.y = look::FIELD_H;
                 ui.set_max_width((ui.available_width() - 16.0).min(860.0));
                 ui.spacing_mut().item_spacing.y = 6.0;
-                ui.label(RichText::new(self.section.label()).font(ternarygrid_ui::style::semibold(ui.ctx(), 19.0)).color(p.text));
+                kit::semibold_label(ui, self.section.label(), 19.0, p.text);
                 if let Some(intro) = self.section.intro() {
                     ui.add_space(1.0);
                     let w = ui.available_width().min(680.0);

@@ -21,6 +21,7 @@ use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
 use crate::tabs::ai_agent::{self, Agent, AgentEvent, ToolStep};
 use crate::tabs::ai_history::{ConversationStore, SavedConversation, title_of};
+use crate::tabs::table_designer::pick;
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType, vec2};
 use egui_phosphor::regular as icon;
 use std::sync::Arc;
@@ -44,6 +45,9 @@ pub const HISTORY_BUDGET: usize = 100_000;
 pub const SAMPLE_ROWS: u64 = 5;
 /// Longest value text of a sample row.
 const SAMPLE_VALUE_CHARS: usize = 120;
+
+/// Height of the connection and schema selects at the top of the panel (as designed).
+const PICKER_H: f32 = 28.0;
 
 /// Fence tags treated as SQL (same list as `ternarygrid_ai::extract_sql_blocks`).
 const SQL_TAGS: &[&str] = &[
@@ -947,6 +951,15 @@ impl AiAssistantTab {
         self.unsaved = true;
     }
 
+    /// Test helper: the model and the token counts of the last answer.
+    #[doc(hidden)]
+    pub fn set_answered_by(&mut self, model: &str, input: u64, output: u64) {
+        if let Some(t) = self.turns.last_mut() {
+            t.model = Some(model.to_string());
+            t.usage = Some(Usage { input_tokens: input, output_tokens: output, ..Default::default() });
+        }
+    }
+
     /// Test helper: a query the assistant ran before the answer of the last turn.
     #[doc(hidden)]
     pub fn push_step(&mut self, step: ToolStep) {
@@ -1000,7 +1013,7 @@ impl AiAssistantTab {
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                ui.set_min_height(style::CONTROL_H);
+                ui.set_min_height(PICKER_H);
                 if self.connection_picker(ui, cx) {
                     self.schema = None;
                     self.object = None;
@@ -1013,12 +1026,13 @@ impl AiAssistantTab {
                 }
             });
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().item_spacing.x = 8.0;
                 ui.set_min_height(24.0);
-                ui.label(RichText::new(icon::DATABASE).size(13.0).color(p.text_muted));
+                icon_box(ui, icon::DATABASE, 13.0, p.text_muted);
                 self.context_status(ui, cx);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
+                    // 8 apart, as the design's row.
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     ui.add(egui::Label::new(RichText::new(cx.settings.ai.model.clone()).size(11.0).color(p.text_faint)).truncate());
                     self.history_button(ui, cx);
                     if ui.add_enabled_ui(!self.turns.is_empty(), |ui| kit::icon_button_ex(ui, icon::PLUS, tr("New conversation"), false, 24.0)).inner.clicked() {
@@ -1050,14 +1064,18 @@ impl AiAssistantTab {
         };
         let mut chosen: Option<Option<String>> = None;
         let none = self.conn.is_none();
-        crate::tabs::table_designer::select(ui, ("ai_conn", self.uid), text, 150.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-            if ui.selectable_label(none, tr("No connection")).clicked() && !none {
+        // As wide as its text (10 and 8 of padding, the chevron 8 from it), at most 220.
+        let w = (ui.painter().layout_no_wrap(text.clone(), egui::FontId::proportional(13.0), Color32::PLACEHOLDER).size().x + 41.0).clamp(80.0, 220.0);
+        crate::tabs::table_designer::select(ui, ("ai_conn", self.uid), text, w, PICKER_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            if pick(ui, none, tr("No connection")) && !none {
                 chosen = Some(None);
             }
             for (id, name, connected, _) in &names {
+                // The chosen one checked, the others with their state (connected or not).
                 let glyph = if *connected { icon::PLUGS_CONNECTED } else { icon::PLUGS };
                 let on = self.conn.as_deref() == Some(id.as_str());
-                if ui.selectable_label(on, kit::with_icon(glyph, name)).clicked() && !on {
+                let clicked = if on { pick(ui, true, name) } else { kit::menu_item(ui, Some(glyph), name, "").clicked() };
+                if clicked && !on {
                     chosen = Some(Some(id.clone()));
                 }
             }
@@ -1094,10 +1112,10 @@ impl AiAssistantTab {
         }
         let label = self.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
         let mut chosen: Option<String> = None;
-        crate::tabs::table_designer::select(ui, ("ai_schema", self.uid), label, 130.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+        crate::tabs::table_designer::select(ui, ("ai_schema", self.uid), label, 130.0, PICKER_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
             for n in &names {
                 let on = self.schema.as_ref().and_then(|s| s.schema.as_deref()) == Some(n.as_str());
-                if ui.selectable_label(on, n).clicked() && !on {
+                if pick(ui, on, n) && !on {
                     chosen = Some(n.clone());
                 }
             }
@@ -1122,8 +1140,9 @@ impl AiAssistantTab {
         let mut open: Option<SavedConversation> = None;
         let mut delete: Option<String> = None;
         let mut clear = false;
-        // As designed: 60 points from the panel's left edge, 9 under the header's hairline.
-        let at = egui::pos2(ui.clip_rect().left() + 60.0, resp.rect.bottom() + 19.0);
+        // As designed: 60 points from the panel's left edge, 9 under the button (on the
+        // context's hairline).
+        let at = egui::pos2(ui.clip_rect().left() + 60.0, resp.rect.bottom() + 9.0);
         egui::Popup::from_toggle_button_response(&resp)
             .anchor(at)
             .align(egui::RectAlign::BOTTOM_START)
@@ -1244,7 +1263,7 @@ impl AiAssistantTab {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 26.0, p.accent_soft);
             ui.painter().text(r.center(), Align2::CENTER_CENTER, icon::SPARKLE, style::icon_font(24.0), p.accent_text);
-            ui.label(RichText::new(title).font(style::semibold(ui.ctx(), 14.0)).color(p.text));
+            kit::semibold_label(ui, &title, 14.0, p.text);
             if let Some(body) = body {
                 ui.scope(|ui| {
                     ui.set_max_width(ui.available_width().min(320.0));
@@ -1363,7 +1382,8 @@ impl AiAssistantTab {
             let caret = if open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
             painter.text(egui::pos2(rect.left() + 5.0, cy), Align2::CENTER_CENTER, caret, style::icon_font(11.0), p.text_faint);
             let (glyph, color) = if step.ok { (icon::DATABASE, p.text_muted) } else { (icon::WARNING, p.warn) };
-            painter.text(egui::pos2(rect.left() + 22.0, cy), Align2::CENTER_CENTER, glyph, style::icon_font(13.0), color);
+            // The design's row: the caret (11), 8, the icon (13), 8, the text.
+            painter.text(egui::pos2(rect.left() + 25.5, cy), Align2::CENTER_CENTER, glyph, style::icon_font(13.0), color);
             let text_color = if !step.ok {
                 p.warn
             } else if resp.hovered() {
@@ -1371,7 +1391,7 @@ impl AiAssistantTab {
             } else {
                 p.text_muted
             };
-            painter.text(egui::pos2(rect.left() + 34.0, cy), Align2::LEFT_CENTER, &title, FontId::proportional(12.5), text_color);
+            painter.text(egui::pos2(rect.left() + 40.0, cy), Align2::LEFT_CENTER, &title, FontId::proportional(12.5), text_color);
             if resp.has_focus() {
                 painter.rect_stroke(rect.expand(2.0), CornerRadius::same(style::RADIUS), Stroke::new(1.5, p.accent), StrokeKind::Outside);
             }
@@ -1439,18 +1459,18 @@ impl AiAssistantTab {
             let t = &self.turns[ti];
             (t.steps.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>(), t.running.clone(), t.steps.last().is_some_and(|(at, _)| *at >= t.answer.len()))
         };
-        // The question.
-        let bubble_w = ui.available_width() * 0.88;
+        // The question (88 % as wide as the panel, as the design measures it).
+        let bubble_w = (ui.available_width() + 28.0) * 0.88;
         ui.with_layout(Layout::top_down(Align::Max), |ui| {
             egui::Frame::new().fill(p.subtle).corner_radius(CornerRadius::same(style::RADIUS_LG)).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
                 ui.set_max_width(bubble_w - 24.0);
                 ui.spacing_mut().item_spacing.y = 4.0;
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(RichText::new(icon::USER).size(13.0).color(p.text_muted));
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        icon_box(ui, icon::USER, 13.0, p.text_muted);
                         // The question's text names its action ("Fix error: …").
-                        ui.label(RichText::new(tr("You")).font(style::semibold(ui.ctx(), 12.5)).color(p.text));
+                        kit::semibold_label(ui, tr("You"), 12.5, p.text);
                     });
                     let segs = answer_segments(&shown);
                     self.segments_ui(ui, cx, &segs, (self.uid, ti, 0));
@@ -1461,9 +1481,9 @@ impl AiAssistantTab {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(RichText::new(icon::SPARKLE).size(13.0).color(p.accent_text));
-                ui.label(RichText::new(tr("Assistant")).font(style::semibold(ui.ctx(), 12.5)).color(p.text));
+                ui.spacing_mut().item_spacing.x = 8.0;
+                icon_box(ui, icon::SPARKLE, 13.0, p.accent_text);
+                kit::semibold_label(ui, tr("Assistant"), 12.5, p.text);
                 if let Some(m) = &model {
                     ui.label(RichText::new(m).size(11.0).color(p.text_faint));
                 }
@@ -1535,7 +1555,7 @@ impl AiAssistantTab {
             match self.action {
                 QuickAction::Describe if connected => self.object_picker(ui, cx),
                 QuickAction::Optimize if connected => {
-                    crate::tabs::table_designer::check(ui, &mut self.include_plan, tr("Include the execution plan (EXPLAIN runs on the connection, the query is not executed)"));
+                    kit::checkbox(ui, &mut self.include_plan, tr("Include the execution plan (EXPLAIN runs on the connection, the query is not executed)"));
                 }
                 _ => {}
             }
@@ -1564,7 +1584,7 @@ impl AiAssistantTab {
                         self.stop();
                     }
                     ui.add(egui::Spinner::new().size(14.0).color(p.accent_text));
-                } else if kit::button_ex(ui, kit::Kind::Primary, Some(icon::PAPER_PLANE_RIGHT), tr("Send"), true).clicked() {
+                } else if kit::button_ex(ui, kit::Kind::Primary, Some(icon::PAPER_PLANE_TILT), tr("Send"), true).clicked() {
                     send = true;
                 }
                 let (enter, shift_enter) = if crate::keys::IS_MAC { ("↩", "⇧↩") } else { ("Enter", "Shift+Enter") };
@@ -1621,7 +1641,7 @@ impl AiAssistantTab {
             ui.label(RichText::new(tr("Object:")).color(p.text_muted));
             let label = self.object.as_ref().map(|o| o.name.clone()).unwrap_or_else(|| tr("(paste a definition)").to_string());
             crate::tabs::table_designer::select(ui, ("ai_obj", self.uid), label, 240.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-                if ui.selectable_label(self.object.is_none(), tr("(paste a definition)")).clicked() {
+                if pick(ui, self.object.is_none(), tr("(paste a definition)")) {
                     self.object = None;
                 }
                 let db = self.schema.as_ref().and_then(|s| s.database.clone());
@@ -1631,7 +1651,8 @@ impl AiAssistantTab {
                 for o in items {
                     let o = o.with_database(db.clone());
                     let on = self.object.as_ref() == Some(&o);
-                    if ui.selectable_label(on, format!("{} {}", crate::nav::kind_icon(o.kind), o.name)).clicked() {
+                    let clicked = if on { pick(ui, true, &o.name) } else { kit::menu_item(ui, Some(crate::nav::kind_icon(o.kind)), &o.name, "").clicked() };
+                    if clicked {
                         self.object = Some(o);
                     }
                 }
@@ -1696,6 +1717,8 @@ fn input_box(ui: &mut Ui, text: &mut String, id: impl std::hash::Hash + std::fmt
             .margin(Margin::ZERO)
             .hint_text(RichText::new(hint).color(p.text_faint))
             .desired_rows(rows)
+            // The design's question box is 64 high (its text 46).
+            .min_size(vec2(0.0, if code { 0.0 } else { 46.0 }))
             .desired_width(f32::INFINITY)
             .return_key(NEW_LINE)
             .id_salt(id);
@@ -1758,18 +1781,27 @@ fn history_item(ui: &mut Ui, title: &str, detail: &str, current: bool) -> Option
     }
 }
 
+/// An icon in a `size` square (as the design's SVG icons take their size).
+fn icon_box(ui: &mut Ui, glyph: &str, size: f32, color: Color32) {
+    let (r, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, glyph, style::icon_font(size), color);
+}
+
 /// The rows a query of the assistant returned, as a small bordered table (numbers at the right).
 fn result_table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, columns: &[String], rows: &[Vec<String>]) {
     let p = ternarygrid_ui::pal(ui);
     let numeric: Vec<bool> = (0..columns.len()).map(|i| !rows.is_empty() && rows.iter().all(|r| r.get(i).is_some_and(|v| looks_numeric(v)))).collect();
     // The design's table: a 32 point header and rows of 26, each with its hairline.
     let (head_h, row_h) = (33.0, 27.0);
-    parts::bordered(ui).show(ui, |ui| {
+    // The design stripes the second, fourth… row; egui the first, third…: the frame shows the
+    // stripe through the rows egui leaves bare, and egui's stripes are the surface.
+    parts::bordered(ui).fill(p.stripe).show(ui, |ui| {
         let r = ui.max_rect();
         let band = Rect::from_min_size(r.min, vec2(r.width(), head_h));
         ui.painter().rect_filled(band, CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, p.header);
         ui.painter().hline(band.x_range(), band.bottom() - 0.5, Stroke::new(1.0, p.border));
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        ui.visuals_mut().faint_bg_color = p.surface;
         ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
         egui::ScrollArea::horizontal().id_salt(("ai_rows_h", &id)).auto_shrink([false, true]).show(ui, |ui| {
             let room = ui.available_width();
@@ -1820,7 +1852,7 @@ fn result_table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, columns
                         let v = values.get(i).map(String::as_str).unwrap_or("");
                         row.col(|ui| {
                             let r = ui.max_rect();
-                            ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, ternarygrid_ui::soft(p.border, 0.75)));
+                            ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.line));
                             cell(ui, RichText::new(v).size(13.0).color(p.text), numeric[i]);
                         });
                     }

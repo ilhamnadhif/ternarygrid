@@ -277,6 +277,13 @@ impl TasksTab {
         self.focus = Some(id.to_string());
     }
 
+    /// Add a task to the selection (as a ⌘-click; the history stays on the focused one).
+    pub fn add_to_selection(&mut self, id: &str) {
+        if !self.selected.iter().any(|s| s == id) {
+            self.selected.push(id.to_string());
+        }
+    }
+
     /// The task whose history is shown.
     pub fn focused_task(&self) -> Option<&str> {
         self.focus.as_deref()
@@ -856,15 +863,18 @@ impl TasksTab {
         ternarygrid_ui::parts::toolbar(ui, |ui| {
             let new = kit::button_ex(ui, Kind::Primary, Some(icon::PLUS), tr("New task"), true);
             egui::Popup::menu(&new).show(|ui| {
+                kit::menu_look(ui, 220.0);
                 for k in NewTaskKind::ALL {
-                    if ui.button(format!("{} {}", k.icon(), k.label())).clicked() {
+                    if kit::menu_item(ui, Some(k.icon()), k.label(), "").clicked() {
                         self.open_new_task(cx, k);
                         ui.close();
                     }
                 }
-                ui.separator();
+                kit::menu_separator(ui);
                 for (glyph, label) in [(icon::EXPORT, tr("Data export")), (icon::DOWNLOAD_SIMPLE, tr("Data import")), (icon::ARROWS_LEFT_RIGHT, tr("Data migration"))] {
-                    ui.add_enabled(false, egui::Button::new(format!("{glyph} {label}"))).on_disabled_hover_text(tr("Created with \"Save as task\" in the transfer wizards"));
+                    ui.add_enabled_ui(false, |ui| kit::menu_item(ui, Some(glyph), label, ""))
+                        .inner
+                        .on_disabled_hover_text(tr("Created with \"Save as task\" in the transfer wizards"));
                 }
             });
             let ghost = |ui: &mut Ui, enabled: bool, glyph: Option<&str>, label: &str| ui.add_enabled_ui(enabled, |ui| kit::button_ex(ui, Kind::Ghost, glyph, label, true)).inner;
@@ -933,8 +943,8 @@ impl TasksTab {
             ui.add_space(14.0);
             look::small_heading(ui, tr("Folders"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(4.0);
-                if kit::icon_button_ex(ui, icon::PLUS, tr("New folder"), false, 22.0).clicked() {
+                ui.add_space(10.0);
+                if kit::icon_button_sized(ui, icon::PLUS, tr("New folder"), false, 22.0, 12.0).clicked() {
                     self.folder_prompt = Some(FolderPrompt { rename: None, parent: self.folder.clone(), name: String::new() });
                 }
             });
@@ -944,7 +954,7 @@ impl TasksTab {
             // Rows of 26 points edge to edge.
             ui.spacing_mut().item_spacing.y = 0.0;
             let total = self.tasks.len().to_string();
-            if look::tree_row(ui, 0, None, icon::LIST_CHECKS, tr("All tasks"), Some(&total), self.folder.is_none(), false).resp.clicked() {
+            if kit::tree_row(ui, 0, None, icon::LIST_CHECKS, tr("All tasks"), Some(&total), self.folder.is_none(), false).resp.clicked() {
                 self.folder = None;
             }
             for (i, f) in folders.iter().enumerate() {
@@ -958,7 +968,7 @@ impl TasksTab {
                 let open = self.folder.as_deref() == Some(f.as_str());
                 let collapsed = self.collapsed.contains(f);
                 let caret = has_children.then_some(!collapsed);
-                let row = look::tree_row(ui, depth, caret, if open { icon::FOLDER_OPEN } else { icon::FOLDER }, &name, Some(&count), open, false);
+                let row = kit::tree_row(ui, depth, caret, if open { icon::FOLDER_OPEN } else { icon::FOLDER }, &name, Some(&count), open, false);
                 if row.caret {
                     if collapsed {
                         self.collapsed.remove(f);
@@ -969,15 +979,17 @@ impl TasksTab {
                     self.folder = Some(f.clone());
                 }
                 row.resp.context_menu(|ui| {
-                    if ui.button((ternarygrid_icons::ic(icon::FOLDER_PLUS), tr("New sub-folder…"))).clicked() {
+                    kit::menu_look(ui, 200.0);
+                    if kit::menu_item(ui, Some(icon::FOLDER_PLUS), tr("New sub-folder…"), "").clicked() {
                         self.folder_prompt = Some(FolderPrompt { rename: None, parent: Some(f.clone()), name: String::new() });
                         ui.close();
                     }
-                    if ui.button((ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Rename…"))).clicked() {
+                    if kit::menu_item(ui, Some(icon::PENCIL_SIMPLE), tr("Rename…"), "").clicked() {
                         self.folder_prompt = Some(FolderPrompt { rename: Some(f.clone()), parent: None, name: name.clone() });
                         ui.close();
                     }
-                    if ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Delete folder"))).on_hover_text(tr("Its tasks move to the parent folder")).clicked() {
+                    kit::menu_separator(ui);
+                    if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete folder"), "").on_hover_text(tr("Its tasks move to the parent folder")).clicked() {
                         let path = f.clone();
                         self.folder_op(cx, move |s| s.delete_folder(&path));
                         ui.close();
@@ -1012,9 +1024,11 @@ impl TasksTab {
         let modifiers = ui.input(|i| i.modifiers);
         let mut actions: Vec<RowAction> = Vec::new();
         let now = Local::now();
+        // The design's columns: 34, 1.6fr, 130, 160, 100, 1.2fr (inside the table's hairline).
+        let fr = ((ui.available_width() - 2.0 - (34.0 + 130.0 + 160.0 + 100.0)) / 2.8).max(60.0);
         let cols = [
             look::Col::new("", look::Width::Exact(34.0)),
-            look::Col::new(tr("Name"), look::Width::Initial(250.0)),
+            look::Col::new(tr("Name"), look::Width::Initial((fr * 1.6).floor())),
             look::Col::new(tr("Type"), look::Width::Initial(130.0)),
             look::Col::new(tr("Schedule"), look::Width::Initial(160.0)),
             look::Col::new(tr("Next run"), look::Width::Initial(100.0)),
@@ -1030,7 +1044,10 @@ impl TasksTab {
                 }
             });
             look::cell(row, false, |ui| {
-                ui.label(RichText::new(kind_icon(&t.kind)).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.text_muted));
+                // The design's 14 point icon, 8 from the name.
+                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, kind_icon(&t.kind), ternarygrid_ui::style::icon_font(14.0), pal.text_muted);
+                ui.add_space(8.0 - ui.spacing().item_spacing.x);
                 let name = if show_folder && t.folder.is_some() { t.path() } else { t.name.clone() };
                 let r = look::cell_text(ui, RichText::new(name).color(if t.enabled { pal.text } else { pal.text_faint }));
                 if let Some(d) = &t.description {
@@ -1106,45 +1123,46 @@ impl TasksTab {
             }
             let targets = if self.selected.iter().any(|s| s == &t.id) { self.selected.clone() } else { vec![t.id.clone()] };
             resp.context_menu(|ui| {
-                if ui.button((ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Edit…"))).clicked() {
+                kit::menu_look(ui, 200.0);
+                if kit::menu_item(ui, Some(icon::PENCIL_SIMPLE), tr("Edit…"), "").clicked() {
                     actions.push(RowAction::Edit(t.id.clone()));
                     ui.close();
                 }
-                if ui.button((ternarygrid_icons::ic(icon::PLAY), tr("Run now"))).clicked() {
+                if kit::menu_item(ui, Some(icon::PLAY), tr("Run now"), "").clicked() {
                     actions.push(RowAction::Run(targets.clone()));
                     ui.close();
                 }
-                if running.contains_key(&t.id) && ui.button((ternarygrid_icons::ic(icon::STOP), tr("Cancel run"))).clicked() {
+                if running.contains_key(&t.id) && kit::menu_item(ui, Some(icon::STOP), tr("Cancel run"), "").clicked() {
                     actions.push(RowAction::Cancel(targets.clone()));
                     ui.close();
                 }
-                if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Duplicate"))).clicked() {
+                if kit::menu_item(ui, Some(icon::COPY), tr("Duplicate"), "").clicked() {
                     actions.push(RowAction::Duplicate(targets.clone()));
                     ui.close();
                 }
                 let label = if t.enabled { tr("Disable") } else { tr("Enable") };
-                if ui.button(format!("{} {label}", if t.enabled { icon::TOGGLE_LEFT } else { icon::TOGGLE_RIGHT })).clicked() {
+                if kit::menu_item(ui, Some(if t.enabled { icon::TOGGLE_LEFT } else { icon::TOGGLE_RIGHT }), label, "").clicked() {
                     actions.push(RowAction::Enable(targets.clone(), !t.enabled));
                     ui.close();
                 }
-                ui.menu_button((ternarygrid_icons::ic(icon::FOLDER), tr("Move to")), |ui| {
-                    if ui.button(tr("(top level)")).clicked() {
+                kit::submenu(ui, Some(icon::FOLDER), tr("Move to"), 200.0, &mut |ui| {
+                    if kit::menu_item(ui, None, tr("(top level)"), "").clicked() {
                         actions.push(RowAction::Move(targets.clone(), None));
                         ui.close();
                     }
                     for f in &folders {
-                        if ui.button(format!("{} {f}", icon::FOLDER)).clicked() {
+                        if kit::menu_item(ui, Some(icon::FOLDER), f, "").clicked() {
                             actions.push(RowAction::Move(targets.clone(), Some(f.clone())));
                             ui.close();
                         }
                     }
                 });
-                if ui.button((ternarygrid_icons::ic(icon::UPLOAD_SIMPLE), tr("Export…"))).clicked() {
+                if kit::menu_item(ui, Some(icon::UPLOAD_SIMPLE), tr("Export…"), "").clicked() {
                     actions.push(RowAction::Export(targets.clone()));
                     ui.close();
                 }
-                ui.separator();
-                if ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Delete…"))).clicked() {
+                kit::menu_separator(ui);
+                if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete…"), "").clicked() {
                     actions.push(RowAction::Delete(targets.clone()));
                     ui.close();
                 }
@@ -1195,7 +1213,7 @@ impl TasksTab {
         let name = self.task(&focus).map(|t| t.path()).unwrap_or_default();
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(trf("Run history — {}", &[&name])).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
+            kit::semibold_label(ui, &trf("Run history — {}", &[&name]), 13.0, pal.text);
             if self.runs_job.is_some() {
                 ui.add(egui::Spinner::new().size(14.0).color(pal.accent_text));
             }
@@ -1214,39 +1232,46 @@ impl TasksTab {
         let mut clicked = None;
         let width = ui.available_width();
         // The runs and the selected run's details share the row 1.3 : 1, 16 points apart.
+        // (Resizable without a line, as the design shows none; the split starts over when the
+        // width changes.)
         let runs_frame = egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 8, top: 0, bottom: 10 });
-        egui::Panel::left(egui::Id::new("tasks_history_runs")).resizable(true).default_size(((width - 16.0) * 1.3 / 2.3).floor() + 8.0).frame(runs_frame).show(ui, |ui| {
-            let cols = [
-                look::Col::new(tr("Status"), look::Width::Initial(100.0)),
-                look::Col::new(tr("Trigger"), look::Width::Initial(100.0)),
-                look::Col::new(tr("Started"), look::Width::Initial(160.0)),
-                look::Col::new(tr("Duration"), look::Width::Initial(80.0)),
-                look::Col::new(tr("Message"), look::Width::Rest(100.0)),
-            ];
-            look::table(ui, "tasks_history_table", &cols, self.history.len(), |row, i| {
-                let r = &self.history[i];
-                row.set_selected(r.run_id == shown);
-                look::cell(row, false, |ui| {
-                    look::cell_text(ui, RichText::new(status_label(r.status)).color(status_color(r.status, &pal)));
+        egui::Panel::left(egui::Id::new(("tasks_history_runs", width as i32 / 8)))
+            .resizable(true)
+            .show_separator_line(false)
+            .default_size(((width - 16.0) * 1.3 / 2.3).floor() + 8.0)
+            .frame(runs_frame)
+            .show(ui, |ui| {
+                let cols = [
+                    look::Col::new(tr("Status"), look::Width::Initial(100.0)),
+                    look::Col::new(tr("Trigger"), look::Width::Initial(100.0)),
+                    look::Col::new(tr("Started"), look::Width::Initial(160.0)),
+                    look::Col::new(tr("Duration"), look::Width::Initial(80.0)),
+                    look::Col::new(tr("Message"), look::Width::Rest(40.0)),
+                ];
+                look::table(ui, "tasks_history_table", &cols, self.history.len(), |row, i| {
+                    let r = &self.history[i];
+                    row.set_selected(r.run_id == shown);
+                    look::cell(row, false, |ui| {
+                        look::cell_text(ui, RichText::new(status_label(r.status)).color(status_color(r.status, &pal)));
+                    });
+                    look::cell(row, false, |ui| {
+                        look::cell_text(ui, trigger_label(r.trigger));
+                    });
+                    look::cell(row, false, |ui| {
+                        look::cell_text(ui, look::mono(ui, &r.started.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string(), pal.text_muted));
+                    });
+                    look::cell(row, false, |ui| {
+                        look::cell_text(ui, run_duration(r));
+                    });
+                    look::cell(row, false, |ui| {
+                        let msg = r.error.clone().or_else(|| r.messages.last().map(|m| m.text.clone())).unwrap_or_default();
+                        look::cell_text(ui, msg.lines().next().unwrap_or_default());
+                    });
+                    if row.response().clicked() {
+                        clicked = Some(r.run_id.clone());
+                    }
                 });
-                look::cell(row, false, |ui| {
-                    look::cell_text(ui, trigger_label(r.trigger));
-                });
-                look::cell(row, false, |ui| {
-                    look::cell_text(ui, look::mono(ui, &r.started.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string(), pal.text_muted));
-                });
-                look::cell(row, false, |ui| {
-                    look::cell_text(ui, run_duration(r));
-                });
-                look::cell(row, false, |ui| {
-                    let msg = r.error.clone().or_else(|| r.messages.last().map(|m| m.text.clone())).unwrap_or_default();
-                    look::cell_text(ui, msg.lines().next().unwrap_or_default());
-                });
-                if row.response().clicked() {
-                    clicked = Some(r.run_id.clone());
-                }
             });
-        });
         if let Some(id) = clicked {
             self.selected_run = Some(id);
         }
@@ -1261,8 +1286,10 @@ impl TasksTab {
         let pal = ternarygrid_ui::pal(ui);
         ui.spacing_mut().item_spacing.y = 8.0;
         let color = status_color(run.status, &pal);
+        // A line as tall as its text, as designed.
+        ui.spacing_mut().interact_size.y = 16.0;
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(status_label(run.status)).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(color));
+            kit::semibold_label(ui, status_label(run.status), 13.0, color);
             let mut facts = format!("{} · {}", run.started.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"), run_duration(run));
             if let Some(rows) = run.rows {
                 facts.push_str(&format!(" · {}", trf("{} row(s)", &[&rows])));
@@ -1329,7 +1356,8 @@ impl TasksTab {
             ui.label(RichText::new(trf("{} message(s) were dropped from the middle of the log", &[&run.dropped_messages])).size(12.0).color(pal.text_faint));
         }
         egui::ScrollArea::vertical().id_salt(("task_run_messages", &run.run_id)).auto_shrink([false, false]).stick_to_bottom(run.status == RunStatus::Running).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
+            // 8 apart on the design's lines of 15 (its monospace's line height).
+            ui.spacing_mut().item_spacing.y = 9.5;
             if run.messages.is_empty() {
                 ui.label(RichText::new("—").color(pal.text_faint));
             }
@@ -1339,7 +1367,7 @@ impl TasksTab {
                     MessageLevel::Warning => pal.warn,
                     MessageLevel::Error => pal.err,
                 };
-                let line = format!("{}  {}", m.time.with_timezone(&Local).format("%H:%M:%S"), m.text);
+                let line = format!("{} {}", m.time.with_timezone(&Local).format("%H:%M:%S"), m.text);
                 let r = ui.add(egui::Label::new(look::mono(ui, &line, c).size(11.5)).truncate());
                 if r.hovered() && ui.fonts_mut(|f| f.layout_no_wrap(line.clone(), egui::FontId::monospace(11.5), c).size().x) > r.rect.width() + 1.0 {
                     r.on_hover_text(&line);
@@ -1386,7 +1414,7 @@ impl TasksTab {
                 },
                 |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if look::danger_button(ui, Some(icon::TRASH), tr("Delete")).clicked() {
+                        if kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Delete"), false).clicked() {
                             delete.set(true);
                         }
                         if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
