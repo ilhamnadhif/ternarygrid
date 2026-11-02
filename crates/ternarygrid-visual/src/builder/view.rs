@@ -1207,6 +1207,7 @@ fn columns_grid(ui: &mut Ui, model: &mut QueryModel, refs: &[String]) {
                 3 => {
                     egui::ComboBox::from_id_salt(("ternarygrid_qb_agg", r))
                         .icon(kit::combo_caret)
+                        .popup_style(egui::containers::menu::menu_style.into())
                         .width(140.0)
                         .selected_text(item.aggregate.map(|a| a.label()).unwrap_or("–"))
                         .show_ui(ui, |ui| {
@@ -1253,6 +1254,7 @@ fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &
                 0 => {
                     egui::ComboBox::from_id_salt((salt, "conn", i))
                         .icon(kit::combo_caret)
+                        .popup_style(egui::containers::menu::menu_style.into())
                         .width(66.0)
                         .selected_text(cond.connector.sql())
                         .show_ui(ui, |ui| {
@@ -1271,6 +1273,7 @@ fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &
                 2 => {
                     egui::ComboBox::from_id_salt((salt, "op", i))
                         .icon(kit::combo_caret)
+                        .popup_style(egui::containers::menu::menu_style.into())
                         .width(100.0)
                         .selected_text(if cond.operator.is_empty() {
                             tr("(expression)")

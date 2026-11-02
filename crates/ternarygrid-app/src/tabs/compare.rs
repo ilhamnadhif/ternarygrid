@@ -158,15 +158,18 @@ impl SchemaCompareTab {
             // 8 from the connection (the schema is 6 from it).
             ui.add_space(2.0);
         }
-        egui::ComboBox::from_id_salt((id, "conn")).icon(kit::combo_caret).selected_text(current).width(CONN_W).show_ui(ui, |ui| {
-            kit::menu_look(ui, CONN_W);
-            for (cid, name) in &names {
-                if choice(ui, side.conn.as_deref() == Some(cid), name) {
-                    side.conn = Some(cid.clone());
-                    side.schema = None;
+        egui::ComboBox::from_id_salt((id, "conn")).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(CONN_W).show_ui(
+            ui,
+            |ui| {
+                kit::menu_look(ui, CONN_W);
+                for (cid, name) in &names {
+                    if choice(ui, side.conn.as_deref() == Some(cid), name) {
+                        side.conn = Some(cid.clone());
+                        side.schema = None;
+                    }
                 }
-            }
-        });
+            },
+        );
         let Some(conn) = side.conn.clone() else { return };
         if !cx.conns.is_connected(&conn) {
             if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUGS_CONNECTED), tr("Connect"), true).clicked() {
@@ -181,21 +184,24 @@ impl SchemaCompareTab {
         let schemas: Vec<String> = live.meta.schemas_of(None).get().map(|v| v.iter().map(|s| s.name.clone()).collect()).unwrap_or_default();
         let db = live.current_database.clone();
         let label = side.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
-        egui::ComboBox::from_id_salt((id, "schema")).icon(kit::combo_caret).selected_text(label).width(SCHEMA_W).show_ui(ui, |ui| {
-            kit::menu_look(ui, SCHEMA_W);
-            if schemas.is_empty() {
-                // Single-schema databases (SQLite, MySQL database = schema).
-                let cur = live.current_schema.clone().or(db.clone());
-                if choice(ui, false, &cur.clone().unwrap_or_else(|| tr("(default)").to_string())) {
-                    side.schema = Some(SchemaRef::new(None, cur));
+        egui::ComboBox::from_id_salt((id, "schema")).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(label).width(SCHEMA_W).show_ui(
+            ui,
+            |ui| {
+                kit::menu_look(ui, SCHEMA_W);
+                if schemas.is_empty() {
+                    // Single-schema databases (SQLite, MySQL database = schema).
+                    let cur = live.current_schema.clone().or(db.clone());
+                    if choice(ui, false, &cur.clone().unwrap_or_else(|| tr("(default)").to_string())) {
+                        side.schema = Some(SchemaRef::new(None, cur));
+                    }
                 }
-            }
-            for s in &schemas {
-                if choice(ui, side.schema.as_ref().and_then(|x| x.schema.as_deref()) == Some(s.as_str()), s) {
-                    side.schema = Some(SchemaRef::new(None, Some(s.clone())));
+                for s in &schemas {
+                    if choice(ui, side.schema.as_ref().and_then(|x| x.schema.as_deref()) == Some(s.as_str()), s) {
+                        side.schema = Some(SchemaRef::new(None, Some(s.clone())));
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 
     fn start(&mut self, cx: &mut AppContext) {

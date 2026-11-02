@@ -568,6 +568,20 @@ fn transfer_snapshots() {
         }
         s.frames(3);
         s.shot("mock_1_settings");
+        // A select's list in the kit's menu look (opened, then closed by a second click).
+        for open in [true, false] {
+            s.frames(20);
+            {
+                let combos: Vec<_> = s.h.query_all_by_role(egui::accesskit::Role::ComboBox).collect();
+                let label = s.h.query_all_by_label("On error").next().expect("the On error label").rect();
+                let combo = combos.iter().find(|n| n.rect().left() > label.right() && (n.rect().center().y - label.center().y).abs() < 12.0).expect("the On error select");
+                combo.click();
+            }
+            s.frames(10);
+            if open {
+                s.shot("mock_select_open");
+            }
+        }
         // Many rows: the run is still going when the screenshot is taken.
         {
             let tab = popup::<MockDataTab>(&mut s.h);

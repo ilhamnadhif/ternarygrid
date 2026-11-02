@@ -407,7 +407,7 @@ fn combo_idx(ui: &mut Ui, id: egui::Id, sel: Option<usize>, labels: &[&str], wid
     let width = if width > 0.0 { width } else { text_w(ui, current) + 39.0 };
     // The list as wide as its longest choice (with the check mark's room).
     let menu_w = labels.iter().map(|l| text_w(ui, l) + 54.0).fold(width, f32::max);
-    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(current).width(width).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(width).show_ui(ui, |ui| {
         kit::menu_look(ui, menu_w);
         for (i, label) in labels.iter().enumerate() {
             if wizard::choice(ui, sel == Some(i), label) && sel != Some(i) {
@@ -679,7 +679,7 @@ pub(crate) fn schema_combo(ui: &mut Ui, cx: &mut AppContext, conn: &str, id: imp
     let names = schema_names(cx, conn);
     let label = value.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("(default)").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(label).width(width).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(label).width(width).show_ui(ui, |ui| {
         kit::menu_look(ui, width);
         if wizard::choice(ui, value.as_ref().is_none_or(|v| v.schema.is_none()), tr("(default)")) {
             *value = None;
@@ -757,7 +757,7 @@ pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash:
     let conns: Vec<(String, String)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
     let current = value.as_ref().and_then(|v| conns.iter().find(|(i, _)| i == v)).map(|(_, n)| n.clone()).unwrap_or_else(|| tr("Choose…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(current).width(width).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(width).show_ui(ui, |ui| {
         kit::menu_look(ui, width);
         for (cid, name) in &conns {
             let glyph = if cx.conns.is_connected(cid) { icon::PLUGS_CONNECTED } else { icon::PLUGS };

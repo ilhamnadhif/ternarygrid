@@ -53,9 +53,12 @@ pub(crate) fn connection_combo_ex(
         .or_else(|| if conn.is_none() { none.map(str::to_string) } else { None })
         .unwrap_or_else(|| tr("Choose a connection…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(if glyph { format!("{} {current}", icon::PLUGS) } else { current }).width(width).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt(id)
+        .icon(ternarygrid_ui::kit::combo_caret)
+        .popup_style(egui::containers::menu::menu_style.into())
+        .selected_text(if glyph { format!("{} {current}", icon::PLUGS) } else { current })
+        .width(width)
+        .show_ui(ui, |ui| {
             kit::menu_look(ui, width);
             if let Some(n) = none
                 && choice(ui, conn.is_none(), n)
@@ -71,8 +74,7 @@ pub(crate) fn connection_combo_ex(
                     changed = true;
                 }
             }
-        },
-    );
+        });
     if changed
         && let Some(c) = conn.as_ref()
         && !cx.conns.is_connected(c)
@@ -114,9 +116,12 @@ pub(crate) fn schema_combo_ex(ui: &mut Ui, cx: &mut AppContext, id: impl Hash + 
         changed = true;
     }
     let label = schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(if glyph { format!("{} {label}", icon::STACK) } else { label }).width(width).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt(id)
+        .icon(ternarygrid_ui::kit::combo_caret)
+        .popup_style(egui::containers::menu::menu_style.into())
+        .selected_text(if glyph { format!("{} {label}", icon::STACK) } else { label })
+        .width(width)
+        .show_ui(ui, |ui| {
             kit::menu_look(ui, width);
             for n in &names {
                 let on = schema.as_ref().and_then(|s| s.schema.as_deref()) == Some(n.as_str());
@@ -125,8 +130,7 @@ pub(crate) fn schema_combo_ex(ui: &mut Ui, cx: &mut AppContext, id: impl Hash + 
                     changed = true;
                 }
             }
-        },
-    );
+        });
     if loading {
         ui.spinner();
     }
@@ -168,9 +172,12 @@ pub(crate) fn table_combo_ex(
     let (items, loading) = schema_tables(cx, conn, schema, true);
     let label = table.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| tr("Table…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(if glyph { format!("{} {label}", icon::TABLE) } else { label }).width(width).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt(id)
+        .icon(ternarygrid_ui::kit::combo_caret)
+        .popup_style(egui::containers::menu::menu_style.into())
+        .selected_text(if glyph { format!("{} {label}", icon::TABLE) } else { label })
+        .width(width)
+        .show_ui(ui, |ui| {
             kit::menu_look(ui, width);
             if items.is_empty() {
                 kit::menu_caption(ui, if loading { tr("Loading…") } else { tr("No tables") });
@@ -182,8 +189,7 @@ pub(crate) fn table_combo_ex(
                     changed = true;
                 }
             }
-        },
-    );
+        });
     if loading {
         ui.spinner();
     }
@@ -665,14 +671,19 @@ impl DataCompareTab {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 ui.horizontal(|ui| {
                     look::muted(ui, tr("Row matching"));
-                    egui::ComboBox::from_id_salt(("dc_strategy", uid)).icon(kit::combo_caret).selected_text(strategy_label(o.strategy)).width(160.0).show_ui(ui, |ui| {
-                        kit::menu_look(ui, 160.0);
-                        for s in [CompareStrategy::Auto, CompareStrategy::MergeJoin, CompareStrategy::HashJoin] {
-                            if choice(ui, o.strategy == s, strategy_label(s)) {
-                                o.strategy = s;
+                    egui::ComboBox::from_id_salt(("dc_strategy", uid))
+                        .icon(kit::combo_caret)
+                        .popup_style(egui::containers::menu::menu_style.into())
+                        .selected_text(strategy_label(o.strategy))
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            kit::menu_look(ui, 160.0);
+                            for s in [CompareStrategy::Auto, CompareStrategy::MergeJoin, CompareStrategy::HashJoin] {
+                                if choice(ui, o.strategy == s, strategy_label(s)) {
+                                    o.strategy = s;
+                                }
                             }
-                        }
-                    });
+                        });
                 });
                 ui.horizontal(|ui| {
                     look::muted(ui, tr("Differing rows to show"));

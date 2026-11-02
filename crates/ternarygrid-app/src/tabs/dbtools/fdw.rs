@@ -232,6 +232,7 @@ impl TabView for FdwConfigTab {
                 }
                 egui::ComboBox::from_id_salt(("fdw_source", &self.conn))
                     .icon(ternarygrid_ui::kit::combo_caret)
+                    .popup_style(egui::containers::menu::menu_style.into())
                     .selected_text(current.as_ref().map(|c| format!("{} ({})", c.name, c.kind.display_name())).unwrap_or_else(|| tr("(choose)").to_string()))
                     .width(260.0)
                     .show_ui(ui, |ui| {

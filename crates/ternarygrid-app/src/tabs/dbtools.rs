@@ -308,16 +308,19 @@ pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash:
     let current =
         cx.conns.config(value).map(|c| c.name.clone()).unwrap_or_else(|| if value.is_empty() { tr("Choose…").to_string() } else { tr("(missing connection)").to_string() });
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(width).show_ui(ui, |ui| {
-        ternarygrid_ui::kit::menu_look(ui, width);
-        for c in cx.conns.configs() {
-            let label = format!("{} {}", crate::nav::db_icon(c.kind), c.name);
-            if crate::tabs::transfer::wizard::choice(ui, *value == c.id, &label) && *value != c.id {
-                *value = c.id.clone();
-                changed = true;
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(width).show_ui(
+        ui,
+        |ui| {
+            ternarygrid_ui::kit::menu_look(ui, width);
+            for c in cx.conns.configs() {
+                let label = format!("{} {}", crate::nav::db_icon(c.kind), c.name);
+                if crate::tabs::transfer::wizard::choice(ui, *value == c.id, &label) && *value != c.id {
+                    *value = c.id.clone();
+                    changed = true;
+                }
             }
-        }
-    });
+        },
+    );
     changed
 }
 

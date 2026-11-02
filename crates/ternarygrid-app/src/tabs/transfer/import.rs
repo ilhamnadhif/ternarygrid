@@ -847,25 +847,31 @@ impl ImportTab {
         let Some(schema) = self.schema.clone().or_else(|| current_schema(cx, &conn)) else { return };
         let tables = schema_tables(cx, &conn, &schema, false);
         let label = self.table.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| tr("Choose…").to_string());
-        egui::ComboBox::from_id_salt(("imp_table", self.uid)).icon(kit::combo_caret).selected_text(label).width(200.0).height(360.0).show_ui(ui, |ui| {
-            kit::menu_look(ui, 200.0);
-            match &tables {
-                None => {
-                    parts::spinner_label(ui, tr("Loading…"));
-                }
-                Some(Err(e)) => {
-                    ui.label(e.full_text());
-                }
-                Some(Ok(list)) => {
-                    for o in list.iter().filter(|o| !o.is_system) {
-                        let selected = self.table.as_ref() == Some(&o.obj);
-                        if wizard::choice(ui, selected, &o.obj.name) && !selected {
-                            self.table = Some(o.obj.clone());
+        egui::ComboBox::from_id_salt(("imp_table", self.uid))
+            .icon(kit::combo_caret)
+            .popup_style(egui::containers::menu::menu_style.into())
+            .selected_text(label)
+            .width(200.0)
+            .height(360.0)
+            .show_ui(ui, |ui| {
+                kit::menu_look(ui, 200.0);
+                match &tables {
+                    None => {
+                        parts::spinner_label(ui, tr("Loading…"));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(e.full_text());
+                    }
+                    Some(Ok(list)) => {
+                        for o in list.iter().filter(|o| !o.is_system) {
+                            let selected = self.table.as_ref() == Some(&o.obj);
+                            if wizard::choice(ui, selected, &o.obj.name) && !selected {
+                                self.table = Some(o.obj.clone());
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
     }
 
     fn sample_values(&self, index: usize) -> String {
@@ -1025,22 +1031,27 @@ impl ImportTab {
                     1 => {
                         let label = if c.skip { tr("(not imported)").to_string() } else { c.target_name.clone() };
                         let w = ui.available_width();
-                        egui::ComboBox::from_id_salt(("imp_map_col", id, i)).icon(kit::combo_caret).selected_text(label).width(w).show_ui(ui, |ui| {
-                            kit::menu_look(ui, w);
-                            if wizard::choice(ui, c.skip, tr("(not imported)")) {
-                                c.skip = true;
-                            }
-                            for col in &def.columns {
-                                let selected = !c.skip && c.target_name == col.name;
-                                if wizard::choice(ui, selected, &col.name) {
-                                    c.skip = col.generated.is_some();
-                                    c.target_name = col.name.clone();
-                                    c.target_type = col.data_type.clone();
-                                    c.target_kind = Some(col.kind);
-                                    c.nullable = col.nullable;
+                        egui::ComboBox::from_id_salt(("imp_map_col", id, i))
+                            .icon(kit::combo_caret)
+                            .popup_style(egui::containers::menu::menu_style.into())
+                            .selected_text(label)
+                            .width(w)
+                            .show_ui(ui, |ui| {
+                                kit::menu_look(ui, w);
+                                if wizard::choice(ui, c.skip, tr("(not imported)")) {
+                                    c.skip = true;
                                 }
-                            }
-                        });
+                                for col in &def.columns {
+                                    let selected = !c.skip && c.target_name == col.name;
+                                    if wizard::choice(ui, selected, &col.name) {
+                                        c.skip = col.generated.is_some();
+                                        c.target_name = col.name.clone();
+                                        c.target_type = col.data_type.clone();
+                                        c.target_kind = Some(col.kind);
+                                        c.nullable = col.nullable;
+                                    }
+                                }
+                            });
                     }
                     2 => {
                         wizard::faint(ui, if c.skip { "" } else { &c.target_type });
@@ -1366,7 +1377,7 @@ fn table_name_from(stem: &str) -> String {
 
 /// A choice of text encodings (export and import), 160 wide.
 pub(crate) fn encoding_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut String, options: &[&str]) {
-    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(value.clone()).width(160.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(value.clone()).width(160.0).show_ui(ui, |ui| {
         kit::menu_look(ui, 160.0);
         for e in options {
             if wizard::choice(ui, value.eq_ignore_ascii_case(e), e) {
@@ -1424,17 +1435,22 @@ fn xlsx_reader_ui(f: &mut Form<'_>, id: u64, o: &mut XlsxReadOptions, sheets: &[
             SheetSelector::Name(n) => n.clone(),
             SheetSelector::Index(i) => sheets.get(*i).cloned().unwrap_or_else(|| trf("Sheet {}", &[&(i + 1)])),
         };
-        egui::ComboBox::from_id_salt(("xlsx_sheet", id)).icon(kit::combo_caret).selected_text(current.clone()).width(180.0).show_ui(ui, |ui| {
-            kit::menu_look(ui, 180.0);
-            if sheets.is_empty() {
-                kit::menu_caption(ui, tr("Loading…"));
-            }
-            for s in sheets {
-                if wizard::choice(ui, *s == current, s) {
-                    o.sheet = SheetSelector::Name(s.clone());
+        egui::ComboBox::from_id_salt(("xlsx_sheet", id))
+            .icon(kit::combo_caret)
+            .popup_style(egui::containers::menu::menu_style.into())
+            .selected_text(current.clone())
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                kit::menu_look(ui, 180.0);
+                if sheets.is_empty() {
+                    kit::menu_caption(ui, tr("Loading…"));
                 }
-            }
-        });
+                for s in sheets {
+                    if wizard::choice(ui, *s == current, s) {
+                        o.sheet = SheetSelector::Name(s.clone());
+                    }
+                }
+            });
     });
     f.check_row(tr("Header"), |ui| wizard::check(ui, &mut o.header, tr("The first row holds the column names")));
     f.row(tr("Skip rows"), |ui| wizard::number(ui, &mut o.skip_rows, 0..=1_000_000, 70.0));

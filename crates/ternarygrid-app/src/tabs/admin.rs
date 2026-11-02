@@ -100,6 +100,7 @@ impl Refresh {
         let mut now = look::small(ui, kit::Kind::Secondary, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked();
         egui::ComboBox::from_id_salt(ui.next_auto_id())
             .icon(kit::combo_caret)
+            .popup_style(egui::containers::menu::menu_style.into())
             .width(120.0)
             .selected_text(if self.interval == 0 { tr("Auto-refresh off").to_string() } else { trf("Every {} s", &[&self.interval]) })
             .show_ui(ui, |ui| {

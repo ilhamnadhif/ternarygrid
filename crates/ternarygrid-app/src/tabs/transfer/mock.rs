@@ -435,15 +435,18 @@ fn generator_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, col:
     let options = choices(col, auto, value);
     let current = options.iter().find(|(g, _)| discriminant(g) == discriminant(value)).map(|(_, l)| l.clone()).unwrap_or_default();
     let w = ui.available_width();
-    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(current).width(w).height(420.0).show_ui(ui, |ui| {
-        kit::menu_look(ui, w);
-        for (g, label) in options {
-            let selected = discriminant(&g) == discriminant(value);
-            if wizard::choice(ui, selected, &label) && !selected {
-                *value = g;
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(w).height(420.0).show_ui(
+        ui,
+        |ui| {
+            kit::menu_look(ui, w);
+            for (g, label) in options {
+                let selected = discriminant(&g) == discriminant(value);
+                if wizard::choice(ui, selected, &label) && !selected {
+                    *value = g;
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 fn date_edit(ui: &mut Ui, value: &mut NaiveDate) {
