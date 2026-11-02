@@ -121,18 +121,18 @@ impl TabView for CatalogObjectTab {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
         let label = self.folder.as_ref().map(|f| tr(f.label)).unwrap_or_default();
-        ui.horizontal(|ui| {
-            ui.heading(format!("{} {}", self.icon(), self.name()));
-            ui.weak(label);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(ternarygrid_icons::ic(icon::ARROW_CLOCKWISE)).on_hover_text(tr("Refresh")).clicked() {
-                    self.started = false;
-                }
-            });
+        let name = self.name();
+        let mut refresh = false;
+        ternarygrid_ui::parts::page_header(ui, self.icon(), &[], name, Some(label), |ui| {
+            refresh = ternarygrid_ui::kit::icon_button(ui, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked();
         });
-        ui.separator();
+        if refresh {
+            self.started = false;
+        }
+        ternarygrid_ui::parts::hline(ui);
+        ui.add_space(6.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.strong(tr("Properties"));
+            ui.label(RichText::new(tr("Properties")).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)));
             match &self.row {
                 Loadable::Loaded(Some(row)) => {
                     egui::Grid::new(("catalog_props", &self.conn, self.folder_id)).num_columns(2).striped(true).spacing([16.0, 4.0]).show(ui, |ui| {

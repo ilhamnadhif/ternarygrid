@@ -297,70 +297,74 @@ impl ObjectEditorTab {
                     self.vmodel = Some(vm.get(&key).cloned().unwrap_or_default());
                 }
                 let Some(vt) = self.vmodel.as_mut() else { return };
-                ui.label(tr("Client-side additions used by the data editor; stored in the project, not in the database."));
+                use ternarygrid_ui::parts::group;
+                ui.label(RichText::new(tr("Client-side additions used by the data editor; stored in the project, not in the database.")).color(ternarygrid_ui::pal(ui).text_muted));
                 ui.add_space(4.0);
-                ui.strong(tr("Virtual key"));
-                ui.weak(tr("Columns that identify a row when the table has no primary or unique key."));
-                ui.horizontal_wrapped(|ui| {
-                    let mut keys = vt.virtual_key.clone().unwrap_or_default();
-                    for c in &t.columns {
-                        let mut on = keys.contains(&c.name);
-                        if ui.checkbox(&mut on, &c.name).changed() {
-                            if on {
-                                keys.push(c.name.clone());
-                            } else {
-                                keys.retain(|k| k != &c.name);
+                group(ui, Some(tr("Virtual key")), Some(tr("Columns that identify a row when the table has no primary or unique key.")), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let mut keys = vt.virtual_key.clone().unwrap_or_default();
+                        for c in &t.columns {
+                            let mut on = keys.contains(&c.name);
+                            if ui.checkbox(&mut on, &c.name).changed() {
+                                if on {
+                                    keys.push(c.name.clone());
+                                } else {
+                                    keys.retain(|k| k != &c.name);
+                                }
                             }
                         }
-                    }
-                    vt.virtual_key = if keys.is_empty() { None } else { Some(keys) };
+                        vt.virtual_key = if keys.is_empty() { None } else { Some(keys) };
+                    })
                 });
-                ui.add_space(6.0);
-                ui.strong(tr("Dictionary"));
-                ui.weak(tr("When other tables reference this one, show these columns next to the key."));
-                ui.horizontal_wrapped(|ui| {
-                    let mut cols = vt.dictionary.clone().map(|d| d.description_columns).unwrap_or_default();
-                    for c in &t.columns {
-                        let mut on = cols.contains(&c.name);
-                        if ui.checkbox(&mut on, &c.name).changed() {
-                            if on {
-                                cols.push(c.name.clone());
-                            } else {
-                                cols.retain(|k| k != &c.name);
+                ui.add_space(8.0);
+                group(ui, Some(tr("Dictionary")), Some(tr("When other tables reference this one, show these columns next to the key.")), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let mut cols = vt.dictionary.clone().map(|d| d.description_columns).unwrap_or_default();
+                        for c in &t.columns {
+                            let mut on = cols.contains(&c.name);
+                            if ui.checkbox(&mut on, &c.name).changed() {
+                                if on {
+                                    cols.push(c.name.clone());
+                                } else {
+                                    cols.retain(|k| k != &c.name);
+                                }
                             }
                         }
-                    }
-                    vt.dictionary = if cols.is_empty() { None } else { Some(ternarygrid_config::project::DictionaryConfig { description_columns: cols }) };
+                        vt.dictionary = if cols.is_empty() { None } else { Some(ternarygrid_config::project::DictionaryConfig { description_columns: cols }) };
+                    })
                 });
-                ui.add_space(6.0);
-                ui.strong(tr("Virtual columns"));
+                ui.add_space(8.0);
                 let mut remove = None;
-                egui::Grid::new("vcols").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
-                    for (i, c) in vt.virtual_columns.iter_mut().enumerate() {
-                        ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(140.0));
-                        ui.add(egui::TextEdit::singleline(&mut c.expression).desired_width(320.0).code_editor());
-                        if ui.small_button(ternarygrid_icons::ic(icon::TRASH)).clicked() {
-                            remove = Some(i);
+                let new_vcol = &mut self.new_vcol;
+                group(ui, Some(tr("Virtual columns")), None, |ui| {
+                    egui::Grid::new("vcols").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
+                        for (i, c) in vt.virtual_columns.iter_mut().enumerate() {
+                            ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(140.0));
+                            ui.add(egui::TextEdit::singleline(&mut c.expression).desired_width(320.0).code_editor());
+                            if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 24.0).clicked() {
+                                remove = Some(i);
+                            }
+                            ui.end_row();
+                        }
+                        ui.add(egui::TextEdit::singleline(&mut new_vcol.0).hint_text(tr("name")).desired_width(180.0));
+                        ui.add(egui::TextEdit::singleline(&mut new_vcol.1).hint_text(tr("expression, e.g. price * quantity")).desired_width(380.0).code_editor());
+                        let ready = !new_vcol.0.trim().is_empty() && !new_vcol.1.trim().is_empty();
+                        if ui.add_enabled_ui(ready, |ui| kit::icon_button_ex(ui, icon::PLUS, tr("Add"), false, 24.0).clicked()).inner {
+                            vt.virtual_columns.push(ternarygrid_config::project::VirtualColumn {
+                                name: new_vcol.0.trim().to_string(),
+                                expression: new_vcol.1.trim().to_string(),
+                                ..Default::default()
+                            });
+                            *new_vcol = (String::new(), String::new());
                         }
                         ui.end_row();
-                    }
-                    ui.add(egui::TextEdit::singleline(&mut self.new_vcol.0).hint_text(tr("name")).desired_width(140.0));
-                    ui.add(egui::TextEdit::singleline(&mut self.new_vcol.1).hint_text(tr("expression, e.g. price * quantity")).desired_width(320.0).code_editor());
-                    if ui.add_enabled(!self.new_vcol.0.trim().is_empty() && !self.new_vcol.1.trim().is_empty(), egui::Button::new(ternarygrid_icons::ic(icon::PLUS))).clicked() {
-                        vt.virtual_columns.push(ternarygrid_config::project::VirtualColumn {
-                            name: self.new_vcol.0.trim().to_string(),
-                            expression: self.new_vcol.1.trim().to_string(),
-                            ..Default::default()
-                        });
-                        self.new_vcol = (String::new(), String::new());
-                    }
-                    ui.end_row();
+                    })
                 });
                 if let Some(i) = remove {
                     vt.virtual_columns.remove(i);
                 }
-                ui.add_space(6.0);
-                if ui.button(RichText::new(format!("{} {}", icon::FLOPPY_DISK, tr("Save virtual model"))).strong()).clicked()
+                ui.add_space(10.0);
+                if kit::primary_icon(ui, icon::FLOPPY_DISK, tr("Save virtual model")).clicked()
                     && let Some(p) = projects
                 {
                     let mut vm = p.virtual_model(&self.conn).unwrap_or_default();
