@@ -8,6 +8,7 @@ use crate::conn::session::SessionHandle;
 use crate::cx::AppContext;
 use crate::tabs::TabView;
 use crate::tabs::dbtools::look::{self, Cell};
+use crate::tabs::transfer::wizard::W;
 use egui::{Align, Layout, Margin, RichText, Ui};
 use egui_phosphor::regular as icon;
 use std::time::{Duration, Instant};
@@ -94,6 +95,8 @@ struct Refresh {
 
 impl Refresh {
     fn ui(&mut self, ui: &mut Ui) -> bool {
+        // The toolbar's pickers are 28 high.
+        ui.spacing_mut().interact_size.y = 28.0;
         let mut now = look::small(ui, kit::Kind::Secondary, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked();
         egui::ComboBox::from_id_salt(ui.next_auto_id())
             .icon(kit::combo_caret)
@@ -125,8 +128,9 @@ fn is_false(v: &str) -> bool {
 /// How a cell of an administration table is drawn, from its column's name.
 fn styled(column: &str, text: String, p: &style::Palette, null_text: &str) -> Cell {
     let c = column.to_ascii_lowercase();
+    // Nothing to show (no wait event, no client address): an empty cell as in the design.
     if text == null_text {
-        return Cell::new(text).color(p.text_faint);
+        return Cell::new("");
     }
     if c == "pid" || c == "id" || c.ends_with("_id") || c == "spid" || c == "session_id" || c.contains("duration") || c == "query" || c == "sql" || c == "info" || c == "mode" {
         return Cell::new(text).mono();
@@ -138,6 +142,20 @@ fn styled(column: &str, text: String, p: &style::Palette, null_text: &str) -> Ce
         return Cell::new(text).color(p.text_muted);
     }
     Cell::new(text)
+}
+
+/// The design's width of a column of the session and lock lists (`None`: a share of the rest).
+fn column_width(column: &str) -> W {
+    match column.to_ascii_lowercase().as_str() {
+        "pid" => W::Px(70.0),
+        "user" | "database" | "granted" | "blocked_by" => W::Px(90.0),
+        "application_name" | "locktype" => W::Px(120.0),
+        "client_addr" => W::Px(100.0),
+        "state" => W::Px(140.0),
+        "wait_event_type" | "relation" | "query_duration" => W::Px(110.0),
+        "mode" => W::Px(160.0),
+        _ => W::Fr(1.0),
+    }
 }
 
 /// The colour of a session state.
@@ -185,7 +203,7 @@ fn kill_dialog(ui: &Ui, id: egui::Id, session: &str, mode: KillMode) -> (bool, b
             let p = style::pal(ui);
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.label(RichText::new(&question).size(13.5));
-            ui.label(RichText::new(explain).color(p.text_muted));
+            ui.label(RichText::new(explain).size(12.5).color(p.text_muted));
         },
         |ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -360,7 +378,8 @@ impl TabView for SessionManagerTab {
                 })
                 .collect();
             let selected_visible = self.selected.as_ref().and_then(|s| index.iter().position(|i| row_id(list, *i).as_ref() == Some(s)));
-            let r = look::table(ui, ("sessions", &self.conn), &headers, &styled_rows, selected_visible);
+            let widths: Vec<W> = list.data.columns.iter().map(|c| column_width(c)).collect();
+            let r = look::table_w(ui, ("sessions", &self.conn), &headers, &styled_rows, selected_visible, &widths);
             if let Some(i) = r.clicked.or(r.context_row) {
                 self.selected = index.get(i).and_then(|i| row_id(list, *i));
             }
@@ -498,7 +517,8 @@ impl TabView for LockManagerTab {
                         .collect()
                 })
                 .collect();
-            look::table(ui, ("locks", &self.conn), &headers, &styled_rows, None);
+            let widths: Vec<W> = list.data.columns.iter().map(|c| column_width(c)).collect();
+            look::table_w(ui, ("locks", &self.conn), &headers, &styled_rows, None, &widths);
         });
         if retry {
             self.refresh.last = None;
@@ -597,7 +617,9 @@ impl TabView for DashboardTab {
             |ui| {
                 look::muted(ui, tr("Sample every"));
                 let mut secs = interval.as_secs_f32();
-                if ui.add_sized([70.0, 24.0], egui::DragValue::new(&mut secs).range(0.5..=60.0).speed(0.1).suffix(" s")).changed() {
+                // "1 s", "0.5 s": no needless decimals.
+                let value = egui::DragValue::new(&mut secs).range(0.5..=60.0).speed(0.1).suffix(" s").custom_formatter(|v, _| format!("{}", (v * 10.0).round() / 10.0));
+                if ui.add_sized([70.0, 28.0], value).changed() {
                     *interval = Duration::from_secs_f32(secs);
                 }
                 kit::vdivider(ui, 18.0);

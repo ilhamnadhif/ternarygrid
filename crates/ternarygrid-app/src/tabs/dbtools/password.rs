@@ -170,7 +170,7 @@ impl TabView for ChangePasswordTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(540.0, 420.0))
+        Some(egui::vec2(540.0, 350.0))
     }
 
     fn title(&self) -> String {
@@ -287,8 +287,8 @@ impl TabView for ChangePasswordTab {
                 let show = self.show;
                 look::row(ui, tr("New password"), lw, |ui| field(ui, &mut self.new_password, show));
                 look::row(ui, tr("Confirm password"), lw, |ui| field(ui, &mut self.confirm, show));
-                look::row(ui, "", lw, |ui| look::checkbox(ui, &mut self.show, tr("Show the password")));
-                look::row(ui, "", lw, |ui| {
+                look::row_top(ui, "", lw, |ui| look::checkbox(ui, &mut self.show, tr("Show the password")));
+                look::row_top(ui, "", lw, |ui| {
                     if saves_password(&cfg) {
                         look::checkbox(ui, &mut self.update_saved, tr("Update the saved password of the connection"));
                     } else {

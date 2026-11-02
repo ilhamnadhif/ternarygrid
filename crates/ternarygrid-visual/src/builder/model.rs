@@ -303,7 +303,7 @@ pub struct QueryModel {
 pub(crate) const QB_HEADER: f32 = 26.0;
 pub(crate) const QB_ROW: f32 = 20.0;
 pub(crate) const QB_FONT: f32 = 12.5;
-const QB_MIN_W: f32 = 170.0;
+const QB_MIN_W: f32 = 210.0;
 const QB_MAX_W: f32 = 340.0;
 
 impl QbTable {

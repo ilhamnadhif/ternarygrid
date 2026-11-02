@@ -401,7 +401,7 @@ impl MaintenanceTab {
             look::muted(ui, tr("Objects:"));
             for t in targets.iter().take(20) {
                 let label = if t.kind == ObjectKind::Database { if t.name.is_empty() { tr("(current database)").to_string() } else { t.name.clone() } } else { t.display_path() };
-                look::chip(ui, Some(crate::nav::kind_icon(t.kind)), &label);
+                look::chip(ui, &label);
             }
             if targets.len() > 20 {
                 look::faint(ui, &trf("… {} more", &[&(targets.len() - 20)]));
@@ -663,7 +663,7 @@ impl TabView for MaintenanceTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(if self.is_truncate() { egui::vec2(620.0, 440.0) } else { egui::vec2(860.0, 580.0) })
+        Some(if self.is_truncate() { egui::vec2(620.0, 330.0) } else { egui::vec2(860.0, 580.0) })
     }
 
     fn title(&self) -> String {

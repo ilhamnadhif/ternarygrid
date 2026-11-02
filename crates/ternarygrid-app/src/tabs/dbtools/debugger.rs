@@ -556,7 +556,10 @@ impl DebuggerTab {
         let p = ternarygrid_ui::pal(ui);
         parts::toolbar(ui, |ui| {
             ui.label(RichText::new(crate::nav::kind_icon(self.routine.kind)).font(ternarygrid_ui::style::icon_font(15.0)).color(p.text_muted));
-            ui.label(RichText::new(self.routine.display_path()).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(p.text));
+            // The signature as in the design: "public.recalc_order_total(bigint)".
+            let types: Vec<&str> = self.args.iter().filter(|a| !a.mode.eq_ignore_ascii_case("OUT")).map(|a| a.data_type.as_str()).collect();
+            let title = if types.is_empty() { self.routine.display_path() } else { format!("{}({})", self.routine.display_path(), types.join(", ")) };
+            ui.label(RichText::new(title).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(p.text));
             if let Loadable::Loaded(d) = &self.def
                 && let Some(l) = &d.language
             {
@@ -627,7 +630,7 @@ impl DebuggerTab {
         let args = &mut self.args;
         ui.add_enabled_ui(editable, |ui| {
             let n = args.len();
-            look::widget_table(ui, id, &[tr("Name"), tr("Value"), "NULL", tr("Expr.")], &[92.0, 104.0, 48.0, 48.0], n, 32.0, |ui, r, c| {
+            look::widget_table(ui, id, &[tr("Name"), tr("Value"), "NULL", tr("Expr.")], &[102.0, 102.0, 44.0, 44.0], n, 30.0, |ui, r, c| {
                 let a = &mut args[r];
                 match c {
                     0 => {
@@ -701,8 +704,7 @@ impl DebuggerTab {
         let gutter_w = 18.0 + 18.0 + number_w;
         let width = gutter_w + self.max_cols as f32 * char_w + 24.0;
         let current = self.state.as_ref().filter(|s| !s.finished).and_then(|s| s.line);
-        let dark = ui.visuals().dark_mode;
-        let current_bg = if dark { egui::Color32::from_rgb(0x4b, 0x44, 0x3b) } else { egui::Color32::from_rgb(0xf3, 0xea, 0xd6) };
+        let current_bg = look::current_line(ui);
         let bp_color = egui::Color32::from_rgb(0xf2, 0x66, 0x5a);
         let can_toggle = self.lines_ok;
         let mut toggled = None;
@@ -765,7 +767,7 @@ impl DebuggerTab {
             let editing = &mut self.editing;
             let id = ("dbg_vars", self.conn.clone());
             egui::ScrollArea::vertical().id_salt(("dbg_vars_scroll", &self.conn)).max_height(ui.available_height() * 0.6).show(ui, |ui| {
-                look::widget_table(ui, id, &[tr("Name"), tr("Type"), tr("Value")], &[116.0, 72.0, 100.0], vars.len(), 30.0, |ui, r, c| {
+                look::widget_table(ui, id, &[tr("Name"), tr("Type"), tr("Value")], &[117.0, 78.0, 97.0], vars.len(), 30.0, |ui, r, c| {
                     let v = &vars[r];
                     match c {
                         0 => {
