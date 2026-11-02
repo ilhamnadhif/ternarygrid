@@ -160,7 +160,7 @@ impl Shots {
         let services = Services::ephemeral(&home.join("home"));
         let conns = ConnectionManager::new(ternarygrid_app::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
         let h = Harness::builder()
-            .with_size(egui::vec2(1400.0, 900.0))
+            .with_size(egui::vec2(1440.0, 900.0))
             .with_pixels_per_point(PPP)
             .with_max_steps(400)
             .with_step_dt(1.0 / 60.0)
@@ -282,7 +282,12 @@ fn ui_snapshots_designer() {
     std::fs::create_dir_all(&root).unwrap();
     let only = std::env::var("TERNARYGRID_SNAPSHOT_ONLY").unwrap_or_default();
     let want = |part: &str| only.is_empty() || only.split(',').any(|p| p == part);
-    for theme in [Theme::Dark, Theme::Light] {
+    let themes: Vec<Theme> = match std::env::var("TERNARYGRID_SNAPSHOT_THEME").as_deref() {
+        Ok("dark") => vec![Theme::Dark],
+        Ok("light") => vec![Theme::Light],
+        _ => vec![Theme::Dark, Theme::Light],
+    };
+    for theme in themes {
         let home = std::env::temp_dir().join(format!("ternarygrid-shots-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&home).unwrap();
         let mut s = Shots::new(&home, root.clone(), theme);
@@ -309,6 +314,8 @@ fn ui_snapshots_designer() {
                 d.add_column("issued_at", "DATETIME", "", true, false);
                 d.add_column("paid_at", "DATETIME", "", false, false);
                 d.add_index("invoice_order_idx", &["order_id"], false);
+                // The mockup's selected row: amount.
+                d.select_column(3);
             }
             s.frames(3);
             s.park_pointer();
@@ -367,6 +374,9 @@ fn ui_snapshots_designer() {
         // The assistant next to an editor: without a key, an answer with its query, running
         // with the history open, a fixed error.
         if want("ai") {
+            // The editor alone (as in the mockups).
+            s.h.state_mut().push_command(AppCommand::CloseAllTabs);
+            s.frames(4);
             s.h.state_mut().push_command(AppCommand::NewSqlEditor {
                 connection: Some(conn.clone()),
                 schema: None,

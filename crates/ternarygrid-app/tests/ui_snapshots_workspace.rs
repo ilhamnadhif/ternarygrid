@@ -443,7 +443,40 @@ fn shots(s: &mut Shots) {
     s.shot("history");
     s.close_tabs();
 
-    // Settings: every section.
+    // Settings: every section, with the values of the mockups.
+    {
+        use ternarygrid_config::settings::{AiEffort, KeywordCase, RowDensity};
+        let st = &mut s.h.state_mut().settings;
+        st.editor.autocomplete.delay_ms = 150;
+        st.editor.autocomplete.insert_single_proposal = false;
+        st.editor.autocomplete.keyword_case = KeywordCase::Lower;
+        st.editor.format.keyword_case = KeywordCase::Lower;
+        st.editor.format.max_line_length = 100;
+        st.results.row_density = RowDensity::Normal;
+        st.results.store_memory_limit_mb = 512;
+        st.results.global_memory_limit_mb = 2048;
+        st.results.max_text_length = 1_000_000;
+        st.results.format.null_text = "NULL".into();
+        st.history.max_entries = 100_000;
+        st.ai.enabled = true;
+        st.ai.max_tokens = 8192;
+        st.ai.effort = AiEffort::Medium;
+        st.ai.model = "claude-opus-5-5".into();
+    }
+    // Network profiles of the mockup.
+    {
+        use ternarygrid_core::config::{NetworkProfile, SshAuth, SshConfig};
+        for (name, host) in [("Office bastion", "bastion.office.example.com"), ("AWS jump host", "jump.aws.example.com"), ("Corporate proxy", "")] {
+            let ssh = (!host.is_empty()).then(|| SshConfig {
+                enabled: true,
+                host: host.into(),
+                user: "ilham".into(),
+                auth: SshAuth::PublicKey { key_path: "~/.ssh/id_ed25519".into() },
+                ..Default::default()
+            });
+            s.h.state_mut().conns.store.set_network_profile(NetworkProfile { id: name.to_lowercase().replace(' ', "-"), name: name.into(), ssh, proxy: None });
+        }
+    }
     s.command(AppCommand::OpenSettings);
     for (section, name) in [
         ("General", "set_general"),
@@ -460,6 +493,12 @@ fn shots(s: &mut Shots) {
         ("Accessibility", "set_a11y"),
     ] {
         s.click(section);
+        s.frames(3);
+        match section {
+            "Connection types" => s.click("Production"),
+            "Network profiles" => s.click("Office bastion"),
+            _ => {}
+        }
         s.frames(3);
         s.shot(name);
         if section == "Network profiles" {

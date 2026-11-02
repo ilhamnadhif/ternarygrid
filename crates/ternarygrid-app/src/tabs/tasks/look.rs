@@ -8,8 +8,8 @@ use egui_extras::{Column, TableBuilder, TableRow};
 use egui_phosphor::regular as icon;
 use ternarygrid_ui::style::{self, RADIUS};
 
-/// Height of a table row (the header is 2 points taller).
-pub const ROW_H: f32 = 30.0;
+/// Height of a table row: 30 points and its hairline (the header: 32 and its line).
+pub const ROW_H: f32 = 31.0;
 
 fn fade(ui: &Ui, c: Color32) -> Color32 {
     if ui.is_enabled() { c } else { c.gamma_multiply(0.45) }
@@ -39,7 +39,7 @@ pub fn checkbox_sub(ui: &mut Ui, on: &mut bool, label: &str, sub: Option<&str>) 
     let line_h = ui.text_style_height(&TextStyle::Body);
     let text_h = title.size().y + sub_g.as_ref().map_or(0.0, |g| g.size().y + 2.0);
     let w = 26.0 + title.size().x.max(sub_g.as_ref().map_or(0.0, |g| g.size().x));
-    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, text_h.max(18.0)), Sense::click());
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, text_h.max(17.0)), Sense::click());
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
@@ -47,7 +47,8 @@ pub fn checkbox_sub(ui: &mut Ui, on: &mut bool, label: &str, sub: Option<&str>) 
     let enabled = ui.is_enabled();
     resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, *on, label));
     if ui.is_rect_visible(rect) {
-        let b = Rect::from_min_size(egui::pos2(rect.left(), rect.top() + ((line_h - 16.0) / 2.0).max(0.0)), vec2(16.0, 16.0));
+        // The box 1 point down from the top of the first line (as in the mockups).
+        let b = Rect::from_min_size(egui::pos2(rect.left(), rect.top() + ((line_h - 16.0) / 2.0).max(0.0) + 1.0), vec2(16.0, 16.0));
         paint_box(ui, b, *on, resp.hovered());
         if resp.has_focus() {
             style::focus_halo(ui, b, 4);
@@ -122,34 +123,143 @@ pub fn radios<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, items: &[(T, &str
     changed
 }
 
-/// A number field at the form height (at least 64 points wide, wider for long numbers),
-/// followed by its unit in muted text.
+/// Height of the mockups' fields (text, number and select boxes).
+pub const FIELD_H: f32 = 30.0;
+
+/// A number field 30 points high and at least 64 wide, its value left-aligned (thousands
+/// grouped while it is not edited), followed 6 points further by its unit in muted text.
+/// Dragging and the arrow keys change it as in egui's `DragValue`.
 pub fn number<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::ops::RangeInclusive<N>, unit: &str) -> Response {
-    let p = ternarygrid_ui::pal(ui);
-    let digits = format!("{}", value.to_f64()).len() as f32;
-    let width = (digits * 8.0 + 26.0).max(64.0);
-    let r = ui.add_sized(vec2(width, style::CONTROL_H), egui::DragValue::new(value).range(range));
-    let unit = unit.trim();
-    if !unit.is_empty() {
-        ui.label(RichText::new(unit).color(p.text_muted));
+    let mut v = value.to_f64();
+    let r = number_dyn(ui, &mut v, range.start().to_f64()..=range.end().to_f64(), N::INTEGRAL, unit, 64.0, FIELD_H, true);
+    if r.changed() {
+        *value = N::from_f64(v);
     }
     r
 }
 
-/// A single-line text field at the form height.
+/// [`number`] `w` wide and `h` high, without a unit (a limit in a toolbar: 70 × 26).
+pub fn number_h<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::ops::RangeInclusive<N>, w: f32, h: f32) -> Response {
+    let mut v = value.to_f64();
+    let r = number_dyn(ui, &mut v, range.start().to_f64()..=range.end().to_f64(), N::INTEGRAL, "", w, h, false);
+    if r.changed() {
+        *value = N::from_f64(v);
+    }
+    r
+}
+
+/// A port: [`number`] 80 points wide, its digits not grouped.
+pub fn port(ui: &mut Ui, value: &mut u16) -> Response {
+    let mut v = f64::from(*value);
+    let r = number_dyn(ui, &mut v, 1.0..=65535.0, true, "", 80.0, FIELD_H, false);
+    if r.changed() {
+        *value = v.round().clamp(1.0, 65535.0) as u16;
+    }
+    r
+}
+
+// Not generic: compiled once for every number type.
+#[allow(clippy::too_many_arguments)]
+fn number_dyn(ui: &mut Ui, v: &mut f64, range: std::ops::RangeInclusive<f64>, integral: bool, unit: &str, min_w: f32, h: f32, group: bool) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    let shown = if group { grouped_number(*v, integral) } else { format!("{v}") };
+    let font = FontId::proportional(13.0);
+    // Tabular figures: every digit in a cell of the same width.
+    let digit_w = 13.0 * 0.63;
+    let glyphs: Vec<_> = shown.chars().map(|c| ui.painter().layout_no_wrap(c.to_string(), font.clone(), p.text)).collect();
+    let cell = |c: char, g: &std::sync::Arc<egui::Galley>| if c.is_ascii_digit() { digit_w } else { g.size().x };
+    let text_w: f32 = shown.chars().zip(&glyphs).map(|(c, g)| cell(c, g)).sum();
+    let width = (text_w + 22.0).max(min_w).ceil();
+    // The value is drawn by hand (left-aligned, grouped) while the field is not edited.
+    let id = ui.next_auto_id();
+    let editing = ui.memory(|m| m.has_focus(id));
+    let saved = (ui.spacing().interact_size, ui.spacing().button_padding, ui.visuals().override_text_color);
+    ui.spacing_mut().interact_size = vec2(width, h);
+    ui.spacing_mut().button_padding = vec2(10.0, ((h - 16.0) / 2.0).max(2.0));
+    if !editing {
+        ui.visuals_mut().override_text_color = Some(Color32::TRANSPARENT);
+    }
+    let mut drag = egui::DragValue::new(v).range(range);
+    if integral {
+        drag = drag.max_decimals(0);
+    }
+    let r = ui.add(drag);
+    ui.spacing_mut().interact_size = saved.0;
+    ui.spacing_mut().button_padding = saved.1;
+    ui.visuals_mut().override_text_color = saved.2;
+    if !editing && ui.is_rect_visible(r.rect) {
+        let mut x = r.rect.left() + 11.0;
+        for (c, g) in shown.chars().zip(glyphs) {
+            let w = cell(c, &g);
+            ui.painter().galley(egui::pos2(x + (w - g.size().x) / 2.0, r.rect.center().y - g.size().y / 2.0), g, fade(ui, p.text));
+            x += w;
+        }
+    }
+    let unit = unit.trim();
+    if !unit.is_empty() {
+        let gap = 6.0 - ui.spacing().item_spacing.x;
+        ui.add_space(gap);
+        ui.label(RichText::new(unit).size(12.5).color(p.text_muted));
+    }
+    r
+}
+
+/// `v` as the settings show it: whole numbers with thousands separators ("100,000").
+pub fn grouped_number(v: f64, integral: bool) -> String {
+    if !integral && v.fract() != 0.0 {
+        return format!("{}", (v * 100.0).round() / 100.0);
+    }
+    let digits = format!("{}", v.round().abs() as u64);
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if v < 0.0 { format!("-{out}") } else { out }
+}
+
+/// A single-line text field 30 points high.
 pub fn text_field(ui: &mut Ui, value: &mut String, width: f32, hint: &str, mono: bool) -> Response {
     let p = ternarygrid_ui::pal(ui);
-    let mut edit = egui::TextEdit::singleline(value).desired_width(width).margin(egui::Margin::symmetric(10, 6)).hint_text(RichText::new(hint).color(p.text_faint));
+    let mut edit = egui::TextEdit::singleline(value)
+        .desired_width(width)
+        .margin(egui::Margin::symmetric(10, 0))
+        .min_size(vec2(0.0, FIELD_H))
+        .vertical_align(egui::Align::Center)
+        .hint_text(RichText::new(hint).color(p.text_faint));
     if mono {
-        edit = edit.font(TextStyle::Monospace);
+        edit = edit.font(FontId::monospace(12.5));
     }
     ui.add(edit)
 }
 
-/// A password field at the form height.
+/// A single-line text field `h` high (26 in toolbars and option rows).
+pub fn text_field_h(ui: &mut Ui, value: &mut String, width: f32, h: f32, hint: &str) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .desired_width(width)
+            .margin(egui::Margin::symmetric(10, 0))
+            .min_size(vec2(0.0, h))
+            .vertical_align(egui::Align::Center)
+            .hint_text(RichText::new(hint).color(p.text_faint)),
+    )
+}
+
+/// A password field 30 points high.
 pub fn password_field(ui: &mut Ui, value: &mut String, width: f32, hint: &str) -> Response {
     let p = ternarygrid_ui::pal(ui);
-    ui.add(egui::TextEdit::singleline(value).password(true).desired_width(width).margin(egui::Margin::symmetric(10, 6)).hint_text(RichText::new(hint).color(p.text_faint)))
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .password(true)
+            .desired_width(width)
+            .margin(egui::Margin::symmetric(10, 0))
+            .min_size(vec2(0.0, FIELD_H))
+            .vertical_align(egui::Align::Center)
+            .hint_text(RichText::new(hint).color(p.text_faint)),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -190,11 +300,16 @@ impl<'a> Col<'a> {
 /// semibold names, striped rows of [`ROW_H`] with hairlines between them. `body` draws a
 /// row's cells with [`cell`] (and may use the row's response for clicks and menus).
 pub fn table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, cols: &[Col], rows: usize, mut body: impl FnMut(&mut TableRow<'_, '_>, usize)) {
-    table_dyn(ui, egui::Id::new(id), cols, rows, &mut body);
+    table_dyn(ui, egui::Id::new(id), cols, rows, ROW_H, &mut body);
+}
+
+/// [`table`] with rows `row_h` high (their hairline included).
+pub fn table_h(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, cols: &[Col], rows: usize, row_h: f32, mut body: impl FnMut(&mut TableRow<'_, '_>, usize)) {
+    table_dyn(ui, egui::Id::new(id), cols, rows, row_h, &mut body);
 }
 
 // The table code is compiled once, not once per caller.
-fn table_dyn(ui: &mut Ui, id: egui::Id, cols: &[Col], rows: usize, body: &mut dyn FnMut(&mut TableRow<'_, '_>, usize)) {
+fn table_dyn(ui: &mut Ui, id: egui::Id, cols: &[Col], rows: usize, row_h: f32, body: &mut dyn FnMut(&mut TableRow<'_, '_>, usize)) {
     let pal = ternarygrid_ui::pal(ui);
     ternarygrid_ui::parts::bordered(ui).show(ui, |ui| {
         ui.scope(|ui| {
@@ -237,7 +352,7 @@ fn table_dyn(ui: &mut Ui, id: egui::Id, cols: &[Col], rows: usize, body: &mut dy
                 }
             })
             .body(|b| {
-                b.rows(ROW_H, rows, |mut row| {
+                b.rows(row_h, rows, |mut row| {
                     let i = row.index();
                     body(&mut row, i);
                 });
@@ -367,30 +482,6 @@ pub fn callout(ui: &mut Ui, tone: ternarygrid_ui::parts::Tone, title: Option<&st
     let w = ui.available_width();
     ui.allocate_ui_with_layout(vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
         ternarygrid_ui::parts::callout(ui, tone, title, body, add);
-    });
-}
-
-/// A callout with content at its right (`right_w` wide, e.g. a button), its text wrapped
-/// before it: the note of the same tone as [`callout`].
-pub fn callout_with(ui: &mut Ui, tone: ternarygrid_ui::parts::Tone, body: &str, right_w: f32, add: impl FnOnce(&mut Ui)) {
-    let p = ternarygrid_ui::pal(ui);
-    let color = tone.color(&p);
-    let fill = tone.fill(ui);
-    let w = ui.available_width();
-    ui.allocate_ui_with_layout(vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-        egui::Frame::new().fill(fill).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin { left: 12, right: 10, top: 9, bottom: 9 }).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(RichText::new(tone.icon()).font(style::icon_font(16.0)).color(color));
-                let text_w = (ui.available_width() - right_w - 12.0).max(80.0);
-                ui.allocate_ui_with_layout(vec2(text_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    ui.set_width(text_w);
-                    ui.add(egui::Label::new(RichText::new(body).color(p.text)).wrap());
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add);
-            });
-        });
     });
 }
 

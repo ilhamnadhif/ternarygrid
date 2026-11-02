@@ -85,12 +85,14 @@ impl TabView for ErrorLogTab {
         let pal = ternarygrid_ui::pal(ui);
         ui.spacing_mut().item_spacing.y = 0.0;
         ternarygrid_ui::parts::toolbar(ui, |ui| {
-            egui::ComboBox::from_id_salt("error_log_level").icon(ternarygrid_ui::kit::combo_caret).width(180.0).selected_text(tr(level_label(self.level))).show_ui(ui, |ui| {
+            // The select at the height of the design's fields.
+            ui.spacing_mut().interact_size.y = 30.0;
+            egui::ComboBox::from_id_salt("error_log_level").icon(ternarygrid_ui::kit::combo_caret).width(190.0).selected_text(tr(level_label(self.level))).show_ui(ui, |ui| {
                 for l in [Level::ERROR, Level::WARN, Level::INFO] {
                     ui.selectable_value(&mut self.level, l, tr(level_label(l)));
                 }
             });
-            ternarygrid_ui::kit::search_field(ui, egui::Id::new("error_log_search"), &mut self.search, tr("Search"), 250.0);
+            ternarygrid_ui::kit::search_field(ui, egui::Id::new("error_log_search"), &mut self.search, tr("Search"), 260.0);
             if ternarygrid_ui::kit::ghost(ui, Some(icon::COPY), tr("Copy")).on_hover_text(tr("Copy the shown entries")).clicked() {
                 let text: Vec<String> = self.visible().iter().rev().map(|e| e.line()).collect();
                 ui.ctx().copy_text(text.join("\n"));
@@ -109,9 +111,13 @@ impl TabView for ErrorLogTab {
             ternarygrid_ui::kit::empty_state(ui, icon::CHECK_CIRCLE, tr("No entries."), tr("Errors and warnings of this session appear here."), |_| {});
             return;
         }
-        let row_h = 30.0;
+        // Rows of 30 and their hairline on the surface colour (the space under them stays the
+        // canvas).
+        let row_h = 31.0;
         let mono = egui::FontId::monospace(12.0);
-        ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, pal.surface);
+        let room = ui.available_rect_before_wrap();
+        let rows_h = (row_h * shown.len() as f32).min(room.height());
+        ui.painter().rect_filled(egui::Rect::from_min_size(room.min, egui::vec2(room.width(), rows_h)), 0.0, pal.surface);
         ternarygrid_ui::kit::show_rows(egui::ScrollArea::both().auto_shrink([false, false]), ui, row_h, shown.len(), |ui, range| {
             for e in &shown[range] {
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
@@ -119,8 +125,12 @@ impl TabView for ErrorLogTab {
                 painter.hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, ternarygrid_ui::soft(pal.border, 0.75)));
                 let cy = rect.center().y;
                 let t = painter.text(egui::pos2(rect.left() + 16.0, cy), egui::Align2::LEFT_CENTER, e.time.format("%H:%M:%S").to_string(), mono.clone(), pal.text_faint);
+                // The level in a bold monospace (drawn twice, half a pixel apart: the
+                // monospace font has no bold face).
                 let level_font = egui::FontId::new(12.0, egui::FontFamily::Monospace);
-                painter.text(egui::pos2(t.right() + 14.0, cy), egui::Align2::LEFT_CENTER, format!("{}", e.level), level_font, level_color(e.level, &pal));
+                for dx in [0.0, 0.35] {
+                    painter.text(egui::pos2(t.right() + 14.0 + dx, cy), egui::Align2::LEFT_CENTER, format!("{}", e.level), level_font.clone(), level_color(e.level, &pal));
+                }
                 let x = t.right() + 14.0 + 62.0;
                 let first = e.message.lines().next().unwrap_or("");
                 let size = ternarygrid_ui::style::body_size(ui.ctx());

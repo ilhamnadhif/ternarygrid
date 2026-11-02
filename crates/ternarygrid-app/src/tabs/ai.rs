@@ -386,10 +386,14 @@ pub fn sql_blocks(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Highlighted, non-wrapping layout of SQL text.
+/// Highlighted, non-wrapping layout of SQL text, 20 points a line.
 fn highlight_job(code: &str, lang: Option<&SqlLanguage>, theme: &EditorTheme, font: egui::FontId) -> egui::text::LayoutJob {
     let tokens = lang.map(|l| l.highlight(code)).unwrap_or_default();
-    crate::sqllang::highlight_job(code, &tokens, theme, font)
+    let mut job = crate::sqllang::highlight_job(code, &tokens, theme, font);
+    for s in &mut job.sections {
+        s.format.line_height = Some(20.0);
+    }
+    job
 }
 
 // -------------------------------------------------------------- the chat
@@ -1118,35 +1122,42 @@ impl AiAssistantTab {
         let mut open: Option<SavedConversation> = None;
         let mut delete: Option<String> = None;
         let mut clear = false;
-        egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            ui.set_width(340.0);
-            ui.spacing_mut().item_spacing.y = 2.0;
-            let saved = self.saved.as_deref().unwrap_or_default();
-            if saved.is_empty() {
-                egui::Frame::new().inner_margin(Margin::same(8)).show(ui, |ui| {
-                    ui.label(RichText::new(tr("No saved conversations")).color(p.text_faint));
-                });
-                return;
-            }
-            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
-                for c in saved {
-                    let when = chrono::DateTime::from_timestamp(c.updated, 0).map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
-                    let conn = c.connection.as_deref().and_then(|id| cx.conns.config(id)).map(|c| c.name.clone()).unwrap_or_default();
-                    let detail = [conn, when].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
-                    match history_item(ui, &c.title, &detail, c.id == self.conversation) {
-                        Some(HistoryClick::Open) => open = Some(c.clone()),
-                        Some(HistoryClick::Delete) => delete = Some(c.id.clone()),
-                        None => {}
+        // As designed: 60 points from the panel's left edge, 9 under the header's hairline.
+        let at = egui::pos2(ui.clip_rect().left() + 60.0, resp.rect.bottom() + 19.0);
+        egui::Popup::from_toggle_button_response(&resp)
+            .anchor(at)
+            .align(egui::RectAlign::BOTTOM_START)
+            .gap(0.0)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_width(340.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let saved = self.saved.as_deref().unwrap_or_default();
+                if saved.is_empty() {
+                    egui::Frame::new().inner_margin(Margin::same(8)).show(ui, |ui| {
+                        ui.label(RichText::new(tr("No saved conversations")).color(p.text_faint));
+                    });
+                    return;
+                }
+                egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                    for c in saved {
+                        let when = chrono::DateTime::from_timestamp(c.updated, 0).map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
+                        let conn = c.connection.as_deref().and_then(|id| cx.conns.config(id)).map(|c| c.name.clone()).unwrap_or_default();
+                        let detail = [conn, when].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+                        match history_item(ui, &c.title, &detail, c.id == self.conversation) {
+                            Some(HistoryClick::Open) => open = Some(c.clone()),
+                            Some(HistoryClick::Delete) => delete = Some(c.id.clone()),
+                            None => {}
+                        }
                     }
+                });
+                let y = ui.cursor().top() + 3.0;
+                ui.painter().hline(ui.max_rect().x_range().shrink(4.0), y, Stroke::new(1.0, p.border));
+                ui.add_space(7.0);
+                if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::TRASH), tr("Clear history"), true).clicked() {
+                    clear = true;
                 }
             });
-            let y = ui.cursor().top() + 3.0;
-            ui.painter().hline(ui.max_rect().x_range().shrink(4.0), y, Stroke::new(1.0, p.border));
-            ui.add_space(7.0);
-            if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::TRASH), tr("Clear history"), true).clicked() {
-                clear = true;
-            }
-        });
         self.history_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
         let store = Self::store(cx);
         let done = if clear {
@@ -1223,8 +1234,12 @@ impl AiAssistantTab {
             AiStatus::Invalid(_) => (tr("The AI settings are incomplete.").to_string(), None),
             AiStatus::Ready => (String::new(), None),
         };
+        // In the middle of the panel: the block's height is measured on the frame before.
+        let height_id = ui.id().with("ai_setup_height");
+        let block_h = ui.data(|d| d.get_temp::<f32>(height_id)).unwrap_or(170.0);
         ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() * 0.3).clamp(20.0, 220.0));
+            ui.add_space(((ui.available_height() - block_h) / 2.0).max(20.0));
+            let top = ui.cursor().top();
             ui.spacing_mut().item_spacing.y = 10.0;
             let (r, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 26.0, p.accent_soft);
@@ -1242,6 +1257,8 @@ impl AiAssistantTab {
             if kit::primary_icon(ui, icon::GEAR, tr("Open settings")).clicked() {
                 cx.push(AppCommand::OpenSettings);
             }
+            let h = ui.min_rect().bottom() - top;
+            ui.data_mut(|d| d.insert_temp(height_id, h));
         });
     }
 
@@ -1273,7 +1290,7 @@ impl AiAssistantTab {
                             if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), true).clicked() {
                                 ui.ctx().copy_text(code.to_string());
                             }
-                            if sql && kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), true).clicked() {
+                            if sql && kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FILE_CODE), tr("Open in SQL editor"), true).clicked() {
                                 self.open_in_editor(cx, code);
                             }
                             if sql
@@ -1288,33 +1305,59 @@ impl AiAssistantTab {
                 },
             );
             parts::hline(ui);
-            egui::Frame::new().inner_margin(Margin { left: 12, right: 12, top: 8, bottom: 0 }).show(ui, |ui| {
-                egui::ScrollArea::horizontal().id_salt(("ai_code", id)).auto_shrink([false, true]).show(ui, |ui| {
-                    let lang = if sql { self.lang.as_ref().map(|(_, l)| l) } else { None };
-                    ui.add(egui::Label::new(highlight_job(code, lang, &theme, FontId::monospace(12.5))).selectable(true).extend());
-                    // Room for the floating scroll bar under the last line.
-                    ui.add_space(9.0);
-                });
+            // Long lines scroll sideways without a bar (as designed, the code is cut at the edge).
+            egui::Frame::new().inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt(("ai_code", id))
+                    .auto_shrink([false, true])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        let lang = if sql { self.lang.as_ref().map(|(_, l)| l) } else { None };
+                        ui.add(egui::Label::new(highlight_job(code, lang, &theme, FontId::monospace(12.5))).selectable(true).extend());
+                    });
             });
         });
     }
 
-    /// A query the assistant ran: one line ("Ran a query · 3 row(s)") over its result and its
-    /// SQL (open at first; the line folds it).
+    /// A query the assistant ran: one line ("Ran a query · 3 row(s)") over its result (open at
+    /// first; the line folds it). Its SQL shows with "SQL" at the right of the line (at once
+    /// when the query failed or returned no columns).
     fn step_ui(&self, ui: &mut Ui, cx: &mut AppContext, step: &ToolStep, id: (u64, usize, usize)) {
         let p = ternarygrid_ui::pal(ui);
         let open_id = egui::Id::new(("ai_step_open", id));
+        let sql_id = egui::Id::new(("ai_step_sql", id));
         let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(true);
+        let mut show_sql = ui.data(|d| d.get_temp::<bool>(sql_id)).unwrap_or(!step.ok || step.columns.is_empty());
         egui::Frame::new().stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 8.0;
             let title = if step.ok { format!("{} · {}", tr("Ran a query"), step.summary) } else { tr("The query did not run").to_string() };
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
             resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, open, &title));
-            if resp.clicked() {
+            // "SQL" at the right end of the line: shows or hides the statement.
+            let sql_g = ui.painter().layout_no_wrap("SQL".to_string(), FontId::proportional(11.5), p.text_faint);
+            let sql_rect = Rect::from_min_max(egui::pos2(rect.right() - sql_g.size().x - 8.0, rect.top()), rect.max);
+            let sql_resp = ui.interact(sql_rect, ui.id().with(("ai_step_sql_btn", id)), Sense::click()).on_hover_text(tr("Show the query"));
+            sql_resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, show_sql, "SQL"));
+            if sql_resp.clicked() {
+                show_sql = !show_sql;
+                open = open || show_sql;
+                ui.data_mut(|d| {
+                    d.insert_temp(sql_id, show_sql);
+                    d.insert_temp(open_id, open);
+                });
+            } else if resp.clicked() {
                 open = !open;
                 ui.data_mut(|d| d.insert_temp(open_id, open));
             }
+            let sql_color = if show_sql {
+                p.accent_text
+            } else if sql_resp.hovered() {
+                p.text
+            } else {
+                p.text_faint
+            };
+            ui.painter().galley(egui::pos2(sql_rect.right() - sql_g.size().x, rect.center().y - sql_g.size().y / 2.0), sql_g, sql_color);
             let painter = ui.painter();
             let cy = rect.center().y;
             let caret = if open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
@@ -1340,7 +1383,9 @@ impl AiAssistantTab {
             } else if !step.columns.is_empty() {
                 result_table(ui, ("ai_step_rows", id), &step.columns, &step.rows);
             }
-            self.code_block(ui, cx, (id.0, id.1, usize::MAX - 1 - id.2, 0), "", &step.sql, true, true);
+            if show_sql {
+                self.code_block(ui, cx, (id.0, id.1, usize::MAX - 1 - id.2, 0), "", &step.sql, true, true);
+            }
         });
     }
 
@@ -1386,9 +1431,9 @@ impl AiAssistantTab {
     /// One question (a bubble at the right) and its answer.
     fn turn_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, ti: usize) {
         let p = ternarygrid_ui::pal(ui);
-        let (action, shown, state, model, usage, truncated, fallback, answer_empty) = {
+        let (shown, state, model, usage, truncated, fallback, answer_empty) = {
             let t = &self.turns[ti];
-            (t.action, t.shown.clone(), t.state.clone(), t.model.clone(), t.usage, t.truncated, t.fallback_from.clone(), t.answer.trim().is_empty())
+            (t.shown.clone(), t.state.clone(), t.model.clone(), t.usage, t.truncated, t.fallback_from.clone(), t.answer.trim().is_empty())
         };
         let (steps, running, after_step) = {
             let t = &self.turns[ti];
@@ -1404,10 +1449,8 @@ impl AiAssistantTab {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         ui.label(RichText::new(icon::USER).size(13.0).color(p.text_muted));
+                        // The question's text names its action ("Fix error: …").
                         ui.label(RichText::new(tr("You")).font(style::semibold(ui.ctx(), 12.5)).color(p.text));
-                        if action != QuickAction::Chat {
-                            ui.label(RichText::new(kit::with_icon(action.icon(), action.label())).size(11.5).color(p.text_faint));
-                        }
                     });
                     let segs = answer_segments(&shown);
                     self.segments_ui(ui, cx, &segs, (self.uid, ti, 0));
@@ -1677,9 +1720,10 @@ enum HistoryClick {
 /// conversation on the accent tint.
 fn history_item(ui: &mut Ui, title: &str, detail: &str, current: bool) -> Option<HistoryClick> {
     let p = ternarygrid_ui::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click());
+    // 8 × 10 of padding, the title's line as tall as the trash button (22), 2, the detail.
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::click());
     resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, current, title));
-    let trash_rect = Rect::from_center_size(egui::pos2(rect.right() - 18.0, rect.top() + 16.0), Vec2::splat(22.0));
+    let trash_rect = Rect::from_center_size(egui::pos2(rect.right() - 21.0, rect.top() + 19.0), Vec2::splat(22.0));
     let trash = ui.interact(trash_rect, resp.id.with("delete"), Sense::click()).on_hover_text(tr("Delete"));
     trash.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, tr("Delete")));
     let resp = resp.on_hover_text(title);
@@ -1694,15 +1738,16 @@ fn history_item(ui: &mut Ui, title: &str, detail: &str, current: bool) -> Option
             painter.rect_filled(trash_rect, CornerRadius::same(style::RADIUS), p.subtle);
         }
         let trash_color = if trash.hovered() { p.text } else { p.text_muted };
-        painter.text(trash_rect.center(), Align2::CENTER_CENTER, icon::TRASH, style::icon_font(12.0), trash_color);
+        painter.text(trash_rect.center(), Align2::CENTER_CENTER, icon::TRASH, style::icon_font(11.0), trash_color);
         let font = if current { style::medium(ui.ctx(), 13.0) } else { FontId::proportional(13.0) };
         let max_w = (rect.width() - 50.0).max(40.0);
         let mut job = egui::text::LayoutJob::simple_singleline(title.to_string(), font, p.text);
         job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
-        painter.galley(egui::pos2(rect.left() + 10.0, rect.top() + 8.0), painter.layout_job(job), p.text);
+        let g = painter.layout_job(job);
+        painter.galley(egui::pos2(rect.left() + 10.0, rect.top() + 19.0 - g.size().y / 2.0), g, p.text);
         let mut job = egui::text::LayoutJob::simple_singleline(detail.to_string(), FontId::proportional(11.5), p.text_faint);
         job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
-        painter.galley(egui::pos2(rect.left() + 10.0, rect.top() + 28.0), painter.layout_job(job), p.text_faint);
+        painter.galley(egui::pos2(rect.left() + 10.0, rect.top() + 32.0), painter.layout_job(job), p.text_faint);
     }
     if trash.clicked() {
         Some(HistoryClick::Delete)
@@ -1717,7 +1762,8 @@ fn history_item(ui: &mut Ui, title: &str, detail: &str, current: bool) -> Option
 fn result_table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, columns: &[String], rows: &[Vec<String>]) {
     let p = ternarygrid_ui::pal(ui);
     let numeric: Vec<bool> = (0..columns.len()).map(|i| !rows.is_empty() && rows.iter().all(|r| r.get(i).is_some_and(|v| looks_numeric(v)))).collect();
-    let (head_h, row_h) = (28.0, 26.0);
+    // The design's table: a 32 point header and rows of 26, each with its hairline.
+    let (head_h, row_h) = (33.0, 27.0);
     parts::bordered(ui).show(ui, |ui| {
         let r = ui.max_rect();
         let band = Rect::from_min_size(r.min, vec2(r.width(), head_h));
@@ -1726,6 +1772,7 @@ fn result_table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, columns
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
         egui::ScrollArea::horizontal().id_salt(("ai_rows_h", &id)).auto_shrink([false, true]).show(ui, |ui| {
+            let room = ui.available_width();
             let mut tb = egui_extras::TableBuilder::new(ui)
                 .id_salt(("ai_rows", &id))
                 .striped(true)
@@ -1733,8 +1780,25 @@ fn result_table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, columns
                 .max_scroll_height(220.0)
                 .vscroll(rows.len() > 8)
                 .cell_layout(Layout::left_to_right(Align::Center));
-            for _ in columns {
-                tb = tb.column(egui_extras::Column::remainder().at_least(70.0).clip(true));
+            // The first column 1.4 shares, numbers in the middle 0.6, the others 1 (as designed).
+            let weights: Vec<f32> = (0..columns.len())
+                .map(|i| {
+                    if i == 0 {
+                        1.4
+                    } else if numeric[i] && i + 1 < columns.len() {
+                        0.6
+                    } else {
+                        1.0
+                    }
+                })
+                .collect();
+            let total: f32 = weights.iter().sum();
+            for (i, w) in weights.iter().enumerate() {
+                tb = if i + 1 == weights.len() {
+                    tb.column(egui_extras::Column::remainder().at_least(60.0).clip(true))
+                } else {
+                    tb.column(egui_extras::Column::exact((room * w / total).floor().max(60.0)).clip(true))
+                };
             }
             let cell = |ui: &mut Ui, text: RichText, right: bool| {
                 let layout = if right { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
@@ -1754,7 +1818,11 @@ fn result_table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, columns
                     let Some(values) = rows.get(row.index()) else { return };
                     for (i, _) in columns.iter().enumerate() {
                         let v = values.get(i).map(String::as_str).unwrap_or("");
-                        row.col(|ui| cell(ui, RichText::new(v).size(12.5).color(p.text), numeric[i]));
+                        row.col(|ui| {
+                            let r = ui.max_rect();
+                            ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, ternarygrid_ui::soft(p.border, 0.75)));
+                            cell(ui, RichText::new(v).size(13.0).color(p.text), numeric[i]);
+                        });
                     }
                 });
             });

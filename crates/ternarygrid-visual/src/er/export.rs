@@ -4,8 +4,8 @@
 
 use super::diagram::{ErDiagram, Notation};
 use super::geometry::{
-    COMMENT_FONT, COMMENT_HEIGHT, CORNER_RADIUS, HEADER_FONT, HEADER_HEIGHT, PAD_X, ROW_FONT,
-    ROW_HEIGHT, SCHEMA_FONT,
+    COMMENT_FONT, COMMENT_HEIGHT, CORNER_RADIUS, HEADER_FONT, HEADER_HEIGHT, HEADER_ICON_WIDTH,
+    PAD_X, ROW_FONT, ROW_HEIGHT, SCHEMA_FONT,
 };
 use super::model::{DiffStatus, ErRelation, ErTable, ErTableKind};
 use super::scene::{ErScene, Route};
@@ -285,7 +285,7 @@ fn table_box(
     } else {
         table_icon(doc, icon_c, EXPORT.type_text);
     }
-    let name_x = rect.left() + PAD_X + 18.0;
+    let name_x = rect.left() + PAD_X + HEADER_ICON_WIDTH;
     let schema_w = t
         .schema
         .as_deref()

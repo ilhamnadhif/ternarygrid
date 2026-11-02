@@ -1754,7 +1754,7 @@ impl eframe::App for TernaryGridApp {
             let max = (ui.available_width() - 640.0).clamp(320.0, 720.0);
             let pal = ternarygrid_ui::pal(ui);
             let frame = egui::Frame::new().fill(pal.canvas);
-            egui::Panel::right("ternarygrid_ai").resizable(true).default_size(440.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
+            egui::Panel::right("ternarygrid_ai").resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
                 // Header: the sparkle, the name and ×, over a hairline.
                 egui::Frame::new().inner_margin(egui::Margin { left: 14, right: 8, top: 6, bottom: 6 }).show(ui, |ui| {
                     ui.horizontal(|ui| {

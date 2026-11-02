@@ -81,7 +81,18 @@ fn when(t: DateTime<Local>) -> String {
 
 fn run_duration(run: &TaskRun) -> String {
     let end = run.finished.unwrap_or_else(chrono::Utc::now);
-    crate::widgets::format_duration((end - run.started).to_std().unwrap_or_default())
+    short_duration((end - run.started).to_std().unwrap_or_default())
+}
+
+/// A run's length as the task list shows it: "850 ms", "41s", "1m 12s", "2h 5m".
+fn short_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0 => format!("{} ms", d.as_millis()),
+        1..60 => format!("{s}s"),
+        60..3600 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, s % 3600 / 60),
+    }
 }
 
 fn in_folder(t: &TaskDef, folder: &str) -> bool {
@@ -826,12 +837,13 @@ impl TasksTab {
         }
         egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 0 }).show(ui, |ui| {
             let text = tr("Scheduled runs are turned off: tasks run only when you start them (or through the system scheduler). Turn on \"Run scheduled tasks while TernaryGrid is open\" in the settings.");
-            let bw = kit::button_width(ui, Some(icon::GEAR), tr("Open settings"), true);
-            look::callout_with(ui, Tone::Warning, text, bw, |ui| {
-                if kit::button_ex(ui, Kind::Secondary, Some(icon::GEAR), tr("Open settings"), true).clicked() {
-                    cx.push(AppCommand::OpenSettings);
-                }
-            });
+            // The note itself opens the settings (the design has no button in it).
+            let w = ui.available_width();
+            let r = ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| ternarygrid_ui::parts::callout(ui, Tone::Warning, None, text, |_| {})).inner;
+            let r = r.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tr("Open settings"));
+            if r.clicked() {
+                cx.push(AppCommand::OpenSettings);
+            }
         });
     }
 
@@ -884,7 +896,7 @@ impl TasksTab {
             }
             kit::vdivider(ui, 18.0);
             let export_label = if any { tr("Export selected…") } else { tr("Export all…") };
-            if ghost(ui, !self.tasks.is_empty(), Some(icon::UPLOAD_SIMPLE), export_label).clicked() {
+            if ghost(ui, !self.tasks.is_empty(), Some(icon::EXPORT), export_label).clicked() {
                 self.export(cx, sel.clone());
             }
             if ghost(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import…")).clicked() {
@@ -927,10 +939,10 @@ impl TasksTab {
                 }
             });
         });
-        ui.add_space(4.0);
         let folders = self.folders.clone();
         egui::ScrollArea::vertical().id_salt("tasks_folders").auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
+            // Rows of 26 points edge to edge.
+            ui.spacing_mut().item_spacing.y = 0.0;
             let total = self.tasks.len().to_string();
             if look::tree_row(ui, 0, None, icon::LIST_CHECKS, tr("All tasks"), Some(&total), self.folder.is_none(), false).resp.clicked() {
                 self.folder = None;
@@ -1066,7 +1078,7 @@ impl TasksTab {
             look::cell(row, false, |ui| {
                 if let Some(r) = running.get(&t.id) {
                     let elapsed = (chrono::Utc::now() - r.started).to_std().unwrap_or_default();
-                    let mut text = format!("{} {}", tr("Running"), crate::widgets::format_duration(elapsed));
+                    let mut text = format!("{} {}", tr("Running"), short_duration(elapsed));
                     if let Some(p) = self.progress.get(&r.run_id) {
                         match p.total {
                             Some(total) if total > 0 => text.push_str(&format!(" · {}/{}", p.done, total)),
@@ -1201,12 +1213,13 @@ impl TasksTab {
         let shown = self.selected_run.clone().filter(|id| self.history.iter().any(|r| &r.run_id == id)).unwrap_or_else(|| self.history[0].run_id.clone());
         let mut clicked = None;
         let width = ui.available_width();
+        // The runs and the selected run's details share the row 1.3 : 1, 16 points apart.
         let runs_frame = egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 8, top: 0, bottom: 10 });
-        egui::Panel::left(egui::Id::new("tasks_history_runs")).resizable(true).default_size(width * 0.56).frame(runs_frame).show(ui, |ui| {
+        egui::Panel::left(egui::Id::new("tasks_history_runs")).resizable(true).default_size(((width - 16.0) * 1.3 / 2.3).floor() + 8.0).frame(runs_frame).show(ui, |ui| {
             let cols = [
                 look::Col::new(tr("Status"), look::Width::Initial(100.0)),
                 look::Col::new(tr("Trigger"), look::Width::Initial(100.0)),
-                look::Col::new(tr("Started"), look::Width::Initial(150.0)),
+                look::Col::new(tr("Started"), look::Width::Initial(160.0)),
                 look::Col::new(tr("Duration"), look::Width::Initial(80.0)),
                 look::Col::new(tr("Message"), look::Width::Rest(100.0)),
             ];
@@ -1237,7 +1250,7 @@ impl TasksTab {
         if let Some(id) = clicked {
             self.selected_run = Some(id);
         }
-        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin { left: 10, right: 0, top: 0, bottom: 10 })).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 })).show(ui, |ui| {
             if let Some(run) = self.history.iter().find(|r| r.run_id == shown).cloned() {
                 self.run_details_ui(ui, cx, &run);
             }
@@ -1315,7 +1328,7 @@ impl TasksTab {
         if run.dropped_messages > 0 {
             ui.label(RichText::new(trf("{} message(s) were dropped from the middle of the log", &[&run.dropped_messages])).size(12.0).color(pal.text_faint));
         }
-        egui::ScrollArea::both().id_salt(("task_run_messages", &run.run_id)).auto_shrink([false, false]).stick_to_bottom(run.status == RunStatus::Running).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(("task_run_messages", &run.run_id)).auto_shrink([false, false]).stick_to_bottom(run.status == RunStatus::Running).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             if run.messages.is_empty() {
                 ui.label(RichText::new("—").color(pal.text_faint));
@@ -1327,7 +1340,10 @@ impl TasksTab {
                     MessageLevel::Error => pal.err,
                 };
                 let line = format!("{}  {}", m.time.with_timezone(&Local).format("%H:%M:%S"), m.text);
-                ui.add(egui::Label::new(look::mono(ui, &line, c).size(11.5)).extend());
+                let r = ui.add(egui::Label::new(look::mono(ui, &line, c).size(11.5)).truncate());
+                if r.hovered() && ui.fonts_mut(|f| f.layout_no_wrap(line.clone(), egui::FontId::monospace(11.5), c).size().x) > r.rect.width() + 1.0 {
+                    r.on_hover_text(&line);
+                }
             }
         });
     }
@@ -1480,12 +1496,11 @@ impl TabView for TasksTab {
         let plain = egui::Frame::new().fill(p.canvas);
         egui::Panel::left(egui::Id::new("tasks_folder_panel")).resizable(true).default_size(210.0).frame(plain).show(ui, |ui| self.folders_ui(ui, cx));
         let history = egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin { left: 16, right: 16, top: 2, bottom: 0 });
-        egui::Panel::bottom(egui::Id::new("tasks_history_panel"))
-            .resizable(true)
-            .default_size((ui.available_height() * 0.42).clamp(160.0, 300.0))
-            .size_range(100.0..=f32::INFINITY)
-            .frame(history)
-            .show(ui, |ui| self.history_ui(ui, cx));
+        egui::Panel::bottom(egui::Id::new("tasks_history_panel")).resizable(true).default_size(300.0).size_range(100.0..=f32::INFINITY).frame(history).show(ui, |ui| {
+            // The panel keeps its height (egui's panels shrink to their contents).
+            ui.set_min_height(ui.max_rect().height());
+            self.history_ui(ui, cx)
+        });
         let list = egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin::symmetric(16, 12));
         egui::CentralPanel::default().frame(list).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
