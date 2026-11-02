@@ -4,7 +4,7 @@
 
 use super::wizard::{self, Clicked, W, line};
 use super::{
-    MessageLog, Running, combo, connection_name, error_text, next_uid, not_connected, number_edit, on_error_options, opt_number, parsed_edit, progress_ui, reload_table_def,
+    MessageLog, Running, combo_w, connection_name, error_text, next_uid, not_connected, number_edit, on_error_options, opt_number, parsed_edit, progress_ui, reload_table_def,
     section, table_def_of,
 };
 use crate::command::AppCommand;
@@ -203,21 +203,27 @@ impl MockDataTab {
         let id = self.uid;
         let c = &mut self.config;
         wizard::form(ui, ("mock_settings", id), 2, 120.0, |f| {
-            f.row(tr("Rows"), |ui| ui.add(egui::DragValue::new(&mut c.rows).range(1..=100_000_000).speed(10.0)));
-            f.row(tr("Rows per batch"), |ui| ui.add(egui::DragValue::new(&mut c.batch_size).range(1..=100_000)));
+            f.row(tr("Rows"), |ui| wizard::number(ui, &mut c.rows, 1..=100_000_000, 120.0));
+            f.row(tr("Rows per batch"), |ui| wizard::number(ui, &mut c.batch_size, 1..=100_000, 120.0));
             f.row(tr("Seed"), |ui| {
                 opt_number(ui, &mut c.seed, tr("random"));
                 wizard::faint(ui, tr("same seed, same data"));
             });
+            // The selects fill their column.
             f.row(tr("Existing rows"), |ui| {
-                combo(
+                let w = ui.available_width();
+                combo_w(
                     ui,
                     ("mock_mode", id),
                     &mut c.mode,
                     &[(MockMode::Append, tr("Keep them and add the new rows").to_string()), (MockMode::TruncateFirst, tr("Delete them first").to_string())],
+                    w,
                 )
             });
-            f.row(tr("On error"), |ui| combo(ui, ("mock_err", id), &mut c.on_error, &on_error_options()));
+            f.row(tr("On error"), |ui| {
+                let w = ui.available_width();
+                combo_w(ui, ("mock_err", id), &mut c.on_error, &on_error_options(), w)
+            });
         });
     }
 
@@ -237,12 +243,12 @@ impl MockDataTab {
         }
         let p = ternarygrid_ui::pal(ui);
         let cols = [
-            wizard::col(tr("Column"), W::Px(110.0)),
-            wizard::col(tr("Type"), W::Px(140.0)),
-            wizard::col(tr("Generator"), W::Px(224.0)),
-            wizard::col(tr("Settings"), W::Min(340.0)),
-            wizard::col(tr("NULL"), W::Px(70.0)),
-            wizard::col(tr("Unique"), W::Px(64.0)),
+            wizard::col(tr("Column"), W::Px(130.0)),
+            wizard::col(tr("Type"), W::Px(170.0)),
+            wizard::col(tr("Generator"), W::Px(230.0)),
+            wizard::col(tr("Settings"), W::Min(200.0)),
+            wizard::col(tr("NULL"), W::Px(60.0)),
+            wizard::col(tr("Unique"), W::Px(60.0)),
         ];
         let (auto, generators) = (&self.auto, &mut self.config.generators);
         wizard::table(
@@ -277,14 +283,16 @@ impl MockDataTab {
                         generator_combo(ui, (id, i), col, &mut g.generator, auto.as_ref());
                     }
                     3 => params_ui(ui, &mut g.generator),
-                    4 => {
-                        ui.add_enabled_ui(col.nullable && g.generator != GeneratorKind::Skip, |ui| {
+                    // The share of NULLs, for the columns that can be NULL.
+                    4 if col.nullable => {
+                        ui.add_enabled_ui(g.generator != GeneratorKind::Skip, |ui| {
                             let mut percent = (g.null_ratio * 100.0).round();
                             if ui.add(egui::DragValue::new(&mut percent).range(0.0..=100.0).suffix(" %")).changed() {
                                 g.null_ratio = (percent / 100.0).clamp(0.0, 1.0);
                             }
                         });
                     }
+                    4 => {}
                     _ => {
                         let textual = col.kind.is_textual() || matches!(col.kind, ternarygrid_core::DataKind::Enum);
                         ui.add_enabled_ui(textual && g.generator != GeneratorKind::Skip, |ui| {
@@ -296,7 +304,8 @@ impl MockDataTab {
         );
     }
 
-    /// The result of the last run; returns true when "Change settings" was clicked.
+    /// The result of the last run and its messages; returns true when "Change settings" was
+    /// clicked.
     fn result_ui(&mut self, ui: &mut Ui) -> bool {
         let p = ternarygrid_ui::pal(ui);
         match &self.result {
@@ -310,7 +319,7 @@ impl MockDataTab {
                 if !s.errors.is_empty() {
                     section(ui, tr("Rejected rows"));
                     ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.spacing_mut().item_spacing.y = 5.5;
                         for e in s.errors.iter().take(100) {
                             ui.add(egui::Label::new(RichText::new(trf("Row {}: {}", &[&e.row, &e.message])).monospace().size(11.5).color(p.err)).wrap());
                         }
@@ -323,6 +332,7 @@ impl MockDataTab {
             }
             None => return false,
         }
+        self.log.ui(ui, ("mock_log", self.uid), 200.0);
         kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked()
     }
 
@@ -359,7 +369,8 @@ impl MockDataTab {
 }
 
 fn describe(s: &MockSummary) -> String {
-    if s.rows_failed > 0 { trf("{} rows generated, {} rejected", &[&s.rows_inserted, &s.rows_failed]) } else { trf("{} rows generated", &[&s.rows_inserted]) }
+    let inserted = super::group(s.rows_inserted);
+    if s.rows_failed > 0 { trf("{} rows generated, {} rejected", &[&inserted, &super::group(s.rows_failed)]) } else { trf("{} rows generated", &[&inserted]) }
 }
 
 /// Generators offered for a column, with their default settings.
@@ -538,15 +549,16 @@ impl TabView for MockDataTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(1020.0, 640.0))
+        // No steps: the design's window is 50 lower than the wizards with steps.
+        Some(wizard::WINDOW - egui::vec2(0.0, 50.0))
     }
 
     fn title(&self) -> String {
-        trf("Mock data: {}", &[&self.table.name])
+        trf("Mock data: {}", &[&self.table.display_path()])
     }
 
     fn icon(&self) -> &'static str {
-        icon::SHUFFLE
+        icon::MAGIC_WAND
     }
 
     fn connection_id(&self) -> Option<&str> {
@@ -564,7 +576,7 @@ impl TabView for MockDataTab {
         if !cx.popup {
             wizard::top_panel(ui, egui::Id::new(("mock_top", uid)), |ui| {
                 ui.horizontal(|ui| {
-                    crate::widgets::icon_heading(ui, icon::SHUFFLE, tr("Generate mock data"));
+                    crate::widgets::icon_heading(ui, icon::MAGIC_WAND, tr("Generate mock data"));
                     ui.label(RichText::new(self.table.display_path()).strong());
                     ui.weak(connection_name(cx, &self.conn));
                 });
@@ -573,7 +585,9 @@ impl TabView for MockDataTab {
         wizard::bottom_panel(ui, egui::Id::new(("mock_bottom", uid)), |ui| {
             let running = self.run.is_some();
             let ok = self.validate().is_ok() && !running;
-            let footer = wizard::Footer { back: None, next: None, run: (tr("Generate"), ok), save: None, error: self.error.as_deref() };
+            // Saving as a task is shown as in the design but not offered (no task runs mock data).
+            let save = Some((false, Some(tr("Mock data generation cannot be saved as a task."))));
+            let footer = wizard::Footer { back: None, next: None, run: (tr("Generate"), ok), save, error: self.error.as_deref() };
             if wizard::footer(ui, &footer) == Some(Clicked::Run) {
                 if self.config.mode == MockMode::TruncateFirst {
                     self.confirm = true;
@@ -617,7 +631,6 @@ impl TabView for MockDataTab {
                 if self.result_ui(ui) {
                     self.result = None;
                 }
-                self.log.ui(ui, ("mock_log", uid), 200.0);
                 return;
             }
             section(ui, tr("Settings"));

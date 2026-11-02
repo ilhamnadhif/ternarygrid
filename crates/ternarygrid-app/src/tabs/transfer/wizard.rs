@@ -3,19 +3,21 @@
 //! chrome colour, form grids with a muted label column, bordered tables, folding cards, check
 //! boxes and radio buttons, the progress block and the message log.
 
-use egui::{
-    Align, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
-};
+use crate::tabs::dbtools::look;
+use egui::{Align, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, Response, RichText, Sense, Stroke, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType, pos2, vec2};
 use egui_phosphor::regular as icon;
 use ternarygrid_core::tr;
 use ternarygrid_ui::kit::{self, Kind};
 use ternarygrid_ui::parts::{self, Tone};
 use ternarygrid_ui::style;
 
+/// The size of a wizard's window: the design's 940 × 645 (the pop-up adds its header).
+pub(crate) const WINDOW: Vec2 = vec2(940.0, 620.0);
+
 /// Space between the parts of a section.
 pub(crate) const GAP: f32 = 10.0;
-/// Padding of text fields (28 px high, like the other controls).
-pub(crate) const INPUT_MARGIN: Margin = Margin::symmetric(8, 6);
+/// Padding of multi-line text fields.
+pub(crate) const INPUT_MARGIN: Margin = Margin::symmetric(10, 6);
 
 // ------------------------------------------------------------------ frame
 
@@ -158,15 +160,24 @@ pub(crate) fn footer(ui: &mut Ui, f: &Footer) -> Option<Clicked> {
 
 /// A section title (13 px semibold); space above it unless it opens the page.
 pub(crate) fn section(ui: &mut Ui, text: &str) {
-    section_with(ui, text, |_| {});
+    section_dyn(ui, text, 0.0, &mut |_| {});
 }
 
-/// A section title with content at its right (buttons, counts).
+/// A section title with small buttons at its right (a 26 px row). Sections are 16 apart (the
+/// gap of the body's parts), their parts 10.
 pub(crate) fn section_with(ui: &mut Ui, text: &str, right: impl FnOnce(&mut Ui)) {
-    if ui.min_rect().height() > 1.0 {
-        ui.add_space(6.0);
+    section_dyn(ui, text, 26.0, &mut once(right));
+}
+
+fn section_dyn(ui: &mut Ui, text: &str, h: f32, right: &mut dyn FnMut(&mut Ui)) {
+    if ui.cursor().top() > ui.max_rect().top() + 1.0 {
+        ui.add_space(16.0 - GAP);
     }
-    parts::section_header(ui, text, right);
+    // As high as its text (or the buttons at its right), not as a form control.
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = h;
+        parts::section_header(ui, text, right);
+    });
 }
 
 /// The title of a running or finished step ("Exporting…").
@@ -194,6 +205,12 @@ pub(crate) fn muted(ui: &mut Ui, text: &str) -> Response {
     ui.add(egui::Label::new(RichText::new(text).size(12.5).color(p.text_muted)).wrap())
 }
 
+/// The explanation under a form row's control (12 px, muted).
+pub(crate) fn sub(ui: &mut Ui, text: &str) -> Response {
+    let p = style::pal(ui);
+    ui.add(egui::Label::new(RichText::new(text).size(12.0).color(p.text_muted)).wrap())
+}
+
 /// Faint text (hints next to controls, counts).
 pub(crate) fn faint(ui: &mut Ui, text: &str) -> Response {
     let p = style::pal(ui);
@@ -217,11 +234,90 @@ pub(crate) fn tone_text(ui: &mut Ui, tone: Tone, text: &str) -> Response {
     ui.add(egui::Label::new(RichText::new(text).size(12.5).color(tone.color(&p))).truncate())
 }
 
+// ------------------------------------------------------------------ progress
+
+/// A progress bar `h` high across the rest of the row: the accent on the subtle track.
+pub(crate) fn bar(ui: &mut Ui, frac: f32, h: f32) {
+    let p = style::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    let r = CornerRadius::same((h / 2.0) as u8);
+    ui.painter().rect_filled(rect, r, p.subtle);
+    let done = Rect::from_min_size(rect.min, vec2(rect.width() * frac.clamp(0.0, 1.0), h));
+    if done.width() > 0.5 {
+        ui.painter().rect_filled(done, r, p.accent);
+    }
+}
+
+/// The counters of a run in two columns (24 apart): a muted label 100 wide, rows 6 apart.
+pub(crate) fn fact_grid(ui: &mut Ui, facts: &[(&str, String, Option<Color32>)]) {
+    fact_rows(ui, facts, 2, 100.0, 6.0);
+}
+
+/// Read-only form rows in `cols` columns (24 apart): a muted label `label_w` wide, 16 from its
+/// value; rows 22 high and `gap` apart, the label 6 lower than the value (as the design's form
+/// rows whose control is plain text).
+fn fact_rows(ui: &mut Ui, facts: &[(&str, String, Option<Color32>)], cols: usize, label_w: f32, gap: f32) {
+    let p = style::pal(ui);
+    let (left, top, w) = (ui.cursor().left(), ui.cursor().top(), ui.available_width());
+    let col_w = (w - 24.0 * (cols - 1) as f32) / cols as f32;
+    let pitch = 22.0 + gap;
+    for (i, (label, value, color)) in facts.iter().enumerate() {
+        let x = left + (i % cols) as f32 * (col_w + 24.0);
+        let y = top + (i / cols) as f32 * pitch;
+        put_left(ui, Rect::from_min_size(pos2(x, y + 6.0), vec2(label_w, 16.0)), egui::Label::new(RichText::new(*label).color(p.text_muted)).truncate());
+        let shown = egui::Label::new(RichText::new(value).color(color.unwrap_or(p.text))).truncate();
+        put_left(ui, Rect::from_min_size(pos2(x + label_w + 16.0, y), vec2(col_w - label_w - 16.0, 16.0)), shown);
+    }
+    let h = (facts.len().div_ceil(cols) as f32 * pitch - gap).max(0.0);
+    ui.advance_cursor_after_rect(Rect::from_min_size(pos2(left, top), vec2(w, h)));
+}
+
+/// `label` at the left of `rect` (`Ui::put` centres it).
+fn put_left(ui: &mut Ui, rect: Rect, label: egui::Label) {
+    ui.scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Min)), |ui| ui.add(label));
+}
+
+// ------------------------------------------------------------------ rows
+
+/// A hairline across the body, 16 from the parts above and below it.
+pub(crate) fn divider(ui: &mut Ui) {
+    ui.add_space(16.0 - GAP);
+    parts::hline(ui);
+    ui.add_space(16.0);
+}
+
+/// A row as high as its content (buttons, check boxes), its parts 8 apart.
+pub(crate) fn tight_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    row_dyn(ui, 0.0, 8.0, &mut once(add));
+}
+
+/// The bar above a list of tables to add: 28 px controls, 8 apart.
+pub(crate) fn picker_bar(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    row_dyn(ui, 28.0, 8.0, &mut once(add));
+}
+
+/// A row of controls `h` high (0: as high as they are), `gap` apart.
+pub(crate) fn row_dyn(ui: &mut Ui, h: f32, gap: f32, add: &mut dyn FnMut(&mut Ui)) {
+    // A horizontal row starts as high as `interact_size.y` of the ui it is in.
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = h;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            add(ui)
+        });
+    });
+}
+
 // ------------------------------------------------------------------ controls
+
+/// `edit` exactly `h` high with its text centred and 10 px at the sides (the design's fields).
+pub(crate) fn fit(edit: egui::TextEdit<'_>, h: f32) -> egui::TextEdit<'_> {
+    edit.margin(Margin::symmetric(10, 0)).min_size(vec2(0.0, h)).vertical_align(Align::Center)
+}
 
 /// A single-line text field as tall as the other controls.
 pub(crate) fn line(text: &mut dyn egui::TextBuffer) -> egui::TextEdit<'_> {
-    egui::TextEdit::singleline(text).margin(INPUT_MARGIN)
+    fit(egui::TextEdit::singleline(text), style::CONTROL_H)
 }
 
 /// [`line`] in the monospace font, `width` wide.
@@ -229,37 +325,28 @@ pub(crate) fn mono_line(text: &mut dyn egui::TextBuffer, width: f32) -> egui::Te
     line(text).font(egui::TextStyle::Monospace).desired_width(width)
 }
 
-/// A check box drawn like the mockups: an accent box with a white check when on.
+/// A whole number in a field `width` wide, shown with thousands separators (it can also be
+/// dragged).
+pub(crate) fn number<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range: std::ops::RangeInclusive<T>, width: f32) -> Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.x = width;
+        ui.add(
+            egui::DragValue::new(value)
+                .range(range)
+                .custom_formatter(|n, _| super::group(n.max(0.0).round() as u64))
+                .custom_parser(|s| s.replace(',', "").trim().parse::<f64>().ok()),
+        )
+    })
+    .inner
+}
+
+/// A check box of the design (the kit's); without a label it is the smaller check box of a
+/// table cell.
 pub(crate) fn check(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
-    let p = style::pal(ui);
-    let enabled = ui.is_enabled();
-    let galley = (!label.is_empty()).then(|| ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(style::body_size(ui.ctx())), Color32::PLACEHOLDER));
-    let w = 16.0 + galley.as_ref().map_or(0.0, |g| 9.0 + g.size().x);
-    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, 18.0), Sense::click());
-    if resp.clicked() {
-        *on = !*on;
-        resp.mark_changed();
+    if label.is_empty() {
+        return look::cell_check(ui, on, "");
     }
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, *on, label));
-    if ui.is_rect_visible(rect) {
-        let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
-        let b = Rect::from_center_size(pos2(rect.left() + 8.0, rect.center().y), vec2(16.0, 16.0));
-        let hovered = enabled && resp.hovered();
-        if *on {
-            ui.painter().rect_filled(b, CornerRadius::same(4), fade(if hovered { p.accent_hover } else { p.accent }));
-            let pts = vec![pos2(b.left() + 4.0, b.center().y + 0.2), pos2(b.left() + 6.9, b.center().y + 3.0), pos2(b.right() - 3.8, b.center().y - 2.8)];
-            ui.painter().add(Shape::line(pts, Stroke::new(1.9, fade(p.on_accent))));
-        } else {
-            ui.painter().rect(b, CornerRadius::same(4), p.surface, Stroke::new(1.5, fade(if hovered { p.accent } else { p.border_strong })), StrokeKind::Inside);
-        }
-        if resp.has_focus() {
-            style::focus_halo(ui, b, 4);
-        }
-        if let Some(g) = galley {
-            ui.painter().galley(pos2(b.right() + 9.0, rect.center().y - g.size().y / 2.0), g, fade(p.text));
-        }
-    }
-    resp
+    kit::checkbox(ui, on, label)
 }
 
 /// A radio button drawn like the mockups: an accent ring with a dot when selected.
@@ -306,11 +393,13 @@ pub(crate) fn prefixed_opt_text(ui: &mut Ui, value: &mut Option<String>, prefix:
     let font = egui::FontId::monospace(11.5);
     let pg = ui.painter().layout_no_wrap(prefix.to_string(), font, p.accent_text);
     let mut s = value.clone().unwrap_or_default();
-    let edit = egui::TextEdit::singleline(&mut s)
-        .font(egui::TextStyle::Monospace)
-        .hint_text(RichText::new(hint).monospace().color(p.text_faint))
-        .desired_width(width)
-        .margin(Margin { left: (10.0 + pg.size().x + 8.0) as i8, right: 8, top: 6, bottom: 6 });
+    let mono = egui::FontId::monospace(12.5);
+    let edit = fit(egui::TextEdit::singleline(&mut s), 26.0).font(mono.clone()).hint_text(RichText::new(hint).font(mono).color(p.text_faint)).desired_width(width).margin(Margin {
+        left: (10.0 + pg.size().x + 8.0).round() as i8,
+        right: 10,
+        top: 0,
+        bottom: 0,
+    });
     let r = ui.add(edit);
     ui.painter().galley(pos2(r.rect.left() + 10.0, r.rect.center().y - pg.size().y / 2.0), pg, p.accent_text);
     if r.changed() {
@@ -328,6 +417,8 @@ pub(crate) struct Form<'u> {
     ui: &'u mut Ui,
     per_row: usize,
     label_w: f32,
+    /// Space between the columns of a line.
+    col_gap: f32,
     n: usize,
     /// Top and height of the row of columns being laid out.
     top: f32,
@@ -337,19 +428,24 @@ pub(crate) struct Form<'u> {
 /// Space between the columns of a form with several rows per line.
 const FORM_COLUMN_GAP: f32 = 28.0;
 
-/// A form (see [`Form`]).
+/// A form (see [`Form`]) with rows [`GAP`] apart.
 pub(crate) fn form<R>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, per_row: usize, label_w: f32, add: impl FnOnce(&mut Form<'_>) -> R) -> R {
+    form_gap(ui, id, per_row, label_w, GAP, add)
+}
+
+/// [`form`] with rows `gap` apart.
+pub(crate) fn form_gap<R>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, per_row: usize, label_w: f32, gap: f32, add: impl FnOnce(&mut Form<'_>) -> R) -> R {
     let mut add = Some(add);
     let mut out = None;
-    form_dyn(ui, Id::new(id), per_row, label_w, &mut |f: &mut Form<'_>| out = add.take().map(|a| a(f)));
+    form_dyn(ui, Id::new(id), per_row, label_w, gap, &mut |f: &mut Form<'_>| out = add.take().map(|a| a(f)));
     out.expect("a form body runs once")
 }
 
-fn form_dyn(ui: &mut Ui, id: Id, per_row: usize, label_w: f32, add: &mut dyn FnMut(&mut Form<'_>)) {
+fn form_dyn(ui: &mut Ui, id: Id, per_row: usize, label_w: f32, gap: f32, add: &mut dyn FnMut(&mut Form<'_>)) {
     ui.push_id(id, |ui| {
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = GAP;
-            let mut f = Form { ui, per_row: per_row.max(1), label_w, n: 0, top: 0.0, height: 0.0 };
+            ui.spacing_mut().item_spacing.y = gap;
+            let mut f = Form { ui, per_row: per_row.max(1), label_w, col_gap: FORM_COLUMN_GAP, n: 0, top: 0.0, height: 0.0 };
             add(&mut f);
             f.finish_line();
         });
@@ -363,6 +459,21 @@ pub(crate) fn form_row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOn
         add(ui)
     })
     .inner
+}
+
+/// See [`Form::check_row`]: a row 22 high, the check boxes 16 apart at its top.
+fn check_row_dyn(ui: &mut Ui, label: &str, label_w: f32, add: &mut dyn FnMut(&mut Ui)) {
+    let p = style::pal(ui);
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.horizontal_top(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(label_w, 22.0), Sense::hover());
+            put_left(ui, Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(label_w, 16.0)), egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
+            ui.add_space(16.0 - ui.spacing().item_spacing.x);
+            ui.spacing_mut().item_spacing.x = 16.0;
+            add(ui);
+        });
+    });
 }
 
 /// The label column of a form row and the gap after it.
@@ -388,6 +499,18 @@ impl Form<'_> {
         r
     }
 
+    /// A row of check boxes: as in the design they sit at its top, the label 6 lower.
+    pub fn check_row<R>(&mut self, label: &str, add: impl FnOnce(&mut Ui) -> R) {
+        let label_w = self.label_w;
+        if self.per_row == 1 {
+            check_row_dyn(self.ui, label, label_w, &mut once(add));
+            return;
+        }
+        let mut child = self.column_ui();
+        check_row_dyn(&mut child, label, label_w, &mut once(add));
+        self.end_column(&child);
+    }
+
     /// The ui of the next column of a line.
     fn column_ui(&mut self) -> Ui {
         let column = self.n % self.per_row;
@@ -396,8 +519,8 @@ impl Form<'_> {
             self.height = 0.0;
         }
         let full = self.ui.max_rect();
-        let w = (full.width() - FORM_COLUMN_GAP * (self.per_row - 1) as f32) / self.per_row as f32;
-        let x = full.left() + column as f32 * (w + FORM_COLUMN_GAP);
+        let w = (full.width() - self.col_gap * (self.per_row - 1) as f32) / self.per_row as f32;
+        let x = full.left() + column as f32 * (w + self.col_gap);
         let rect = Rect::from_min_size(pos2(x, self.top), vec2(w, 4000.0));
         self.ui.new_child(UiBuilder::new().id_salt(("row", self.n)).max_rect(rect).layout(Layout::top_down(Align::Min)))
     }
@@ -441,18 +564,9 @@ pub(crate) fn card<R>(ui: &mut Ui, pad: i8, add: impl FnOnce(&mut Ui) -> R) -> R
 }
 
 /// A card of read-only form rows (summaries).
-pub(crate) fn facts(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, label_w: f32, rows: &[(&str, String, Option<Color32>)]) {
-    let p = style::pal(ui);
+pub(crate) fn facts(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, label_w: f32, gap: f32, rows: &[(&str, String, Option<Color32>)]) {
     card(ui, 14, |ui| {
-        ui.push_id(Id::new(id), |ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
-            ui.spacing_mut().interact_size.y = 18.0;
-            for (label, value, color) in rows {
-                form_row(ui, label, label_w, |ui| {
-                    ui.add(egui::Label::new(RichText::new(value).color(color.unwrap_or(p.text))).wrap());
-                });
-            }
-        });
+        ui.push_id(Id::new(id), |ui| fact_rows(ui, rows, 1, label_w, gap));
     });
 }
 
@@ -471,8 +585,12 @@ fn fold_card_dyn(ui: &mut Ui, id: Id, open: &mut bool, title: &str, summary: Opt
         if fill {
             ui.set_width(ui.available_width());
         }
+        // The head as high as its text (the body keeps the form controls' height).
+        let control_h = ui.spacing().interact_size.y;
+        ui.spacing_mut().interact_size.y = 0.0;
         let head = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
+            ui.spacing_mut().interact_size.y = control_h;
             let chevron = if *open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
             ui.label(RichText::new(chevron).font(style::icon_font(12.0)).color(p.text_faint));
             ui.label(RichText::new(title).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
@@ -483,6 +601,7 @@ fn fold_card_dyn(ui: &mut Ui, id: Id, open: &mut bool, title: &str, summary: Opt
                 ui.allocate_space(vec2(ui.available_width(), 1.0));
             }
         });
+        ui.spacing_mut().interact_size.y = control_h;
         let rect = head.response.rect.expand(4.0);
         let resp = ui.interact(rect, id.with("fold"), Sense::click());
         resp.widget_info(|| WidgetInfo::labeled(WidgetType::CollapsingHeader, true, title));
@@ -541,10 +660,12 @@ pub(crate) struct Col<'a> {
     pub title: &'a str,
     pub w: W,
     pub right: bool,
+    /// Like a data grid's column: its name in the text colour, a hairline at its right.
+    pub grid: bool,
 }
 
 pub(crate) fn col(title: &str, w: W) -> Col<'_> {
-    Col { title, w, right: false }
+    Col { title, w, right: false, grid: false }
 }
 
 impl Col<'_> {
@@ -553,10 +674,16 @@ impl Col<'_> {
         self.right = true;
         self
     }
+
+    /// A data grid's column (see [`Col::grid`]).
+    pub fn grid(mut self) -> Self {
+        self.grid = true;
+        self
+    }
 }
 
-/// A bordered table like the mockups: a header row on the header colour, striped rows of
-/// `row_h` with hairlines between them. `header` adds to a header cell (a check box),
+/// A bordered table like the mockups: a 32 px header row on the header colour, striped rows
+/// `row_h` high, each with a hairline under it. `header` adds to a header cell (a check box),
 /// `cell(ui, row, column)` draws a cell. With `max_h` the rows scroll under the header.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn table(
@@ -575,7 +702,9 @@ pub(crate) fn table(
 #[allow(clippy::too_many_arguments)]
 fn table_dyn(ui: &mut Ui, id: Id, cols: &[Col], row_h: f32, max_h: Option<f32>, rows: usize, header: &mut dyn FnMut(&mut Ui, usize), cell: &mut dyn FnMut(&mut Ui, usize, usize)) {
     let p = style::pal(ui);
-    let stripe = ui.visuals().faint_bg_color;
+    let (stripe, line) = (look::stripe(ui), look::line(ui));
+    // The rows' hairlines are part of their height.
+    let pitch = row_h + 1.0;
     let avail = ui.available_width() - 2.0;
     let fixed: f32 = cols.iter().map(|c| if let W::Px(w) = c.w { w } else { 0.0 }).sum();
     let fr: f32 = cols.iter().map(|c| c.w.flex().0).sum();
@@ -595,35 +724,37 @@ fn table_dyn(ui: &mut Ui, id: Id, cols: &[Col], row_h: f32, max_h: Option<f32>, 
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
             let mut draw = |ui: &mut Ui| {
                 // Header.
-                let (hr, _) = ui.allocate_exact_size(vec2(total, 32.0), Sense::hover());
+                let (hr, _) = ui.allocate_exact_size(vec2(total, 33.0), Sense::hover());
                 ui.painter().rect_filled(hr, CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, p.header);
                 ui.painter().hline(hr.x_range(), hr.bottom() - 0.5, Stroke::new(1.0, p.border));
                 let mut x = hr.left();
                 for (i, c) in cols.iter().enumerate() {
-                    let r = Rect::from_min_size(pos2(x, hr.top()), vec2(widths[i], hr.height()));
+                    let r = Rect::from_min_size(pos2(x, hr.top()), vec2(widths[i], hr.height() - 1.0));
                     let mut child = ui.new_child(UiBuilder::new().id_salt(("h", i)).max_rect(r.shrink2(vec2(10.0, 0.0))).layout(layout_of(c)));
                     child.set_clip_rect(r.intersect(ui.clip_rect()));
                     child.spacing_mut().item_spacing.x = 6.0;
                     if !c.title.is_empty() {
-                        child.add(egui::Label::new(RichText::new(c.title).font(style::semibold(child.ctx(), 12.0)).color(p.text_muted)).truncate());
+                        let (size, color) = if c.grid { (12.5, p.text) } else { (12.0, p.text_muted) };
+                        child.add(egui::Label::new(RichText::new(c.title).font(style::semibold(child.ctx(), size)).color(color)).truncate());
                     }
                     header(&mut child, i);
                     x += widths[i];
+                    if c.grid {
+                        ui.painter().vline(x - 0.5, r.y_range(), Stroke::new(1.0, line));
+                    }
                 }
                 // Rows.
                 let mut body = |ui: &mut Ui| {
                     for row in 0..rows {
                         let top = ui.cursor().top();
                         let left = ui.cursor().left();
-                        let rr = Rect::from_min_size(pos2(left, top), vec2(total, row_h));
+                        let rr = Rect::from_min_size(pos2(left, top), vec2(total, pitch));
                         if row % 2 == 1 {
                             let last = row + 1 == rows && max_h.is_none();
                             let r = if last { CornerRadius { nw: 0, ne: 0, sw: 7, se: 7 } } else { CornerRadius::ZERO };
                             ui.painter().rect_filled(rr, r, stripe);
                         }
-                        if row + 1 < rows {
-                            ui.painter().hline(rr.x_range(), rr.bottom() - 0.5, Stroke::new(1.0, p.border));
-                        }
+                        ui.painter().hline(rr.x_range(), rr.bottom() - 0.5, Stroke::new(1.0, line));
                         if ui.is_rect_visible(rr) {
                             let mut x = left;
                             for (i, c) in cols.iter().enumerate() {
@@ -631,9 +762,12 @@ fn table_dyn(ui: &mut Ui, id: Id, cols: &[Col], row_h: f32, max_h: Option<f32>, 
                                 let mut child = ui.new_child(UiBuilder::new().id_salt((row, i)).max_rect(r.shrink2(vec2(10.0, 0.0))).layout(layout_of(c)));
                                 child.set_clip_rect(r.intersect(ui.clip_rect()));
                                 child.spacing_mut().item_spacing.x = 6.0;
-                                child.spacing_mut().interact_size.y = (row_h - 10.0).min(style::CONTROL_H);
+                                child.spacing_mut().interact_size.y = (row_h - 4.0).min(26.0);
                                 cell(&mut child, row, i);
                                 x += widths[i];
+                                if c.grid {
+                                    ui.painter().vline(x - 0.5, r.y_range(), Stroke::new(1.0, line));
+                                }
                             }
                         }
                         ui.allocate_rect(rr, Sense::hover());
