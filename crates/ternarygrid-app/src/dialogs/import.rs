@@ -292,7 +292,7 @@ impl ImportDialog {
                 }
                 _ => {
                     if c.init.shell_before_connect.is_some() || c.init.shell_after_disconnect.is_some() {
-                        ui.label(RichText::new(icon::TERMINAL).size(14.0).color(p.warn)).on_hover_text(tr("Runs a shell command when connecting or disconnecting."));
+                        ui.label(RichText::new(icon::TERMINAL_WINDOW).size(14.0).color(p.warn)).on_hover_text(tr("Runs a shell command when connecting or disconnecting."));
                     }
                 }
             }
