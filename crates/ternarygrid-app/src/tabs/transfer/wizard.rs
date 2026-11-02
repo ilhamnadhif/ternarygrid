@@ -272,9 +272,10 @@ fn fact_rows(ui: &mut Ui, facts: &[(&str, String, Option<Color32>)], cols: usize
     ui.advance_cursor_after_rect(Rect::from_min_size(pos2(left, top), vec2(w, h)));
 }
 
-/// `label` at the left of `rect` (`Ui::put` centres it).
+/// `label` at the left of `rect`, without moving the cursor (`Ui::put` centres it and moves
+/// the cursor).
 fn put_left(ui: &mut Ui, rect: Rect, label: egui::Label) {
-    ui.scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Min)), |ui| ui.add(label));
+    ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Min))).add(label);
 }
 
 // ------------------------------------------------------------------ rows

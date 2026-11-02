@@ -792,7 +792,7 @@ impl ExportTab {
         if fill {
             cards(ui);
         } else {
-            ui.horizontal(|ui| {
+            ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 cards(ui)
             });

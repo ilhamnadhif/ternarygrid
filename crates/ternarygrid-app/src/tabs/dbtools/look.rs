@@ -414,9 +414,8 @@ pub(crate) fn row_top<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnc
             ui.spacing_mut().interact_size.y = control_h;
             let (rect, _) = ui.allocate_exact_size(vec2(label_w, 22.0), Sense::hover());
             let at = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(label_w, 16.0));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(at).layout(Layout::left_to_right(Align::Min)), |ui| {
-                ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
-            });
+            // A child ui: the cursor stays after the label column.
+            ui.new_child(egui::UiBuilder::new().max_rect(at).layout(Layout::left_to_right(Align::Min))).add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 add(ui)
