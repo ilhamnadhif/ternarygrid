@@ -67,14 +67,25 @@ impl RunLog {
         let _g = self.lock.lock();
         let path = self.file(0);
         {
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| io_err("Cannot write", &path, e))?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            // Created private: run messages may name databases, files and errors.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&path).map_err(|e| io_err("Cannot write", &path, e))?;
             // one write per record keeps concurrent appenders (CLI runs) line-atomic
             f.write_all(line.as_bytes()).map_err(|e| io_err("Cannot write", &path, e))?;
         }
+        // A file written by an earlier version may still be world-readable.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            if std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
         }
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if size > self.opts.max_file_bytes {
@@ -269,6 +280,23 @@ mod tests {
         assert!(run_process_alive(me, started));
         // A run older than this process: its number now belongs to another one.
         assert!(!run_process_alive(me, started - Duration::hours(1)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let log = RunLog::open(dir.path(), RunLogOptions::default()).unwrap();
+        let path = dir.path().join(RunLog::FILE_NAME);
+        log.record(&TaskRun::start(&task("a"), Trigger::Manual, Utc::now(), None)).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        // A world-readable file of an earlier version is tightened on the next record.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        log.record(&TaskRun::start(&task("b"), Trigger::Manual, Utc::now(), None)).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(log.runs().unwrap().len(), 2);
     }
 
     #[test]

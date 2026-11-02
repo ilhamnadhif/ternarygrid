@@ -11,7 +11,7 @@
 //! `keymap.json` (see [`crate::keymap`]).
 
 use crate::keymap::{self, KeymapConfig};
-use crate::paths::{AppPaths, backup_corrupt_file, write_json};
+use crate::paths::{AppPaths, backup_corrupt_file, read_json, write_json};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use ternarygrid_core::DbResult;
@@ -932,10 +932,26 @@ fn parse_sections(
 }
 
 /// Writes `settings.json` and `keymap.json` atomically (mode 0600).
+///
+/// Top-level sections this version does not know (written by a newer
+/// version) are carried over from the existing file, so going back and
+/// forth between versions does not lose them.
 pub fn save(paths: &AppPaths, settings: &AppSettings) -> DbResult<()> {
     let mut s = settings.clone();
     s.version = SETTINGS_VERSION;
-    write_json(&paths.settings_file(), &s)?;
+    let path = paths.settings_file();
+    let mut value = serde_json::to_value(&s)?;
+    if let Some(new) = value.as_object_mut()
+        && let Ok(Some(serde_json::Value::Object(old))) = read_json::<serde_json::Value>(&path)
+    {
+        for (key, section) in old {
+            // `keymap` is skipped on purpose: it lives in keymap.json.
+            if key != "keymap" && !new.contains_key(&key) {
+                new.insert(key, section);
+            }
+        }
+    }
+    write_json(&path, &value)?;
     keymap::save_config(paths, &settings.keymap)
 }
 
@@ -1041,6 +1057,36 @@ mod tests {
         assert_eq!(s.general.theme, Theme::System);
         assert_eq!(s.results.layout, ResultsLayout::Bottom);
         assert_eq!(s.results.fetch_size, 1000);
+    }
+
+    #[test]
+    fn sections_of_a_newer_version_survive_a_save() {
+        let (_d, p) = paths();
+        std::fs::create_dir_all(p.config_dir()).unwrap();
+        std::fs::write(
+            p.settings_file(),
+            r#"{"results": {"fetch_size": 1000},
+                "brand_new_section": {"x": 1, "nested": ["a"]},
+                "keymap": {"preset": "old"}}"#,
+        )
+        .unwrap();
+        let mut s = load(&p);
+        s.results.fetch_size = 77;
+        save(&p, &s).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(p.settings_file()).unwrap()).unwrap();
+        assert_eq!(
+            v["brand_new_section"],
+            serde_json::json!({"x": 1, "nested": ["a"]})
+        );
+        assert_eq!(v["results"]["fetch_size"], 77, "known sections are written");
+        assert!(v.get("keymap").is_none(), "keymap lives in keymap.json");
+        assert_eq!(load(&p), s);
+        // Saving again (and without an existing file) keeps working.
+        save(&p, &s).unwrap();
+        std::fs::remove_file(p.settings_file()).unwrap();
+        save(&p, &s).unwrap();
+        assert_eq!(load(&p), s);
     }
 
     #[test]

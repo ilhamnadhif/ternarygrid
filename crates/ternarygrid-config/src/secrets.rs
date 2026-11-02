@@ -362,9 +362,11 @@ const KDF_ARGON2ID: u8 = 1;
 const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 /// Upper bounds accepted when reading a vault, protecting against files
-/// that would make us allocate absurd amounts of memory.
-const MAX_M_COST_KIB: u32 = 4 * 1024 * 1024;
-const MAX_T_COST: u32 = 64;
+/// that would make us allocate absurd amounts of memory (the parameters are
+/// used before the AEAD check can tell a forged header). TernaryGrid only
+/// writes [`KdfParams::default`] (64 MiB, 3 iterations, 1 lane).
+const MAX_M_COST_KIB: u32 = 1024 * 1024;
+const MAX_T_COST: u32 = 16;
 const MAX_P_COST: u32 = 64;
 
 /// Argon2id cost parameters, stored in the vault header.
@@ -563,32 +565,61 @@ struct Opened {
     entries: BTreeMap<String, Secret>,
 }
 
-fn open_vault(bytes: &[u8], master: &Secret) -> DbResult<Opened> {
-    let (header, header_len) = VaultHeader::decode(bytes)?;
-    let key = derive_key(master, &header.salt, header.params)?;
-    let cipher = XChaCha20Poly1305::new_from_slice(&key[..])
+/// Decrypts the entries of a vault file whose header was decoded; `None`
+/// when the key does not authenticate the content.
+fn decrypt_entries(
+    key: &[u8; 32],
+    header: &VaultHeader,
+    bytes: &[u8],
+    header_len: usize,
+) -> DbResult<Option<BTreeMap<String, Secret>>> {
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| DbError::internal("Invalid vault key length"))?;
     let aad = &bytes[..header_len];
     let ciphertext = &bytes[header_len..];
-    let plaintext = Zeroizing::new(
-        cipher
-            .decrypt(
-                &XNonce::from(header.nonce),
-                Payload {
-                    msg: ciphertext,
-                    aad,
-                },
-            )
-            .map_err(|_| DbError::auth("Wrong master password (or the vault file was modified)"))?,
-    );
+    let Ok(plaintext) = cipher.decrypt(
+        &XNonce::from(header.nonce),
+        Payload {
+            msg: ciphertext,
+            aad,
+        },
+    ) else {
+        return Ok(None);
+    };
+    let plaintext = Zeroizing::new(plaintext);
     let raw: BTreeMap<String, String> = serde_json::from_slice(&plaintext)
         .map_err(|_| DbError::config("The vault content is damaged"))?;
-    let entries = raw.into_iter().map(|(k, v)| (k, Secret::from(v))).collect();
+    Ok(Some(
+        raw.into_iter().map(|(k, v)| (k, Secret::from(v))).collect(),
+    ))
+}
+
+fn open_vault(bytes: &[u8], master: &Secret) -> DbResult<Opened> {
+    let (header, header_len) = VaultHeader::decode(bytes)?;
+    let key = derive_key(master, &header.salt, header.params)?;
+    let entries = decrypt_entries(&key, &header, bytes, header_len)?
+        .ok_or_else(|| DbError::auth("Wrong master password (or the vault file was modified)"))?;
     Ok(Opened {
         key,
         params: header.params,
         salt: header.salt,
         entries,
+    })
+}
+
+/// Decrypts the current vault file with the key of an unlocked vault. The
+/// key only fits a file with the same salt and KDF parameters: different
+/// ones mean another process changed the master password (or re-created the
+/// vault), and the vault must be unlocked again with the current password.
+fn reopen_with_key(bytes: &[u8], opened: &Opened) -> DbResult<BTreeMap<String, Secret>> {
+    let (header, header_len) = VaultHeader::decode(bytes)?;
+    if header.salt != opened.salt || header.params != opened.params {
+        return Err(DbError::auth(
+            "The vault was re-encrypted by another TernaryGrid process (master password changed); unlock it again",
+        ));
+    }
+    decrypt_entries(&opened.key, &header, bytes, header_len)?.ok_or_else(|| {
+        DbError::auth("The vault file was modified and cannot be decrypted; unlock it again")
     })
 }
 
@@ -708,6 +739,9 @@ impl VaultStore {
         if new.is_empty() {
             return Err(DbError::config("The master password must not be empty"));
         }
+        // Held from reading to writing the file: a concurrent `set` of this
+        // process must not write with the old key in between.
+        let mut guard = self.state.lock();
         let bytes = self.read_file()?;
         let opened = open_vault(&bytes, old)?;
         let mut salt = vec![0u8; SALT_LEN];
@@ -715,12 +749,13 @@ impl VaultStore {
         let key = derive_key(new, &salt, params)?;
         let out = seal(&key, params, &salt, &opened.entries)?;
         write_secure(&self.path, &out)?;
-        *self.state.lock() = Some(Opened {
+        *guard = Some(Opened {
             key,
             params,
             salt,
             entries: opened.entries,
         });
+        drop(guard);
         self.touch();
         Ok(())
     }
@@ -755,9 +790,38 @@ impl VaultStore {
         r
     }
 
-    fn persist(&self, opened: &Opened) -> DbResult<()> {
-        let bytes = seal(&opened.key, opened.params, &opened.salt, &opened.entries)?;
-        write_secure(&self.path, &bytes)
+    /// Applies `change` to the entries *in the file* and writes them back.
+    ///
+    /// Another TernaryGrid process (a second window, `--run-task`) may have
+    /// written the vault since this one was unlocked: the file is read and
+    /// decrypted again with the key in memory, so its secrets are kept, and
+    /// becomes the new in-memory state. When the file no longer fits the key
+    /// (the master password was changed elsewhere), nothing is written and
+    /// the vault locks: writing with the old key would silently revert the
+    /// password change. `change` returns whether anything changed.
+    fn update(&self, change: impl FnOnce(&mut BTreeMap<String, Secret>) -> bool) -> DbResult<()> {
+        let mut guard = self.state.lock();
+        let opened = guard
+            .as_mut()
+            .ok_or_else(|| DbError::auth("The secret vault is locked"))?;
+        let bytes = self.read_file()?;
+        let mut entries = match reopen_with_key(&bytes, opened) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind == ErrorKind::Auth {
+                    *guard = None;
+                }
+                return Err(e);
+            }
+        };
+        if change(&mut entries) {
+            let sealed = seal(&opened.key, opened.params, &opened.salt, &entries)?;
+            write_secure(&self.path, &sealed)?;
+        }
+        opened.entries = entries;
+        drop(guard);
+        self.touch();
+        Ok(())
     }
 }
 
@@ -766,29 +830,13 @@ impl SecretStore for VaultStore {
         self.with_open(|o| Ok(o.entries.get(key).cloned()))
     }
     fn set(&self, key: &str, value: &Secret) -> DbResult<()> {
-        self.with_open(|o| {
-            let previous = o.entries.insert(key.to_string(), value.clone());
-            if let Err(e) = self.persist(o) {
-                match previous {
-                    Some(p) => o.entries.insert(key.to_string(), p),
-                    None => o.entries.remove(key),
-                };
-                return Err(e);
-            }
-            Ok(())
+        self.update(|entries| {
+            entries.insert(key.to_string(), value.clone());
+            true
         })
     }
     fn delete(&self, key: &str) -> DbResult<()> {
-        self.with_open(|o| match o.entries.remove(key) {
-            None => Ok(()),
-            Some(previous) => {
-                if let Err(e) = self.persist(o) {
-                    o.entries.insert(key.to_string(), previous);
-                    return Err(e);
-                }
-                Ok(())
-            }
-        })
+        self.update(|entries| entries.remove(key).is_some())
     }
     fn backend_name(&self) -> &'static str {
         "vault"
@@ -1243,6 +1291,92 @@ mod tests {
             v.unlock(&Secret::new("m")).unwrap_err().kind,
             ErrorKind::Config
         );
+    }
+
+    #[test]
+    fn kdf_parameters_from_the_file_are_bounded() {
+        assert!(
+            KdfParams::default().validate().is_ok(),
+            "what TernaryGrid writes"
+        );
+        assert!(KdfParams::new(1024 * 1024, 3, 1).validate().is_ok());
+        assert!(KdfParams::new(1024 * 1024 + 1, 3, 1).validate().is_err());
+        assert!(KdfParams::new(64 * 1024, 17, 1).validate().is_err());
+        // A writable vault.bin claiming 2 GiB is refused before any allocation.
+        let (_d, v) = vault();
+        v.create_with_params(&Secret::new("m"), TEST_PARAMS)
+            .unwrap();
+        let mut raw = std::fs::read(v.path()).unwrap();
+        raw[10..14].copy_from_slice(&(2u32 * 1024 * 1024).to_le_bytes());
+        std::fs::write(v.path(), &raw).unwrap();
+        v.lock();
+        let e = v.unlock(&Secret::new("m")).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Config, "{e}");
+    }
+
+    #[test]
+    fn two_processes_writing_the_vault_keep_each_others_secrets() {
+        let (_d, a) = vault();
+        a.create_with_params(&Secret::new("m"), TEST_PARAMS)
+            .unwrap();
+        a.set("stale", &Secret::new("old")).unwrap();
+        // A second process (GUI + headless `--run-task`) unlocks the same file.
+        let b = VaultStore::new(a.path());
+        b.unlock(&Secret::new("m")).unwrap();
+        a.set("from-a", &Secret::new("1")).unwrap();
+        a.delete("stale").unwrap();
+        b.set("from-b", &Secret::new("2")).unwrap();
+        // b merged a's writes instead of overwriting them with its stale state.
+        assert_eq!(b.get("from-a").unwrap().unwrap().expose(), "1");
+        assert!(
+            b.get("stale").unwrap().is_none(),
+            "a's delete is not undone"
+        );
+        a.delete("missing").unwrap();
+        let c = VaultStore::new(a.path());
+        c.unlock(&Secret::new("m")).unwrap();
+        let mut keys = c.list_keys().unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["from-a".to_string(), "from-b".to_string()]);
+    }
+
+    #[test]
+    fn a_password_change_elsewhere_is_not_reverted() {
+        let (_d, a) = vault();
+        a.create_with_params(&Secret::new("old"), TEST_PARAMS)
+            .unwrap();
+        a.set("k", &Secret::new("v")).unwrap();
+        let b = VaultStore::new(a.path());
+        b.unlock(&Secret::new("old")).unwrap();
+        a.change_master_password_with_params(&Secret::new("old"), &Secret::new("new"), TEST_PARAMS)
+            .unwrap();
+        let before = std::fs::read(a.path()).unwrap();
+        // b still holds the old key: it must not re-encrypt the file with it.
+        let e = b.set("k2", &Secret::new("v2")).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Auth, "{e}");
+        assert!(b.is_locked(), "unlock again with the current password");
+        assert_eq!(std::fs::read(a.path()).unwrap(), before, "nothing written");
+        assert_eq!(b.delete("k").unwrap_err().kind, ErrorKind::Auth);
+        assert!(b.unlock(&Secret::new("old")).is_err());
+        b.unlock(&Secret::new("new")).unwrap();
+        b.set("k2", &Secret::new("v2")).unwrap();
+        // a (new key) keeps working and sees b's write.
+        a.set("k3", &Secret::new("v3")).unwrap();
+        assert_eq!(a.get("k2").unwrap().unwrap().expose(), "v2");
+        a.lock();
+        a.unlock(&Secret::new("new")).unwrap();
+        assert_eq!(a.list_keys().unwrap().len(), 3);
+        // A modified file under the same header is refused, nothing written.
+        let mut raw = std::fs::read(a.path()).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 1;
+        std::fs::write(a.path(), &raw).unwrap();
+        assert_eq!(
+            a.set("x", &Secret::new("y")).unwrap_err().kind,
+            ErrorKind::Auth
+        );
+        assert_eq!(std::fs::read(a.path()).unwrap(), raw);
+        assert!(a.is_locked());
     }
 
     #[test]

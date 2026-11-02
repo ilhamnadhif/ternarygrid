@@ -522,7 +522,10 @@ fn split_host_port(s: &str) -> DbResult<(String, Option<u16>)> {
 fn parse_port(p: &str) -> DbResult<u16> {
     match p.trim().parse::<u16>() {
         Ok(n) if n > 0 => Ok(n),
-        _ => Err(DbError::config(format!("Invalid port '{p}' in the URL"))),
+        // The text is not shown: in `scheme://user:password` (no `@`) it is the password.
+        _ => Err(DbError::config(
+            "Invalid port in the URL (a number from 1 to 65535 is expected; a user name and password must be followed by @host)",
+        )),
     }
 }
 
@@ -536,10 +539,21 @@ pub fn redact_url(url: &str) -> String {
             .find('/')
             .map(|i| i + auth_start)
             .unwrap_or(out.len());
-        if let Some(at) = out[auth_start..auth_end].rfind('@').map(|i| i + auth_start)
-            && let Some(colon) = out[auth_start..at].find(':').map(|i| i + auth_start)
+        let authority = &out[auth_start..auth_end];
+        if let Some(at) = authority.rfind('@').map(|i| i + auth_start) {
+            if let Some(colon) = out[auth_start..at].find(':').map(|i| i + auth_start) {
+                out.replace_range(colon + 1..at, "***");
+            }
+        } else if !authority.starts_with('[')
+            && let Some(colon) = authority.rfind(':')
         {
-            out.replace_range(colon + 1..at, "***");
+            // `user:password` without `@host`: anything but a port is masked.
+            let value = &authority[colon + 1..];
+            let value = &value[..value.find(['?', ';', '#', ',']).unwrap_or(value.len())];
+            if !value.is_empty() && !value.bytes().all(|b| b.is_ascii_digit()) {
+                let start = auth_start + colon + 1;
+                out.replace_range(start..start + value.len(), "***");
+            }
         }
     }
     // password=... in query / properties
@@ -947,6 +961,23 @@ mod tests {
             redact_url("jdbc:sqlserver://h;user=sa;password=abc;x=1"),
             "jdbc:sqlserver://h;user=sa;password=***;x=1"
         );
+        // `user:password` without `@host` looks like host:port; the "port" is never echoed.
+        for url in [
+            "postgres://user:s3cret",
+            "postgresql://user:s3cret/db",
+            "mysql://user:s3cret?ssl=true",
+            "mongodb://user:s3cret,h2/db",
+        ] {
+            let e = parse_connection_url(url).unwrap_err();
+            assert!(!e.to_string().contains("s3cret"), "{url}: {e}");
+            assert!(e.message.contains("Invalid port"), "{url}: {e}");
+        }
+        assert_eq!(redact_url("foo://user:s3cret"), "foo://user:***");
+        assert_eq!(redact_url("foo://user:s3cret?x=1"), "foo://user:***?x=1");
+        assert_eq!(redact_url("foo://host:5432/db"), "foo://host:5432/db");
+        assert_eq!(redact_url("foo://[::1]:5432/db"), "foo://[::1]:5432/db");
+        let e = parse_connection_url("foo://user:s3cret").unwrap_err();
+        assert!(!e.message.contains("s3cret"), "{}", e.message);
     }
 
     #[test]

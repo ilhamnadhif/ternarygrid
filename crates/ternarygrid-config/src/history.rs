@@ -120,44 +120,194 @@ pub struct RetentionPolicy {
     pub max_age_days: Option<u32>,
 }
 
-static REDACT_LITERAL: LazyLock<Option<Regex>> = LazyLock::new(|| {
+/// A keyword followed by a password value (parsed by [`value_len`]). The
+/// `bare` alternatives also take an unquoted value (Oracle's
+/// `IDENTIFIED BY tiger`).
+static REDACT_KEYWORD: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b(set\s+password(?:\s+for\s+\S+)?|password|identified(?:\s+with\s+[a-z0-9_]+)?\s+by(?:\s+password)?|secret)(\s*=\s*|\s+)(N?'(?:[^']|'')*'|"(?:[^"]|"")*"|\$\$.*?\$\$|PASSWORD\s*\(\s*'(?:[^']|'')*'\s*\))"#,
+        r#"(?i)\b(?:set\s+password(?:\s+for\s+\S+)?|password|secret|(?P<bare>identified(?:\s+with\s+\S+)?\s+(?:by|as)(?:\s+(?:password|values))?))(?:\s*=\s*|\s+)"#,
     )
     .ok()
 });
 
+/// Oracle / MySQL: `IDENTIFIED BY new REPLACE old` (right after the new value).
+static REDACT_REPLACE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s+replace\s+").ok());
+
 static REDACT_KV: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"(?i)\b(password|pwd)(\s*=\s*)([^\s';]+)").ok());
 
-/// Masks passwords in SQL text: `PASSWORD 'x'`, `PASSWORD = 'x'`,
-/// `IDENTIFIED BY 'x'`, `IDENTIFIED WITH plugin BY 'x'`, `SET PASSWORD = PASSWORD('x')`
-/// and `password=x` inside connection strings become `'***'` / `***`.
+/// MongoDB / JSON documents: `pwd: "x"`, `"password": 'x'`.
+static REDACT_JSON: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(["']?\b(?:password|passwd|pwd)["']?\s*:\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"#,
+    )
+    .ok()
+});
+
+/// Redis: `AUTH [user] pass`, `HELLO 3 AUTH user pass`, `CONFIG SET requirepass|masterauth pass`.
+static REDACT_REDIS: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"(?im)(^[ \t]*auth[ \t]+|^[ \t]*hello[ \t]+\d+[ \t]+auth[ \t]+\S+[ \t]+|\b(?:requirepass|masterauth)[ \t]+)(\S[^\r\n]*)").ok()
+});
+
+/// Length of the string literal at the start of `s`: `'…'` (with `''`),
+/// `N'…'`, PostgreSQL `E'…'` (backslash escapes), `"…"` or `$tag$…$tag$`
+/// (any lines). An unterminated literal runs to the end of `s`.
+fn literal_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (start, backslash) = match b {
+        [b'E' | b'e', b'\'', ..] => (1, true),
+        [b'N' | b'n', b'\'', ..] => (1, false),
+        [b'\'' | b'"', ..] => (0, false),
+        [b'$', ..] => {
+            let tag_end = 1 + b[1..]
+                .iter()
+                .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))?;
+            if b[tag_end] != b'$' || b.get(1).is_some_and(u8::is_ascii_digit) {
+                return None; // `$1` is a parameter
+            }
+            let tag = &s[..=tag_end];
+            return Some(match s[tag.len()..].find(tag) {
+                Some(i) => 2 * tag.len() + i,
+                None => s.len(),
+            });
+        }
+        _ => return None,
+    };
+    let quote = b[start];
+    let mut i = start + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if backslash => i += 2,
+            c if c == quote => {
+                if b.get(i + 1) == Some(&quote) {
+                    i += 2;
+                } else {
+                    return Some(i + 1);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Some(s.len())
+}
+
+/// Length of the password value at the start of `s` and whether it was
+/// unquoted: a literal ([`literal_len`]), MySQL's `PASSWORD('…')`, or, when
+/// `bare` is allowed, an unquoted word.
+fn value_len(s: &str, bare: bool) -> Option<(usize, bool)> {
+    if let Some(n) = literal_len(s) {
+        return Some((n, false));
+    }
+    if s.len() >= 8 && s.as_bytes()[..8].eq_ignore_ascii_case(b"password") {
+        let rest = &s[8..];
+        let open = rest.len() - rest.trim_start().len();
+        if rest[open..].starts_with('(') {
+            let inner = &rest[open + 1..];
+            let pad = inner.len() - inner.trim_start().len();
+            let lit = literal_len(&inner[pad..])?;
+            let after = &inner[pad + lit..];
+            let close = after.len() - after.trim_start().len();
+            let end = 8 + open + 1 + pad + lit + close;
+            let closed = after[close..].starts_with(')');
+            return Some((if closed { end + 1 } else { end }, false));
+        }
+    }
+    if !bare {
+        return None;
+    }
+    let n = s
+        .find(|c: char| c.is_whitespace() || matches!(c, ';' | ',' | '(' | ')' | '\'' | '"'))
+        .unwrap_or(s.len());
+    // MySQL `IDENTIFIED BY RANDOM PASSWORD` names no password.
+    (n > 0 && !s[..n].eq_ignore_ascii_case("random")).then_some((n, true))
+}
+
+/// Masks the values after the password keywords; `None` when there is none.
+fn redact_keyword_values(sql: &str) -> Option<String> {
+    let re = REDACT_KEYWORD.as_ref()?;
+    let mask = |out: &mut String, bare: bool| out.push_str(if bare { "***" } else { "'***'" });
+    let mut out = String::new();
+    let (mut copied, mut pos) = (0, 0);
+    while let Some(caps) = re.captures_at(sql, pos) {
+        let m = caps.get(0)?;
+        let bare = caps.name("bare").is_some();
+        let Some((len, unquoted)) = value_len(&sql[m.end()..], bare) else {
+            pos = m.end();
+            continue;
+        };
+        out.push_str(&sql[copied..m.end()]);
+        mask(&mut out, unquoted);
+        let mut end = m.end() + len;
+        if bare
+            && let Some(r) = REDACT_REPLACE.as_ref().and_then(|r| r.find(&sql[end..]))
+            && let Some((old, unquoted)) = value_len(&sql[end + r.end()..], true)
+        {
+            out.push_str(&sql[end..end + r.end()]);
+            mask(&mut out, unquoted);
+            end += r.end() + old;
+        }
+        copied = end;
+        pos = end;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
+/// Masks passwords in SQL text: `PASSWORD 'x'`, `PASSWORD = 'x'` (also
+/// `ENCRYPTED PASSWORD`, `E'…'`, `$$…$$` and `$tag$…$tag$` values),
+/// `IDENTIFIED BY 'x'` / `IDENTIFIED BY tiger` (and `REPLACE old`),
+/// `IDENTIFIED WITH plugin BY 'x'`, `SET PASSWORD = PASSWORD('x')`,
+/// `password=x` inside connection strings, `pwd: "x"` in MongoDB documents
+/// and Redis `AUTH` / `requirepass` become `'***'` / `***`.
 pub fn redact_sql(sql: &str) -> Cow<'_, str> {
     let lower = sql.to_ascii_lowercase();
     if !(lower.contains("password")
         || lower.contains("identified")
         || lower.contains("pwd")
-        || lower.contains("secret"))
+        || lower.contains("passwd")
+        || lower.contains("secret")
+        || lower.contains("auth")
+        || lower.contains("requirepass"))
     {
         return Cow::Borrowed(sql);
     }
     let mut out: Cow<'_, str> = Cow::Borrowed(sql);
-    if let Some(re) = REDACT_LITERAL.as_ref()
-        && re.is_match(&out)
-    {
-        out = Cow::Owned(re.replace_all(&out, "$1$2'***'").into_owned());
+    if let Some(masked) = redact_keyword_values(&out) {
+        out = Cow::Owned(masked);
     }
     if let Some(re) = REDACT_KV.as_ref()
         && re.is_match(&out)
     {
         out = Cow::Owned(re.replace_all(&out, "$1$2***").into_owned());
     }
+    if let Some(re) = REDACT_JSON.as_ref()
+        && re.is_match(&out)
+    {
+        out = Cow::Owned(re.replace_all(&out, "$1\"***\"").into_owned());
+    }
+    if let Some(re) = REDACT_REDIS.as_ref()
+        && re.is_match(&out)
+    {
+        out = Cow::Owned(re.replace_all(&out, "$1***").into_owned());
+    }
     out
 }
 
 fn sql_err(e: rusqlite::Error) -> DbError {
     DbError::io(format!("Query history database error: {e}"))
+}
+
+/// The file is damaged or not an SQLite database (as opposed to locked,
+/// unreadable or on a full disk).
+fn is_corrupt(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+    )
 }
 
 /// Thread-safe query history store.
@@ -196,8 +346,11 @@ impl HistoryStore {
             opts.open(path)
                 .map_err(|e| DbError::io(format!("Cannot create {}: {e}", path.display())))?;
         }
-        let conn = Connection::open(path).map_err(sql_err)?;
-        Self::init(conn)
+        Self::open_sqlite(path).map_err(sql_err)
+    }
+
+    fn open_sqlite(path: &Path) -> rusqlite::Result<HistoryStore> {
+        Self::init_sqlite(Connection::open(path)?)
     }
 
     /// Like [`HistoryStore::open`], but a damaged database file is moved
@@ -205,9 +358,19 @@ impl HistoryStore {
     /// broken history never prevents TernaryGrid from starting. Returns the store
     /// and a warning when recovery happened.
     pub fn open_or_recover(path: &Path) -> DbResult<(HistoryStore, Option<String>)> {
-        match Self::open(path) {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            crate::paths::ensure_private_dir(dir)?;
+        }
+        if !path.exists() {
+            return Self::open(path).map(|s| (s, None));
+        }
+        // Only a damaged file is moved aside: a lock held past the busy timeout
+        // or a permission problem is reported, the history is kept.
+        match Self::open_sqlite(path) {
             Ok(s) => Ok((s, None)),
-            Err(first) if path.exists() => {
+            Err(e) if !is_corrupt(&e) => Err(sql_err(e)),
+            Err(first) => {
+                let first = sql_err(first);
                 let backup = crate::paths::backup_corrupt_file(path)?;
                 for suffix in ["-wal", "-shm"] {
                     let side = PathBuf::from(format!("{}{suffix}", path.display()));
@@ -223,7 +386,6 @@ impl HistoryStore {
                     )),
                 ))
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -233,8 +395,11 @@ impl HistoryStore {
     }
 
     fn init(conn: Connection) -> DbResult<HistoryStore> {
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(sql_err)?;
+        Self::init_sqlite(conn).map_err(sql_err)
+    }
+
+    fn init_sqlite(conn: Connection) -> rusqlite::Result<HistoryStore> {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // WAL is not available for in-memory databases; ignore the result.
         let _ = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0));
         conn.execute_batch(
@@ -254,8 +419,7 @@ impl HistoryStore {
              );
              CREATE INDEX IF NOT EXISTS history_ts ON history(ts);
              CREATE INDEX IF NOT EXISTS history_conn_ts ON history(connection_id, ts);",
-        )
-        .map_err(sql_err)?;
+        )?;
         let fts = conn
             .execute_batch(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(sql, content='history', content_rowid='id', tokenize='trigram');
@@ -274,8 +438,7 @@ impl HistoryStore {
         if !fts {
             tracing::info!("SQLite FTS5 trigram index unavailable; query history search uses LIKE");
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(sql_err)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(HistoryStore {
             conn: Mutex::new(conn),
             fts,
@@ -762,6 +925,89 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(redact_sql(input), expected, "{input}");
         }
+        // Forms that used to slip through.
+        let more = [
+            // Oracle / MySQL unquoted, VALUES hashes and REPLACE of the old password.
+            (
+                "CREATE USER scott IDENTIFIED BY tiger DEFAULT TABLESPACE users",
+                "CREATE USER scott IDENTIFIED BY *** DEFAULT TABLESPACE users",
+            ),
+            (
+                "alter user scott identified by tiger;",
+                "alter user scott identified by ***;",
+            ),
+            (
+                "ALTER USER scott IDENTIFIED BY lion REPLACE tiger",
+                "ALTER USER scott IDENTIFIED BY *** REPLACE ***",
+            ),
+            (
+                "ALTER USER u IDENTIFIED BY 'new1' REPLACE 'old1'",
+                "ALTER USER u IDENTIFIED BY '***' REPLACE '***'",
+            ),
+            (
+                "CREATE USER x IDENTIFIED BY VALUES 'S:AB12'",
+                "CREATE USER x IDENTIFIED BY VALUES '***'",
+            ),
+            (
+                "CREATE DATABASE LINK l CONNECT TO u IDENTIFIED BY pw1 USING 'tns'",
+                "CREATE DATABASE LINK l CONNECT TO u IDENTIFIED BY *** USING 'tns'",
+            ),
+            (
+                "CREATE USER u IDENTIFIED BY RANDOM PASSWORD",
+                "CREATE USER u IDENTIFIED BY RANDOM PASSWORD",
+            ),
+            // PostgreSQL E'' strings, dollar quoting (also multi-line), roles.
+            (
+                r"ALTER ROLE r PASSWORD E'it\'s ''x'' secret'",
+                "ALTER ROLE r PASSWORD '***'",
+            ),
+            (
+                "ALTER ROLE r PASSWORD $$hun\nter2$$ LOGIN",
+                "ALTER ROLE r PASSWORD '***' LOGIN",
+            ),
+            (
+                "CREATE ROLE r LOGIN PASSWORD $pw$hunter2$pw$ VALID UNTIL 'infinity'",
+                "CREATE ROLE r LOGIN PASSWORD '***' VALID UNTIL 'infinity'",
+            ),
+            (
+                "CREATE ROLE r WITH LOGIN ENCRYPTED PASSWORD 'SCRAM-SHA-256$4096:abc'",
+                "CREATE ROLE r WITH LOGIN ENCRYPTED PASSWORD '***'",
+            ),
+            (
+                "create role r encrypted password E'a\\\\b' createdb",
+                "create role r encrypted password '***' createdb",
+            ),
+            (
+                "ALTER ROLE r PASSWORD 'unterminated",
+                "ALTER ROLE r PASSWORD '***'",
+            ),
+            // Not passwords.
+            ("ALTER ROLE r PASSWORD NULL", "ALTER ROLE r PASSWORD NULL"),
+            (
+                "ALTER USER u PASSWORD EXPIRE",
+                "ALTER USER u PASSWORD EXPIRE",
+            ),
+            (
+                "SELECT password FROM users WHERE id = $1",
+                "SELECT password FROM users WHERE id = $1",
+            ),
+            // MongoDB and Redis consoles.
+            (
+                r#"db.createUser({user: "u", pwd: "hunter2", roles: []})"#,
+                r#"db.createUser({user: "u", pwd: "***", roles: []})"#,
+            ),
+            (r#"{"password": 'a\'b'}"#, r#"{"password": "***"}"#),
+            ("AUTH default hunter2", "AUTH ***"),
+            (
+                "CONFIG SET requirepass hunter2",
+                "CONFIG SET requirepass ***",
+            ),
+            ("HELLO 3 AUTH default hunter2", "HELLO 3 AUTH default ***"),
+            ("SELECT author FROM books", "SELECT author FROM books"),
+        ];
+        for (input, expected) in more {
+            assert_eq!(redact_sql(input), expected, "{input}");
+        }
         let h = HistoryStore::open_in_memory().unwrap();
         let mut e = HistoryEntry::new(
             "CREATE USER bob WITH PASSWORD 'hunter2'",
@@ -833,6 +1079,34 @@ mod tests {
         drop(h);
         let (_, warning) = HistoryStore::open_or_recover(&path).unwrap();
         assert!(warning.is_none());
+    }
+
+    #[test]
+    fn only_a_damaged_database_is_moved_aside() {
+        // Something that cannot be opened but is not a damaged database (here a
+        // directory; a lock held past the busy timeout behaves the same): an
+        // error, and the history stays where it is.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"x").unwrap();
+        assert!(HistoryStore::open_or_recover(&path).is_err());
+        assert!(path.join("keep").exists());
+        let moved = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
+        assert!(!moved, "not treated as corruption");
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(!is_corrupt(&busy));
+        let notadb = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            None,
+        );
+        assert!(is_corrupt(&notadb));
     }
 
     #[test]

@@ -94,20 +94,48 @@ pub fn decrypt_credentials(bytes: &[u8]) -> DbResult<DbeaverCredentials> {
     parse_credentials_json(&plaintext)
 }
 
+/// Overwrites every string of a JSON tree (the parsed credentials).
+fn wipe_strings(v: &mut Value) {
+    use zeroize::Zeroize;
+    match v {
+        Value::String(s) => s.zeroize(),
+        Value::Array(a) => a.iter_mut().for_each(wipe_strings),
+        Value::Object(m) => m.values_mut().for_each(wipe_strings),
+        _ => {}
+    }
+}
+
+/// The parsed tree, wiped when dropped (also on early returns).
+struct WipedOnDrop(BTreeMap<String, BTreeMap<String, Value>>);
+
+impl Drop for WipedOnDrop {
+    fn drop(&mut self) {
+        self.0
+            .values_mut()
+            .flat_map(|sections| sections.values_mut())
+            .for_each(wipe_strings);
+    }
+}
+
 fn parse_credentials_json(plaintext: &[u8]) -> DbResult<DbeaverCredentials> {
-    let raw: BTreeMap<String, BTreeMap<String, serde_json::Value>> =
-        serde_json::from_slice(plaintext).map_err(|e| {
-            DbError::config(format!(
-                "The decrypted DBeaver credentials are not valid JSON: {e}"
-            ))
-        })?;
+    // serde_json's message can quote a value of the file (a password): only
+    // the position is reported.
+    let raw = WipedOnDrop(serde_json::from_slice(plaintext).map_err(|e| {
+        DbError::config(format!(
+            "The decrypted DBeaver credentials are not valid JSON (line {}, column {})",
+            e.line(),
+            e.column()
+        ))
+    })?);
     let mut out = DbeaverCredentials::default();
-    for (conn, sections) in raw {
+    for (conn, sections) in &raw.0 {
         let mut parsed = BTreeMap::new();
         for (section, value) in sections {
+            // Deserialized from a reference: the only copy of a password goes
+            // into a `Secret`, the tree itself is wiped by `WipedOnDrop`.
             if let Ok(c) = RawCredential::deserialize(value) {
                 parsed.insert(
-                    section,
+                    section.clone(),
                     DbeaverCredential {
                         user: c.user.filter(|u| !u.is_empty()),
                         password: c.password.map(|p| p.0).filter(|p| !p.is_empty()),
@@ -115,7 +143,7 @@ fn parse_credentials_json(plaintext: &[u8]) -> DbResult<DbeaverCredentials> {
                 );
             }
         }
-        out.entries.insert(conn, parsed);
+        out.entries.insert(conn.clone(), parsed);
     }
     Ok(out)
 }
@@ -1147,6 +1175,38 @@ mod tests {
             hex::encode(DBEAVER_CREDENTIALS_KEY),
             "babb4a9f774ab853c96c2d653dfe544a"
         );
+    }
+
+    #[test]
+    fn malformed_credentials_never_quote_a_password() {
+        // serde_json's own message would be `invalid type: string "hunter2" ...`.
+        for json in [
+            r#"{"a": "hunter2"}"#,
+            r##"{"a": {"#connection": {"password": "hunter2"}}, "b": ["hunter2"]}"##,
+            r##"{"a": {"#connection": {"password": "hunter2"}}"##,
+        ] {
+            let e = parse_credentials_json(json.as_bytes()).unwrap_err();
+            assert!(!e.message.contains("hunter2"), "{}", e.message);
+            assert!(e.message.contains("line 1"), "{}", e.message);
+        }
+        // Sections that are not credentials are skipped, the others kept.
+        let c = parse_credentials_json(
+            br##"{"a": {"#connection": {"user": "u", "password": "p", "extra": ["x"]}, "other": 5}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            c.get("a", "#connection")
+                .unwrap()
+                .password
+                .as_ref()
+                .unwrap()
+                .expose(),
+            "p"
+        );
+        assert!(c.get("a", "other").is_none());
+        let mut v = serde_json::json!({"p": "secret", "l": ["secret", {"x": "secret"}]});
+        wipe_strings(&mut v);
+        assert!(!v.to_string().contains("secret"));
     }
 
     #[test]

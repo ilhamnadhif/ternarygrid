@@ -209,11 +209,19 @@ pub(crate) struct SseEvent {
     pub data: String,
 }
 
+/// Longest line accepted from an event stream (a `data:` line holds one
+/// JSON event; real ones are far smaller).
+pub(crate) const MAX_SSE_LINE: usize = 8 * 1024 * 1024;
+/// Largest event (all of its `data:` lines) accepted from an event stream.
+pub(crate) const MAX_SSE_EVENT: usize = 16 * 1024 * 1024;
+
 /// Incremental parser of a `text/event-stream`, fed line by line.
 #[derive(Debug, Default)]
 pub(crate) struct SseParser {
     event: Option<String>,
     data: Vec<String>,
+    /// Bytes of `data` (with the joining newlines) of the pending event.
+    pending: usize,
 }
 
 impl SseParser {
@@ -234,10 +242,19 @@ impl SseParser {
         };
         match field {
             "event" => self.event = Some(value.to_string()),
-            "data" => self.data.push(value.to_string()),
+            "data" => {
+                self.pending += value.len() + 1;
+                self.data.push(value.to_string())
+            }
             _ => {}
         }
         None
+    }
+
+    /// Size in bytes of the data buffered for the event not yet dispatched
+    /// (the reader stops at [`MAX_SSE_EVENT`]).
+    pub fn pending_bytes(&self) -> usize {
+        self.pending
     }
 
     /// End of stream: dispatch a pending event.
@@ -246,6 +263,7 @@ impl SseParser {
     }
 
     fn dispatch(&mut self) -> Option<SseEvent> {
+        self.pending = 0;
         if self.data.is_empty() && self.event.is_none() {
             return None;
         }
@@ -639,7 +657,7 @@ mod tests {
                 "system": [{"type": "text", "text": req().system, "cache_control": {"type": "ephemeral"}}],
                 "messages": [{"role": "user", "content": "count users"}],
                 "stream": true,
-                "output_config": {"effort": "medium"},
+                "output_config": {"effort": "high"},
                 "fallbacks": "default"
             })
         );
@@ -657,7 +675,7 @@ mod tests {
         let r = build_request(&cfg, &req(), Flags::initial(&cfg)).unwrap();
         assert!(r.header("anthropic-beta").is_none());
         assert!(r.body.get("fallbacks").is_none());
-        assert_eq!(r.body["output_config"]["effort"], "medium");
+        assert_eq!(r.body["output_config"]["effort"], "high");
         let mut proxy = AiConfig::anthropic("k");
         proxy.base_url = Some("https://gateway.example.com/anthropic".into());
         let r = build_request(&proxy, &req(), Flags::initial(&proxy)).unwrap();
