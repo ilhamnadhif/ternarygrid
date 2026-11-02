@@ -211,14 +211,17 @@ pub fn show_dashboard_with(
                             )
                             .max(1);
                         let card_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).max(120.0);
-                        for row in metrics.chunks(cols) {
+                        // Rows 12 apart (the spacing and 4), groups 18 (the spacing and 10).
+                        for (r, row) in metrics.chunks(cols).enumerate() {
+                            if r > 0 {
+                                ui.add_space(4.0);
+                            }
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = gap;
                                 for m in row {
                                     metric_card(ui, m, now, window, card_w, layout.chart_height);
                                 }
                             });
-                            ui.add_space(4.0);
                         }
                     }
                 });

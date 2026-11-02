@@ -101,8 +101,9 @@ pub trait TabView: Any {
         crate::keys::ActionContext::Global
     }
 
-    /// Opens in a pop-up window of this size instead of a tab: wizards and
-    /// one-off actions (export, import, backup …).
+    /// Opens in a pop-up window instead of a tab (wizards and one-off actions: export,
+    /// import, backup …) of this size: the design's window inside its 1-point border (the
+    /// modal's CSS width × height, header included); the window adds the border.
     fn popup_size(&self) -> Option<egui::Vec2> {
         None
     }

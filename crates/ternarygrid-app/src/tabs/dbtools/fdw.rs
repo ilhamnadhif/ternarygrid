@@ -186,8 +186,8 @@ impl FdwConfigTab {
 
 impl TabView for FdwConfigTab {
     fn popup_size(&self) -> Option<egui::Vec2> {
-        // The design's 862 × 630 with its border (the pop-up adds 30).
-        Some(egui::vec2(862.0, 600.0))
+        // The design's window inside its border.
+        Some(egui::vec2(860.0, 628.0))
     }
 
     fn title(&self) -> String {
@@ -223,6 +223,8 @@ impl TabView for FdwConfigTab {
             let sources: Vec<ConnectionConfig> = cx.conns.configs().iter().filter(|c| c.id != self.conn && wrapper_of(c.kind).is_some()).cloned().collect();
             let current = self.source.as_ref().and_then(|id| sources.iter().find(|c| &c.id == id)).cloned();
             let lw = 150.0;
+            // The design's select box is 30 high, as the fields (the logo centred on it).
+            ui.spacing_mut().interact_size.y = ternarygrid_ui::style::CONTROL_H;
             look::row(ui, tr("Source connection"), lw, |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if let Some(c) = &current {
@@ -250,6 +252,8 @@ impl TabView for FdwConfigTab {
             });
             look::row(ui, tr("Tables"), lw, |ui| look::field(ui, &mut self.tables, tr("comma separated; empty = all"), f32::INFINITY, false));
             ui.add_space(4.0);
+            // The buttons' row as high as they are (26).
+            ui.spacing_mut().interact_size.y = ternarygrid_ui::style::SMALL_H;
             match self.script() {
                 Ok(script) => {
                     ui.horizontal(|ui| {

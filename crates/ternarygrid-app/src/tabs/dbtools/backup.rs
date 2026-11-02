@@ -1088,8 +1088,8 @@ impl TabView for BackupTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        // The design's 862 × 441.5 and 902 × 731.5 with their border (the pop-up adds 30).
-        Some(if self.restore { egui::vec2(862.0, 411.5) } else { egui::vec2(902.0, 701.5) })
+        // The design's windows inside their border.
+        Some(if self.restore { egui::vec2(860.0, 439.5) } else { egui::vec2(900.0, 729.5) })
     }
 
     fn title(&self) -> String {

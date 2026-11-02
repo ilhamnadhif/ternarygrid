@@ -11,9 +11,9 @@ use ternarygrid_ui::kit::{self, Kind};
 use ternarygrid_ui::parts::{self, Tone};
 use ternarygrid_ui::style;
 
-/// The size of a wizard's window: the design's 942 × 645 with its border (the pop-up adds 30
-/// to the height asked for).
-pub(crate) const WINDOW: Vec2 = vec2(942.0, 615.0);
+/// The size of a wizard's window inside its border, as the design's modal (940 × 643, the
+/// header, the steps and the footer included).
+pub(crate) const WINDOW: Vec2 = vec2(940.0, 643.0);
 
 /// Space between the parts of a section.
 pub(crate) const GAP: f32 = 10.0;

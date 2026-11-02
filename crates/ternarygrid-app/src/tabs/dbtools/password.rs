@@ -170,8 +170,9 @@ impl TabView for ChangePasswordTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        // The design's 542 × 366 with its border (the pop-up adds 30).
-        Some(egui::vec2(542.0, 336.0))
+        // The design's window inside its border (the form; the window keeps its size when the
+        // password was changed).
+        Some(egui::vec2(540.0, 364.0))
     }
 
     fn title(&self) -> String {

@@ -645,8 +645,8 @@ impl TabView for MaintenanceTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        // The design's 622 × 357 and 862 × 511 with their border (the pop-up adds 30).
-        Some(if self.is_truncate() { egui::vec2(622.0, 327.0) } else { egui::vec2(862.0, 481.0) })
+        // The design's windows inside their border.
+        Some(if self.is_truncate() { egui::vec2(620.0, 355.0) } else { egui::vec2(860.0, 509.0) })
     }
 
     fn title(&self) -> String {
