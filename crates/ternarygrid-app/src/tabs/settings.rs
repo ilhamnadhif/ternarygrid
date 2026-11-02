@@ -201,6 +201,12 @@ impl SettingsTab {
                 combo(ui, "set_time_zone", &mut s.time_zone, &items)
             });
             c |= row(ui, tr("Theme"), |ui| combo(ui, "set_theme", &mut s.theme, &[(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))]));
+            ui.label("");
+            let mut colored = s.colored_icons.unwrap_or(false);
+            if check(ui, &mut colored, tr("Coloured icons (the classic look)")) {
+                s.colored_icons = Some(colored);
+                c = true;
+            }
             c |= row(ui, tr("Font size"), |ui| num(ui, &mut s.ui_font_size, 8.0..=32.0, " pt"));
             c |= row(ui, tr("Zoom"), |ui| {
                 let mut pct = (s.ui_scale * 100.0).round();

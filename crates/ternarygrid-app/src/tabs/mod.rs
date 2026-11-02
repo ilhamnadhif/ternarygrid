@@ -308,6 +308,13 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         if response.middle_clicked() {
             self.cx.commands.push(crate::command::AppCommand::CloseTab(tab.id));
         }
+        // The focused tab: a short accent line along its top, as in TernaryWire and TernaryShell.
+        if self.active_tab == Some(tab.id) {
+            let r = response.rect;
+            let line = egui::Rect::from_min_max(egui::pos2(r.left() + 8.0, r.top() + 1.0), egui::pos2(r.right() - 8.0, r.top() + 3.0));
+            let painter = response.ctx.layer_painter(response.layer_id).with_clip_rect(response.interact_rect);
+            painter.rect_filled(line, egui::CornerRadius::same(1), ternarygrid_ui::palette(self.style.visuals.dark_mode).accent);
+        }
     }
 
     fn context_menu(&mut self, ui: &mut Ui, tab: &mut Tab, _path: egui_dock::NodePath) {

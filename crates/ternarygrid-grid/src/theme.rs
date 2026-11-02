@@ -72,8 +72,8 @@ impl GridTheme {
             line: if dark { mix(bg, Color32::BLACK, 0.17) } else { mix(bg, text, 0.12) },
             header_bg: mix(header_base, bg, 0.25),
             header_text: v.strong_text_color(),
-            // DBeaver's grey-violet in the dark theme (selected headers, the record view's field).
-            header_selected_bg: if dark { Color32::from_rgb(0x5F, 0x5F, 0x6F) } else { mix(header_base, v.selection.bg_fill, 0.45) },
+            // Selected headers and the record view's field: the header tinted with the selection.
+            header_selected_bg: mix(header_base, v.selection.bg_fill, if dark { 0.6 } else { 0.45 }),
             // White on the dark blue-grey header (as in DBeaver), grey on the light one.
             rownum_text: if dark { v.strong_text_color() } else { v.weak_text_color() },
             record_bg: if dark { mix(bg, text, 0.053) } else { bg },

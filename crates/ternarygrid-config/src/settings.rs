@@ -140,6 +140,9 @@ pub struct GeneralSettings {
     /// The first-start setup (import from DBeaver, keyboard, look) was
     /// finished or skipped. Installs from before it existed count as done.
     pub onboarding_done: bool,
+    /// Coloured icons (the classic look) instead of monochrome ones; unset
+    /// follows the look's default (monochrome).
+    pub colored_icons: Option<bool>,
 }
 
 impl Default for GeneralSettings {
@@ -154,6 +157,7 @@ impl Default for GeneralSettings {
             show_tips: true,
             next_tip: 0,
             onboarding_done: false,
+            colored_icons: None,
         }
     }
 }

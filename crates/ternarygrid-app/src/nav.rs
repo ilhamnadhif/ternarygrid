@@ -1231,7 +1231,7 @@ impl Navigator {
                 let logo_rect = egui::Rect::from_center_size(egui::pos2(x + 8.0, y), egui::vec2(font.size + 5.0, font.size + 5.0));
                 let icon_rect = match r.logo {
                     Some(kind) if crate::dblogo::paint(ui, kind, logo_rect, crate::theme::legible_on(icol, row_bg)) => logo_rect,
-                    _ => ui.painter().text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, r.icon, ternarygrid_icons::fill_font(ui.ctx(), font.size), icol),
+                    _ => ui.painter().text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, r.icon, egui::FontId::proportional(font.size), icol),
                 };
                 if let Some(badge) = r.badge {
                     let at = icon_rect.right_bottom() + egui::vec2(-1.0, -2.0);

@@ -1,10 +1,29 @@
-//! Icon colours, DBeaver-style: folders orange, tables blue, keys gold,
-//! "new" green, "delete" red … so icons can be told apart at a glance. One
-//! palette serves both themes: every colour has a contrast of about 3:1 or
-//! more against the light and the dark panel background.
+//! Icon colours. Two styles:
+//! - **coloured** (the classic, DBeaver-like look): folders orange, tables
+//!   blue, keys gold, "new" green, "delete" red … so icons can be told apart
+//!   at a glance;
+//! - **monochrome** (the modern look shared with TernaryWire and
+//!   TernaryShell): icons in the text colour, colour only where it means
+//!   something (destructive actions, warnings).
+//!
+//! One palette serves both themes: every colour has a contrast of about 3:1
+//! or more against the light and the dark panel background.
 
-use egui::{Color32, FontFamily, FontId, RichText};
+use egui::{Color32, RichText};
 use egui_phosphor::regular as i;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static COLORED: AtomicBool = AtomicBool::new(true);
+
+/// Choose the icon style of the whole application: coloured or monochrome.
+pub fn set_colored(colored: bool) {
+    COLORED.store(colored, Ordering::Relaxed);
+}
+
+/// Whether icons are coloured.
+pub fn colored() -> bool {
+    COLORED.load(Ordering::Relaxed)
+}
 
 const fn rgb(c: u32) -> Color32 {
     Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
@@ -29,6 +48,9 @@ pub const SKY: Color32 = rgb(0x0284C7);
 /// The colour of an icon glyph (`egui_phosphor::regular`), `None` for icons
 /// drawn in the text colour.
 pub fn color(glyph: &str) -> Option<Color32> {
+    if !colored() {
+        return meaning(glyph);
+    }
     Some(match glyph {
         // Folders and groups.
         i::FOLDER | i::FOLDER_OPEN | i::FOLDER_SIMPLE | i::FOLDERS | i::FOLDER_PLUS => ORANGE,
@@ -91,28 +113,13 @@ pub fn color(glyph: &str) -> Option<Color32> {
     })
 }
 
-/// Font family of the filled Phosphor icons (the navigator's objects).
-pub const FILL_FAMILY: &str = "phosphor-fill";
-
-/// Register the filled icons as [`FILL_FAMILY`] (the regular ones stay the
-/// fallback of proportional text).
-pub fn add_fill_font(fonts: &mut egui::FontDefinitions) {
-    egui_phosphor::add_font_bytes_as_family(
-        fonts,
-        FILL_FAMILY,
-        egui_phosphor::Variant::Fill.font_bytes(),
-    );
-}
-
-/// The filled icons at this size; the regular ones when the filled font is
-/// not registered.
-pub fn fill_font(ctx: &egui::Context, size: f32) -> FontId {
-    let family = FontFamily::Name(FILL_FAMILY.into());
-    if ctx.fonts(|f| f.definitions().families.contains_key(&family)) {
-        FontId::new(size, family)
-    } else {
-        FontId::proportional(size)
-    }
+/// Monochrome icons keep the colours that carry a meaning.
+fn meaning(glyph: &str) -> Option<Color32> {
+    Some(match glyph {
+        i::TRASH | i::STOP | i::STOP_CIRCLE | i::MINUS_CIRCLE | i::WARNING_OCTAGON => RED,
+        i::WARNING => ORANGE,
+        _ => return None,
+    })
 }
 
 /// An icon as a coloured text atom: `ui.button((ic(icon::TABLE), "Tables"))`
@@ -135,5 +142,13 @@ mod tests {
         assert_eq!(color(i::TRASH), Some(RED));
         assert_eq!(color(i::COPY), None);
         assert_eq!(ic(i::TABLE).text(), i::TABLE);
+        // Monochrome: the text colour, except where colour means something.
+        set_colored(false);
+        assert_eq!(color(i::FOLDER), None);
+        assert_eq!(color(i::TABLE), None);
+        assert_eq!(color(i::PLAY), None);
+        assert_eq!(color(i::TRASH), Some(RED));
+        assert_eq!(color(i::WARNING), Some(ORANGE));
+        set_colored(true);
     }
 }

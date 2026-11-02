@@ -6492,6 +6492,7 @@ dependencies = [
  "ternarygrid-sql",
  "ternarygrid-tasks",
  "ternarygrid-transfer",
+ "ternarygrid-ui",
  "ternarygrid-visual",
  "tokio",
  "tokio-util",
@@ -6860,6 +6861,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ternarygrid-ui"
+version = "0.5.2"
+dependencies = [
+ "egui",
+ "egui-phosphor",
 ]
 
 [[package]]
