@@ -181,9 +181,9 @@ fn num<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range: std::ops::Ran
 }
 
 fn heading(ui: &mut Ui, text: &str) {
-    ui.add_space(8.0);
-    ui.label(RichText::new(text).strong());
-    ui.add_space(2.0);
+    ui.add_space(12.0);
+    ui.label(ternarygrid_ui::kit::section_title(ui, text));
+    ui.add_space(4.0);
 }
 
 impl SettingsTab {
@@ -915,10 +915,11 @@ impl TabView for SettingsTab {
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let mut changed = false;
-        egui::Panel::left("settings_sections").resizable(false).exact_size(200.0).show(ui, |ui| {
+        egui::Panel::left("settings_sections").resizable(false).exact_size(210.0).show(ui, |ui| {
             ui.add_space(6.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
             for s in Section::ALL {
-                if ui.selectable_label(self.section == s, (ternarygrid_icons::ic(s.icon()), s.label())).clicked() {
+                if ternarygrid_ui::kit::nav_item(ui, s.icon(), s.label(), self.section == s).clicked() {
                     self.section = s;
                     self.message = None;
                     self.recording = None;
@@ -926,7 +927,7 @@ impl TabView for SettingsTab {
             }
             ui.add_space(12.0);
             let dir = cx.services.paths.config_dir().to_path_buf();
-            if ui.add(egui::Button::new((ternarygrid_icons::ic(icon::FOLDER_OPEN), tr("Open settings folder"))).frame(false)).on_hover_text(dir.display().to_string()).clicked() {
+            if ternarygrid_ui::kit::ghost(ui, Some(icon::FOLDER_OPEN), tr("Open settings folder")).on_hover_text(dir.display().to_string()).clicked() {
                 let _ = open::that_detached(&dir);
             }
             if self.confirm_reset {
@@ -943,13 +944,14 @@ impl TabView for SettingsTab {
                         self.confirm_reset = false;
                     }
                 });
-            } else if ui.button((ternarygrid_icons::ic(icon::ARROW_COUNTER_CLOCKWISE), tr("Reset all settings…"))).clicked() {
+            } else if ternarygrid_ui::kit::ghost(ui, Some(icon::ARROW_COUNTER_CLOCKWISE), tr("Reset all settings…")).clicked() {
                 self.confirm_reset = true;
             }
         });
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(self.section.label());
             ui.add_space(4.0);
+            ui.label(RichText::new(self.section.label()).font(ternarygrid_ui::style::semibold(ui.ctx(), 18.0)));
+            ui.add_space(8.0);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 changed |= match self.section {
                     Section::General => self.general(ui, cx),

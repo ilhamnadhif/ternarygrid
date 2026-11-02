@@ -1172,10 +1172,15 @@ impl Navigator {
                 } else if resp.hovered() {
                     Some(ui.visuals().widgets.hovered.weak_bg_fill)
                 } else {
-                    r.tint.map(|t| t.gamma_multiply(0.22))
+                    None
                 };
                 if let Some(fill) = fill {
-                    ui.painter().rect_filled(rect, 3.0, fill);
+                    ui.painter().rect_filled(rect, 4.0, fill);
+                }
+                // A marked connection type (Production): a stripe on the row's left edge.
+                if let Some(t) = r.tint {
+                    let stripe = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + 3.0), egui::pos2(rect.left() + 3.0, rect.bottom() - 3.0));
+                    ui.painter().rect_filled(stripe, 1.5, t);
                 }
                 let row_bg = fill.map_or(ui.visuals().panel_fill, |f| crate::theme::over(f, ui.visuals().panel_fill));
                 let mut x = rect.left() + 4.0 + r.depth as f32 * 14.0;
@@ -1240,20 +1245,19 @@ impl Navigator {
                     ui.painter().circle(at, 3.5, badge, egui::Stroke::new(1.5, bg));
                 }
                 x += 20.0;
-                // Name and detail cut with "…" at the panel's edge (or the size's box).
+                // Name and detail cut with "…" at the panel's edge (or the size).
                 let mut right = rect.right() - 6.0;
                 let fit = |ui: &Ui, text: egui::RichText, width: f32, style: egui::TextStyle| {
                     egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), width, style)
                 };
                 let resp = match &r.size {
                     Some((short, tip)) if right - x > 120.0 => {
-                        let weak = ui.visuals().weak_text_color();
-                        let g = fit(ui, RichText::new(short).small().color(weak), 60.0, egui::TextStyle::Small);
-                        let boxed = egui::Rect::from_min_max(egui::pos2(right - g.size().x - 8.0, y - 7.5), egui::pos2(right, y + 7.5));
-                        ui.painter().rect_filled(boxed, 2.0, ui.visuals().faint_bg_color);
-                        ui.painter().rect_stroke(boxed, 2.0, egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
-                        ui.painter().galley(egui::pos2(boxed.right() - 4.0 - g.size().x, y - g.size().y / 2.0), g, weak);
-                        right = boxed.left() - 6.0;
+                        // Faint, right-aligned: there when wanted, not a box on every row.
+                        let faint = ternarygrid_ui::pal(ui).text_faint;
+                        let g = fit(ui, RichText::new(short).small().color(faint), 60.0, egui::TextStyle::Small);
+                        let left = right - g.size().x;
+                        ui.painter().galley(egui::pos2(left, y - g.size().y / 2.0), g, faint);
+                        right = left - 8.0;
                         resp.on_hover_text(tip)
                     }
                     _ => resp,

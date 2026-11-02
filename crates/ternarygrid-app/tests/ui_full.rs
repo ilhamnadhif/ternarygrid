@@ -731,14 +731,14 @@ fn settings_grid_menu_and_editor_helpers() {
         "Keyboard shortcuts",
         "Connection types",
         "Network profiles",
-        "AI",
+        "AI assistant",
         "Security",
         "Accessibility",
         "General",
     ] {
         pause(&mut h);
-        let key = format!(" {section}");
-        let Some(n) = h.query_all_by_label_contains(&key).find(|n| !on_toolbar(&h, n)) else {
+        // The section's own row (the rail and the top bar have some of the same names).
+        let Some(n) = h.query_all_by_label(section).find(|n| !on_toolbar(&h, n)) else {
             panic!("settings section {section:?}; labels: {:?}", labels(&h));
         };
         n.click();

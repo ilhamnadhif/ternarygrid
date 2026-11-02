@@ -297,6 +297,31 @@ pub fn tab_strip<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T,
     out
 }
 
+/// A full-width row of a side navigation (settings sections, panels): its icon and name, the
+/// selected one on a soft accent.
+pub fn nav_item(ui: &mut Ui, icon: &str, text: &str, selected: bool) -> Response {
+    let p = style::pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, text));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if selected {
+            painter.rect_filled(rect, CornerRadius::same(RADIUS), p.accent_soft);
+        } else if resp.hovered() {
+            painter.rect_filled(rect, CornerRadius::same(RADIUS), p.hover);
+        }
+        if resp.has_focus() {
+            painter.rect_stroke(rect, CornerRadius::same(RADIUS), Stroke::new(1.5, p.accent), StrokeKind::Inside);
+        }
+        let size = style::body_size(ui.ctx());
+        let cy = rect.center().y;
+        painter.text(egui::pos2(rect.left() + 18.0, cy), Align2::CENTER_CENTER, icon, style::icon_font(size + 2.0), if selected { p.accent_text } else { p.text_muted });
+        let font = if selected { style::medium(ui.ctx(), size) } else { FontId::proportional(size) };
+        painter.text(egui::pos2(rect.left() + 36.0, cy), Align2::LEFT_CENTER, text, font, p.text);
+    }
+    resp
+}
+
 /// One tab of a row of underlined tabs: an optional icon, its text and an optional count, the
 /// selected one underlined in the accent. Lay several out in a horizontal `ui` (the row's
 /// hairline is the caller's), so each tab keeps its own response for menus and middle clicks.

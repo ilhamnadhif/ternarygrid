@@ -273,26 +273,6 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
 
     /// A tab of a connection whose type has a colour (Production: red) is
     /// tinted in it, as in DBeaver: work on that server stands out.
-    fn tab_style_override(&self, tab: &Tab, global: &egui_dock::TabStyle) -> Option<egui_dock::TabStyle> {
-        let color = tab.view.connection_id().and_then(|c| self.cx.conns.color_of(c)).and_then(crate::theme::connection_marker)?;
-        let dark = self.style.visuals.dark_mode;
-        let mut s = global.clone();
-        let tint = |base: egui::Color32, t: f32| ternarygrid_grid::theme::mix(base, color, t);
-        for (style, t) in [
-            (&mut s.active, if dark { 0.45 } else { 0.35 }),
-            (&mut s.focused, if dark { 0.45 } else { 0.35 }),
-            (&mut s.active_with_kb_focus, if dark { 0.45 } else { 0.35 }),
-            (&mut s.focused_with_kb_focus, if dark { 0.45 } else { 0.35 }),
-            (&mut s.inactive, if dark { 0.3 } else { 0.22 }),
-            (&mut s.inactive_with_kb_focus, if dark { 0.3 } else { 0.22 }),
-            (&mut s.hovered, if dark { 0.4 } else { 0.3 }),
-        ] {
-            style.bg_fill = tint(style.bg_fill, t);
-            style.outline_color = color;
-        }
-        Some(s)
-    }
-
     fn ui(&mut self, ui: &mut Ui, tab: &mut Tab) {
         self.cx.tab_active = self.active_tab == Some(tab.id);
         self.cx.current_tab = Some(tab.id);
@@ -313,12 +293,18 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         if response.middle_clicked() {
             self.cx.commands.push(crate::command::AppCommand::CloseTab(tab.id));
         }
-        // The focused tab: a short accent line along its top, as in TernaryWire and TernaryShell.
-        if self.active_tab == Some(tab.id) {
+        // A line along the top: the connection type's colour on every tab of a marked
+        // connection (Production stays visible), else the accent on the focused tab, as in
+        // TernaryWire and TernaryShell.
+        let marker = tab.view.connection_id().and_then(|c| self.cx.conns.color_of(c)).and_then(crate::theme::connection_marker);
+        let active = self.active_tab == Some(tab.id);
+        let color = marker.or_else(|| active.then(|| ternarygrid_ui::palette(self.style.visuals.dark_mode).accent));
+        if let Some(color) = color {
             let r = response.rect;
-            let line = egui::Rect::from_min_max(egui::pos2(r.left() + 8.0, r.top() + 1.0), egui::pos2(r.right() - 8.0, r.top() + 3.0));
+            let thick = if active { 3.0 } else { 2.0 };
+            let line = egui::Rect::from_min_max(egui::pos2(r.left() + 6.0, r.top() + 1.0), egui::pos2(r.right() - 6.0, r.top() + 1.0 + thick));
             let painter = response.ctx.layer_painter(response.layer_id).with_clip_rect(response.interact_rect);
-            painter.rect_filled(line, egui::CornerRadius::same(1), ternarygrid_ui::palette(self.style.visuals.dark_mode).accent);
+            painter.rect_filled(line, egui::CornerRadius::same(1), color);
         }
     }
 
