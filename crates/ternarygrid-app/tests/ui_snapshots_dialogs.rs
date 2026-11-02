@@ -472,6 +472,8 @@ fn ui_snapshots_dialogs() {
             s.set_right_of(label, text);
         }
         s.open_combo_right_of("Connection type");
+        // A drop-down in the design's menu look.
+        s.shot("conn_type_menu");
         s.click("Production");
         s.unfocus();
         s.shot("conn_main");
