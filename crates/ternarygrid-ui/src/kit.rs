@@ -650,7 +650,9 @@ pub fn field_with_icon(ui: &mut Ui, id: egui::Id, text: &mut String, hint_text: 
         .fill(p.surface)
         .stroke(Stroke::new(1.0, if hovered { p.border_strong } else { p.border }))
         .corner_radius(CornerRadius::same(RADIUS))
-        .inner_margin(egui::Margin { left: 32, right: if clear { 28 } else { 10 }, top: 0, bottom: 0 });
+        // The design's input: the icon's centre 18 in, the text 35 in (border, 10 padding,
+        // 14 icon, 8 gap and the input's own 2).
+        .inner_margin(egui::Margin { left: 34, right: if clear { 28 } else { 10 }, top: 0, bottom: 0 });
     let edit = egui::TextEdit::singleline(text)
         .id(id)
         .hint_text(RichText::new(hint_text).color(p.text_faint))
@@ -663,7 +665,7 @@ pub fn field_with_icon(ui: &mut Ui, id: egui::Id, text: &mut String, hint_text: 
     if resp.has_focus() {
         style::focus_halo(ui, r, RADIUS);
     }
-    ui.painter().text(egui::pos2(r.left() + 17.0, r.center().y), Align2::CENTER_CENTER, icon, style::icon_font(14.0), p.text_faint);
+    ui.painter().text(egui::pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, icon, style::icon_font(14.0), p.text_faint);
     if clear && !text.is_empty() {
         let x_rect = Rect::from_center_size(egui::pos2(r.right() - 15.0, r.center().y), Vec2::splat(18.0));
         let x = ui.interact(x_rect, resp.id.with("clear"), Sense::click());
@@ -779,7 +781,7 @@ pub fn tree_section(ui: &mut Ui, open: &mut bool, glyph: &str, title: &str) -> R
 /// The design's menu look for the `ui` of a context menu or a pop-up menu (call it first in
 /// the menu's closure): items 28 points high padded by 10, the icon 10 points from the text,
 /// no gap between items, hovered items on the hover fill with a radius of 5, the menu
-/// `min_width` wide (shortcuts at its right edge). Items added with `ui.button` get the height and padding; for the
+/// `min_width` wide outside (shortcuts at its right edge). Items added with `ui.button` get the height and padding; for the
 /// muted icon and the faint shortcut use [`menu_item`].
 pub fn menu_look(ui: &mut Ui, min_width: f32) {
     let p = style::pal(ui);
@@ -795,8 +797,11 @@ pub fn menu_look(ui: &mut Ui, min_width: f32) {
     w.hovered.weak_bg_fill = p.hover;
     w.active.weak_bg_fill = p.subtle;
     w.open.weak_bg_fill = p.hover;
-    ui.set_min_width(min_width);
-    ui.set_max_width(min_width);
+    // `min_width` is the menu's outer width, as the design gives it (border-box): its 5 point
+    // margin and its 1 point border on both sides come off for the items.
+    let inner = (min_width - 12.0).max(0.0);
+    ui.set_min_width(inner);
+    ui.set_max_width(inner);
 }
 
 /// A menu item as in the design: a muted icon (or the room of one), the text, and the
