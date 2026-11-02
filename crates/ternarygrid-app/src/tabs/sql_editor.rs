@@ -1193,11 +1193,15 @@ impl SqlEditorTab {
             let caret = RichText::new(icon::CARET_DOWN).size(10.0).color(p.text_faint);
             ui.add(egui::Button::new((lead, RichText::new(text).color(p.text), caret)).frame_when_inactive(false)).on_hover_text(tip)
         };
+        // A narrow editor (a side panel open, a split): shorter names, the transaction mode
+        // as its icon, so the toolbar never runs over itself.
+        let narrow = ui.available_width() < 820.0;
+        let short = |s: String, max: usize| if narrow && s.chars().count() > max { format!("{}…", s.chars().take(max - 1).collect::<String>()) } else { s };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.set_min_height(30.0);
             // Connection selector.
-            let conn_name = self.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("No connection").to_string());
+            let conn_name = short(self.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("No connection").to_string()), 14);
             let marker = self.conn.as_ref().and_then(|c| cx.conns.color_of(c)).and_then(crate::theme::connection_marker);
             let lead = RichText::new(icon::PLUGS).color(marker.unwrap_or(p.text_muted));
             let r = picker(ui, lead, &conn_name, format!("{} ({})", tr("Active connection"), crate::keys::label(cx.keymap, Action::SelectConnection)));
@@ -1237,7 +1241,7 @@ impl SqlEditorTab {
                 None => self.schema.as_ref().and_then(|s| s.schema.clone().or(s.database.clone())).unwrap_or_else(|| "—".into()),
             };
             let lead = RichText::new(crate::nav::kind_icon(ternarygrid_core::meta::ObjectKind::Schema)).color(p.text_muted);
-            let r = picker(ui, lead, &schema_label, format!("{} ({})", tr("Active schema"), crate::keys::label(cx.keymap, Action::SelectSchema)));
+            let r = picker(ui, lead, &short(schema_label.clone(), 12), format!("{} {schema_label} ({})", tr("Active schema"), crate::keys::label(cx.keymap, Action::SelectSchema)));
             if r.clicked() {
                 self.select_schema_open = !self.select_schema_open;
             }
@@ -1369,8 +1373,11 @@ impl SqlEditorTab {
             if transactions {
                 kit::vdivider(ui, 18.0);
                 let (ic, label) = if manual { (icon::TOGGLE_LEFT, tr("Manual commit")) } else { (icon::TOGGLE_RIGHT, tr("Auto-commit")) };
+                let shown = if narrow { "" } else { label };
                 let toggled = ui
-                    .add_enabled_ui(tx.is_some(), |ui| kit::button_full(ui, kit::Kind::Ghost, Some(ic), label, true, manual).on_hover_text(tip(Action::ToggleAutoCommit)).clicked())
+                    .add_enabled_ui(tx.is_some(), |ui| {
+                        kit::button_full(ui, kit::Kind::Ghost, Some(ic), shown, true, manual).on_hover_text(format!("{label} · {}", tip(Action::ToggleAutoCommit))).clicked()
+                    })
                     .inner;
                 if toggled {
                     self.set_tx_mode(cx, if manual { TransactionMode::Auto } else { TransactionMode::Manual });
