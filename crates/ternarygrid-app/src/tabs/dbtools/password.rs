@@ -8,12 +8,14 @@ use crate::backend::Job;
 use crate::command::AppCommand;
 use crate::cx::AppContext;
 use crate::tabs::TabView;
+use crate::tabs::dbtools::look;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use std::time::Duration;
 use ternarygrid_core::config::{AuthMethod, ConnectionConfig, SecretSlot, secret_key};
 use ternarygrid_core::driver::TransactionMode;
 use ternarygrid_core::{DbError, DbResult, Secret, tr};
+use ternarygrid_ui::{kit, parts};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Changed {
@@ -144,6 +146,12 @@ impl ChangePasswordTab {
         }));
     }
 
+    /// Show the outcome of a change as if it had run (`saved_updated`: the saved password too).
+    #[doc(hidden)]
+    pub fn show_changed(&mut self, saved_updated: bool) {
+        self.outcome = Some(Ok(Changed { saved_updated, saved_error: None }));
+    }
+
     fn poll(&mut self) {
         if let Some(r) = self.job.as_mut().and_then(|j| j.poll()) {
             self.job = None;
@@ -162,14 +170,14 @@ impl TabView for ChangePasswordTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(520.0, 380.0))
+        Some(egui::vec2(540.0, 420.0))
     }
 
     fn title(&self) -> String {
         tr("Change password").to_string()
     }
     fn icon(&self) -> &'static str {
-        icon::PASSWORD
+        icon::KEY
     }
     fn connection_id(&self) -> Option<&str> {
         Some(&self.conn)
@@ -199,85 +207,110 @@ impl TabView for ChangePasswordTab {
             cx.push(crate::command::AppCommand::UnlockVault);
         }
         let Some(cfg) = cx.conns.config(&self.conn).cloned() else {
-            crate::widgets::error_box(ui, tr("The connection does not exist."));
+            egui::Frame::new().inner_margin(look::BODY).show(ui, |ui| look::error(ui, tr("The connection does not exist.")));
             return;
         };
-        if !cx.popup {
-            ui.heading(tr("Change password"));
-        }
-        egui::Grid::new(("pw_info", &self.conn)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Connection"));
-            ui.label(RichText::new(&cfg.name).strong());
-            ui.end_row();
-            ui.label(tr("User"));
-            ui.label(cfg.user.clone().filter(|u| !u.is_empty()).unwrap_or_else(|| tr("(current user)").to_string()));
-            ui.end_row();
-        });
-        ui.add_space(6.0);
-        if !cx.conns.is_connected(&self.conn) {
-            ui.horizontal(|ui| {
-                ui.label(tr("Connect first: the password is changed by the server."));
-                if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
-                    cx.push(AppCommand::Connect(self.conn.clone()));
-                }
+        let p = ternarygrid_ui::pal(ui);
+        let conn = self.conn.clone();
+        // Changed: what happened, Reconnect and Close.
+        if let Some(Ok(c)) = self.outcome.clone() {
+            look::footer(ui, ("pw_footer", &conn), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Close"), false).clicked() {
+                        self.done = true;
+                    }
+                });
             });
-            return;
-        }
-        let busy = self.job.is_some();
-        ui.add_enabled_ui(!busy, |ui| {
-            egui::Grid::new(("pw_fields", &self.conn)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label(tr("New password"));
-                ui.add(egui::TextEdit::singleline(&mut self.new_password).password(!self.show).desired_width(240.0));
-                ui.end_row();
-                ui.label(tr("Confirm password"));
-                ui.add(egui::TextEdit::singleline(&mut self.confirm).password(!self.show).desired_width(240.0));
-                ui.end_row();
-                ui.label("");
-                ui.checkbox(&mut self.show, tr("Show the password"));
-                ui.end_row();
-            });
-            if saves_password(&cfg) {
-                ui.checkbox(&mut self.update_saved, tr("Update the saved password of the connection"));
-            } else {
-                ui.weak(tr("The connection does not save its password: enter the new password when you connect next time."));
-            }
-        });
-        let problem = self.problem(cx);
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!busy && problem.is_none(), crate::widgets::primary_button(ui, icon::KEY, tr("Change password"))).clicked() {
-                self.start(cx);
-            }
-            if busy {
-                ui.spinner();
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
-            } else if let Some(p) = &problem
-                && (!self.new_password.is_empty() || !self.confirm.is_empty() || p != tr("Enter the new password."))
-            {
-                ui.label(RichText::new(p).color(crate::theme::warning_color(ui.visuals().dark_mode)));
-            }
-        });
-        let dark = ui.visuals().dark_mode;
-        match &self.outcome {
-            Some(Ok(c)) => {
-                ui.label(RichText::new(format!("{} {}", icon::CHECK_CIRCLE, tr("The password was changed."))).color(crate::theme::success_color(dark)));
+            look::body(ui, ("pw_body", &conn), |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon::CHECK_CIRCLE).font(ternarygrid_ui::style::icon_font(18.0)).color(p.ok));
+                    ui.label(RichText::new(tr("The password was changed.")).font(ternarygrid_ui::style::semibold(ui.ctx(), 14.0)).color(p.ok));
+                });
                 if c.saved_updated {
-                    ui.label(tr("The saved password was updated."));
+                    look::muted(ui, tr("The saved password was updated."));
                 }
                 if let Some(e) = &c.saved_error {
-                    crate::widgets::error_box(ui, &format!("{}\n{e}", tr("The saved password could not be updated.")));
+                    look::error(ui, &format!("{}\n{e}", tr("The saved password could not be updated.")));
                 }
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
                     ui.label(tr("Reconnect so that new sessions use the new password."));
-                    if ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Reconnect"))).clicked() {
+                    if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::ARROW_CLOCKWISE), tr("Reconnect"), true).clicked() {
                         cx.push(AppCommand::Reconnect(self.conn.clone()));
                     }
                 });
-            }
-            Some(Err(e)) => {
-                crate::widgets::error_box(ui, &format!("{}\n{e}", tr("The password could not be changed.")));
-            }
-            None => {}
+            });
+            return;
         }
+        let connected = cx.conns.is_connected(&self.conn);
+        let busy = self.job.is_some();
+        let problem = self.problem(cx);
+        look::footer(ui, ("pw_footer", &conn), |ui| {
+            if busy {
+                parts::spinner_label(ui, tr("Changing the password…"));
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled_ui(connected && !busy && problem.is_none(), |ui| kit::primary_icon(ui, icon::KEY, tr("Change password"))).inner.clicked() {
+                    self.start(cx);
+                }
+                if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                    self.done = true;
+                }
+            });
+        });
+        look::body(ui, ("pw_body", &conn), |ui| {
+            if !cx.popup {
+                look::title(ui, tr("Change password"));
+            }
+            let lw = 150.0;
+            look::row(ui, tr("Connection"), lw, |ui| ui.label(RichText::new(&cfg.name).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(p.text)));
+            look::row(ui, tr("User"), lw, |ui| ui.label(cfg.user.clone().filter(|u| !u.is_empty()).unwrap_or_else(|| tr("(current user)").to_string())));
+            look::divider(ui);
+            if !connected {
+                look::note_with(ui, parts::Tone::Info, None, tr("Connect first: the password is changed by the server."), |ui| {
+                    if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUGS_CONNECTED), tr("Connect"), true).clicked() {
+                        cx.push(AppCommand::Connect(self.conn.clone()));
+                    }
+                });
+                return;
+            }
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.spacing_mut().item_spacing.y = 12.0;
+                let field = |ui: &mut Ui, value: &mut String, show: bool| {
+                    let r = ui.add(egui::TextEdit::singleline(value).password(!show).desired_width(ui.available_width()).margin(egui::Margin::symmetric(8, 5)));
+                    if r.has_focus() {
+                        ternarygrid_ui::style::focus_halo(ui, r.rect, ternarygrid_ui::style::RADIUS);
+                    }
+                };
+                let show = self.show;
+                look::row(ui, tr("New password"), lw, |ui| field(ui, &mut self.new_password, show));
+                look::row(ui, tr("Confirm password"), lw, |ui| field(ui, &mut self.confirm, show));
+                look::row(ui, "", lw, |ui| look::checkbox(ui, &mut self.show, tr("Show the password")));
+                look::row(ui, "", lw, |ui| {
+                    if saves_password(&cfg) {
+                        look::checkbox(ui, &mut self.update_saved, tr("Update the saved password of the connection"));
+                    } else {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(tr("The connection does not save its password: enter the new password when you connect next time.")).color(p.text_muted),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
+            });
+            if !busy
+                && let Some(pr) = &problem
+                && (!self.new_password.is_empty() || !self.confirm.is_empty() || pr != tr("Enter the new password."))
+            {
+                look::note(ui, parts::Tone::Warning, None, pr);
+            }
+            if let Some(Err(e)) = &self.outcome {
+                look::error(ui, &format!("{}\n{e}", tr("The password could not be changed.")));
+            }
+        });
     }
 
     crate::impl_tab_any!();
