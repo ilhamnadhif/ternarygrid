@@ -44,8 +44,10 @@ millions of rows never have to fit in memory.
 - **AI assistant** (optional, with your own API key: Anthropic, OpenAI or any compatible service) in a
   side panel: it knows the schema, writes and explains SQL, keeps its conversations and, if you
   allow it, runs read-only queries itself.
-- Light and dark themes (View → Theme or the sun / moon button in the status
-  bar), customisable shortcuts and toolbar, no telemetry.
+- A quiet, modern interface shared with TernaryWire and TernaryShell: a top bar with the active
+  connection › schema and a search box for every command, object and script (`⇧⌘P`), an icon rail
+  (navigator, projects, history, tasks), and a status bar with the transaction mode. Light and dark
+  themes (View → Theme or the sun / moon button in the top bar), customisable shortcuts, no telemetry.
 - **Automatic updates** from GitHub releases (optional), with one click to install, and release notes after every update.
 
 <p>
@@ -155,7 +157,7 @@ pwsh scripts/bundle-windows.ps1                        # Windows: installer and 
 
 If you allow it, TernaryGrid looks for a new release when it starts and every 6 hours. A new version
 opens a dialog with the current and new version and what's new (found later, it lights up an
-**Update** button in the toolbar instead of interrupting you). On Windows, **Download** gets the new
+**Update** button in the top bar instead of interrupting you). On Windows, **Download** gets the new
 installer (run it over the installed version); on Linux it opens the release page with the packages.
 On macOS, **Install update**:
 

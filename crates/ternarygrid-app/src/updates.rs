@@ -678,7 +678,7 @@ impl Updates {
                     ui.add(egui::ProgressBar::new(fraction));
                     ui.weak(text);
                     ui.add_space(8.0);
-                    if ui.button(tr("Hide")).on_hover_text(tr("The download goes on; the toolbar shows its progress")).clicked() {
+                    if ui.button(tr("Hide")).on_hover_text(tr("The download goes on; the top bar shows its progress")).clicked() {
                         hide = true;
                     }
                 }
