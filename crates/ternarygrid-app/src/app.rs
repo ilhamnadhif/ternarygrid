@@ -21,6 +21,10 @@ use ternarygrid_core::tr;
 use ternarygrid_ui::kit;
 use ternarygrid_ui::parts::Dialog;
 
+/// Width kept free at the left of the top bar for the window buttons of macOS, where the top
+/// bar is the title bar (with the bar's 16 points of padding, "New" starts 84 points in).
+pub const MAC_TITLEBAR_INSET: f32 = 68.0;
+
 /// Settings changed are written after this long without another change.
 const SETTINGS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
 
@@ -139,6 +143,10 @@ pub struct TernaryGridApp {
     /// Width kept free at the left of the top bar for the window buttons
     /// (macOS, where the top bar is the title bar).
     pub titlebar_inset: f32,
+    /// The menus are in the system's menu bar (macOS), not at the left of the top bar.
+    pub native_menu_bar: bool,
+    /// Where each tab's button was drawn in the last frame (the tab bar's + after them).
+    tab_rects: std::collections::HashMap<u64, egui::Rect>,
 }
 
 impl TernaryGridApp {
@@ -196,10 +204,50 @@ impl TernaryGridApp {
             diagnostics: None,
             chrome: ChromeRects::default(),
             titlebar_inset: 0.0,
+            native_menu_bar: false,
+            tab_rects: Default::default(),
         };
         app.existing_install = crate::updates::is_existing_install(&app.services.paths);
         app.updates.data_dir = Some(app.services.paths.data_dir().to_path_buf());
         app
+    }
+
+    /// What the design's tab bars have besides the tabs: the hairline under the bar (1 point,
+    /// open under the open tab) and "+" (a new SQL editor) after the last tab.
+    fn tab_bar_extras(ui: &mut Ui, dock: &DockState<Tab>, tab_rects: &std::collections::HashMap<u64, egui::Rect>, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
+        for (path, leaf) in dock.iter_leaves() {
+            if leaf.tabs.is_empty() || !leaf.rect.is_positive() {
+                continue;
+            }
+            let bar = leaf.rect.with_max_y(leaf.rect.top() + crate::tabs::TAB_BAR_H);
+            let painter = ui.painter().with_clip_rect(bar);
+            let y = bar.bottom() - 0.5;
+            let open = leaf.tabs.get(leaf.active.0).and_then(|t| tab_rects.get(&t.id)).copied();
+            let stroke = egui::Stroke::new(1.0, p.border);
+            match open {
+                Some(r) if r.left() > bar.left() => {
+                    painter.hline(bar.left()..=r.left() + 1.0, y, stroke);
+                    painter.hline(r.right() - 1.0..=bar.right(), y, stroke);
+                }
+                _ => {
+                    painter.hline(bar.x_range(), y, stroke);
+                }
+            }
+            let last = leaf.tabs.iter().filter_map(|t| tab_rects.get(&t.id)).map(|r| r.right()).fold(f32::NEG_INFINITY, f32::max);
+            let at = egui::Rect::from_min_size(egui::pos2(last + 2.0, bar.top() + 6.0), egui::vec2(26.0, 26.0));
+            if last.is_finite() && at.right() <= bar.right() - 8.0 {
+                let mut b = ui.new_child(egui::UiBuilder::new().max_rect(at).id_salt(("tab_bar_new", path.node)));
+                if kit::icon_button_sized(&mut b, icon::PLUS, tr("New SQL editor"), false, 26.0, 14.0).clicked() {
+                    cx.commands.push(AppCommand::Action(crate::keys::Action::NewSqlEditor));
+                }
+            }
+        }
+    }
+
+    /// Where the button of tab `id` was drawn in the last frame.
+    pub fn tab_rect(&self, id: u64) -> Option<egui::Rect> {
+        self.tab_rects.get(&id).copied()
     }
 
     /// Queue a command for the next frame (as a menu item would).
@@ -1468,61 +1516,62 @@ impl TernaryGridApp {
         let state = self.menu_state();
         let chosen: std::cell::Cell<Option<M>> = std::cell::Cell::new(None);
         egui::MenuBar::new().ui(ui, |ui| {
-            // An item: an optional (coloured) icon and its text.
+            // An item as in the design's menus: a muted icon (or its room) and the text.
             let item = |ui: &mut Ui, enabled: bool, glyph: Option<&str>, text: &str, action: M| {
-                let button = match glyph {
-                    Some(g) => egui::Button::new((ternarygrid_icons::ic(g), text)),
-                    None => egui::Button::new(text),
-                };
-                if ui.add_enabled(enabled, button).clicked() {
+                if ui.add_enabled_ui(enabled, |ui| kit::menu_item(ui, glyph, text, "")).inner.clicked() {
                     chosen.set(Some(action));
                     ui.close();
                 }
             };
             ui.menu_button(tr("File"), |ui| {
-                item(ui, true, Some(icon::FILE_SQL), tr("New SQL editor"), M::NewSqlEditor);
+                kit::menu_look(ui, 230.0);
+                item(ui, true, Some(icon::FILE_CODE), tr("New SQL editor"), M::NewSqlEditor);
                 item(ui, true, Some(icon::FOLDER_OPEN), tr("Open script…"), M::OpenScript);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::GEAR), tr("Settings…"), M::Settings);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, None, tr("Quit"), M::Quit);
             });
             ui.menu_button(tr("Database"), |ui| {
+                kit::menu_look(ui, 230.0);
                 item(ui, true, Some(icon::PLUS), tr("New connection…"), M::NewConnection);
                 item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), M::ImportConnections);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, state.new_database, Some(icon::DATABASE), tr("New database…"), M::NewDatabase);
                 item(ui, state.new_schema, Some(icon::STACK), tr("New schema…"), M::NewSchema);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::PLUGS), tr("Disconnect all"), M::DisconnectAll);
                 item(ui, true, Some(icon::QUEUE), tr("Pending transactions…"), M::PendingTransactions);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::GIT_DIFF), tr("Compare schemas…"), M::CompareSchemas);
                 item(ui, true, Some(icon::ARROWS_LEFT_RIGHT), tr("Compare data…"), M::CompareData);
                 item(ui, true, Some(icon::MAGNIFYING_GLASS), tr("Search…"), M::Search);
             });
             ui.menu_button(tr("Tools"), |ui| {
-                item(ui, true, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Query history"), M::QueryHistory);
+                kit::menu_look(ui, 230.0);
+                item(ui, true, Some(icon::CLOCK), tr("Query history"), M::QueryHistory);
                 item(ui, true, Some(icon::LIST_CHECKS), tr("Tasks"), M::Tasks);
                 item(ui, true, Some(icon::SPARKLE), tr("AI assistant"), M::AiAssistant);
-                item(ui, true, Some(icon::HOURGLASS), tr("Background operations"), M::BackgroundOperations);
-                ui.separator();
+                item(ui, true, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Background operations"), M::BackgroundOperations);
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::EXPORT), tr("Export data…"), M::ExportData);
                 item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import data…"), M::ImportData);
                 item(ui, true, Some(icon::GRAPH), tr("ER diagram"), M::ErDiagram);
                 item(ui, true, Some(icon::USERS), tr("Session manager"), M::SessionManager);
             });
             ui.menu_button(tr("View"), |ui| {
+                kit::menu_look(ui, 230.0);
                 item(ui, true, None, tr("Toggle navigator"), M::ToggleNavigator);
                 let mut props = state.properties;
-                if ternarygrid_ui::kit::checkbox(ui, &mut props, tr("Properties panel")).clicked() {
+                if kit::menu_check(ui, &mut props, tr("Properties panel")).clicked() {
                     chosen.set(Some(M::PropertiesPanel));
                     ui.close();
                 }
-                ui.menu_button((ternarygrid_icons::ic(icon::CIRCLE_HALF), tr("Theme")), |ui| {
+                kit::submenu(ui, Some(icon::CIRCLE_HALF), tr("Theme"), 160.0, &mut |ui| {
                     use ternarygrid_config::settings::Theme;
                     for (t, label) in [(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))] {
-                        if ternarygrid_ui::kit::radio(ui, state.theme == t, label).clicked() {
+                        let mut on = state.theme == t;
+                        if kit::menu_check(ui, &mut on, label).clicked() {
                             chosen.set(Some(M::Theme(t)));
                             ui.close();
                         }
@@ -1531,14 +1580,15 @@ impl TernaryGridApp {
                 item(ui, true, None, tr("Command palette"), M::CommandPalette);
             });
             ui.menu_button(tr("Help"), |ui| {
+                kit::menu_look(ui, 230.0);
                 item(ui, true, None, tr("Keyboard shortcuts"), M::KeyboardShortcuts);
                 item(ui, true, None, tr("Database drivers"), M::DatabaseDrivers);
                 item(ui, true, None, tr("Create sample database"), M::CreateSampleDatabase);
                 item(ui, true, Some(icon::LIGHTBULB), tr("Tip of the day"), M::TipOfTheDay);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::WARNING_OCTAGON), tr("Error log"), M::ErrorLog);
                 item(ui, state.diagnostics, Some(icon::FILE_ZIP), tr("Collect diagnostic info"), M::CollectDiagnostics);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::SPARKLE), tr("What's new"), M::WhatsNew);
                 item(ui, state.updates, Some(icon::ARROW_CIRCLE_UP), tr("Check for updates…"), M::CheckForUpdates);
                 item(ui, true, None, tr("About TernaryGrid"), M::About);
@@ -1693,18 +1743,28 @@ impl eframe::App for TernaryGridApp {
 
         let mut chrome = ChromeRects::default();
         // On macOS the menus are in the system's menu bar; elsewhere at the left of the top bar.
-        #[cfg(target_os = "macos")]
-        let native_menu = self.app_menu.is_some();
-        #[cfg(not(target_os = "macos"))]
-        let native_menu = false;
+        let native_menu = self.native_menu_bar;
         // The window buttons of a macOS window whose title bar is the top bar (none in full screen).
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         let inset = if fullscreen { 0.0 } else { self.titlebar_inset };
-        let bar = |style: &egui::Style, x: i8| egui::Frame::new().fill(crate::theme::chrome(&style.visuals)).inner_margin(egui::Margin::symmetric(x, 0));
-        chrome.toolbar =
-            Some(egui::Panel::top("ternarygrid_topbar").exact_size(shell::TOP_BAR_H).frame(bar(ui.style(), 10)).show(ui, |ui| self.top_bar(ui, inset, !native_menu)).response.rect);
-        chrome.status = Some(egui::Panel::bottom("ternarygrid_status").exact_size(shell::STATUS_H).frame(bar(ui.style(), 12)).show(ui, |ui| self.status_bar(ui)).response.rect);
-        chrome.rail = Some(egui::Panel::left("ternarygrid_rail").exact_size(shell::RAIL_W).resizable(false).frame(bar(ui.style(), 0)).show(ui, |ui| self.rail(ui)).response.rect);
+        // The chrome's panels in the chrome colour, their hairline (drawn by the panel on its
+        // inner edge) left out of the content: the top bar 16 / 10 points from the sides.
+        let bar = |style: &egui::Style, m: egui::Margin| egui::Frame::new().fill(crate::theme::chrome(&style.visuals)).inner_margin(m);
+        let top_margin = egui::Margin { left: 16, right: 10, top: 0, bottom: 1 };
+        chrome.toolbar = Some(
+            egui::Panel::top("ternarygrid_topbar")
+                .exact_size(shell::TOP_BAR_H)
+                .frame(bar(ui.style(), top_margin))
+                .show(ui, |ui| self.top_bar(ui, inset, !native_menu))
+                .response
+                .rect,
+        );
+        let status_margin = egui::Margin { left: 12, right: 12, top: 1, bottom: 0 };
+        chrome.status =
+            Some(egui::Panel::bottom("ternarygrid_status").exact_size(shell::STATUS_H).frame(bar(ui.style(), status_margin)).show(ui, |ui| self.status_bar(ui)).response.rect);
+        let rail_margin = egui::Margin { left: 0, right: 1, top: 0, bottom: 0 };
+        chrome.rail =
+            Some(egui::Panel::left("ternarygrid_rail").exact_size(shell::RAIL_W).resizable(false).frame(bar(ui.style(), rail_margin)).show(ui, |ui| self.rail(ui)).response.rect);
 
         let mut cx = AppContext {
             backend: &self.backend,
@@ -1720,21 +1780,24 @@ impl eframe::App for TernaryGridApp {
             popup: false,
         };
         if self.show_nav {
-            let nav_panel = egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(280.0).size_range(180.0..=600.0).show(ui, |ui| {
-                // The view's title and its buttons, as tall as the tab bar beside it.
+            // 272 points and the hairline at its right, on the canvas; the header 38 points
+            // high over a hairline, the title at 14, its buttons 8 from the edge.
+            let frame = egui::Frame::new().fill(ternarygrid_ui::pal(ui).canvas).inner_margin(egui::Margin { left: 0, right: 1, top: 0, bottom: 0 });
+            let nav_panel = egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(273.0).size_range(180.0..=600.0).frame(frame).show(ui, |ui| {
                 let title = if self.show_project { tr("Projects") } else { tr("Database Navigator") };
-                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(title).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)));
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 38.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_height(38.0);
+                    ui.add_space(14.0);
+                    kit::semibold_label(ui, title, 13.0, ternarygrid_ui::pal(ui).text);
                     if !self.show_project {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
                             self.nav.toolbar_ui(ui, &mut cx);
-                            if ternarygrid_ui::kit::icon_button_ex(ui, icon::PLUS, tr("New connection"), false, 22.0).clicked() {
-                                cx.commands.push(AppCommand::Action(crate::keys::Action::NewConnection));
-                            }
                         });
                     }
                 });
-                ui.separator();
+                ternarygrid_ui::parts::hline(ui);
                 if self.show_project {
                     self.project.ui(ui, &mut cx);
                     self.nav.has_focus = false;
@@ -1797,8 +1860,26 @@ impl eframe::App for TernaryGridApp {
                 crate::tabs::welcome::show(ui, &mut cx);
                 return;
             }
-            let mut viewer = DockViewer { cx: &mut cx, close_vetoed: Vec::new(), close_confirm: Vec::new(), active_tab: self.active_tab, style: ui.style().clone(), suffixes };
-            DockArea::new(&mut self.dock).style(crate::theme::dock_style(ui.style())).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
+            let open_tabs = self.dock.iter_leaves().filter_map(|(_, l)| l.tabs.get(l.active.0).map(|t| t.id)).collect();
+            let mut viewer = DockViewer {
+                cx: &mut cx,
+                close_vetoed: Vec::new(),
+                close_confirm: Vec::new(),
+                active_tab: self.active_tab,
+                style: ui.style().clone(),
+                suffixes,
+                tab_rects: Default::default(),
+                open_tabs,
+            };
+            // The open tab's × is the viewer's (the others have none, as in the design).
+            DockArea::new(&mut self.dock)
+                .style(crate::theme::dock_style(ui.style()))
+                .show_leaf_collapse_buttons(false)
+                .show_close_buttons(false)
+                .show_leaf_close_all_buttons(false)
+                .show_inside(ui, &mut viewer);
+            self.tab_rects = std::mem::take(&mut viewer.tab_rects);
+            Self::tab_bar_extras(ui, &self.dock, &self.tab_rects, viewer.cx);
             for id in viewer.close_confirm {
                 if !self.close_confirm.contains(&id) {
                     self.close_confirm.push(id);

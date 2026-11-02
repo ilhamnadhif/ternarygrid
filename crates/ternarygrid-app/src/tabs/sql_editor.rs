@@ -193,6 +193,7 @@ fn editor_options(cx: &AppContext) -> EditorOptions {
     o.mark_occurrences = e.mark_occurrences;
     o.highlight_current_line = e.highlight_current_line;
     o.word_wrap = e.word_wrap;
+    o.line_height = 21.0 / 13.0;
     o.auto_close_brackets = e.auto_close_brackets || e.auto_close_quotes;
     o.auto_complete = e.autocomplete.enabled;
     o.auto_complete_delay_ms = e.autocomplete.delay_ms as u64;
@@ -246,6 +247,11 @@ fn release_result(item: ResultItem, cx: &AppContext) {
 }
 
 impl SqlEditorTab {
+    /// Rename the tab (an unsaved script's "Script-3").
+    pub fn set_title(&mut self, title: &str) {
+        self.title = title.to_string();
+    }
+
     pub fn new(conn: Option<String>, schema: Option<SchemaRef>, text: String, path: Option<PathBuf>, console: bool, title: String) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -271,7 +277,8 @@ impl SqlEditorTab {
             bottom: Bottom::Output,
             stats: Vec::new(),
             output: Vec::new(),
-            show_results: true,
+            // The results panel opens with the first run (an editor that has not run fills the tab).
+            show_results: false,
             maximized: false,
             show_outline: false,
             variables: BTreeMap::new(),
@@ -685,6 +692,7 @@ impl SqlEditorTab {
             let s = session.clone();
             let q = sql.clone();
             self.explain_job = Some((sql, cx.backend.spawn(async move { s.lock().await.explain(&q, analyze).await })));
+            self.show_results = true;
             self.log("INFO", if analyze { tr("Explain analyze…") } else { tr("Explain…") });
             return;
         }
@@ -719,6 +727,8 @@ impl SqlEditorTab {
         self.variables = prepared.variables.clone();
         self.log("INFO", trf("Executing {} statement(s)…", &[&prepared.plans.len()]));
         self.exec = Some(Execution::start(cx.backend, session, prepared.plans, opts, history));
+        // What runs shows its progress, results and messages under the editor.
+        self.show_results = true;
         self.editor.set_diagnostics(Vec::new());
     }
 
@@ -1188,238 +1198,281 @@ impl SqlEditorTab {
 
     fn toolbar(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let p = ternarygrid_ui::pal(ui);
-        // A picker: an icon, the current value and a caret, framed only when hovered.
+        // A picker as in the design: an icon, the current value and a faint chevron, 28
+        // points high, framed only when hovered.
         let picker = |ui: &mut Ui, lead: RichText, text: &str, tip: String| -> egui::Response {
-            let caret = RichText::new(icon::CARET_DOWN).size(10.0).color(p.text_faint);
-            ui.add(egui::Button::new((lead, RichText::new(text).color(p.text), caret)).frame_when_inactive(false)).on_hover_text(tip)
+            ui.scope(|ui| {
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 0.0);
+                ui.spacing_mut().icon_spacing = 6.0;
+                ui.spacing_mut().interact_size.y = 28.0;
+                let caret = RichText::new(icon::CARET_DOWN).font(ternarygrid_ui::style::icon_font(11.0)).color(p.text_faint);
+                ui.add(egui::Button::new((lead.font(ternarygrid_ui::style::icon_font(14.0)), RichText::new(text).size(13.0).color(p.text), caret)).frame_when_inactive(false))
+                    .on_hover_text(tip)
+            })
+            .inner
         };
         // A narrow editor (a side panel open, a split): shorter names, the transaction mode
         // as its icon, so the toolbar never runs over itself.
         let narrow = ui.available_width() < 820.0;
         let short = |s: String, max: usize| if narrow && s.chars().count() > max { format!("{}…", s.chars().take(max - 1).collect::<String>()) } else { s };
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.set_min_height(30.0);
-            // Connection selector.
-            let conn_name = short(self.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("No connection").to_string()), 14);
-            let marker = self.conn.as_ref().and_then(|c| cx.conns.color_of(c)).and_then(crate::theme::connection_marker);
-            let lead = RichText::new(icon::PLUGS).color(marker.unwrap_or(p.text_muted));
-            let r = picker(ui, lead, &conn_name, format!("{} ({})", tr("Active connection"), crate::keys::label(cx.keymap, Action::SelectConnection)));
-            if r.clicked() {
-                self.select_conn_open = !self.select_conn_open;
-            }
-            let conns: Vec<(String, String)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
-            let mut chosen: Option<Option<String>> = None;
-            egui::Popup::from_response(&r).open_bool(&mut self.select_conn_open).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                ui.set_min_width(220.0);
-                if ui.selectable_label(self.conn.is_none(), tr("No connection")).clicked() {
-                    chosen = Some(None);
+        let bar = egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 0));
+        bar.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.set_min_height(40.0);
+                // Connection selector.
+                let conn_name = short(self.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("No connection").to_string()), 14);
+                let marker = self.conn.as_ref().and_then(|c| cx.conns.color_of(c)).and_then(|c| crate::theme::marker(c, ui.visuals().dark_mode));
+                let lead = RichText::new(icon::PLUG).color(marker.unwrap_or(p.text_muted));
+                let r = picker(ui, lead, &conn_name, format!("{} ({})", tr("Active connection"), crate::keys::label(cx.keymap, Action::SelectConnection)));
+                if r.clicked() {
+                    self.select_conn_open = !self.select_conn_open;
                 }
-                for (id, name) in &conns {
-                    let st = if cx.conns.is_connected(id) { icon::PLUGS_CONNECTED } else { icon::PLUGS };
-                    if ui.selectable_label(self.conn.as_deref() == Some(id), format!("{st} {name}")).clicked() {
-                        chosen = Some(Some(id.clone()));
+                let conns: Vec<(String, String)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
+                let mut chosen: Option<Option<String>> = None;
+                egui::Popup::from_response(&r).open_bool(&mut self.select_conn_open).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.set_min_width(220.0);
+                    if ui.selectable_label(self.conn.is_none(), tr("No connection")).clicked() {
+                        chosen = Some(None);
                     }
+                    for (id, name) in &conns {
+                        let st = if cx.conns.is_connected(id) { icon::PLUGS_CONNECTED } else { icon::PLUGS };
+                        if ui.selectable_label(self.conn.as_deref() == Some(id), format!("{st} {name}")).clicked() {
+                            chosen = Some(Some(id.clone()));
+                        }
+                    }
+                });
+                if let Some(c) = chosen {
+                    self.select_conn_open = false;
+                    self.set_connection(cx, c);
                 }
-            });
-            if let Some(c) = chosen {
-                self.select_conn_open = false;
-                self.set_connection(cx, c);
-            }
-            // Schema selector.
-            // The schema in use; "database.schema" for another database of the server.
-            let schema_label = match self.conn.as_ref().and_then(|c| cx.conns.live(c)) {
-                Some(live) => {
-                    let s = self.effective_schema(live);
-                    match (s.database, s.schema) {
-                        (Some(db), Some(schema)) if Some(&db) != live.current_database.as_ref() => format!("{db}.{schema}"),
-                        (_, Some(schema)) => schema,
-                        (Some(db), None) => db,
-                        (None, None) => "—".into(),
+                // Schema selector.
+                // The schema in use; "database.schema" for another database of the server.
+                let schema_label = match self.conn.as_ref().and_then(|c| cx.conns.live(c)) {
+                    Some(live) => {
+                        let s = self.effective_schema(live);
+                        match (s.database, s.schema) {
+                            (Some(db), Some(schema)) if Some(&db) != live.current_database.as_ref() => format!("{db}.{schema}"),
+                            (_, Some(schema)) => schema,
+                            (Some(db), None) => db,
+                            (None, None) => "—".into(),
+                        }
                     }
+                    None => self.schema.as_ref().and_then(|s| s.schema.clone().or(s.database.clone())).unwrap_or_else(|| "—".into()),
+                };
+                let lead = RichText::new(crate::nav::kind_icon(ternarygrid_core::meta::ObjectKind::Schema)).color(p.text_muted);
+                let r =
+                    picker(ui, lead, &short(schema_label.clone(), 12), format!("{} {schema_label} ({})", tr("Active schema"), crate::keys::label(cx.keymap, Action::SelectSchema)));
+                if r.clicked() {
+                    self.select_schema_open = !self.select_schema_open;
                 }
-                None => self.schema.as_ref().and_then(|s| s.schema.clone().or(s.database.clone())).unwrap_or_else(|| "—".into()),
-            };
-            let lead = RichText::new(crate::nav::kind_icon(ternarygrid_core::meta::ObjectKind::Schema)).color(p.text_muted);
-            let r = picker(ui, lead, &short(schema_label.clone(), 12), format!("{} {schema_label} ({})", tr("Active schema"), crate::keys::label(cx.keymap, Action::SelectSchema)));
-            if r.clicked() {
-                self.select_schema_open = !self.select_schema_open;
-            }
-            let mut chosen_schema: Option<SchemaRef> = None;
-            if self.select_schema_open
-                && let Some(conn) = self.conn.clone()
-            {
-                let backend = cx.backend;
-                if let Some(live) = cx.conns.live_mut(&conn) {
-                    let main = live.main.clone();
-                    let multi = live.driver.info().capabilities.multiple_databases;
-                    if multi {
-                        live.meta.request_databases(backend, &main);
-                    }
-                    // The schemas of the editor's database (catalog_sync requests another database's).
-                    let editor_db = self.schema.as_ref().and_then(|s| s.database.clone());
-                    if editor_db.is_none() {
-                        live.meta.request_schemas(backend, &main, None);
-                    }
-                    let dbs: Vec<String> = live.meta.databases.get().map(|v| v.iter().map(|d| d.name.clone()).collect()).unwrap_or_default();
-                    let schemas: Vec<String> =
-                        live.meta.schemas_of(editor_db.as_deref()).get().map(|v| v.iter().filter(|s| !s.is_system).map(|s| s.name.clone()).collect()).unwrap_or_default();
-                    let cur_db = editor_db.clone().or_else(|| live.current_database.clone());
-                    egui::Popup::from_response(&r).open_bool(&mut self.select_schema_open).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                        ui.set_min_width(200.0);
-                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                            if multi && !dbs.is_empty() {
-                                ui.weak(tr("Databases"));
-                                for d in &dbs {
-                                    if ui.selectable_label(cur_db.as_deref() == Some(d.as_str()), format!("{} {d}", icon::DATABASE)).clicked() {
-                                        chosen_schema = Some(SchemaRef::new(Some(d.clone()), None));
+                let mut chosen_schema: Option<SchemaRef> = None;
+                if self.select_schema_open
+                    && let Some(conn) = self.conn.clone()
+                {
+                    let backend = cx.backend;
+                    if let Some(live) = cx.conns.live_mut(&conn) {
+                        let main = live.main.clone();
+                        let multi = live.driver.info().capabilities.multiple_databases;
+                        if multi {
+                            live.meta.request_databases(backend, &main);
+                        }
+                        // The schemas of the editor's database (catalog_sync requests another database's).
+                        let editor_db = self.schema.as_ref().and_then(|s| s.database.clone());
+                        if editor_db.is_none() {
+                            live.meta.request_schemas(backend, &main, None);
+                        }
+                        let dbs: Vec<String> = live.meta.databases.get().map(|v| v.iter().map(|d| d.name.clone()).collect()).unwrap_or_default();
+                        let schemas: Vec<String> =
+                            live.meta.schemas_of(editor_db.as_deref()).get().map(|v| v.iter().filter(|s| !s.is_system).map(|s| s.name.clone()).collect()).unwrap_or_default();
+                        let cur_db = editor_db.clone().or_else(|| live.current_database.clone());
+                        egui::Popup::from_response(&r).open_bool(&mut self.select_schema_open).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                            ui.set_min_width(200.0);
+                            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                                if multi && !dbs.is_empty() {
+                                    ui.weak(tr("Databases"));
+                                    for d in &dbs {
+                                        if ui.selectable_label(cur_db.as_deref() == Some(d.as_str()), format!("{} {d}", icon::DATABASE)).clicked() {
+                                            chosen_schema = Some(SchemaRef::new(Some(d.clone()), None));
+                                        }
+                                    }
+                                    ui.separator();
+                                }
+                                ui.weak(tr("Schemas"));
+                                for s in &schemas {
+                                    if ui.selectable_label(false, format!("{} {s}", icon::TREE_STRUCTURE)).clicked() {
+                                        chosen_schema = Some(SchemaRef::new(editor_db.clone(), Some(s.clone())));
                                     }
                                 }
-                                ui.separator();
-                            }
-                            ui.weak(tr("Schemas"));
-                            for s in &schemas {
-                                if ui.selectable_label(false, format!("{} {s}", icon::TREE_STRUCTURE)).clicked() {
-                                    chosen_schema = Some(SchemaRef::new(editor_db.clone(), Some(s.clone())));
-                                }
-                            }
+                            });
                         });
-                    });
-                }
-            }
-            if let Some(s) = chosen_schema {
-                self.select_schema_open = false;
-                let db_changed = s.database.is_some() && s.database != self.schema.as_ref().and_then(|x| x.database.clone());
-                // Another database closes the session: not over a transaction or pending edits.
-                let blocked = if db_changed { self.session_switch_blocked(cx) } else { None };
-                if let Some(why) = blocked {
-                    cx.toasts.warning(tr("The database was not changed"), Some(why.to_string()));
-                } else {
-                    self.schema = Some(s);
-                    if db_changed {
-                        self.reset_session(cx);
-                    }
-                    self.pending_schema = true;
-                    self.catalog_generation = None;
-                }
-            }
-            kit::vdivider(ui, 18.0);
-            let running = self.exec.is_some() || self.explain_job.is_some();
-            let tip = |a: Action| format!("{} ({})", crate::keys::action_label(a), crate::keys::label(cx.keymap, a));
-            // Run, or Stop while a statement runs (the same place: the hand need not move).
-            if running {
-                if kit::button_full(ui, kit::Kind::Danger, Some(icon::STOP), tr("Stop"), true, false).on_hover_text(tip(Action::CancelQuery)).clicked() {
-                    self.cancel(cx);
-                }
-            } else if kit::button_full(ui, kit::Kind::Primary, Some(icon::PLAY), tr("Run"), true, false).on_hover_text(tip(Action::ExecuteStatement)).clicked() {
-                self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None });
-            }
-            let explain = self.can_explain(cx);
-            let (mut new_tab, mut script, mut plan) = (false, false, false);
-            ui.add_enabled_ui(!running, |ui| {
-                new_tab = kit::icon_button_ex(ui, icon::PLUS_SQUARE, &tip(Action::ExecuteInNewTab), false, 26.0).clicked();
-                script = kit::icon_button_ex(ui, icon::FAST_FORWARD, &tip(Action::ExecuteScript), false, 26.0).clicked();
-                plan = explain && kit::icon_button_ex(ui, icon::TREE_VIEW, &tip(Action::ExplainPlan), false, 26.0).clicked();
-            });
-            if new_tab {
-                self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None });
-            }
-            if script {
-                self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None });
-            }
-            if plan {
-                self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None });
-            }
-            if self.is_sql(cx) && kit::icon_button_ex(ui, icon::TEXT_INDENT, &tip(Action::FormatSql), false, 26.0).clicked() {
-                self.format(cx);
-            }
-            let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More editor commands"), false, 26.0);
-            egui::Popup::menu(&more).show(|ui| {
-                for a in [
-                    Action::NextStatement,
-                    Action::PreviousStatement,
-                    Action::CopyStatement,
-                    Action::SelectRowCount,
-                    Action::EvaluateExpression,
-                    Action::OpenDeclaration,
-                    Action::MorphToDelimited,
-                    Action::TrimTrailingSpaces,
-                    Action::SearchWeb,
-                    Action::ToggleFold,
-                    Action::CollapseAllFolds,
-                    Action::ExpandAllFolds,
-                    Action::LoadExecutionPlan,
-                ] {
-                    let keys = crate::keys::label(cx.keymap, a);
-                    let mut b = egui::Button::new(format!("{}  {}", crate::keys::action_icon(a), crate::keys::action_label(a)));
-                    if !keys.is_empty() {
-                        b = b.shortcut_text(keys);
-                    }
-                    if ui.add(b).clicked() {
-                        ui.close();
-                        let ctx = ui.ctx().clone();
-                        self.editor_command(&ctx, cx, a);
                     }
                 }
-            });
-            // Transaction controls, for databases that have transactions.
-            let transactions = self.has_transactions(cx);
-            let tx = match &self.session {
-                SessionSlot::Ready(s) => Some(s.tx_state()),
-                _ => None,
-            };
-            let manual = tx.as_ref().is_some_and(|t| t.mode == TransactionMode::Manual);
-            let pending = tx.as_ref().map(|t| t.log.len()).unwrap_or(0);
-            if transactions {
+                if let Some(s) = chosen_schema {
+                    self.select_schema_open = false;
+                    let db_changed = s.database.is_some() && s.database != self.schema.as_ref().and_then(|x| x.database.clone());
+                    // Another database closes the session: not over a transaction or pending edits.
+                    let blocked = if db_changed { self.session_switch_blocked(cx) } else { None };
+                    if let Some(why) = blocked {
+                        cx.toasts.warning(tr("The database was not changed"), Some(why.to_string()));
+                    } else {
+                        self.schema = Some(s);
+                        if db_changed {
+                            self.reset_session(cx);
+                        }
+                        self.pending_schema = true;
+                        self.catalog_generation = None;
+                    }
+                }
                 kit::vdivider(ui, 18.0);
-                let (ic, label) = if manual { (icon::TOGGLE_LEFT, tr("Manual commit")) } else { (icon::TOGGLE_RIGHT, tr("Auto-commit")) };
-                let shown = if narrow { "" } else { label };
-                let toggled = ui
-                    .add_enabled_ui(tx.is_some(), |ui| {
-                        kit::button_full(ui, kit::Kind::Ghost, Some(ic), shown, true, manual).on_hover_text(format!("{label} · {}", tip(Action::ToggleAutoCommit))).clicked()
-                    })
-                    .inner;
-                if toggled {
-                    self.set_tx_mode(cx, if manual { TransactionMode::Auto } else { TransactionMode::Manual });
-                }
-            }
-            if manual {
-                if kit::button_full(ui, kit::Kind::Secondary, Some(icon::CHECK_CIRCLE), tr("Commit"), true, false).on_hover_text(tip(Action::Commit)).clicked() {
-                    self.commit(cx, true);
-                }
-                if kit::button_full(ui, kit::Kind::Ghost, Some(icon::ARROW_U_UP_LEFT), tr("Rollback"), true, false).on_hover_text(tip(Action::Rollback)).clicked() {
-                    self.commit(cx, false);
-                }
-                if pending > 0 && kit::button_full(ui, kit::Kind::Ghost, None, &trf("{} pending", &[&pending]), true, false).on_hover_text(tr("Transaction log")).clicked() {
-                    self.bottom = Bottom::Transaction;
-                    self.show_results = true;
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if kit::icon_toggle(ui, icon::LIST_BULLETS, tr("Outline"), self.show_outline).clicked() {
-                    self.show_outline = !self.show_outline;
-                }
-                if kit::icon_toggle(ui, icon::TERMINAL, tr("Terminal mode: print results as text"), self.terminal).clicked() {
-                    self.terminal = !self.terminal;
-                }
-                if kit::icon_toggle(ui, icon::ROWS, &tip(Action::ToggleResultsPanel), self.show_results).clicked() {
-                    self.show_results = !self.show_results;
-                }
+                let running = self.exec.is_some() || self.explain_job.is_some();
+                let tip = |a: Action| format!("{} ({})", crate::keys::action_label(a), crate::keys::label(cx.keymap, a));
+                // Run, or Stop while a statement runs (the same place: the hand need not move).
                 if running {
-                    ui.spinner();
-                    if let Some(e) = &self.exec {
-                        ui.weak(crate::widgets::format_duration(e.started.elapsed()));
+                    if kit::button_full(ui, kit::Kind::Danger, Some(icon::STOP), tr("Stop"), true, false).on_hover_text(tip(Action::CancelQuery)).clicked() {
+                        self.cancel(cx);
+                    }
+                } else if kit::button_full(ui, kit::Kind::Primary, Some(icon::PLAY), tr("Run"), true, false).on_hover_text(tip(Action::ExecuteStatement)).clicked() {
+                    self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None });
+                }
+                let explain = self.can_explain(cx);
+                let (mut new_tab, mut script, mut plan) = (false, false, false);
+                ui.add_enabled_ui(!running, |ui| {
+                    new_tab = kit::icon_button_sized(ui, icon::PLUS, &tip(Action::ExecuteInNewTab), false, 26.0, 14.0).clicked();
+                    script = kit::icon_button_sized(ui, icon::FAST_FORWARD, &tip(Action::ExecuteScript), false, 26.0, 14.0).clicked();
+                    plan = explain && kit::icon_button_sized(ui, icon::TREE_STRUCTURE, &tip(Action::ExplainPlan), false, 26.0, 14.0).clicked();
+                });
+                if new_tab {
+                    self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None });
+                }
+                if script {
+                    self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None });
+                }
+                if plan {
+                    self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None });
+                }
+                if self.is_sql(cx) && kit::icon_button_sized(ui, icon::TEXT_AA, &tip(Action::FormatSql), false, 26.0, 14.0).clicked() {
+                    self.format(cx);
+                }
+                let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More editor commands"), false, 26.0, 14.0);
+                egui::Popup::menu(&more).gap(4.0).show(|ui| {
+                    kit::menu_look(ui, 260.0);
+                    for a in [
+                        Action::NextStatement,
+                        Action::PreviousStatement,
+                        Action::CopyStatement,
+                        Action::SelectRowCount,
+                        Action::EvaluateExpression,
+                        Action::OpenDeclaration,
+                        Action::MorphToDelimited,
+                        Action::TrimTrailingSpaces,
+                        Action::SearchWeb,
+                        Action::ToggleFold,
+                        Action::CollapseAllFolds,
+                        Action::ExpandAllFolds,
+                        Action::LoadExecutionPlan,
+                    ] {
+                        let keys = crate::keys::label(cx.keymap, a);
+                        if kit::menu_item(ui, Some(crate::keys::action_icon(a)), crate::keys::action_label(a), &keys).clicked() {
+                            ui.close();
+                            let ctx = ui.ctx().clone();
+                            self.editor_command(&ctx, cx, a);
+                        }
+                    }
+                });
+                // Transaction controls, for databases that have transactions.
+                let transactions = self.has_transactions(cx);
+                let tx = match &self.session {
+                    SessionSlot::Ready(s) => Some(s.tx_state()),
+                    _ => None,
+                };
+                let manual = tx.as_ref().is_some_and(|t| t.mode == TransactionMode::Manual);
+                let pending = tx.as_ref().map(|t| t.log.len()).unwrap_or(0);
+                if transactions {
+                    kit::vdivider(ui, 18.0);
+                    // Auto-commit: a quiet check; Manual commit: the soft accent with a pause.
+                    let (ic, label, kind) = if manual { (icon::PAUSE, tr("Manual commit"), kit::Kind::Soft) } else { (icon::CHECK, tr("Auto-commit"), kit::Kind::Ghost) };
+                    let shown = if narrow { "" } else { label };
+                    let toggled = ui
+                        .add_enabled_ui(tx.is_some(), |ui| {
+                            kit::button_full(ui, kind, Some(ic), shown, true, false).on_hover_text(format!("{label} · {}", tip(Action::ToggleAutoCommit))).clicked()
+                        })
+                        .inner;
+                    if toggled {
+                        self.set_tx_mode(cx, if manual { TransactionMode::Auto } else { TransactionMode::Manual });
                     }
                 }
-            });
+                if manual {
+                    if kit::button_full(ui, kit::Kind::Secondary, Some(icon::CHECK_CIRCLE), tr("Commit"), true, false).on_hover_text(tip(Action::Commit)).clicked() {
+                        self.commit(cx, true);
+                    }
+                    if kit::button_full(ui, kit::Kind::Ghost, Some(icon::ARROW_LEFT), tr("Rollback"), true, false).on_hover_text(tip(Action::Rollback)).clicked() {
+                        self.commit(cx, false);
+                    }
+                    if pending > 0 && kit::button_full(ui, kit::Kind::Ghost, None, &trf("{} pending", &[&pending]), true, false).on_hover_text(tr("Transaction log")).clicked() {
+                        self.bottom = Bottom::Transaction;
+                        self.show_results = true;
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if kit::icon_button_sized(ui, icon::LIST_BULLETS, tr("Outline"), self.show_outline, 28.0, 15.0).clicked() {
+                        self.show_outline = !self.show_outline;
+                    }
+                    if kit::icon_button_sized(ui, icon::TERMINAL_WINDOW, tr("Terminal mode: print results as text"), self.terminal, 28.0, 15.0).clicked() {
+                        self.terminal = !self.terminal;
+                    }
+                    if kit::icon_button_sized(ui, icon::ROWS, &tip(Action::ToggleResultsPanel), self.show_results, 28.0, 15.0).clicked() {
+                        self.show_results = !self.show_results;
+                    }
+                    if running && let Some(e) = &self.exec {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(crate::widgets::format_duration(e.started.elapsed())).size(12.0).color(p.text_muted));
+                        ui.add(egui::Spinner::new().size(12.0).color(p.accent_text));
+                    }
+                });
+            })
         });
+        ternarygrid_ui::parts::hline(ui);
     }
 
     fn results_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let mut close: Option<usize> = None;
-        const TAB_H: f32 = 32.0;
+        const TAB_H: f32 = 34.0;
+        // A running statement over the results (as in the design), where one waits for it: what runs, for
+        // how long, and Cancel.
+        if let Some(e) = &self.exec {
+            let what = match e.current {
+                Some(c) if e.total > 1 => trf("Running statement {} of {}…", &[&(c + 1), &e.total]),
+                _ => tr("Running…").to_string(),
+            };
+            let elapsed = crate::widgets::format_duration(e.started.elapsed());
+            let mut cancel = false;
+            let pal = ternarygrid_ui::pal(ui);
+            // On the accent's soft colour: what runs, for how long, and Cancel at the right.
+            egui::Frame::new().fill(pal.accent_soft).inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0).color(pal.accent_text));
+                    ui.label(RichText::new(what).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))).color(pal.text));
+                    ui.label(RichText::new(elapsed).size(12.5).color(pal.text_muted));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let keys = crate::keys::label(cx.keymap, Action::CancelQuery);
+                        cancel = kit::button_kbd(ui, kit::Kind::Danger, Some(icon::STOP), tr("Cancel"), &keys, true)
+                            .on_hover_text(crate::keys::action_label(Action::CancelQuery))
+                            .clicked();
+                    });
+                });
+            });
+            ternarygrid_ui::parts::hline(ui);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            if cancel {
+                self.cancel(cx);
+            }
+        }
         let tabs = ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.add_space(4.0);
             for i in 0..self.results.len() {
                 let (ic, label, dirty) = match &self.results[i] {
                     ResultItem::Rows(p) => (icon::TABLE, p.title.clone(), p.has_changes()),
@@ -1436,7 +1489,8 @@ impl SqlEditorTab {
                     close = Some(i);
                 }
                 r.context_menu(|ui| {
-                    if ui.button(tr("Close")).clicked() {
+                    kit::menu_look(ui, 160.0);
+                    if kit::menu_item(ui, Some(icon::X), tr("Close"), "").clicked() {
                         close = Some(i);
                         ui.close();
                     }
@@ -1448,7 +1502,13 @@ impl SqlEditorTab {
             if kit::underline_tab(ui, Some(icon::TERMINAL_WINDOW), tr("Output"), None, self.bottom == Bottom::Output, TAB_H).clicked() {
                 self.bottom = Bottom::Output;
             }
-            if kit::underline_tab(ui, Some(icon::CLOCK), tr("Transaction log"), None, self.bottom == Bottom::Transaction, TAB_H).clicked() {
+            // The statements a manual transaction holds, as a count on its tab.
+            let pending = match &self.session {
+                SessionSlot::Ready(s) => s.tx_state().log.len(),
+                _ => 0,
+            };
+            let pending = (pending > 0).then(|| pending.to_string());
+            if kit::underline_tab(ui, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Transaction log"), pending.as_deref(), self.bottom == Bottom::Transaction, TAB_H).clicked() {
                 self.bottom = Bottom::Transaction;
             }
             let vars = (!self.variables.is_empty()).then(|| self.variables.len().to_string());
@@ -1456,8 +1516,9 @@ impl SqlEditorTab {
                 self.bottom = Bottom::Variables;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (ic, on) = if self.maximized { (icon::ARROWS_IN, true) } else { (icon::ARROWS_OUT, false) };
-                if kit::icon_toggle(ui, ic, crate::keys::action_label(Action::MaximizeResults), on).clicked() {
+                ui.add_space(10.0);
+                let (ic, on) = if self.maximized { (icon::CORNERS_IN, true) } else { (icon::CORNERS_OUT, false) };
+                if kit::icon_button_sized(ui, ic, crate::keys::action_label(Action::MaximizeResults), on, 26.0, 14.0).clicked() {
                     self.maximized = !self.maximized;
                 }
             });
@@ -1465,42 +1526,13 @@ impl SqlEditorTab {
         // A hairline under the tabs, across the panel.
         let bottom = tabs.response.rect.bottom();
         ui.painter().hline(ui.max_rect().x_range(), bottom - 0.5, egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border));
+        ui.add_space(1.0);
         if let Some(i) = close {
             if self.result_has_changes(i) {
                 cx.toasts.info(tr("Save or discard the data changes first."));
             } else {
                 release_result(self.results.remove(i), cx);
                 self.bottom = if self.results.is_empty() { Bottom::Output } else { Bottom::Result(i.min(self.results.len() - 1)) };
-            }
-        }
-        // A running statement in the results, where one waits for it: what runs, for
-        // how long, and Cancel.
-        if let Some(e) = &self.exec {
-            let what = match e.current {
-                Some(c) if e.total > 1 => trf("Running statement {} of {}…", &[&(c + 1), &e.total]),
-                _ => tr("Running…").to_string(),
-            };
-            let elapsed = crate::widgets::format_duration(e.started.elapsed());
-            let mut cancel = false;
-            let pal = ternarygrid_ui::pal(ui);
-            // On the accent's soft colour: what runs, for how long, and Cancel at the right.
-            egui::Frame::new().fill(pal.accent_soft).inner_margin(egui::Margin::symmetric(16, 7)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(14.0).color(pal.accent_text));
-                    ui.label(RichText::new(what).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))).color(pal.text));
-                    ui.label(RichText::new(elapsed).color(pal.text_muted));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let keys = crate::keys::label(cx.keymap, Action::CancelQuery);
-                        cancel = kit::button_full(ui, kit::Kind::Danger, Some(icon::STOP), tr("Cancel"), true, false)
-                            .on_hover_text(format!("{} ({keys})", crate::keys::action_label(Action::CancelQuery)))
-                            .clicked();
-                    });
-                });
-            });
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-            if cancel {
-                self.cancel(cx);
             }
         }
         match self.bottom {
@@ -1634,43 +1666,56 @@ impl SqlEditorTab {
                     if manual {
                         let pal = ternarygrid_ui::pal(ui);
                         let mut decision = None;
-                        egui::Frame::new().fill(ternarygrid_ui::parts::Tone::Warning.fill(ui)).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 9)).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(icon::PAUSE).color(pal.warn));
-                                ui.label(
-                                    RichText::new(trf("{} statements are not committed yet.", &[&log.len()])).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text),
-                                );
-                                ui.label(RichText::new(tr("Other sessions do not see them until you commit.")).color(pal.text));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let keys = crate::keys::label(cx.keymap, Action::Commit);
-                                    if kit::button_full(ui, kit::Kind::Primary, Some(icon::CHECK), tr("Commit"), true, false).on_hover_text(keys).clicked() {
-                                        decision = Some(true);
-                                    }
-                                    if kit::button_full(ui, kit::Kind::Ghost, None, tr("Rollback"), true, false).clicked() {
-                                        decision = Some(false);
-                                    }
+                        egui::Frame::new()
+                            .fill(pal.modified)
+                            .corner_radius(8)
+                            .inner_margin(egui::Margin::symmetric(12, 7))
+                            .outer_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 0 })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 10.0;
+                                    ui.label(RichText::new(icon::PAUSE).font(ternarygrid_ui::style::icon_font(16.0)).color(pal.warn));
+                                    ui.label(
+                                        RichText::new(trf("{} statements are not committed yet.", &[&log.len()]))
+                                            .font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0))
+                                            .color(pal.text),
+                                    );
+                                    ui.label(RichText::new(tr("Other sessions do not see them until you commit.")).color(pal.text));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        let keys = crate::keys::label(cx.keymap, Action::Commit);
+                                        if kit::button_kbd(ui, kit::Kind::Primary, Some(icon::CHECK), tr("Commit"), &keys, true).clicked() {
+                                            decision = Some(true);
+                                        }
+                                        if kit::button_full(ui, kit::Kind::Ghost, None, tr("Rollback"), true, false).clicked() {
+                                            decision = Some(false);
+                                        }
+                                    });
                                 });
                             });
-                        });
                         if let Some(commit) = decision {
                             self.commit(cx, commit);
                         }
                         ui.add_space(8.0);
                     }
+                    // The design's log: Time, Statement, Rows, Duration (and whether it went
+                    // through), 12 / 16 points from the edges.
                     let rows: Vec<Vec<String>> = log
                         .iter()
                         .map(|e| {
                             vec![
                                 e.at.format("%H:%M:%S").to_string(),
+                                e.sql.split_whitespace().collect::<Vec<_>>().join(" "),
                                 e.rows.map(|r| r.to_string()).unwrap_or_default(),
                                 crate::widgets::format_duration(e.duration),
                                 if e.ok { tr("OK").to_string() } else { tr("Error").to_string() },
-                                e.sql.split_whitespace().collect::<Vec<_>>().join(" "),
                             ]
                         })
                         .collect();
-                    crate::widgets::simple_table(ui, ("txlog", self.editor.id()), &[tr("Time"), tr("Rows"), tr("Duration"), tr("Status"), tr("SQL")], &rows, None);
+                    egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
+                        crate::widgets::simple_table(ui, ("txlog", self.editor.id()), &[tr("Time"), tr("Statement"), tr("Rows"), tr("Duration"), tr("Status")], &rows, None);
+                    });
                 }
             }
         }
@@ -1930,7 +1975,7 @@ impl TabView for SqlEditorTab {
     }
 
     fn icon(&self) -> &'static str {
-        if self.console { icon::TERMINAL_WINDOW } else { icon::FILE_SQL }
+        if self.console { icon::TERMINAL_WINDOW } else { icon::FILE_CODE }
     }
 
     fn tooltip(&self) -> Option<String> {
@@ -2214,22 +2259,29 @@ impl TabView for SqlEditorTab {
             self.run(cx, Request { scope: Scope::Script, new_tab: true, explain: None, confirmed, sql: None });
         }
         self.poll_exec(&ctx, cx);
+        ui.spacing_mut().item_spacing.y = 0.0;
         self.toolbar(ui, cx);
-        ui.separator();
-        // Status line.
-        egui::Panel::bottom(egui::Id::new(("sql_status", self.editor.id()))).exact_size(18.0).show(ui, |ui| {
-            ui.horizontal(|ui| {
+        // Status line: 22 points under a hairline, "11:1 · last run 286 ms" in faint small text.
+        let pal = ternarygrid_ui::pal(ui);
+        let status_frame = egui::Frame::new().fill(pal.canvas).inner_margin(egui::Margin { left: 12, right: 12, top: 1, bottom: 0 });
+        egui::Panel::bottom(egui::Id::new(("sql_status", self.editor.id()))).exact_size(23.0).frame(status_frame).show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
                 let (l, c) = self.editor.line_col();
-                ui.weak(format!("{l}:{c}"));
+                let mut parts = vec![format!("{l}:{c}")];
                 if let Some(sel) = self.editor.selected_text() {
-                    ui.weak(trf("{} selected", &[&sel.chars().count()]));
+                    parts.push(trf("{} selected", &[&sel.chars().count()]));
                 }
-                if let Some((_, d)) = self.last_run {
-                    ui.weak(trf("last run {}", &[&crate::widgets::format_duration(d)]));
+                let failed = matches!(self.bottom, Bottom::Result(i) if matches!(self.results.get(i), Some(ResultItem::Error { .. })));
+                if self.exec.is_some() {
+                    parts.push(tr("running").to_string());
+                } else if let Some((_, d)) = self.last_run {
+                    let d = crate::widgets::format_duration(d);
+                    parts.push(if failed { trf("failed after {}", &[&d]) } else { trf("last run {}", &[&d]) });
                 }
                 if self.editor.is_modified() && !self.console {
-                    ui.weak(tr("modified"));
+                    parts.push(tr("modified").to_string());
                 }
+                ui.label(RichText::new(parts.join(" · ")).size(11.5).color(pal.text_faint));
             });
         });
         let results_visible = self.show_results;
@@ -2241,10 +2293,19 @@ impl TabView for SqlEditorTab {
         if results_visible {
             let right = cx.settings.results.layout == ternarygrid_config::settings::ResultsLayout::Right;
             let id = egui::Id::new(("sql_results", self.editor.id()));
+            let frame = egui::Frame::new().fill(pal.canvas);
             if right {
-                egui::Panel::right(id).resizable(true).default_size(ui.available_width() * 0.45).show(ui, |ui| self.results_ui(ui, cx));
+                egui::Panel::right(id).resizable(true).default_size(ui.available_width() * 0.45).frame(frame).show(ui, |ui| self.results_ui(ui, cx));
             } else {
-                egui::Panel::bottom(id).resizable(true).default_size(ui.available_height() * 0.45).size_range(80.0..=f32::INFINITY).show(ui, |ui| self.results_ui(ui, cx));
+                // The editor 310 points high in a 1440 × 900 window, as in the design.
+                egui::Panel::bottom(id).resizable(true).show_separator_line(false).default_size(ui.available_height() * 0.57).size_range(80.0..=f32::INFINITY).frame(frame).show(
+                    ui,
+                    |ui| {
+                        // The panel keeps its height when what it shows is shorter (an error).
+                        ui.set_min_height(ui.max_rect().height());
+                        self.results_ui(ui, cx)
+                    },
+                );
             }
         }
         if self.show_outline {
@@ -2256,7 +2317,8 @@ impl TabView for SqlEditorTab {
             self.request_focus = false;
             self.editor.request_focus(&ctx);
         }
-        let resp = egui::CentralPanel::default().show(ui, |ui| SqlEditor::new(&mut self.editor, &self.lang, &opts, &theme).show(ui)).inner;
+        let editor_frame = egui::Frame::new().fill(pal.surface);
+        let resp = egui::CentralPanel::default().frame(editor_frame).show(ui, |ui| SqlEditor::new(&mut self.editor, &self.lang, &opts, &theme).show(ui)).inner;
         if resp.changed {
             self.changed_at = Some(Instant::now());
         }
@@ -2385,16 +2447,16 @@ impl SqlEditorTab {
 /// A failed statement: the first line of the error with its SQLSTATE and Copy, the rest of the
 /// message (position, hint), and "Fix error" (the AI assistant). Returns true when it is clicked.
 fn error_card(ui: &mut Ui, sql: &str, text: &str) -> bool {
-    use ternarygrid_ui::parts::Tone;
     let pal = ternarygrid_ui::pal(ui);
     let mut fix = false;
     let mut lines = text.lines();
     let first = lines.next().unwrap_or("");
     let rest: Vec<&str> = lines.collect();
     let state = text.find("SQLSTATE").map(|i| text[i..].chars().take(14).collect::<String>().trim_end_matches([')', ']', '.', ',']).to_string());
+    let edge = if ui.visuals().dark_mode { egui::Color32::from_rgb(0x5a, 0x3b, 0x40) } else { egui::Color32::from_rgb(0xf3, 0xc7, 0xc2) };
     egui::Frame::new()
-        .fill(Tone::Error.fill(ui))
-        .stroke(egui::Stroke::new(1.0, ternarygrid_ui::soft(pal.err, 0.35)))
+        .fill(pal.prod_soft)
+        .stroke(egui::Stroke::new(1.0, edge))
         .corner_radius(10)
         .inner_margin(egui::Margin::symmetric(16, 14))
         .outer_margin(egui::Margin::symmetric(16, 14))
@@ -2409,18 +2471,19 @@ fn error_card(ui: &mut Ui, sql: &str, text: &str) -> bool {
                         ui.ctx().copy_text(text.to_string());
                     }
                     if let Some(s) = &state {
-                        kit::pill(ui, s, pal.text_muted);
+                        kit::chip(ui, s);
                     }
                 });
             });
             if !rest.is_empty() {
-                ui.add(egui::Label::new(RichText::new(rest.join("\n")).monospace().color(pal.text)).wrap().selectable(true));
+                let mono = egui::FontId::monospace(12.5);
+                ui.add(egui::Label::new(RichText::new(rest.join("\n")).font(mono).color(pal.text)).wrap().selectable(true));
             }
             ui.horizontal(|ui| {
-                fix = kit::button_full(ui, kit::Kind::Ghost, Some(icon::SPARKLE), tr("Fix error"), true, true).clicked();
-                ui.label(RichText::new(tr("The AI assistant reads the statement and the error and proposes a fix.")).color(pal.text_muted));
+                ui.spacing_mut().item_spacing.x = 8.0;
+                fix = kit::button_full(ui, kit::Kind::Soft, Some(icon::SPARKLE), tr("Fix error"), true, false).on_hover_text(sql.lines().next().unwrap_or("")).clicked();
+                ui.label(RichText::new(tr("The AI assistant reads the statement and the error and proposes a fix.")).size(12.5).color(pal.text_muted));
             });
-            ui.add(egui::Label::new(RichText::new(sql.lines().next().unwrap_or("")).monospace().color(pal.text_faint)).truncate());
         });
     fix
 }

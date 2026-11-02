@@ -91,7 +91,7 @@ impl<'a> Dialog<'a> {
         ui.spacing_mut().item_spacing.y = 0.0;
         let mut close = false;
         // Header.
-        Frame::new().inner_margin(Margin { left: 20, right: 12, top: 14, bottom: 12 }).show(ui, |ui| {
+        Frame::new().inner_margin(Margin { left: 20, right: 16, top: 16, bottom: 14 }).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 if let Some(icon) = self.icon {
@@ -99,22 +99,21 @@ impl<'a> Dialog<'a> {
                     ui.painter().rect_filled(r, CornerRadius::same(RADIUS_LG), p.accent_soft);
                     ui.painter().text(r.center(), Align2::CENTER_CENTER, icon, style::icon_font(19.0), p.accent_text);
                 }
-                let title = RichText::new(self.title).font(style::semibold(ui.ctx(), 15.0)).color(p.text);
                 match self.subtitle {
                     // Title over subtitle; a lone title stays centred on the row.
                     Some(s) => {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(title);
+                            kit::semibold_label(ui, self.title, 15.0, p.text);
                             ui.label(RichText::new(s).size(12.5).color(p.text_muted));
                         });
                     }
                     None => {
-                        ui.label(title);
+                        kit::semibold_label(ui, self.title, 15.0, p.text);
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if kit::icon_button(ui, egui_phosphor::regular::X, crate_close_label()).clicked() {
+                    if kit::icon_button_sized(ui, egui_phosphor::regular::X, crate_close_label(), false, 28.0, 14.0).clicked() {
                         close = true;
                     }
                 });
@@ -137,8 +136,10 @@ impl<'a> Dialog<'a> {
             ui.painter().rect_filled(rect.shrink(1.0), r, p.chrome);
             ui.painter().hline(rect.x_range(), top + 0.5, Stroke::new(1.0, p.border));
             Frame::new().inner_margin(Margin { left: 20, right: 16, top: 12, bottom: 12 }).show(ui, |ui| {
-                ui.set_min_height(30.0);
-                ui.horizontal(|ui| {
+                // The row is the buttons' height from its first widget on, so a leading label or
+                // check box sits centred on them.
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), style::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_height(style::CONTROL_H);
                     ui.spacing_mut().item_spacing.x = 8.0;
                     footer(ui);
                 });
@@ -243,7 +244,7 @@ pub fn stepper(ui: &mut Ui, steps: &[&str], active: usize, reachable: usize) -> 
         ui.spacing_mut().item_spacing.x = 10.0;
         for (i, s) in steps.iter().enumerate() {
             let w = 22.0 + 8.0 + label_w[i];
-            let (rect, resp) = ui.allocate_exact_size(vec2(w, 26.0), if i <= reachable { Sense::click() } else { Sense::hover() });
+            let (rect, resp) = ui.allocate_exact_size(vec2(w, 22.0), if i <= reachable { Sense::click() } else { Sense::hover() });
             resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, i <= reachable, i == active, *s));
             let c = egui::pos2(rect.left() + 11.0, rect.center().y);
             let painter = ui.painter();
@@ -258,8 +259,15 @@ pub fn stepper(ui: &mut Ui, steps: &[&str], active: usize, reachable: usize) -> 
                 painter.text(c, Align2::CENTER_CENTER, (i + 1).to_string(), style::medium(ui.ctx(), 11.5), p.text_muted);
             }
             let color = if i == active { p.text } else { p.text_muted };
+            // The active step's name in the design's semibold.
             let font = if i == active { style::semibold(ui.ctx(), size) } else { egui::FontId::proportional(size) };
-            painter.text(egui::pos2(rect.left() + 30.0, rect.center().y), Align2::LEFT_CENTER, *s, font, color);
+            let g = painter.layout_no_wrap(s.to_string(), font, color);
+            let pos = egui::pos2(rect.left() + 30.0, rect.center().y - g.size().y / 2.0);
+            if i == active {
+                kit::paint_semibold(painter, pos, g, color);
+            } else {
+                painter.galley(pos, g, color);
+            }
             if resp.hovered() && i <= reachable && i != active {
                 painter.rect_stroke(rect.expand(3.0), CornerRadius::same(RADIUS), Stroke::new(1.0, p.border), StrokeKind::Outside);
             }
@@ -267,7 +275,7 @@ pub fn stepper(ui: &mut Ui, steps: &[&str], active: usize, reachable: usize) -> 
                 clicked = Some(i);
             }
             if i + 1 < n {
-                let (r, _) = ui.allocate_exact_size(vec2(line_w, 26.0), Sense::hover());
+                let (r, _) = ui.allocate_exact_size(vec2(line_w, 22.0), Sense::hover());
                 ui.painter().hline(r.x_range(), r.center().y, Stroke::new(1.0, p.border));
             }
         }
@@ -308,13 +316,16 @@ impl Tone {
         }
     }
 
-    /// The soft fill behind a callout of this tone.
+    /// The soft fill behind a callout of this tone (the design's note colours).
     pub fn fill(self, ui: &Ui) -> Color32 {
         let p = style::pal(ui);
         let dark = ui.visuals().dark_mode;
+        let rgb = |c: u32| Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
         match self {
             Tone::Info => p.accent_soft,
-            _ => blend(p.surface, self.color(&p), if dark { 0.16 } else { 0.10 }),
+            Tone::Warning => rgb(if dark { 0x3f3826 } else { 0xfbf3df }),
+            Tone::Error => p.prod_soft,
+            Tone::Success => rgb(if dark { 0x253b2b } else { 0xe3f4e7 }),
         }
     }
 }
@@ -341,7 +352,7 @@ fn callout_dyn(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: &m
     Frame::new()
         .fill(tone.fill(ui))
         .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin { left: 12, right: 10, top: 9, bottom: 9 })
+        .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
@@ -350,9 +361,9 @@ fn callout_dyn(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: &m
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     if let Some(t) = title {
-                        ui.label(RichText::new(t).font(style::semibold(ui.ctx(), style::body_size(ui.ctx()))).color(p.text));
+                        kit::semibold_label(ui, t, 13.0, p.text);
                     }
-                    ui.add(egui::Label::new(RichText::new(body).color(p.text)).wrap().selectable(true));
+                    ui.add(egui::Label::new(RichText::new(body).size(12.5).color(p.text)).wrap().selectable(true));
                     // Extra content (buttons) under the text at the right; nothing when empty
                     // (a right-to-left layout beside the text would take the panel's height).
                     ui.scope(|ui| {
@@ -423,7 +434,14 @@ fn segmented_idx(ui: &mut Ui, sel: Option<usize>, labels: &[&str], small: bool) 
     let p = style::pal(ui);
     let h = if small { 24.0 } else { 28.0 };
     let fs = 12.5;
-    let galleys: Vec<_> = labels.iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), egui::FontId::proportional(fs), Color32::PLACEHOLDER)).collect();
+    let galleys: Vec<_> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let font = if sel == Some(i) { style::medium(ui.ctx(), fs) } else { egui::FontId::proportional(fs) };
+            ui.painter().layout_no_wrap(l.to_string(), font, Color32::PLACEHOLDER)
+        })
+        .collect();
     let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + 20.0).collect();
     let total = widths.iter().sum::<f32>() + 4.0 + (labels.len().saturating_sub(1)) as f32 * 2.0;
     let (rect, _) = ui.allocate_exact_size(vec2(total, h), Sense::hover());
@@ -436,8 +454,7 @@ fn segmented_idx(ui: &mut Ui, sel: Option<usize>, labels: &[&str], small: bool) 
         let on = sel == Some(i);
         resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, on, *label));
         if on {
-            ui.painter().rect_filled(r, CornerRadius::same(5), p.surface);
-            ui.painter().rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, p.border), StrokeKind::Inside);
+            kit::raised(ui.painter(), r, CornerRadius::same(5), p.surface);
         } else if resp.hovered() {
             ui.painter().rect_filled(r, CornerRadius::same(5), p.hover);
         }
@@ -488,14 +505,20 @@ pub fn switch(ui: &mut Ui, on: &mut bool, label: &str, sub: Option<&str>) -> Res
 
 /// A thin progress bar `width` wide (`f32::INFINITY`: the rest of the row).
 pub fn progress(ui: &mut Ui, fraction: f32, width: f32) -> Response {
+    progress_h(ui, fraction, width, 6.0)
+}
+
+/// [`progress`] `height` points high (the design's update progress: 8).
+pub fn progress_h(ui: &mut Ui, fraction: f32, width: f32, height: f32) -> Response {
     let p = style::pal(ui);
     let w = if width.is_finite() { width } else { ui.available_width() };
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 6.0), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(3), p.subtle);
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, height), Sense::hover());
+    let radius = CornerRadius::same((height / 2.0).round() as u8);
+    ui.painter().rect_filled(rect, radius, p.subtle);
     let f = fraction.clamp(0.0, 1.0);
     if f > 0.0 {
-        let r = Rect::from_min_size(rect.min, vec2((rect.width() * f).max(6.0), rect.height()));
-        ui.painter().rect_filled(r, CornerRadius::same(3), p.accent);
+        let r = Rect::from_min_size(rect.min, vec2((rect.width() * f).max(height), rect.height()));
+        ui.painter().rect_filled(r, radius, p.accent);
     }
     resp
 }
@@ -539,14 +562,15 @@ pub fn group<R>(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, add: impl F
 
 fn group_dyn(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, add: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
-    kit::card(ui).corner_radius(CornerRadius::same(RADIUS_LG)).inner_margin(Margin::symmetric(20, 16)).show(ui, |ui| {
+    // The design's settings groups: 18 × 20 points of padding, 14 between rows.
+    kit::card(ui).inner_margin(Margin::symmetric(20, 18)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = 12.0;
+        ui.spacing_mut().item_spacing.y = 14.0;
         if title.is_some() || sub.is_some() {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
                 if let Some(t) = title {
-                    ui.label(RichText::new(t).font(style::semibold(ui.ctx(), 13.5)).color(p.text));
+                    kit::semibold_label(ui, t, 13.5, p.text);
                 }
                 if let Some(s) = sub {
                     ui.add(egui::Label::new(RichText::new(s).size(12.5).color(p.text_muted)).wrap());
@@ -561,7 +585,7 @@ fn group_dyn(ui: &mut Ui, title: Option<&str>, sub: Option<&str>, add: &mut dyn 
 pub fn section_header(ui: &mut Ui, title: &str, right: impl FnOnce(&mut Ui)) {
     let p = style::pal(ui);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+        kit::semibold_label(ui, title, 13.0, p.text);
         ui.with_layout(Layout::right_to_left(Align::Center), right);
     });
 }
@@ -575,7 +599,7 @@ pub fn stat_tile(ui: &mut Ui, label: &str, value: &str, sub: Option<&str>) -> Re
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.label(RichText::new(label).size(12.0).color(p.text_muted));
-            ui.label(RichText::new(value).font(style::semibold(ui.ctx(), 22.0)).color(p.text));
+            kit::semibold_label(ui, value, 22.0, p.text);
             if let Some(s) = sub {
                 ui.label(RichText::new(s).size(12.0).color(p.text_faint));
             }
@@ -583,20 +607,29 @@ pub fn stat_tile(ui: &mut Ui, label: &str, value: &str, sub: Option<&str>) -> Re
         .response
 }
 
-/// A form row with a label column of `label_w`: the label (muted), then `add`.
+/// A form row as in the design: a label column of `label_w` (the design's dialogs use 150, its
+/// settings 168) with the label muted and top-aligned 6 points down, 16 points, then `add`
+/// (laid out in a row, centred on its tallest control); the row is as tall as its controls.
 pub fn form_row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.horizontal(|ui| {
+    let mut add = Some(add);
+    let mut out = None;
+    form_row_dyn(ui, label, label_w, &mut |ui| out = add.take().map(|a| a(ui)));
+    out.expect("a form row's control runs once")
+}
+
+fn form_row_dyn(ui: &mut Ui, label: &str, label_w: f32, add: &mut dyn FnMut(&mut Ui)) {
+    ui.horizontal_top(|ui| {
         form_label(ui, label, label_w);
-        add(ui)
-    })
-    .inner
+        ui.add_space((16.0 - ui.spacing().item_spacing.x).max(0.0));
+        ui.horizontal(|ui| add(ui));
+    });
 }
 
 fn form_label(ui: &mut Ui, label: &str, label_w: f32) {
     let p = style::pal(ui);
-    let h = ui.spacing().interact_size.y.max(style::CONTROL_H);
-    ui.allocate_ui_with_layout(vec2(label_w, h), Layout::left_to_right(Align::Center), |ui| {
+    ui.allocate_ui_with_layout(vec2(label_w, 0.0), Layout::top_down(Align::Min), |ui| {
         ui.set_min_width(label_w);
+        ui.add_space(6.0);
         ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
     });
 }
@@ -639,20 +672,22 @@ pub fn page_header(ui: &mut Ui, icon: &str, place: &[&str], title: &str, facts: 
 
 fn page_header_dyn(ui: &mut Ui, icon: &str, place: &[&str], title: &str, facts: Option<&str>, right: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        ui.add_space(4.0);
-        ui.label(RichText::new(icon).font(style::icon_font(17.0)).color(p.text_muted));
-        for part in place {
-            ui.label(RichText::new(*part).color(p.text_muted));
-            ui.label(RichText::new(egui_phosphor::regular::CARET_RIGHT).size(11.0).color(p.text_faint));
-        }
-        ui.label(RichText::new(title).font(style::semibold(ui.ctx(), 15.0)).color(p.text));
-        if let Some(f) = facts {
-            ui.label(RichText::new(f).color(p.text_faint));
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), right);
+    Frame::new().inner_margin(Margin { left: 16, right: 16, top: 12, bottom: 6 }).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.set_min_height(28.0);
+            ui.label(RichText::new(icon).font(style::icon_font(18.0)).color(p.text_muted));
+            for part in place {
+                ui.label(RichText::new(*part).size(13.0).color(p.text_muted));
+                ui.label(RichText::new("›").size(13.0).color(p.text_faint));
+            }
+            kit::semibold_label(ui, title, 15.0, p.text);
+            if let Some(f) = facts {
+                ui.add_space(4.0);
+                ui.label(RichText::new(f).size(12.5).color(p.text_faint));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), right);
+        });
     });
 }
 
@@ -665,10 +700,10 @@ pub fn toolbar<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 }
 
 fn toolbar_dyn(ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)) {
-    Frame::new().inner_margin(Margin { left: 12, right: 12, top: 6, bottom: 6 }).show(ui, |ui| {
+    Frame::new().inner_margin(Margin::symmetric(16, 8)).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.set_min_height(28.0);
+            ui.set_min_height(30.0);
             add(ui);
         });
     });

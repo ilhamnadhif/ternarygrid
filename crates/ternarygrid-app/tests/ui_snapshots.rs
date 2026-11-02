@@ -147,11 +147,12 @@ struct Shots {
 
 impl Shots {
     fn new(home: &Path, dir: PathBuf, theme: Theme) -> Shots {
-        Shots::with(home, dir, theme, egui::vec2(1400.0, 900.0), Vec::new())
+        Shots::with(home, dir, theme, egui::vec2(1440.0, 900.0), Vec::new(), true)
     }
 
-    /// A window of `size` points with the `extra` connections saved before it opens.
-    fn with(home: &Path, dir: PathBuf, theme: Theme, size: egui::Vec2, extra: Vec<ternarygrid_core::config::ConnectionConfig>) -> Shots {
+    /// A window of `size` points with the `extra` connections saved before it opens; `mac`: as
+    /// on macOS (no in-window menus, room for the window buttons).
+    fn with(home: &Path, dir: PathBuf, theme: Theme, size: egui::Vec2, extra: Vec<ternarygrid_core::config::ConnectionConfig>, mac: bool) -> Shots {
         let mut settings = Settings::default();
         settings.updates.check_automatically = Some(false);
         settings.general.restore_session = false;
@@ -169,7 +170,14 @@ impl Shots {
             move |cc| {
                 ternarygrid_app::theme::setup_fonts(&cc.egui_ctx);
                 backend.set_context(cc.egui_ctx.clone());
-                TernaryGridApp::new(backend, conns, services, settings)
+                let mut app = TernaryGridApp::new(backend, conns, services, settings);
+                // As on macOS (the mockups): the menus in the system's menu bar, room for the
+                // window buttons at the left of the top bar.
+                if mac {
+                    app.native_menu_bar = true;
+                    app.titlebar_inset = ternarygrid_app::app::MAC_TITLEBAR_INSET;
+                }
+                app
             },
         );
         ternarygrid_app::theme::apply_settings(&h.ctx, &h.state().settings);
@@ -364,7 +372,7 @@ fn readme_screenshots() {
         example(DbKind::MySql, "Shop", "shop.example.com", 3306, "shop", "test"),
     ];
     // 1280 × 848 points at 2× (downscaled to 1600 × 1060 below).
-    let mut s = Shots::with(&home, docs.clone(), Theme::Light, egui::vec2(1280.0, 848.0), extra);
+    let mut s = Shots::with(&home, docs.clone(), Theme::Light, egui::vec2(1280.0, 848.0), extra, false);
     s.suffix.clear();
     let conn = s.sample_database();
     s.nav_open("Tables");

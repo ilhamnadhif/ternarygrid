@@ -172,7 +172,15 @@ fn size_badge(o: &ObjectInfo) -> Option<(String, String)> {
     if let Some(d) = &o.detail {
         tip.push_str(&format!("\n{d}"));
     }
-    Some((short_size(b), tip))
+    Some((tree_size(b), tip))
+}
+
+/// A size as the design shows it at the right of a table: `976 KB`, `4.4 MB`, `31 MB`.
+fn tree_size(bytes: i64) -> String {
+    match long_size(bytes) {
+        s if s.ends_with(" bytes") => s.replace(" bytes", " B"),
+        s => s,
+    }
 }
 
 fn short_size(bytes: i64) -> String {
@@ -423,7 +431,7 @@ impl Navigator {
             ConnStatus::Failed(_) | ConnStatus::Lost => Some(crate::theme::error_color(dark)),
             ConnStatus::Disconnected => None,
         };
-        let marker = cx.conns.color_of(&cfg.id).and_then(crate::theme::connection_marker);
+        let marker = cx.conns.color_of(&cfg.id).and_then(|c| crate::theme::marker(c, dark));
         let start = rows.len();
         rows.push(Row {
             node: node.clone(),
@@ -1036,65 +1044,71 @@ impl Navigator {
         out
     }
 
+    /// The properties of the selected object under the tree, as in the design: a 34-point
+    /// header (an info icon and "Properties"), then name / value rows (12.5 points, the names
+    /// muted in a 110-point column, every other row striped, long values wrapped).
     fn properties_ui(&self, ui: &mut Ui, cx: &AppContext) {
         let p = ternarygrid_ui::pal(ui);
+        ui.spacing_mut().item_spacing.y = 0.0;
         ui.horizontal(|ui| {
             ui.set_min_height(34.0);
-            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.add_space(14.0);
             ui.label(RichText::new(icon::INFO).font(ternarygrid_ui::style::icon_font(14.0)).color(p.text_muted));
-            ui.label(RichText::new(tr("Properties")).font(ternarygrid_ui::style::semibold(ui.ctx(), 12.5)).color(p.text));
+            ternarygrid_ui::kit::semibold_label(ui, tr("Properties"), 12.5, p.text);
         });
         // only a node of the tree (not one removed since it was selected)
         let in_tree = self.selected.as_ref().is_some_and(|sel| self.rows.iter().any(|r| &r.node == sel));
         let props = if in_tree { self.selected_properties(cx) } else { Vec::new() };
         if props.is_empty() {
             ui.horizontal(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(14.0);
                 ui.label(RichText::new(tr("Select an object in the navigator.")).size(12.5).color(p.text_muted));
             });
             return;
         }
         egui::ScrollArea::vertical().id_salt("nav_properties_scroll").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            let stripe = ui.visuals().faint_bg_color;
             for (i, (k, v)) in props.iter().enumerate() {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
-                if i % 2 == 1 {
-                    ui.painter().rect_filled(rect, 0.0, stripe);
-                }
-                let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
-                row.spacing_mut().item_spacing.x = 8.0;
-                row.allocate_ui_with_layout(egui::vec2(110.0, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.set_min_width(110.0);
-                    ui.add(egui::Label::new(RichText::new(k).size(12.5).color(p.text_muted)).truncate());
-                });
-                let first = v.lines().next().unwrap_or("");
-                let resp = row.add(egui::Label::new(RichText::new(first).size(12.5).color(p.text)).truncate());
-                resp.context_menu(|ui| {
-                    if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).clicked() {
-                        ui.ctx().copy_text(v.clone());
-                        ui.close();
-                    }
+                let fill = if i % 2 == 1 { p.stripe } else { egui::Color32::TRANSPARENT };
+                egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(14, 5)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.allocate_ui_with_layout(egui::vec2(110.0, 16.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                            ui.set_min_width(110.0);
+                            ui.add(egui::Label::new(RichText::new(k).size(12.5).color(p.text_muted)).truncate());
+                        });
+                        let first = v.lines().next().unwrap_or("");
+                        let resp = ui.add(egui::Label::new(RichText::new(first).size(12.5).color(p.text)).wrap());
+                        resp.context_menu(|ui| {
+                            ternarygrid_ui::kit::menu_look(ui, 140.0);
+                            if ternarygrid_ui::kit::menu_item(ui, Some(icon::COPY), tr("Copy"), "").clicked() {
+                                ui.ctx().copy_text(v.clone());
+                                ui.close();
+                            }
+                        });
+                    });
                 });
             }
             ui.add_space(6.0);
         });
     }
 
-    /// Width of [`toolbar_ui`](Self::toolbar_ui): four icons.
-    pub const TOOLBAR_WIDTH: f32 = 4.0 * 22.0 + 3.0;
-
-    /// The tree's actions as plain icons, right-aligned in `ui`'s row (as in
-    /// DBeaver, next to the Database / Project switch), the rest in "⋯". New
-    /// connection and New SQL editor are in the main toolbar.
+    /// The tree's buttons, right-aligned in `ui`'s row as in the design: New connection,
+    /// Refresh and "⋯" (a new folder, connect / disconnect the selected connection, collapse
+    /// all, the properties panel, link with editor).
     pub fn toolbar_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        use ternarygrid_ui::kit::icon_button_ex;
+        use ternarygrid_ui::kit;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 1.0;
-            let more = icon_button_ex(ui, icon::DOTS_THREE, tr("More"), false, 22.0);
-            egui::Popup::menu(&more).show(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let sel_conn = self.selected.as_ref().and_then(|n| n.connection()).map(str::to_string);
+            let connected = sel_conn.as_deref().is_some_and(|c| cx.conns.is_connected(c));
+            let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More"), false, 26.0, 15.0);
+            egui::Popup::menu(&more).gap(4.0).show(|ui| {
+                kit::menu_look(ui, 200.0);
                 // A new folder inside the selected folder, else at the top level.
-                if ui.button((ternarygrid_icons::ic(icon::FOLDER_PLUS), tr("New folder…"))).clicked() {
+                if kit::menu_item(ui, Some(icon::FOLDER), tr("New folder…"), "").clicked() {
                     let parent = match &self.selected {
                         Some(NavNode::Folder(f)) => Some(f.clone()),
                         _ => None,
@@ -1102,32 +1116,37 @@ impl Navigator {
                     cx.push(AppCommand::NewFolder { parent });
                     ui.close();
                 }
-                ui.separator();
+                if let Some(c) = &sel_conn {
+                    let (plug, label) = if connected { (icon::PLUGS, tr("Disconnect")) } else { (icon::PLUGS_CONNECTED, tr("Connect")) };
+                    if kit::menu_item(ui, Some(plug), label, "").clicked() {
+                        cx.push(if connected { AppCommand::Disconnect(c.clone()) } else { AppCommand::Connect(c.clone()) });
+                        ui.close();
+                    }
+                }
+                if kit::menu_item(ui, Some(icon::ARROWS_IN_SIMPLE), tr("Collapse all"), "").clicked() {
+                    self.collapse_all();
+                    ui.close();
+                }
+                kit::menu_separator(ui);
                 let mut props = cx.settings.navigator.show_properties;
-                if ternarygrid_ui::kit::checkbox(ui, &mut props, tr("Properties panel")).changed() {
+                if kit::menu_check(ui, &mut props, tr("Properties panel")).changed() {
                     cx.settings.navigator.show_properties = props;
                     cx.push(AppCommand::SettingsChanged);
                 }
                 let mut link = cx.settings.navigator.link_with_editor;
-                if ternarygrid_ui::kit::checkbox(ui, &mut link, tr("Link with editor")).on_hover_text(tr("Link with editor: select the object of the active tab")).changed() {
+                if kit::menu_check(ui, &mut link, tr("Link with editor")).on_hover_text(tr("Link with editor: select the object of the active tab")).changed() {
                     cx.settings.navigator.link_with_editor = link;
                     cx.push(AppCommand::SettingsChanged);
                 }
             });
-            if icon_button_ex(ui, icon::ARROWS_IN_SIMPLE, tr("Collapse all"), false, 22.0).clicked() {
-                self.collapse_all();
-            }
-            let sel_conn = self.selected.as_ref().and_then(|n| n.connection()).map(str::to_string);
-            let connected = sel_conn.as_deref().is_some_and(|c| cx.conns.is_connected(c));
-            if ui.add_enabled_ui(connected, |ui| icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 22.0)).inner.clicked() {
+            // No connections (the empty state): New connection and "⋯" only, as in the design.
+            if !cx.conns.configs().is_empty()
+                && ui.add_enabled_ui(connected, |ui| kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 15.0)).inner.clicked()
+            {
                 self.refresh_selected(cx);
             }
-            let plug = if connected { icon::PLUGS } else { icon::PLUGS_CONNECTED };
-            let label = if connected { tr("Disconnect") } else { tr("Connect") };
-            if ui.add_enabled_ui(sel_conn.is_some(), |ui| icon_button_ex(ui, plug, label, false, 22.0)).inner.clicked()
-                && let Some(c) = sel_conn
-            {
-                cx.push(if connected { AppCommand::Disconnect(c) } else { AppCommand::Connect(c) });
+            if kit::icon_button_sized(ui, icon::PLUS, tr("New connection"), false, 26.0, 15.0).clicked() {
+                cx.push(AppCommand::Action(crate::keys::Action::NewConnection));
             }
         });
     }
@@ -1137,16 +1156,18 @@ impl Navigator {
         if self.prefs != cx.settings.navigator {
             self.prefs = cx.settings.navigator.clone();
         }
-        ui.add_space(4.0);
-        let search = ternarygrid_ui::kit::search_field(ui, egui::Id::new("nav_filter"), &mut self.filter, tr("Filter objects"), ui.available_width());
+        // The filter: 10 points from the header and the sides, 6 above the tree.
+        let search = egui::Frame::new()
+            .inner_margin(egui::Margin { left: 10, right: 10, top: 10, bottom: 6 })
+            .show(ui, |ui| ternarygrid_ui::kit::search_field(ui, egui::Id::new("nav_filter"), &mut self.filter, tr("Filter objects"), ui.available_width()))
+            .inner;
         if search.changed() {
             // keep selection visible
             self.scroll_to_selected = true;
         }
-        ui.add_space(4.0);
         if cx.settings.navigator.show_properties && !cx.conns.configs().is_empty() {
-            let frame = egui::Frame::new().fill(ternarygrid_ui::pal(ui).canvas).inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 6 });
-            egui::Panel::bottom("nav_properties").resizable(true).default_size(200.0).size_range(60.0..=600.0).frame(frame).show(ui, |ui| self.properties_ui(ui, cx));
+            let frame = egui::Frame::new().fill(ternarygrid_ui::pal(ui).canvas);
+            egui::Panel::bottom("nav_properties").resizable(true).default_size(230.0).size_range(60.0..=600.0).frame(frame).show(ui, |ui| self.properties_ui(ui, cx));
         }
 
         self.request_child_loads(cx);
@@ -1157,11 +1178,10 @@ impl Navigator {
         }
 
         if cx.conns.configs().is_empty() {
-            ternarygrid_ui::kit::empty_state(ui, icon::DATABASE, tr("No connections yet"), tr("Connect to a database to browse it here."), |ui| {
+            ternarygrid_ui::kit::empty_state_at(ui, 32.0, icon::DATABASE, tr("No connections yet"), tr("Connect to a database to browse it here."), |ui| {
                 if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Primary, Some(icon::PLUS), tr("New connection"), true).clicked() {
                     cx.push(AppCommand::NewConnection { kind: None, folder: None });
                 }
-                ui.add_space(4.0);
                 if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Ghost, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), true)
                     .on_hover_text(tr("From DBeaver, ~/.pgpass or a connection URL"))
                     .clicked()
@@ -1172,8 +1192,8 @@ impl Navigator {
             return;
         }
 
-        // Rows of 26 points with no gap between them, inset by 6 points (their rounded fill).
-        let row_h = 26.0;
+        // Rows of 26 points a point apart, inset by 6 points (their rounded fill).
+        let (row_h, pitch) = (26.0, 27.0);
         let rows = std::mem::take(&mut self.rows);
         let mut clicked: Option<(usize, bool)> = None; // (row, double)
         let mut toggled: Option<usize> = None;
@@ -1187,18 +1207,20 @@ impl Navigator {
         // horizontal bar was always shown for a few pixels of overflow.
         let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("nav_scroll");
         if let Some(i) = scroll_target {
-            sa = sa.vertical_scroll_offset((i as f32 * row_h - 80.0).max(0.0));
+            sa = sa.vertical_scroll_offset((i as f32 * pitch - 80.0).max(0.0));
         }
         let p = ternarygrid_ui::pal(ui);
         let item_gap = std::mem::replace(&mut ui.spacing_mut().item_spacing.y, 0.0);
-        // The rows reach the panel's edges (their own inset is the mockup's 6 points).
-        let full = ui.available_rect_before_wrap().expand2(egui::vec2(6.0, 0.0));
+        // The rows reach the panel's edges (their own inset is the design's 6 points).
+        let full = ui.available_rect_before_wrap();
         let mut area = ui.new_child(egui::UiBuilder::new().max_rect(full).layout(egui::Layout::top_down(egui::Align::Min)));
         area.spacing_mut().item_spacing.y = 0.0;
-        sa.show_rows(&mut area, row_h, rows.len(), |ui, range| {
+        sa.show_rows(&mut area, pitch, rows.len(), |ui, range| {
             for i in range {
                 let r = &rows[i];
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(200.0), row_h), Sense::click());
+                let (slot, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(200.0), pitch), Sense::hover());
+                let rect = egui::Rect::from_min_size(slot.min, egui::vec2(slot.width(), row_h));
+                let resp = ui.interact(rect, ui.id().with(("nav_row", i)), Sense::click());
                 let selected = r.kind == RowKind::Node && Some(&r.node) == self.selected.as_ref();
                 resp.widget_info(|| match &r.kind {
                     RowKind::Node => egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &r.label),
@@ -1231,7 +1253,7 @@ impl Navigator {
                 if r.expandable {
                     let arrow = if r.expanded { icon::CARET_DOWN } else { icon::CARET_RIGHT };
                     let arrow_rect = egui::Rect::from_center_size(egui::pos2(x + 6.0, y), egui::vec2(16.0, row_h));
-                    ui.painter().text(arrow_rect.center(), egui::Align2::CENTER_CENTER, arrow, ternarygrid_ui::style::icon_font(11.0), p.text_faint);
+                    ui.painter().text(arrow_rect.center(), egui::Align2::CENTER_CENTER, arrow, ternarygrid_ui::style::icon_font(12.0), p.text_faint);
                     if resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| arrow_rect.contains(q)) {
                         toggled = Some(i);
                     }
@@ -1240,7 +1262,7 @@ impl Navigator {
                 let small = egui::FontId::proportional(12.5);
                 match &r.kind {
                     RowKind::Loading => {
-                        ui.painter().text(egui::pos2(x + 6.5, y), egui::Align2::CENTER_CENTER, icon::HOURGLASS, ternarygrid_ui::style::icon_font(13.0), p.text_faint);
+                        ui.painter().text(egui::pos2(x + 6.5, y), egui::Align2::CENTER_CENTER, icon::CLOCK_COUNTER_CLOCKWISE, ternarygrid_ui::style::icon_font(13.0), p.text_faint);
                         ui.painter().text(egui::pos2(x + 19.0, y), egui::Align2::LEFT_CENTER, tr("Loading…"), small, p.text_faint);
                         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                         continue;
@@ -1493,25 +1515,26 @@ impl Navigator {
     }
 
     fn context_menu(&mut self, ui: &mut Ui, cx: &mut AppContext, node: &NavNode) {
+        ternarygrid_ui::kit::menu_look(ui, 240.0);
         let conn = node.connection().map(str::to_string);
         match node {
             NavNode::Folder(f) => {
-                if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("New connection here"))).clicked() {
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::PLUS), tr("New connection here"), "").clicked() {
                     cx.push(AppCommand::NewConnection { kind: None, folder: Some(f.clone()) });
                     ui.close();
                 }
-                if ui.button((ternarygrid_icons::ic(icon::FOLDER_PLUS), tr("New folder…"))).clicked() {
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::FOLDER), tr("New folder…"), "").clicked() {
                     cx.push(AppCommand::NewFolder { parent: Some(f.clone()) });
                     ui.close();
                 }
-                ui.separator();
-                if ui.button((ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Rename folder…"))).clicked() {
+                ternarygrid_ui::kit::menu_separator(ui);
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::PENCIL_SIMPLE), tr("Rename folder…"), "").clicked() {
                     cx.push(AppCommand::RenameFolder(f.clone()));
                     ui.close();
                 }
-                let red = crate::theme::error_color(ui.visuals().dark_mode);
                 if ui
-                    .button(RichText::new(format!("{} {}", icon::TRASH, tr("Delete folder…"))).color(red))
+                    .scope(|ui| ternarygrid_ui::kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete folder…"), ""))
+                    .inner
                     .on_hover_text(tr("Its connections move to the folder above; none is deleted"))
                     .clicked()
                 {
@@ -1522,49 +1545,51 @@ impl Navigator {
             NavNode::Connection(id) => {
                 let connected = cx.conns.is_connected(id);
                 if connected {
-                    if ui.button((ternarygrid_icons::ic(icon::PLUGS), tr("Disconnect"))).clicked() {
+                    if ternarygrid_ui::kit::menu_item(ui, Some(icon::PLUGS), tr("Disconnect"), "").clicked() {
                         cx.push(AppCommand::Disconnect(id.clone()));
                         ui.close();
                     }
-                    if ui.button((ternarygrid_icons::ic(icon::ARROWS_CLOCKWISE), tr("Reconnect"))).clicked() {
+                    if ternarygrid_ui::kit::menu_item(ui, Some(icon::ARROWS_CLOCKWISE), tr("Reconnect"), "").clicked() {
                         cx.push(AppCommand::Reconnect(id.clone()));
                         ui.close();
                     }
-                } else if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
+                } else if ternarygrid_ui::kit::menu_item(ui, Some(icon::PLUGS_CONNECTED), tr("Connect"), "").clicked() {
                     cx.push(AppCommand::Connect(id.clone()));
                     ui.close();
                 }
-                ui.separator();
-                if item(ui, icon::FILE_SQL, tr("New SQL editor"), &crate::keys::label(cx.keymap, crate::keys::Action::NewSqlEditor)).clicked() {
+                ternarygrid_ui::kit::menu_separator(ui);
+                if item(ui, icon::FILE_CODE, tr("New SQL editor"), &crate::keys::label(cx.keymap, crate::keys::Action::NewSqlEditor)).clicked() {
                     cx.push(AppCommand::NewSqlEditor { connection: Some(id.clone()), schema: None, text: None });
                     ui.close();
                 }
-                if ui.button((ternarygrid_icons::ic(icon::TERMINAL), tr("Open SQL console"))).clicked() {
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::TERMINAL), tr("Open SQL console"), "").clicked() {
                     cx.push(AppCommand::NewSqlConsole { connection: id.clone() });
                     ui.close();
                 }
                 create_menu_items(ui, cx, id, None);
-                ui.separator();
-                if ui.button((ternarygrid_icons::ic(icon::PENCIL), tr("Edit connection"))).clicked() {
+                ternarygrid_ui::kit::menu_separator(ui);
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::PENCIL_SIMPLE), tr("Edit connection"), &crate::keys::label(cx.keymap, crate::keys::Action::EditConnection))
+                    .clicked()
+                {
                     cx.push(AppCommand::EditConnection(id.clone()));
                     ui.close();
                 }
-                if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Duplicate"))).clicked() {
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::COPY), tr("Duplicate"), "").clicked() {
                     cx.push(AppCommand::DuplicateConnection(id.clone()));
                     ui.close();
                 }
-                if ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Delete"))).clicked() {
+                if ternarygrid_ui::kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete"), "").clicked() {
                     cx.push(AppCommand::DeleteConnection(id.clone()));
                     ui.close();
                 }
                 let others: Vec<String> = cx.conns.configs().iter().map(|c| c.id.clone()).filter(|c| c != id && cx.conns.is_connected(c)).collect();
-                if !others.is_empty() && ui.button((ternarygrid_icons::ic(icon::PLUGS), tr("Disconnect others"))).clicked() {
+                if !others.is_empty() && ternarygrid_ui::kit::menu_item(ui, None, tr("Disconnect others"), "").clicked() {
                     for o in others {
                         cx.push(AppCommand::Disconnect(o));
                     }
                     ui.close();
                 }
-                ui.menu_button((ternarygrid_icons::ic(icon::ARROWS_DOWN_UP), tr("Move")), |ui| {
+                ternarygrid_ui::kit::submenu(ui, None, tr("Move"), 170.0, &mut |ui| {
                     use crate::command::MovePos as M;
                     for (pos, label, i) in [
                         (M::Top, tr("To the top"), icon::ARROW_LINE_UP),
@@ -1572,7 +1597,7 @@ impl Navigator {
                         (M::Down, tr("Down"), icon::ARROW_DOWN),
                         (M::Bottom, tr("To the bottom"), icon::ARROW_LINE_DOWN),
                     ] {
-                        if ui.button(format!("{i} {label}")).clicked() {
+                        if ternarygrid_ui::kit::menu_item(ui, Some(i), label, "").clicked() {
                             cx.push(AppCommand::MoveConnection { id: id.clone(), to: pos });
                             ui.close();
                         }
@@ -1580,8 +1605,8 @@ impl Navigator {
                 });
                 let current = cx.conns.config(id).and_then(|c| c.folder.clone());
                 let folders = cx.conns.folders().to_vec();
-                ui.menu_button((ternarygrid_icons::ic(icon::FOLDER), tr("Move to folder")), |ui| {
-                    if ui.add_enabled(current.is_some(), egui::Button::new(tr("(top level)"))).clicked() {
+                ternarygrid_ui::kit::submenu(ui, Some(icon::FOLDER), tr("Move to folder"), 200.0, &mut |ui| {
+                    if ui.add_enabled_ui(current.is_some(), |ui| ternarygrid_ui::kit::menu_item(ui, None, tr("(top level)"), "")).inner.clicked() {
                         cx.push(AppCommand::MoveToFolder { id: id.clone(), folder: None });
                         ui.close();
                     }
@@ -1589,28 +1614,28 @@ impl Navigator {
                         // Subfolders indented under their parent.
                         let depth = f.matches('/').count();
                         let name = f.rsplit('/').next().unwrap_or(f);
-                        let label = (RichText::new(format!("{}{}", "    ".repeat(depth), icon::FOLDER)).color(ternarygrid_icons::ORANGE), name);
-                        if ui.add_enabled(current.as_deref() != Some(f.as_str()), egui::Button::new(label)).clicked() {
+                        let label = format!("{}{name}", "    ".repeat(depth));
+                        if ui.add_enabled_ui(current.as_deref() != Some(f.as_str()), |ui| ternarygrid_ui::kit::menu_item(ui, Some(icon::FOLDER), &label, "")).inner.clicked() {
                             cx.push(AppCommand::MoveToFolder { id: id.clone(), folder: Some(f.clone()) });
                             ui.close();
                         }
                     }
-                    ui.separator();
-                    if ui.button((ternarygrid_icons::ic(icon::FOLDER_PLUS), tr("New folder…"))).clicked() {
+                    ternarygrid_ui::kit::menu_separator(ui);
+                    if ternarygrid_ui::kit::menu_item(ui, Some(icon::FOLDER), tr("New folder…"), "").clicked() {
                         cx.push(AppCommand::NewFolder { parent: None });
                         ui.close();
                     }
                 });
                 if connected {
-                    ui.separator();
-                    ui.menu_button((ternarygrid_icons::ic(icon::WRENCH), tr("Tools")), |ui| {
+                    ternarygrid_ui::kit::menu_separator(ui);
+                    ternarygrid_ui::kit::submenu(ui, Some(icon::WRENCH), tr("Tools"), 220.0, &mut |ui| {
                         tools_menu(ui, cx, id, None);
                     });
                 }
             }
             NavNode::Database { conn, db } => database_menu(ui, cx, conn, db),
             NavNode::Schema { conn, schema } | NavNode::KindFolder { conn, schema, .. } => {
-                if item(ui, icon::FILE_SQL, tr("New SQL editor"), &crate::keys::label(cx.keymap, crate::keys::Action::NewSqlEditor)).clicked() {
+                if item(ui, icon::FILE_CODE, tr("New SQL editor"), &crate::keys::label(cx.keymap, crate::keys::Action::NewSqlEditor)).clicked() {
                     cx.push(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: Some(schema.clone()), text: None });
                     ui.close();
                 }
@@ -1622,7 +1647,8 @@ impl Navigator {
                     let read_only = live.config.read_only;
                     let database = schema.database.clone().or_else(|| live.current_database.clone());
                     let b = ui
-                        .add_enabled(!read_only, egui::Button::new((ternarygrid_icons::ic(icon::STACK), tr("New schema…"))))
+                        .add_enabled_ui(!read_only, |ui| ternarygrid_ui::kit::menu_item(ui, Some(icon::STACK), tr("New schema…"), ""))
+                        .inner
                         .on_disabled_hover_text(tr("The connection is read-only."));
                     if b.clicked() {
                         cx.push(AppCommand::NewSchema { connection: conn.clone(), database });
@@ -1631,32 +1657,34 @@ impl Navigator {
                 }
                 // Table designer, diagrams, imports and compare write SQL.
                 if is_sql(cx, conn) {
-                    if ui.button((ternarygrid_icons::ic(icon::TABLE), tr("Create table"))).clicked() {
+                    if ternarygrid_ui::kit::menu_item(ui, Some(icon::PLUS), tr("Create table"), "").clicked() {
                         cx.push(AppCommand::CreateTable { connection: conn.clone(), schema: schema.clone() });
                         ui.close();
                     }
-                    if ui.button((ternarygrid_icons::ic(icon::GRAPH), tr("ER diagram"))).clicked() {
+                    if ternarygrid_ui::kit::menu_item(ui, Some(icon::GRAPH), tr("ER diagram"), "").clicked() {
                         cx.push(AppCommand::OpenErDiagram { connection: conn.clone(), schema: schema.clone(), tables: Vec::new() });
                         ui.close();
                     }
-                    if ui.button((ternarygrid_icons::ic(icon::DOWNLOAD), tr("Import data"))).clicked() {
+                    if ternarygrid_ui::kit::menu_item(ui, Some(icon::DOWNLOAD), tr("Import data"), "").clicked() {
                         cx.push(AppCommand::OpenImport { connection: conn.clone(), table: None, schema: Some(schema.clone()) });
                         ui.close();
                     }
-                    if ui.button((ternarygrid_icons::ic(icon::GIT_DIFF), tr("Compare schema"))).clicked() {
+                    if ternarygrid_ui::kit::menu_item(ui, Some(icon::GIT_DIFF), tr("Compare schema"), "").clicked() {
                         cx.push(AppCommand::OpenSchemaCompare { connection: Some(conn.clone()), schema: Some(schema.clone()) });
                         ui.close();
                     }
                 }
-                ui.menu_button((ternarygrid_icons::ic(icon::WRENCH), tr("Tools")), |ui| tools_menu(ui, cx, conn, Some(schema.clone())));
+                ternarygrid_ui::kit::submenu(ui, Some(icon::WRENCH), tr("Tools"), 220.0, &mut |ui| tools_menu(ui, cx, conn, Some(schema.clone())));
                 if let NavNode::KindFolder { kind, .. } = node
                     && cx.conns.config(conn).is_some_and(|c| name_filter(&c.filters, *kind).is_active())
-                    && ui.button((ternarygrid_icons::ic(icon::FUNNEL_X), tr("Clear navigator filter"))).on_hover_text(tr("Show the hidden objects of this type again")).clicked()
+                    && ternarygrid_ui::kit::menu_item(ui, Some(icon::FUNNEL_X), tr("Clear navigator filter"), "")
+                        .on_hover_text(tr("Show the hidden objects of this type again"))
+                        .clicked()
                 {
                     cx.push(AppCommand::ClearNavigatorFilter { connection: conn.clone(), kind: *kind });
                     ui.close();
                 }
-                ui.separator();
+                ternarygrid_ui::kit::menu_separator(ui);
                 if item(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), &crate::keys::label(cx.keymap, crate::keys::Action::Refresh)).clicked() {
                     cx.push(AppCommand::RefreshMetadata { connection: conn.clone(), object: None, schema: Some(schema.clone()) });
                     ui.close();
@@ -1686,7 +1714,7 @@ impl Navigator {
                 }
             }
             NavNode::CatalogFolder { conn, folder, ctx } => {
-                if ui.button((ternarygrid_icons::ic(icon::TABLE), tr("View as table"))).clicked() {
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::TABLE), tr("View as table"), "").clicked() {
                     cx.push(AppCommand::OpenCatalogTable { connection: conn.clone(), folder, ctx: ctx.clone() });
                     ui.close();
                 }
@@ -1783,28 +1811,30 @@ fn database_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, db: &str) {
     let editable = edits != ternarygrid_core::DatabaseEdits::default() || live.dialect.database_properties_sql(db).is_some();
     let maintenance = live.dialect.maintenance_ops().iter().any(|o| o.applies_to.contains(&ObjectKind::Database));
     let read_only = live.config.read_only;
-    if item(ui, icon::FILE_SQL, tr("New SQL editor"), &crate::keys::label(cx.keymap, crate::keys::Action::NewSqlEditor)).clicked() {
+    if item(ui, icon::FILE_CODE, tr("New SQL editor"), &crate::keys::label(cx.keymap, crate::keys::Action::NewSqlEditor)).clicked() {
         cx.push(AppCommand::NewSqlEditor { connection: Some(conn.to_string()), schema: Some(schema.clone()), text: None });
         ui.close();
     }
-    ui.separator();
+    ternarygrid_ui::kit::menu_separator(ui);
     if editable
-        && ui.button((ternarygrid_icons::ic(icon::PENCIL), tr("Edit database…"))).on_hover_text(tr("Its owner, comment, limits … and the statements that change them")).clicked()
+        && ternarygrid_ui::kit::menu_item(ui, Some(icon::PENCIL), tr("Edit database…"), "")
+            .on_hover_text(tr("Its owner, comment, limits … and the statements that change them"))
+            .clicked()
     {
         cx.push(AppCommand::EditDatabase { connection: conn.to_string(), database: db.to_string(), rename: false });
         ui.close();
     }
-    if edits.name && ui.add_enabled(!read_only, egui::Button::new((ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Rename…"))).shortcut_text("F2")).clicked() {
+    if edits.name && ui.add_enabled_ui(!read_only, |ui| ternarygrid_ui::kit::menu_item(ui, Some(icon::PENCIL_SIMPLE), tr("Rename…"), "F2")).inner.clicked() {
         cx.push(AppCommand::EditDatabase { connection: conn.to_string(), database: db.to_string(), rename: true });
         ui.close();
     }
     create_menu_items(ui, cx, conn, Some(db.to_string()));
-    if maintenance && ui.button((ternarygrid_icons::ic(icon::BROOM), tr("Maintenance"))).on_hover_text(tr("Vacuum, analyze, reindex the whole database")).clicked() {
+    if maintenance && ternarygrid_ui::kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance"), "").on_hover_text(tr("Vacuum, analyze, reindex the whole database")).clicked() {
         cx.push(AppCommand::OpenMaintenance { connection: conn.to_string(), objects: vec![database.clone()], op: None });
         ui.close();
     }
-    ui.menu_button((ternarygrid_icons::ic(icon::WRENCH), tr("Tools")), |ui| tools_menu(ui, cx, conn, Some(schema.clone())));
-    ui.separator();
+    ternarygrid_ui::kit::submenu(ui, Some(icon::WRENCH), tr("Tools"), 220.0, &mut |ui| tools_menu(ui, cx, conn, Some(schema.clone())));
+    ternarygrid_ui::kit::menu_separator(ui);
     if item(ui, icon::COPY, tr("Copy name"), COPY_KEYS).clicked() {
         ui.ctx().copy_text(db.to_string());
         ui.close();
@@ -1813,9 +1843,8 @@ fn database_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, db: &str) {
         cx.push(AppCommand::RefreshMetadata { connection: conn.to_string(), object: None, schema: Some(schema) });
         ui.close();
     }
-    ui.separator();
-    let red = crate::theme::error_color(ui.visuals().dark_mode);
-    if ui.add(egui::Button::new(RichText::new(format!("{} {}", icon::TRASH, tr("Drop…"))).color(red)).shortcut_text(DROP_KEYS)).clicked() {
+    ternarygrid_ui::kit::menu_separator(ui);
+    if ternarygrid_ui::kit::menu_item_danger(ui, Some(icon::TRASH), tr("Drop…"), DROP_KEYS).clicked() {
         cx.push(AppCommand::DropObjects { connection: conn.to_string(), objects: vec![database] });
         ui.close();
     }
@@ -1834,7 +1863,7 @@ pub fn create_menu_items(ui: &mut Ui, cx: &mut AppContext, conn: &str, database:
     let multiple_databases = live.driver.info().capabilities.multiple_databases;
     let why = tr("The connection is read-only.");
     if databases {
-        let b = ui.add_enabled(!read_only, egui::Button::new((ternarygrid_icons::ic(icon::DATABASE), tr("New database…")))).on_disabled_hover_text(why);
+        let b = ui.add_enabled_ui(!read_only, |ui| ternarygrid_ui::kit::menu_item(ui, Some(icon::DATABASE), tr("New database…"), "")).inner.on_disabled_hover_text(why);
         if b.clicked() {
             cx.push(AppCommand::NewDatabase { connection: conn.to_string() });
             ui.close();
@@ -1843,7 +1872,7 @@ pub fn create_menu_items(ui: &mut Ui, cx: &mut AppContext, conn: &str, database:
     // A schema belongs to a database: on servers with several databases it
     // is created from a database (or schema) node, not the connection.
     if schemas && (database.is_some() || !multiple_databases) {
-        let b = ui.add_enabled(!read_only, egui::Button::new((ternarygrid_icons::ic(icon::STACK), tr("New schema…")))).on_disabled_hover_text(why);
+        let b = ui.add_enabled_ui(!read_only, |ui| ternarygrid_ui::kit::menu_item(ui, Some(icon::STACK), tr("New schema…"), "")).inner.on_disabled_hover_text(why);
         if b.clicked() {
             cx.push(AppCommand::NewSchema { connection: conn.to_string(), database });
             ui.close();
@@ -1854,46 +1883,45 @@ pub fn create_menu_items(ui: &mut Ui, cx: &mut AppContext, conn: &str, database:
 /// Administration tools for a connection.
 pub fn tools_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, schema: Option<SchemaRef>) {
     let caps = cx.conns.live(conn).map(|l| l.driver.info().capabilities.clone()).unwrap_or_default();
-    if caps.session_manager && ui.button((ternarygrid_icons::ic(icon::USERS), tr("Session manager"))).clicked() {
+    if caps.session_manager && ternarygrid_ui::kit::menu_item(ui, Some(icon::USERS), tr("Session manager"), "").clicked() {
         cx.push(AppCommand::OpenSessionManager { connection: conn.to_string() });
         ui.close();
     }
-    if caps.lock_manager && ui.button((ternarygrid_icons::ic(icon::LOCK), tr("Lock manager"))).clicked() {
+    if caps.lock_manager && ternarygrid_ui::kit::menu_item(ui, Some(icon::LOCK), tr("Lock manager"), "").clicked() {
         cx.push(AppCommand::OpenLockManager { connection: conn.to_string() });
         ui.close();
     }
-    if caps.server_metrics && ui.button((ternarygrid_icons::ic(icon::CHART_LINE), tr("Server dashboard"))).clicked() {
+    if caps.server_metrics && ternarygrid_ui::kit::menu_item(ui, Some(icon::CHART_BAR), tr("Server dashboard"), "").clicked() {
         cx.push(AppCommand::OpenDashboard { connection: conn.to_string() });
         ui.close();
     }
-    if caps.backup && ui.button((ternarygrid_icons::ic(icon::ARCHIVE), tr("Backup"))).clicked() {
+    if caps.backup && ternarygrid_ui::kit::menu_item(ui, Some(icon::PACKAGE), tr("Backup"), "").clicked() {
         cx.push(AppCommand::OpenBackup { connection: conn.to_string(), schema: schema.clone(), restore: false });
         ui.close();
     }
-    if caps.restore && ui.button((ternarygrid_icons::ic(icon::ARROW_COUNTER_CLOCKWISE), tr("Restore"))).clicked() {
+    if caps.restore && ternarygrid_ui::kit::menu_item(ui, Some(icon::REPEAT), tr("Restore"), "").clicked() {
         cx.push(AppCommand::OpenBackup { connection: conn.to_string(), schema: schema.clone(), restore: true });
         ui.close();
     }
     let sql = is_sql(cx, conn);
-    if sql && ui.button((ternarygrid_icons::ic(icon::BLUEPRINT), tr("Query builder"))).clicked() {
+    if sql && ternarygrid_ui::kit::menu_item(ui, Some(icon::BLUEPRINT), tr("Query builder"), "").clicked() {
         cx.push(AppCommand::OpenQueryBuilder { connection: conn.to_string(), schema: schema.clone() });
         ui.close();
     }
-    if ui.button((ternarygrid_icons::ic(icon::MAGNIFYING_GLASS), tr("Search metadata"))).clicked() {
+    if ternarygrid_ui::kit::menu_item(ui, Some(icon::MAGNIFYING_GLASS), tr("Search metadata"), "").clicked() {
         cx.push(AppCommand::OpenSearch { connection: Some(conn.to_string()), data: false });
         ui.close();
     }
-    if sql && ui.button((ternarygrid_icons::ic(icon::TEXT_AA), tr("Search data"))).clicked() {
+    if sql && ternarygrid_ui::kit::menu_item(ui, Some(icon::TEXT_AA), tr("Search data"), "").clicked() {
         cx.push(AppCommand::OpenSearch { connection: Some(conn.to_string()), data: true });
         ui.close();
     }
-    if cx.conns.live(conn).is_some_and(|l| l.config.kind == DbKind::Postgres) && ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Foreign data wrapper…"))).clicked()
-    {
+    if cx.conns.live(conn).is_some_and(|l| l.config.kind == DbKind::Postgres) && ternarygrid_ui::kit::menu_item(ui, Some(icon::PLUG), tr("Foreign data wrapper…"), "").clicked() {
         cx.push(AppCommand::OpenFdwConfigurator { connection: conn.to_string() });
         ui.close();
     }
     let can_change_password = cx.conns.live(conn).is_some_and(|l| l.dialect.change_password_sql(None, "x").is_some());
-    if can_change_password && ui.button((ternarygrid_icons::ic(icon::PASSWORD), tr("Change password"))).clicked() {
+    if can_change_password && ternarygrid_ui::kit::menu_item(ui, Some(icon::KEY), tr("Change password"), "").clicked() {
         cx.push(AppCommand::ChangePassword { connection: conn.to_string() });
         ui.close();
     }
@@ -1901,7 +1929,7 @@ pub fn tools_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, schema: Option<S
 
 /// A menu item with its shortcut on the right.
 fn item(ui: &mut Ui, glyph: &str, text: &str, keys: &str) -> egui::Response {
-    ui.add(egui::Button::new((ternarygrid_icons::ic(glyph), text)).shortcut_text(keys))
+    ternarygrid_ui::kit::menu_item(ui, Some(glyph), text, keys)
 }
 
 /// The navigator's own keys, as shown in its menus.
@@ -1920,35 +1948,36 @@ fn is_sql(cx: &AppContext, conn: &str) -> bool {
 }
 
 pub fn object_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, obj: &ObjectRef, in_navigator: bool) {
+    ternarygrid_ui::kit::menu_look(ui, 260.0);
     let c = conn.to_string();
     let sql = is_sql(cx, conn);
     let keys = |k: &str| if in_navigator { k.to_string() } else { String::new() };
-    if in_navigator && item(ui, icon::ARROW_SQUARE_OUT, tr("Open"), &keys(OPEN_KEYS)).clicked() {
+    if in_navigator && item(ui, icon::EYE, tr("Open"), &keys(OPEN_KEYS)).clicked() {
         cx.push(AppCommand::OpenObject { connection: c.clone(), object: obj.clone(), page: ObjectPage::Properties });
         ui.close();
     }
-    if in_navigator && obj.kind.has_data() && ui.button((ternarygrid_icons::ic(icon::TABLE), tr("View data"))).clicked() {
+    if in_navigator && obj.kind.has_data() && ternarygrid_ui::kit::menu_item(ui, Some(icon::TABLE), tr("View data"), "").clicked() {
         cx.push(AppCommand::OpenObject { connection: c.clone(), object: obj.clone(), page: ObjectPage::Data });
         ui.close();
     }
-    if in_navigator && ui.button((ternarygrid_icons::ic(icon::CODE), tr("View DDL"))).clicked() {
+    if in_navigator && ternarygrid_ui::kit::menu_item(ui, Some(icon::FILE_CODE), tr("View DDL"), "").clicked() {
         cx.push(AppCommand::OpenObject { connection: c.clone(), object: obj.clone(), page: ObjectPage::Ddl });
         ui.close();
     }
     if sql && obj.kind.is_table_like() {
-        if ui.button((ternarygrid_icons::ic(icon::PENCIL), tr("Edit table"))).clicked() {
+        if ternarygrid_ui::kit::menu_item(ui, Some(icon::PENCIL), tr("Edit table"), "").clicked() {
             cx.push(AppCommand::EditTable { connection: c.clone(), table: obj.clone() });
             ui.close();
         }
-        if in_navigator && ui.button((ternarygrid_icons::ic(icon::GRAPH), tr("ER diagram"))).clicked() {
+        if in_navigator && ternarygrid_ui::kit::menu_item(ui, Some(icon::GRAPH), tr("ER diagram"), "").clicked() {
             cx.push(AppCommand::OpenErDiagram { connection: c.clone(), schema: obj.schema_ref(), tables: vec![obj.name.clone()] });
             ui.close();
         }
     }
     if sql {
-        ui.menu_button((ternarygrid_icons::ic(icon::FILE_SQL), tr("Generate SQL")), |ui| {
+        ternarygrid_ui::kit::submenu(ui, Some(icon::FILE_CODE), tr("Generate SQL"), 150.0, &mut |ui| {
             for (label, kind) in [("SELECT", "select"), ("INSERT", "insert"), ("UPDATE", "update"), ("DELETE", "delete"), ("UPSERT", "upsert"), ("DDL", "ddl")] {
-                if (obj.kind.is_table_like() || kind == "ddl" || kind == "select") && ui.button(label).clicked() {
+                if (obj.kind.is_table_like() || kind == "ddl" || kind == "select") && ternarygrid_ui::kit::menu_item(ui, None, label, "").clicked() {
                     cx.push(AppCommand::GenerateSql { connection: c.clone(), object: obj.clone(), kind: kind.to_string() });
                     ui.close();
                 }
@@ -1956,46 +1985,47 @@ pub fn object_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, obj: &ObjectRef
         });
     }
     if obj.kind.has_data() {
-        ui.separator();
-        if ui.button((ternarygrid_icons::ic(icon::EXPORT), tr("Export data"))).clicked() {
+        ternarygrid_ui::kit::menu_separator(ui);
+        if ternarygrid_ui::kit::menu_item(ui, Some(icon::EXPORT), tr("Export data"), "").clicked() {
             cx.push(AppCommand::OpenExport { connection: c.clone(), objects: vec![obj.clone()], sql: None });
             ui.close();
         }
         if sql && obj.kind.is_table_like() {
-            if ui.button((ternarygrid_icons::ic(icon::DOWNLOAD), tr("Import data"))).clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::DOWNLOAD), tr("Import data"), "").clicked() {
                 cx.push(AppCommand::OpenImport { connection: c.clone(), table: Some(obj.clone()), schema: Some(obj.schema_ref()) });
                 ui.close();
             }
-            if ui.button((ternarygrid_icons::ic(icon::SHUFFLE), tr("Generate mock data"))).clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::MAGIC_WAND), tr("Generate mock data"), "").clicked() {
                 cx.push(AppCommand::OpenMockData { connection: c.clone(), table: obj.clone() });
                 ui.close();
             }
-            if ui.button((ternarygrid_icons::ic(icon::ARROWS_LEFT_RIGHT), tr("Migrate to another database"))).clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::ARROW_RIGHT), tr("Migrate to another database"), "").clicked() {
                 cx.push(AppCommand::OpenMigration { connection: c.clone(), objects: vec![obj.clone()] });
                 ui.close();
             }
-            if ui.button((ternarygrid_icons::ic(icon::GIT_DIFF), tr("Compare data"))).clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::GIT_DIFF), tr("Compare data"), "").clicked() {
                 cx.push(AppCommand::OpenDataCompare { connection: Some(c.clone()), table: Some(obj.clone()) });
                 ui.close();
             }
-            if ui.button((ternarygrid_icons::ic(icon::BROOM), tr("Maintenance"))).clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance"), "").clicked() {
                 cx.push(AppCommand::OpenMaintenance { connection: c.clone(), objects: vec![obj.clone()], op: None });
                 ui.close();
             }
         }
     }
-    if obj.kind.is_routine() && ui.button((ternarygrid_icons::ic(icon::PLAY), tr("Execute…"))).on_hover_text(tr("Open a script that calls it with parameters")).clicked() {
+    if obj.kind.is_routine() && ternarygrid_ui::kit::menu_item(ui, Some(icon::PLAY), tr("Execute…"), "").on_hover_text(tr("Open a script that calls it with parameters")).clicked()
+    {
         cx.push(AppCommand::ExecuteRoutine { connection: c.clone(), routine: obj.clone() });
         ui.close();
     }
-    if obj.kind.is_routine() && ui.button((ternarygrid_icons::ic(icon::BUG), tr("Debug"))).clicked() {
+    if obj.kind.is_routine() && ternarygrid_ui::kit::menu_item(ui, Some(icon::BUG), tr("Debug"), "").clicked() {
         cx.push(AppCommand::OpenDebugger { connection: c.clone(), routine: obj.clone() });
         ui.close();
     }
-    ui.separator();
+    ternarygrid_ui::kit::menu_separator(ui);
     if sql && obj.kind == ObjectKind::Column && obj.table.is_some() {
         for (label, unique) in [(tr("Create index…"), false), (tr("Add unique constraint…"), true)] {
-            if ui.button(format!("{} {label}", if unique { icon::KEY } else { icon::LIST_NUMBERS })).clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(if unique { icon::KEY } else { icon::LIST_NUMBERS }), label, "").clicked() {
                 if let Some(live) = cx.conns.live(conn) {
                     let text = column_constraint_sql(live.dialect.as_ref(), obj, unique);
                     cx.push(AppCommand::NewSqlEditor { connection: Some(conn.to_string()), schema: Some(obj.schema_ref()), text: Some(text) });
@@ -2006,18 +2036,18 @@ pub fn object_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, obj: &ObjectRef
     }
     if obj.kind == ObjectKind::Trigger
         && cx.conns.live(conn).is_some_and(|l| l.dialect.maintenance_ops().iter().any(|o| o.applies_to.contains(&ObjectKind::Trigger)))
-        && ui.button((ternarygrid_icons::ic(icon::BROOM), tr("Maintenance"))).on_hover_text(tr("Enable or disable the trigger")).clicked()
+        && ternarygrid_ui::kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance"), "").on_hover_text(tr("Enable or disable the trigger")).clicked()
     {
         cx.push(AppCommand::OpenMaintenance { connection: conn.to_string(), objects: vec![obj.clone()], op: None });
         ui.close();
     }
     if obj.table.is_none()
-        && ui.button((ternarygrid_icons::ic(icon::EYE_SLASH), tr("Hide in navigator"))).on_hover_text(tr("Adds the name to the connection's navigator filter")).clicked()
+        && ternarygrid_ui::kit::menu_item(ui, Some(icon::EYE_SLASH), tr("Hide in navigator"), "").on_hover_text(tr("Adds the name to the connection's navigator filter")).clicked()
     {
         cx.push(AppCommand::HideInNavigator { connection: conn.to_string(), object: obj.clone() });
         ui.close();
     }
-    if ui.button((ternarygrid_icons::ic(icon::BOOKMARK_SIMPLE), tr("Add bookmark"))).clicked() {
+    if ternarygrid_ui::kit::menu_item(ui, Some(icon::PUSH_PIN), tr("Add bookmark"), "").clicked() {
         cx.push(AppCommand::AddBookmark { connection: c.clone(), object: obj.clone() });
         ui.close();
     }
@@ -2030,17 +2060,16 @@ pub fn object_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, obj: &ObjectRef
         cx.push(AppCommand::RefreshMetadata { connection: c.clone(), object: Some(obj.clone()), schema: None });
         ui.close();
     }
-    ui.separator();
-    let red = crate::theme::error_color(ui.visuals().dark_mode);
+    ternarygrid_ui::kit::menu_separator(ui);
     // Truncate (Tools › Truncate in DBeaver): its options and SQL in the maintenance dialog.
     if sql
         && matches!(obj.kind, ObjectKind::Table | ObjectKind::Partition)
-        && ui.add(egui::Button::new(RichText::new(format!("{} {}", icon::ERASER, tr("Truncate…"))).color(red))).on_hover_text(tr("Delete every row of the table")).clicked()
+        && ternarygrid_ui::kit::menu_item_danger(ui, Some(icon::TRASH), tr("Truncate…"), "").on_hover_text(tr("Delete every row of the table")).clicked()
     {
         cx.push(AppCommand::OpenMaintenance { connection: c.clone(), objects: vec![obj.clone()], op: Some(ternarygrid_core::admin::MaintenanceOp::TRUNCATE.to_string()) });
         ui.close();
     }
-    if ui.add(egui::Button::new(RichText::new(format!("{} {}", icon::TRASH, tr("Drop…"))).color(red)).shortcut_text(keys(DROP_KEYS))).clicked() {
+    if ternarygrid_ui::kit::menu_item_danger(ui, Some(icon::TRASH), tr("Drop…"), &keys(DROP_KEYS)).clicked() {
         cx.push(AppCommand::DropObjects { connection: c, objects: vec![obj.clone()] });
         ui.close();
     }
