@@ -136,14 +136,14 @@ impl TabView for HistoryTab {
             ui.label(icon::MAGNIFYING_GLASS);
             changed |= ui.add(egui::TextEdit::singleline(&mut self.text).hint_text(tr("Search SQL text…")).desired_width(260.0)).changed();
             let conn_name = self.connection.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("All connections").to_string());
-            egui::ComboBox::from_id_salt("hist_conn").selected_text(conn_name).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("hist_conn").icon(ternarygrid_ui::kit::combo_caret).selected_text(conn_name).show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut self.connection, None, tr("All connections")).changed();
                 for c in cx.conns.configs() {
                     changed |= ui.selectable_value(&mut self.connection, Some(c.id.clone()), &c.name).changed();
                 }
             });
             let st = self.status.map(status_label).unwrap_or(tr("Any status"));
-            egui::ComboBox::from_id_salt("hist_status").selected_text(st).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("hist_status").icon(ternarygrid_ui::kit::combo_caret).selected_text(st).show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut self.status, None, tr("Any status")).changed();
                 for s in [QueryStatus::Ok, QueryStatus::Error, QueryStatus::Cancelled] {
                     changed |= ui.selectable_value(&mut self.status, Some(s), status_label(s)).changed();

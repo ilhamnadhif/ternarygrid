@@ -282,7 +282,8 @@ impl ConnectionDialog {
                         ui.separator();
                     }
                     ui.vertical(|ui| {
-                        ui.horizontal_wrapped(|ui| {
+                        let tabs = ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
                             for (p, label) in [
                                 (Page::Main, tr("Main")),
                                 (Page::Ssh, tr("SSH")),
@@ -296,10 +297,14 @@ impl ConnectionDialog {
                                 if self.cfg.kind.is_file_based() && matches!(p, Page::Ssh | Page::Proxy | Page::Ssl) {
                                     continue;
                                 }
-                                ui.selectable_value(&mut self.page, p, label);
+                                if ternarygrid_ui::kit::underline_tab(ui, None, label, None, self.page == p, 32.0).clicked() {
+                                    self.page = p;
+                                }
                             }
                         });
-                        ui.separator();
+                        let line = egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border);
+                        ui.painter().hline(ui.max_rect().x_range(), tabs.response.rect.bottom() - 0.5, line);
+                        ui.add_space(8.0);
                         egui::ScrollArea::vertical().max_height(body - 50.0).auto_shrink([false, true]).show(ui, |ui| match self.page {
                             Page::Main => self.main_page(ui, cx),
                             Page::Ssh => self.ssh_page(ui, cx),
@@ -325,9 +330,12 @@ impl ConnectionDialog {
                     }
                     None => {}
                 }
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
+                    use ternarygrid_ui::kit;
                     let testing = self.test.is_some();
-                    if ui.add_enabled(!testing, egui::Button::new((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Test connection")))).clicked() {
+                    let test = ui.add_enabled_ui(!testing, |ui| kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Test connection")).clicked()).inner;
+                    if test {
                         self.sync_auto_commit();
                         self.test_result = None;
                         match self.validate() {
@@ -342,14 +350,16 @@ impl ConnectionDialog {
                         ui.spinner();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(tr("Cancel")).clicked() {
-                            close = true;
-                        }
-                        if ui.button(RichText::new(tr("Save")).strong()).clicked() && self.save(cx) {
-                            close = true;
-                        }
-                        if self.is_new && ui.add(crate::widgets::primary_button(ui, icon::PLUGS_CONNECTED, tr("Save and connect"))).clicked() && self.save(cx) {
+                        // The main action on the right: Save and connect (new) or Save.
+                        let main = if self.is_new { kit::Kind::Secondary } else { kit::Kind::Primary };
+                        if self.is_new && kit::primary_icon(ui, icon::PLUGS_CONNECTED, tr("Save and connect")).clicked() && self.save(cx) {
                             cx.push(crate::command::AppCommand::Connect(self.cfg.id.clone()));
+                            close = true;
+                        }
+                        if kit::button_ex(ui, main, None, tr("Save"), false).clicked() && self.save(cx) {
+                            close = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
                             close = true;
                         }
                     });
@@ -449,7 +459,7 @@ impl ConnectionDialog {
                 ui.end_row();
                 ui.label(tr("Authentication"));
                 let current = auth_label(&self.cfg.auth);
-                egui::ComboBox::from_id_salt("auth_method").selected_text(current).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("auth_method").icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
                     let mut options = vec![AuthMethod::Password, AuthMethod::Prompt];
                     if kind.is_postgres_family() {
                         options.push(AuthMethod::Pgpass);
@@ -504,7 +514,7 @@ impl ConnectionDialog {
             ui.horizontal(|ui| {
                 let types = cx.conns.connection_types();
                 let current = types.iter().find(|t| t.id == self.cfg.connection_type).map(|t| t.name.clone()).unwrap_or_default();
-                egui::ComboBox::from_id_salt("conn_type").selected_text(tr(&current)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("conn_type").icon(ternarygrid_ui::kit::combo_caret).selected_text(tr(&current)).show_ui(ui, |ui| {
                     for t in &types {
                         let marker = crate::theme::connection_marker(t.color).map(|c| RichText::new("■ ").color(c)).unwrap_or_else(|| RichText::new("□ "));
                         ui.horizontal(|ui| {
@@ -581,7 +591,7 @@ impl ConnectionDialog {
                 .and_then(|id| profiles.iter().find(|(i, _)| i == id))
                 .map(|(_, n)| n.clone())
                 .unwrap_or_else(|| tr("(none — settings below)").to_string());
-            egui::ComboBox::from_id_salt("net_profile").selected_text(current).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("net_profile").icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.cfg.network_profile, None, tr("(none — settings below)"));
                 for (id, name) in &profiles {
                     ui.selectable_value(&mut self.cfg.network_profile, Some(id.clone()), name);
@@ -616,7 +626,7 @@ impl ConnectionDialog {
         let ssl = &mut self.cfg.ssl;
         egui::Grid::new("ssl_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label(tr("SSL mode"));
-            egui::ComboBox::from_id_salt("sslmode").selected_text(ssl.mode.label()).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("sslmode").icon(ternarygrid_ui::kit::combo_caret).selected_text(ssl.mode.label()).show_ui(ui, |ui| {
                 for m in SslMode::ALL {
                     ui.selectable_value(&mut ssl.mode, m, m.label());
                 }
@@ -765,7 +775,7 @@ impl ConnectionDialog {
                 if ui.add(egui::TextEdit::singleline(&mut folder).hint_text(tr("none")).desired_width(200.0)).changed() {
                     self.cfg.folder = if folder.trim().is_empty() { None } else { Some(folder.trim().trim_matches('/').to_string()) };
                 }
-                egui::ComboBox::from_id_salt("folders").selected_text("").width(24.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("folders").icon(ternarygrid_ui::kit::combo_caret).selected_text("").width(24.0).show_ui(ui, |ui| {
                     for f in cx.conns.folders() {
                         if ui.selectable_label(self.cfg.folder.as_deref() == Some(f), f).clicked() {
                             self.cfg.folder = Some(f.clone());
@@ -919,7 +929,7 @@ pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut Strin
             ui.add(egui::DragValue::new(&mut ssh.keepalive_secs).range(0..=3600));
             ui.end_row();
             ui.label(tr("Host key check"));
-            egui::ComboBox::from_id_salt((id, "hostkey")).selected_text(host_key_label(ssh.host_key_policy)).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt((id, "hostkey")).icon(ternarygrid_ui::kit::combo_caret).selected_text(host_key_label(ssh.host_key_policy)).show_ui(ui, |ui| {
                 for p in [HostKeyPolicy::AcceptNew, HostKeyPolicy::Strict, HostKeyPolicy::AcceptAll] {
                     ui.selectable_value(&mut ssh.host_key_policy, p, host_key_label(p));
                 }

@@ -44,7 +44,7 @@ pub(crate) fn connection_combo(ui: &mut Ui, cx: &mut AppContext, id: impl Hash +
         .or_else(|| if conn.is_none() { none.map(str::to_string) } else { None })
         .unwrap_or_else(|| tr("Choose a connection…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).selected_text(format!("{} {current}", icon::PLUGS)).width(190.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(format!("{} {current}", icon::PLUGS)).width(190.0).show_ui(ui, |ui| {
         if let Some(n) = none
             && ui.selectable_label(conn.is_none(), n).clicked()
             && conn.is_some()
@@ -103,7 +103,7 @@ pub(crate) fn schema_combo(ui: &mut Ui, cx: &mut AppContext, id: impl Hash + std
         changed = true;
     }
     let label = schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
-    egui::ComboBox::from_id_salt(id).selected_text(format!("{} {label}", icon::STACK)).width(150.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(format!("{} {label}", icon::STACK)).width(150.0).show_ui(ui, |ui| {
         for n in &names {
             let on = schema.as_ref().and_then(|s| s.schema.as_deref()) == Some(n.as_str());
             if ui.selectable_label(on, n).clicked() && !on {
@@ -142,7 +142,7 @@ pub(crate) fn table_combo(ui: &mut Ui, cx: &mut AppContext, id: impl Hash + std:
     let (items, loading) = schema_tables(cx, conn, schema, true);
     let label = table.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| tr("Table…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).selected_text(format!("{} {label}", icon::TABLE)).width(200.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(format!("{} {label}", icon::TABLE)).width(200.0).show_ui(ui, |ui| {
         if items.is_empty() {
             ui.weak(if loading { tr("Loading…") } else { tr("No tables") });
         }
@@ -581,7 +581,7 @@ impl DataCompareTab {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label(tr("Row matching"));
-                egui::ComboBox::from_id_salt(("dc_strategy", self.uid)).selected_text(strategy_label(o.strategy)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(("dc_strategy", self.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(strategy_label(o.strategy)).show_ui(ui, |ui| {
                     for s in [CompareStrategy::Auto, CompareStrategy::MergeJoin, CompareStrategy::HashJoin] {
                         ui.selectable_value(&mut o.strategy, s, strategy_label(s));
                     }

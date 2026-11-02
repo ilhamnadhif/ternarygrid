@@ -42,18 +42,22 @@ impl ProjectView {
         if let Some(pm) = cx.services.projects.clone() {
             let active = pm.active_name();
             ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("project_switch").selected_text(format!("{} {}", icon::FOLDER_SIMPLE, active)).width(ui.available_width() - 4.0).show_ui(ui, |ui| {
-                    for p in pm.list().unwrap_or_default() {
-                        if ui.selectable_label(p.name() == active, p.name()).clicked() && p.name() != active {
-                            cx.push(AppCommand::SetActiveProject(p.name().to_string()));
-                            self.loaded = None;
+                egui::ComboBox::from_id_salt("project_switch")
+                    .icon(ternarygrid_ui::kit::combo_caret)
+                    .selected_text(format!("{} {}", icon::FOLDER_SIMPLE, active))
+                    .width(ui.available_width() - 4.0)
+                    .show_ui(ui, |ui| {
+                        for p in pm.list().unwrap_or_default() {
+                            if ui.selectable_label(p.name() == active, p.name()).clicked() && p.name() != active {
+                                cx.push(AppCommand::SetActiveProject(p.name().to_string()));
+                                self.loaded = None;
+                            }
                         }
-                    }
-                    ui.separator();
-                    if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("New project…"))).clicked() {
-                        self.new_project = Some(String::new());
-                    }
-                });
+                        ui.separator();
+                        if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("New project…"))).clicked() {
+                            self.new_project = Some(String::new());
+                        }
+                    });
             });
             if let Some(name) = &mut self.new_project {
                 let mut done = false;

@@ -108,7 +108,7 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
             ui.horizontal(|ui| {
                 ui.label(tr("Every"));
                 ui.add(egui::DragValue::new(&mut s.every).range(1..=100_000).speed(1));
-                egui::ComboBox::from_id_salt("sched_unit").selected_text(s.unit.label()).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("sched_unit").icon(ternarygrid_ui::kit::combo_caret).selected_text(s.unit.label()).show_ui(ui, |ui| {
                     for u in IntervalUnit::ALL {
                         ui.selectable_value(&mut s.unit, u, u.label());
                     }
@@ -414,7 +414,7 @@ impl TaskEditor {
                 ui.horizontal(|ui| {
                     let candidates: Vec<&TaskDef> = tasks.iter().filter(|t| Some(&t.id) != own_id.as_ref()).collect();
                     let label = self.add_step.as_ref().and_then(|id| candidates.iter().find(|t| &t.id == id)).map(|t| t.path()).unwrap_or_else(|| tr("Choose a task…").to_string());
-                    egui::ComboBox::from_id_salt("task_add_step").selected_text(label).width(280.0).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("task_add_step").icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(280.0).show_ui(ui, |ui| {
                         for t in &candidates {
                             ui.selectable_value(&mut self.add_step, Some(t.id.clone()), format!("{} {}", kind_icon(&t.kind), t.path()));
                         }

@@ -135,7 +135,7 @@ impl ImportDialog {
                         ui.label(tr("Workspace folder (contains General/.dbeaver/data-sources.json):"));
                         ui.horizontal(|ui| {
                             let current = self.workspace.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| tr("(none found)").to_string());
-                            egui::ComboBox::from_id_salt("dbeaver_ws").selected_text(current).width(420.0).show_ui(ui, |ui| {
+                            egui::ComboBox::from_id_salt("dbeaver_ws").icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(420.0).show_ui(ui, |ui| {
                                 for w in &self.workspaces {
                                     ui.selectable_value(&mut self.workspace, Some(w.clone()), w.display().to_string());
                                 }

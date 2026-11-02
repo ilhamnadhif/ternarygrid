@@ -884,6 +884,7 @@ fn toolbar(
         ui.separator();
         let before = diagram.settings;
         egui::ComboBox::from_id_salt("ternarygrid_er_columns")
+            .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(tr(diagram.settings.columns.label()))
             .show_ui(ui, |ui| {
                 for d in ColumnDisplay::ALL {
@@ -897,6 +898,7 @@ fn toolbar(
         ui.toggle_value(&mut diagram.settings.show_comments, tr("Comments"))
             .on_hover_text(tr("Show table comments"));
         egui::ComboBox::from_id_salt("ternarygrid_er_notation")
+            .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(tr(diagram.settings.notation.label()))
             .show_ui(ui, |ui| {
                 for n in [Notation::CrowsFoot, Notation::Simple] {

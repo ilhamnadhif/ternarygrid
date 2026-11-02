@@ -1122,14 +1122,15 @@ impl Navigator {
         }
 
         if cx.conns.configs().is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
-                ui.label(RichText::new(icon::DATABASE).size(32.0).weak());
-                ui.label(tr("No connections yet."));
-                if ui.button(tr("Create a connection")).clicked() {
+            ternarygrid_ui::kit::empty_state(ui, icon::DATABASE, tr("No connections yet"), tr("Connect to a database to browse it here."), |ui| {
+                if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Primary, Some(icon::PLUS), tr("New connection"), true).clicked() {
                     cx.push(AppCommand::NewConnection { kind: None, folder: None });
                 }
-                if ui.button(tr("Import from DBeaver")).clicked() {
+                ui.add_space(4.0);
+                if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Ghost, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), true)
+                    .on_hover_text(tr("From DBeaver, ~/.pgpass or a connection URL"))
+                    .clicked()
+                {
                     cx.push(AppCommand::ImportConnections);
                 }
             });

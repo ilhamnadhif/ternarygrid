@@ -83,7 +83,7 @@ impl TabView for ErrorLogTab {
         // new entries appear while the tab is open
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("error_log_level").selected_text(tr(level_label(self.level))).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("error_log_level").icon(ternarygrid_ui::kit::combo_caret).selected_text(tr(level_label(self.level))).show_ui(ui, |ui| {
                 for l in [Level::ERROR, Level::WARN, Level::INFO] {
                     ui.selectable_value(&mut self.level, l, tr(level_label(l)));
                 }

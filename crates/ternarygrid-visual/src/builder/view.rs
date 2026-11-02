@@ -892,6 +892,7 @@ fn columns_grid(ui: &mut Ui, model: &mut QueryModel, refs: &[String]) {
                 });
                 ui.add(egui::TextEdit::singleline(&mut item.alias).desired_width(120.0));
                 egui::ComboBox::from_id_salt(("ternarygrid_qb_agg", i))
+                    .icon(ternarygrid_ui::kit::combo_caret)
                     .selected_text(item.aggregate.map(|a| a.label()).unwrap_or("–"))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut item.aggregate, None, "–");
@@ -936,6 +937,7 @@ fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &
                     ui.weak(tr("where"));
                 } else {
                     egui::ComboBox::from_id_salt((salt, "conn", i))
+                        .icon(ternarygrid_ui::kit::combo_caret)
                         .width(60.0)
                         .selected_text(c.connector.sql())
                         .show_ui(ui, |ui| {
@@ -945,6 +947,7 @@ fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &
                 }
                 ui.horizontal(|ui| expr_field(ui, &mut c.expr, refs, 200.0));
                 egui::ComboBox::from_id_salt((salt, "op", i))
+                    .icon(ternarygrid_ui::kit::combo_caret)
                     .width(100.0)
                     .selected_text(if c.operator.is_empty() {
                         tr("(expression)")

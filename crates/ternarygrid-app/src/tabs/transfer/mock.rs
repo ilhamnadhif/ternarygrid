@@ -396,7 +396,7 @@ fn text_limit(c: &ColumnDef) -> Option<usize> {
 fn generator_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, col: &ColumnDef, value: &mut GeneratorKind, auto: Option<&GeneratorKind>) {
     let options = choices(col, auto, value);
     let current = options.iter().find(|(g, _)| discriminant(g) == discriminant(value)).map(|(_, l)| l.clone()).unwrap_or_default();
-    egui::ComboBox::from_id_salt(id).selected_text(current).width(190.0).height(420.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(190.0).height(420.0).show_ui(ui, |ui| {
         for (g, label) in options {
             let selected = discriminant(&g) == discriminant(value);
             if ui.selectable_label(selected, label).clicked() && !selected {

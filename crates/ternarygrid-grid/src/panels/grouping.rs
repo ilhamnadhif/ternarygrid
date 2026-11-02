@@ -102,7 +102,7 @@ impl<'a> GroupingPanel<'a> {
                 state.spec.columns.remove(i);
                 changed = true;
             }
-            ComboBox::from_id_salt("ternarygrid_group_add").selected_text(tr("Add column…")).show_ui(ui, |ui| {
+            ComboBox::from_id_salt("ternarygrid_group_add").icon(ternarygrid_ui::kit::combo_caret).selected_text(tr("Add column…")).show_ui(ui, |ui| {
                 for (c, n) in names.iter().enumerate() {
                     if !state.spec.columns.contains(&c) && ui.selectable_label(false, n).clicked() {
                         state.spec.columns.push(c);
@@ -114,7 +114,7 @@ impl<'a> GroupingPanel<'a> {
         ui.horizontal(|ui| {
             ui.label(tr("Measure"));
             let current = state.spec.measure.and_then(|m| names.get(m)).cloned().unwrap_or_else(|| tr("(none)").to_string());
-            ComboBox::from_id_salt("ternarygrid_group_measure").selected_text(current).show_ui(ui, |ui| {
+            ComboBox::from_id_salt("ternarygrid_group_measure").icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
                 if ui.selectable_label(state.spec.measure.is_none(), tr("(none)")).clicked() {
                     state.spec.measure = None;
                     changed = true;

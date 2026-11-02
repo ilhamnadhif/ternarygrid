@@ -38,7 +38,7 @@ impl GridFrame<'_> {
             ui.add_space(4.0);
             Grid::new(self.id.with("copy_grid")).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label(tr("Format"));
-                ComboBox::from_id_salt(self.id.with("copy_format")).selected_text(opts.format.label()).show_ui(ui, |ui| {
+                ComboBox::from_id_salt(self.id.with("copy_format")).icon(ternarygrid_ui::kit::combo_caret).selected_text(opts.format.label()).show_ui(ui, |ui| {
                     for f in CopyFormat::ALL {
                         ui.selectable_value(&mut opts.format, f, f.label());
                     }
@@ -58,6 +58,7 @@ impl GridFrame<'_> {
                         ui.add(TextEdit::singleline(&mut opts.delimiter).desired_width(60.0).hint_text(default));
                         ui.label(tr("Quote"));
                         ComboBox::from_id_salt(self.id.with("copy_quote"))
+                            .icon(ternarygrid_ui::kit::combo_caret)
                             .selected_text(match opts.quote {
                                 QuoteMode::Auto => tr("When needed"),
                                 QuoteMode::Always => tr("Always"),

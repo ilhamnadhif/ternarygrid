@@ -68,6 +68,7 @@ pub fn show_plan_tree(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) 
         ui.separator();
         ui.label(tr("Color by"));
         egui::ComboBox::from_id_salt("ternarygrid_plan_tree_metric")
+            .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(tr(state.metric.label()))
             .show_ui(ui, |ui| {
                 for m in [PlanMetric::Auto, PlanMetric::Time, PlanMetric::Cost] {

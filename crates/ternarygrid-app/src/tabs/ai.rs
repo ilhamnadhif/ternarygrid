@@ -1422,7 +1422,7 @@ impl AiAssistantTab {
         ui.horizontal(|ui| {
             ui.label(tr("Object:"));
             let label = self.object.as_ref().map(|o| o.name.clone()).unwrap_or_else(|| tr("(paste a definition)").to_string());
-            egui::ComboBox::from_id_salt(("ai_obj", self.uid)).selected_text(label).width(240.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt(("ai_obj", self.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(240.0).show_ui(ui, |ui| {
                 if ui.selectable_label(self.object.is_none(), tr("(paste a definition)")).clicked() {
                     self.object = None;
                 }

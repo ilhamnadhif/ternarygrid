@@ -1362,7 +1362,7 @@ fn common_ui(ui: &mut Ui, id: u64, o: &mut ExportOptions, format: ExportFormat) 
         if !format.is_binary() {
             ui.label(tr("Encoding"));
             ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt(("exp_enc", id)).selected_text(o.encoding.clone()).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(("exp_enc", id)).icon(ternarygrid_ui::kit::combo_caret).selected_text(o.encoding.clone()).show_ui(ui, |ui| {
                     for e in ENCODINGS {
                         if ui.selectable_label(o.encoding.eq_ignore_ascii_case(e), e).clicked() {
                             o.encoding = e.to_string();

@@ -273,8 +273,15 @@ fn ui_snapshots() {
         s.shot("settings");
         let ctx = s.h.ctx.clone();
         s.h.state_mut().dispatch_action(&ctx, Action::NewConnection);
-        s.frames(4);
+        // Windows fade in: let the animation end.
+        s.frames(30);
         s.shot("connection_dialog");
+        s.h.key_press(egui::Key::Escape);
+        s.frames(30);
+        // The command palette over the start page's tabs.
+        s.h.state_mut().dialogs.palette_open = true;
+        s.frames(30);
+        s.shot("command_palette");
 
         drop(s);
         let _ = std::fs::remove_dir_all(&home);

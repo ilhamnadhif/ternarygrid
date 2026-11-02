@@ -96,6 +96,7 @@ impl Refresh {
     fn ui(&mut self, ui: &mut Ui) -> bool {
         let mut now = ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Refresh"))).clicked();
         egui::ComboBox::from_id_salt(ui.next_auto_id())
+            .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(if self.interval == 0 { tr("Auto-refresh off").to_string() } else { trf("Every {} s", &[&self.interval]) })
             .show_ui(ui, |ui| {
                 for s in [0u32, 1, 2, 5, 10, 30, 60] {

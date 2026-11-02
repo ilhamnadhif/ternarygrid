@@ -171,22 +171,22 @@ pub fn reset(ctx: &egui::Context) {
 /// One full-width row: the coloured icon, the label, and on the right the
 /// detail (category and shortcut, connection, script folder).
 fn row(ui: &mut egui::Ui, it: &Item, selected: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
-    let v = ui.visuals();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+    let p = ternarygrid_ui::pal(ui);
     if selected {
-        ui.painter().rect_filled(rect, 4.0, v.selection.bg_fill);
+        ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, p.accent_soft);
     } else if resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, v.widgets.hovered.weak_bg_fill);
+        ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, p.hover);
     }
-    let text = if selected { v.selection.stroke.color } else { v.text_color() };
-    let weak = v.weak_text_color();
-    let body = egui::TextStyle::Body.resolve(ui.style());
-    ui.painter().text(rect.left_center() + egui::vec2(10.0, 0.0), egui::Align2::LEFT_CENTER, it.icon, body, ternarygrid_icons::color(it.icon).unwrap_or(weak));
+    let text = p.text;
+    let weak = p.text_faint;
+    let icon_color = if selected { p.accent_text } else { ternarygrid_icons::color(it.icon).unwrap_or(p.text_muted) };
+    ui.painter().text(rect.left_center() + egui::vec2(12.0, 0.0), egui::Align2::LEFT_CENTER, it.icon, ternarygrid_ui::style::icon_font(15.0), icon_color);
     let fit = |text: RichText, width: f32, style: egui::TextStyle| egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), width, style);
     let detail = (!it.detail.is_empty()).then(|| fit(RichText::new(&it.detail).small().color(weak), rect.width() * 0.45, egui::TextStyle::Small));
     let detail_w = detail.as_ref().map_or(0.0, |g| g.size().x + 16.0);
     let label = fit(RichText::new(&it.label).color(text), (rect.width() - 44.0 - detail_w).max(40.0), egui::TextStyle::Body);
-    ui.painter().galley(egui::pos2(rect.left() + 34.0, rect.center().y - label.size().y / 2.0), label, text);
+    ui.painter().galley(egui::pos2(rect.left() + 38.0, rect.center().y - label.size().y / 2.0), label, text);
     if let Some(g) = detail {
         ui.painter().galley(egui::pos2(rect.right() - 10.0 - g.size().x, rect.center().y - g.size().y / 2.0), g, weak);
     }
@@ -220,9 +220,23 @@ pub fn show(ctx: &egui::Context, cx: &mut AppContext, open: &mut bool) {
         chosen = Some(state.selected);
     }
     let area = egui::Area::new(id.with("area")).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_width(560.0);
-            let r = ui.add(egui::TextEdit::singleline(&mut state.query).hint_text(tr("Type a command, connection or object…")).desired_width(f32::INFINITY));
+        let p = ternarygrid_ui::pal(ui);
+        let frame = egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(ternarygrid_ui::style::RADIUS_LG).shadow(ui.visuals().popup_shadow);
+        frame.show(ui, |ui| {
+            ui.set_width(600.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let line = egui::Stroke::new(1.0, p.border);
+            // The search: a large frameless field with a magnifier painted in its margin.
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut state.query)
+                    .hint_text(RichText::new(tr("Type a command, connection or object…")).color(p.text_faint))
+                    .font(egui::FontId::proportional(15.0))
+                    // A custom frame brings its own margin (the field's `margin` is then unused).
+                    .frame(egui::Frame::new().inner_margin(egui::Margin { left: 42, right: 14, top: 14, bottom: 14 }))
+                    .desired_width(f32::INFINITY),
+            );
+            let glass = egui::pos2(r.rect.left() + 22.0, r.rect.center().y);
+            ui.painter().text(glass, egui::Align2::CENTER_CENTER, icon::MAGNIFYING_GLASS, ternarygrid_ui::style::icon_font(17.0), p.text_faint);
             if !state.focus_requested {
                 r.request_focus();
                 state.focus_requested = true;
@@ -230,21 +244,39 @@ pub fn show(ctx: &egui::Context, cx: &mut AppContext, open: &mut bool) {
             if r.changed() {
                 state.selected = 0;
             }
-            ui.separator();
-            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                for (i, (_, it)) in scored.iter().enumerate() {
-                    let sel = i == state.selected;
-                    let resp = row(ui, it, sel);
-                    if sel {
-                        resp.scroll_to_me(None);
+            let y = ui.cursor().top();
+            ui.painter().hline(ui.max_rect().x_range(), y, line);
+            egui::Frame::new().inner_margin(6).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                    for (i, (_, it)) in scored.iter().enumerate() {
+                        let sel = i == state.selected;
+                        let resp = row(ui, it, sel);
+                        if sel {
+                            resp.scroll_to_me(None);
+                        }
+                        if resp.clicked() {
+                            chosen = Some(i);
+                        }
                     }
-                    if resp.clicked() {
-                        chosen = Some(i);
+                    if scored.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(tr("No matches")).color(p.text_muted));
+                        ui.add_space(8.0);
                     }
-                }
-                if scored.is_empty() {
-                    ui.weak(tr("No matches"));
-                }
+                });
+            });
+            // How to use it, quietly.
+            let y = ui.cursor().top();
+            ui.painter().hline(ui.max_rect().x_range(), y, line);
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (keys, what) in [("↑↓", tr("move")), ("↵", tr("open")), ("esc", tr("close"))] {
+                        ternarygrid_ui::kit::kbd(ui, keys);
+                        ui.label(RichText::new(what).size(ternarygrid_ui::style::SMALL).color(p.text_faint));
+                        ui.add_space(6.0);
+                    }
+                });
             });
         });
     });

@@ -166,7 +166,7 @@ fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
 fn combo<T: PartialEq + Copy>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, &str)]) -> bool {
     let mut changed = false;
     let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| *l).unwrap_or("");
-    egui::ComboBox::from_id_salt(id).selected_text(current).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
         for (v, l) in options {
             if ui.selectable_value(value, *v, *l).changed() {
                 changed = true;

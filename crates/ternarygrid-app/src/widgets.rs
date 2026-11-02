@@ -20,8 +20,9 @@ const CELL_PAD: f32 = 6.0;
 
 /// The main action of a dialog or wizard: white text on the accent colour.
 pub fn primary_button(ui: &Ui, glyph: &str, text: impl Into<String>) -> egui::Button<'static> {
-    let fill = crate::theme::accent(ui.visuals().dark_mode);
-    egui::Button::new(RichText::new(format!("{glyph}  {}", text.into())).color(egui::Color32::WHITE).strong()).fill(fill)
+    let p = ternarygrid_ui::pal(ui);
+    let font = ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()));
+    egui::Button::new(RichText::new(format!("{glyph}  {}", text.into())).font(font).color(p.on_accent)).fill(p.accent).stroke(egui::Stroke::NONE)
 }
 
 /// Escape pressed on the dialog window shown in `layer` while it is the top window,

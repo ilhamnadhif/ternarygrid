@@ -1122,7 +1122,7 @@ impl ResultPanel {
             if ui.button((ternarygrid_icons::ic(icon::TABLE), tr("Back to grid"))).clicked() {
                 self.mode = Mode::Grid;
             }
-            egui::ComboBox::from_id_salt("spatial_col").selected_text(names.get(sv.column).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("spatial_col").icon(ternarygrid_ui::kit::combo_caret).selected_text(names.get(sv.column).cloned().unwrap_or_default()).show_ui(ui, |ui| {
                 for c in &cols {
                     if ui.selectable_value(&mut sv.column, *c, names.get(*c).cloned().unwrap_or_default()).changed() {
                         rebuild = true;

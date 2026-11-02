@@ -371,7 +371,7 @@ pub(crate) fn steps_ui(ui: &mut Ui, steps: &[&str], current: usize, reachable: u
 pub(crate) fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut T, options: &[(T, String)]) -> bool {
     let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| l.clone()).unwrap_or_default();
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).selected_text(current).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
         for (v, label) in options {
             if ui.selectable_label(v == value, label).clicked() && v != value {
                 *value = v.clone();
@@ -638,7 +638,7 @@ pub(crate) fn schema_combo(ui: &mut Ui, cx: &mut AppContext, conn: &str, id: imp
     let names = schema_names(cx, conn);
     let label = value.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("(default)").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).selected_text(label).width(180.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(180.0).show_ui(ui, |ui| {
         if ui.selectable_label(value.as_ref().is_none_or(|v| v.schema.is_none()), tr("(default)")).clicked() {
             *value = None;
             changed = true;
@@ -715,7 +715,7 @@ pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash:
     let conns: Vec<(String, String)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
     let current = value.as_ref().and_then(|v| conns.iter().find(|(i, _)| i == v)).map(|(_, n)| n.clone()).unwrap_or_else(|| tr("Choose…").to_string());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).selected_text(current).width(200.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(200.0).show_ui(ui, |ui| {
         for (cid, name) in &conns {
             let glyph = if cx.conns.is_connected(cid) { icon::PLUGS_CONNECTED } else { icon::PLUGS };
             let selected = value.as_deref() == Some(cid.as_str());

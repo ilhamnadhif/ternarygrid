@@ -210,13 +210,17 @@ impl TabView for FdwConfigTab {
         let selected = self.source.as_ref().and_then(|id| sources.iter().find(|c| &c.id == id)).map(|c| format!("{} ({})", c.name, c.kind.display_name()));
         egui::Grid::new(("fdw_form", &self.conn)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label(tr("Source connection"));
-            egui::ComboBox::from_id_salt(("fdw_source", &self.conn)).selected_text(selected.unwrap_or_else(|| tr("(choose)").to_string())).width(260.0).show_ui(ui, |ui| {
-                for c in &sources {
-                    if ui.selectable_label(self.source.as_deref() == Some(&c.id), format!("{} ({})", c.name, c.kind.display_name())).clicked() {
-                        self.set_source(c);
+            egui::ComboBox::from_id_salt(("fdw_source", &self.conn))
+                .icon(ternarygrid_ui::kit::combo_caret)
+                .selected_text(selected.unwrap_or_else(|| tr("(choose)").to_string()))
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for c in &sources {
+                        if ui.selectable_label(self.source.as_deref() == Some(&c.id), format!("{} ({})", c.name, c.kind.display_name())).clicked() {
+                            self.set_source(c);
+                        }
                     }
-                }
-            });
+                });
             ui.end_row();
             ui.label(tr("Server name"));
             ui.add(egui::TextEdit::singleline(&mut self.spec.server).desired_width(260.0));

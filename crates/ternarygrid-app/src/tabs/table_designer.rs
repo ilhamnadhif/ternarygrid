@@ -1446,6 +1446,7 @@ impl TableDesignerTab {
                     }
                     ui.label("→");
                     egui::ComboBox::from_id_salt(("td_fks", uid, f.uid))
+                        .icon(ternarygrid_ui::kit::combo_caret)
                         .selected_text(if f.ref_schema.is_empty() { "—".to_string() } else { f.ref_schema.clone() })
                         .width(120.0)
                         .show_ui(ui, |ui| {
@@ -1463,7 +1464,7 @@ impl TableDesignerTab {
                         tables.push(this_table.clone());
                     }
                     let label = if f.ref_table.is_empty() { tr("Table…").to_string() } else { f.ref_table.clone() };
-                    egui::ComboBox::from_id_salt(("td_fkt", uid, f.uid)).selected_text(label).width(170.0).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt(("td_fkt", uid, f.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(170.0).show_ui(ui, |ui| {
                         for t in &tables {
                             if ui.selectable_label(&f.ref_table == t, t).clicked() && &f.ref_table != t {
                                 f.ref_table = t.clone();
@@ -1495,6 +1496,7 @@ impl TableDesignerTab {
                         ui.label(format!("{name} →"));
                         let cur = f.ref_columns.get(j).cloned().unwrap_or_default();
                         egui::ComboBox::from_id_salt(("td_fkc", uid, f.uid, j))
+                            .icon(ternarygrid_ui::kit::combo_caret)
                             .selected_text(if cur.is_empty() { tr("column…").to_string() } else { cur.clone() })
                             .width(130.0)
                             .show_ui(ui, |ui| {
@@ -1511,11 +1513,14 @@ impl TableDesignerTab {
                 ui.horizontal(|ui| {
                     for (label, action, salt) in [(tr("On update"), &mut f.on_update, "u"), (tr("On delete"), &mut f.on_delete, "d")] {
                         ui.label(label);
-                        egui::ComboBox::from_id_salt(("td_fka", uid, f.uid, salt)).selected_text(action.sql()).width(110.0).show_ui(ui, |ui| {
-                            for a in FkAction::ALL {
-                                ui.selectable_value(action, a, a.sql());
-                            }
-                        });
+                        egui::ComboBox::from_id_salt(("td_fka", uid, f.uid, salt)).icon(ternarygrid_ui::kit::combo_caret).selected_text(action.sql()).width(110.0).show_ui(
+                            ui,
+                            |ui| {
+                                for a in FkAction::ALL {
+                                    ui.selectable_value(action, a, a.sql());
+                                }
+                            },
+                        );
                     }
                 });
             });
@@ -1591,7 +1596,7 @@ impl TableDesignerTab {
                 let mut changed = false;
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui.add(egui::TextEdit::singleline(&mut t.name).desired_width(160.0).id_salt(("td_trn", uid, t.uid))).changed();
-                    egui::ComboBox::from_id_salt(("td_trt", uid, t.uid)).selected_text(t.timing.clone()).width(100.0).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt(("td_trt", uid, t.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(t.timing.clone()).width(100.0).show_ui(ui, |ui| {
                         for timing in ["BEFORE", "AFTER", "INSTEAD OF"] {
                             if ui.selectable_label(t.timing == timing, timing).clicked() && t.timing != timing {
                                 t.timing = timing.to_string();
@@ -1612,13 +1617,14 @@ impl TableDesignerTab {
                     }
                     if pg {
                         let mut row = t.for_each_row;
-                        egui::ComboBox::from_id_salt(("td_trl", uid, t.uid)).selected_text(if row { tr("for each row") } else { tr("for each statement") }).width(140.0).show_ui(
-                            ui,
-                            |ui| {
+                        egui::ComboBox::from_id_salt(("td_trl", uid, t.uid))
+                            .icon(ternarygrid_ui::kit::combo_caret)
+                            .selected_text(if row { tr("for each row") } else { tr("for each statement") })
+                            .width(140.0)
+                            .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut row, true, tr("for each row"));
                                 ui.selectable_value(&mut row, false, tr("for each statement"));
-                            },
-                        );
+                            });
                         if row != t.for_each_row {
                             t.for_each_row = row;
                             changed = true;

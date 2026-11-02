@@ -241,15 +241,18 @@ impl BackupForm {
             let whole_server = self.all_databases && flavor == ToolFlavor::Postgres;
             if (pg || sqlite) && !whole_server {
                 ui.label(tr("Format"));
-                egui::ComboBox::from_id_salt((id, "format")).selected_text(flavor_format_label(flavor, self.format)).width(200.0).show_ui(ui, |ui| {
-                    for &f in formats(flavor) {
-                        let old = self.format;
-                        if ui.selectable_value(&mut self.format, f, flavor_format_label(flavor, f)).changed() {
-                            self.output = retarget_extension_for(flavor, &self.output, old, f);
-                            changed = true;
+                egui::ComboBox::from_id_salt((id, "format")).icon(ternarygrid_ui::kit::combo_caret).selected_text(flavor_format_label(flavor, self.format)).width(200.0).show_ui(
+                    ui,
+                    |ui| {
+                        for &f in formats(flavor) {
+                            let old = self.format;
+                            if ui.selectable_value(&mut self.format, f, flavor_format_label(flavor, f)).changed() {
+                                self.output = retarget_extension_for(flavor, &self.output, old, f);
+                                changed = true;
+                            }
                         }
-                    }
-                });
+                    },
+                );
                 ui.end_row();
             }
             // pg_dumpall has no database, schema or table selection.
@@ -425,11 +428,14 @@ impl RestoreForm {
             ui.end_row();
             if pg || sqlite {
                 ui.label(tr("Format"));
-                egui::ComboBox::from_id_salt((id, "rformat")).selected_text(flavor_format_label(flavor, self.format)).width(200.0).show_ui(ui, |ui| {
-                    for &f in formats(flavor) {
-                        changed |= ui.selectable_value(&mut self.format, f, flavor_format_label(flavor, f)).changed();
-                    }
-                });
+                egui::ComboBox::from_id_salt((id, "rformat")).icon(ternarygrid_ui::kit::combo_caret).selected_text(flavor_format_label(flavor, self.format)).width(200.0).show_ui(
+                    ui,
+                    |ui| {
+                        for &f in formats(flavor) {
+                            changed |= ui.selectable_value(&mut self.format, f, flavor_format_label(flavor, f)).changed();
+                        }
+                    },
+                );
                 ui.end_row();
             }
             ui.label(tr("Target database"));

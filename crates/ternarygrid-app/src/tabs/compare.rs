@@ -132,7 +132,7 @@ impl SchemaCompareTab {
     fn side_ui(ui: &mut Ui, cx: &mut AppContext, id: &str, side: &mut Side) {
         let names: Vec<(String, String)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
         let current = side.conn.as_ref().and_then(|c| names.iter().find(|(i, _)| i == c)).map(|(_, n)| n.clone()).unwrap_or_else(|| tr("Choose…").to_string());
-        egui::ComboBox::from_id_salt((id, "conn")).selected_text(current).width(180.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt((id, "conn")).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).width(180.0).show_ui(ui, |ui| {
             for (cid, name) in &names {
                 if ui.selectable_label(side.conn.as_deref() == Some(cid), name).clicked() {
                     side.conn = Some(cid.clone());
@@ -154,7 +154,7 @@ impl SchemaCompareTab {
         let schemas: Vec<String> = live.meta.schemas_of(None).get().map(|v| v.iter().map(|s| s.name.clone()).collect()).unwrap_or_default();
         let db = live.current_database.clone();
         let label = side.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
-        egui::ComboBox::from_id_salt((id, "schema")).selected_text(label).width(160.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt((id, "schema")).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(160.0).show_ui(ui, |ui| {
             if schemas.is_empty() {
                 // Single-schema databases (SQLite, MySQL database = schema).
                 let cur = live.current_schema.clone().or(db.clone());

@@ -775,25 +775,28 @@ impl ImportTab {
         let Some(schema) = self.schema.clone().or_else(|| current_schema(cx, &conn)) else { return };
         let tables = schema_tables(cx, &conn, &schema, false);
         let label = self.table.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| tr("Choose…").to_string());
-        egui::ComboBox::from_id_salt(("imp_table", self.uid)).selected_text(label).width(240.0).height(360.0).show_ui(ui, |ui| match &tables {
-            None => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak(tr("Loading…"));
-                });
-            }
-            Some(Err(e)) => {
-                ui.label(e.full_text());
-            }
-            Some(Ok(list)) => {
-                for o in list.iter().filter(|o| !o.is_system) {
-                    let selected = self.table.as_ref() == Some(&o.obj);
-                    if ui.selectable_label(selected, &o.obj.name).clicked() && !selected {
-                        self.table = Some(o.obj.clone());
+        egui::ComboBox::from_id_salt(("imp_table", self.uid)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(240.0).height(360.0).show_ui(
+            ui,
+            |ui| match &tables {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak(tr("Loading…"));
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.label(e.full_text());
+                }
+                Some(Ok(list)) => {
+                    for o in list.iter().filter(|o| !o.is_system) {
+                        let selected = self.table.as_ref() == Some(&o.obj);
+                        if ui.selectable_label(selected, &o.obj.name).clicked() && !selected {
+                            self.table = Some(o.obj.clone());
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
     }
 
     fn sample_values(&self, index: usize) -> String {
@@ -903,7 +906,7 @@ impl ImportTab {
             for (i, c) in self.columns.iter_mut().enumerate() {
                 ui.label(names.get(c.source_index).cloned().unwrap_or_default());
                 let label = if c.skip { tr("(not imported)").to_string() } else { c.target_name.clone() };
-                egui::ComboBox::from_id_salt(("imp_map_col", id, i)).selected_text(label).width(200.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(("imp_map_col", id, i)).icon(ternarygrid_ui::kit::combo_caret).selected_text(label).width(200.0).show_ui(ui, |ui| {
                     if ui.selectable_label(c.skip, tr("(not imported)")).clicked() {
                         c.skip = true;
                     }
@@ -1228,7 +1231,7 @@ fn table_name_from(stem: &str) -> String {
 // ------------------------------------------------------------ reader options
 
 fn encoding_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut String) {
-    egui::ComboBox::from_id_salt(id).selected_text(value.clone()).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(value.clone()).show_ui(ui, |ui| {
         for e in ENCODINGS {
             if ui.selectable_label(value.eq_ignore_ascii_case(e), e).clicked() {
                 *value = e.to_string();
@@ -1294,7 +1297,7 @@ fn xlsx_reader_ui(ui: &mut Ui, id: u64, o: &mut XlsxReadOptions, sheets: &[Strin
         SheetSelector::Name(n) => n.clone(),
         SheetSelector::Index(i) => sheets.get(*i).cloned().unwrap_or_else(|| trf("Sheet {}", &[&(i + 1)])),
     };
-    egui::ComboBox::from_id_salt(("xlsx_sheet", id)).selected_text(current.clone()).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(("xlsx_sheet", id)).icon(ternarygrid_ui::kit::combo_caret).selected_text(current.clone()).show_ui(ui, |ui| {
         if sheets.is_empty() {
             ui.weak(tr("Loading…"));
         }

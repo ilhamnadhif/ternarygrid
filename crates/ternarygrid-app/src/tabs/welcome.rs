@@ -52,28 +52,57 @@ fn recent_row(ui: &mut Ui, icon: &str, logo: Option<ternarygrid_core::DbKind>, i
     resp
 }
 
+/// A full-width action: its icon, its name and its shortcut, framed only when hovered.
+fn action_row(ui: &mut Ui, ic: &str, label: &str, keys: &str) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if resp.hovered() {
+            painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, p.hover);
+        }
+        if resp.has_focus() {
+            painter.rect_stroke(rect, ternarygrid_ui::style::RADIUS, egui::Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
+        }
+        let cy = rect.center().y;
+        painter.text(egui::pos2(rect.left() + 20.0, cy), egui::Align2::CENTER_CENTER, ic, ternarygrid_ui::style::icon_font(16.0), p.text_muted);
+        let size = ternarygrid_ui::style::body_size(ui.ctx());
+        painter.text(egui::pos2(rect.left() + 40.0, cy), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(size), p.text);
+        if !keys.is_empty() {
+            let g = painter.layout_no_wrap(keys.to_string(), egui::FontId::proportional(ternarygrid_ui::style::SMALL), p.text_muted);
+            let r = egui::Rect::from_min_size(egui::pos2(rect.right() - 10.0 - g.size().x - 10.0, cy - (g.size().y + 4.0) / 2.0), g.size() + egui::vec2(10.0, 4.0));
+            ternarygrid_ui::kit::paint_kbd(painter, r, &p);
+            painter.galley(r.center() - g.size() / 2.0, g, p.text_muted);
+        }
+    }
+    resp
+}
+
 /// Draw the start page in `ui` (new connection, recent connections and scripts).
 pub fn show(ui: &mut Ui, cx: &mut AppContext) {
     use crate::keys::Action;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.add_space(32.0);
+        let p = ternarygrid_ui::pal(ui);
+        ui.add_space(40.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("TernaryGrid").size(34.0).strong());
-            ui.label(RichText::new(tr("Lightweight SQL client written in Rust")).weak());
-            ui.label(RichText::new(format!("{} {}", tr("Version"), env!("CARGO_PKG_VERSION"))).small().weak());
+            ui.label(RichText::new("TernaryGrid").font(ternarygrid_ui::style::semibold(ui.ctx(), 30.0)).color(p.text));
+            ui.add_space(2.0);
+            ui.label(RichText::new(tr("A fast, lightweight database client")).color(p.text_muted));
+            ui.label(RichText::new(format!("{} {}", tr("Version"), env!("CARGO_PKG_VERSION"))).size(ternarygrid_ui::style::SMALL).color(p.text_faint));
         });
-        ui.add_space(24.0);
+        ui.add_space(28.0);
         // Two cards side by side when there is room, else stacked.
         let card_w = 340.0;
         let wide = ui.available_width() >= card_w * 2.0 + 48.0;
         let total = if wide { card_w * 2.0 + 24.0 } else { card_w };
         let margin = ((ui.available_width() - total) / 2.0).max(8.0);
         let card = |ui: &mut Ui, title: &str, add: &mut dyn FnMut(&mut Ui)| {
-            egui::Frame::group(ui.style()).fill(ui.visuals().window_fill).corner_radius(8).inner_margin(16).show(ui, |ui| {
+            ternarygrid_ui::kit::card(ui).corner_radius(ternarygrid_ui::style::RADIUS_LG).inner_margin(16).show(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.set_width(card_w - 34.0);
-                    ui.label(RichText::new(title).strong().size(15.0));
-                    ui.add_space(8.0);
+                    ui.label(ternarygrid_ui::kit::section_title(ui, title));
+                    ui.add_space(10.0);
                     add(ui);
                 });
             });
@@ -85,30 +114,25 @@ pub fn show(ui: &mut Ui, cx: &mut AppContext) {
         let push = |c: AppCommand| cmds.borrow_mut().push(c);
         let ro: &AppContext = cx;
         let mut start = |ui: &mut Ui| {
-            ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
-            let full = egui::vec2(ui.available_width(), 32.0);
-            let accent = crate::theme::accent(ui.visuals().dark_mode);
-            let on_accent = egui::Color32::WHITE;
-            let primary = egui::Button::new(RichText::new(format!("{}  {}", icon::PLUS, tr("New connection"))).color(on_accent).strong()).fill(accent).min_size(full);
+            let full = egui::vec2(ui.available_width(), 34.0);
+            let pal = ternarygrid_ui::pal(ui);
+            let label =
+                RichText::new(format!("{}  {}", icon::PLUS, tr("New connection"))).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx())));
+            let primary = egui::Button::new(label.color(pal.on_accent)).fill(pal.accent).stroke(egui::Stroke::NONE).corner_radius(ternarygrid_ui::style::RADIUS).min_size(full);
             if ui.add(primary).clicked() {
                 push(AppCommand::NewConnection { kind: None, folder: None });
             }
-            ui.add_space(4.0);
+            ui.add_space(6.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
             let items: [(&str, &str, Option<Action>, Option<&str>, AppCommand); 4] = [
                 (icon::FILE_SQL, tr("New SQL editor"), Some(Action::NewSqlEditor), None, AppCommand::NewSqlEditor { connection: None, schema: None, text: None }),
                 (icon::COMMAND, tr("Command palette"), Some(Action::CommandPalette), None, AppCommand::ShowPalette),
-                (icon::DOWNLOAD_SIMPLE, tr("Import connections from DBeaver"), None, None, AppCommand::ImportConnections),
+                (icon::DOWNLOAD_SIMPLE, tr("Import connections…"), None, Some(tr("From DBeaver, ~/.pgpass or a connection URL")), AppCommand::ImportConnections),
                 (icon::DATABASE, tr("Create sample database"), None, Some(tr("A small SQLite shop database to try every feature")), AppCommand::CreateSampleDatabase),
             ];
             for (ic, label, action, tip, cmd) in items {
-                let mut b = egui::Button::new((ternarygrid_icons::ic(ic), label)).min_size(full);
-                if let Some(a) = action {
-                    let keys = shortcut(a);
-                    if !keys.is_empty() {
-                        b = b.shortcut_text(keys);
-                    }
-                }
-                let mut r = ui.add(b);
+                let keys = action.map(shortcut).unwrap_or_default();
+                let mut r = action_row(ui, ic, label, &keys);
                 if let Some(t) = tip {
                     r = r.on_hover_text(t);
                 }
@@ -120,9 +144,10 @@ pub fn show(ui: &mut Ui, cx: &mut AppContext) {
         let mut recent_ui = |ui: &mut Ui| {
             let mut recent: Vec<_> = ro.conns.configs().iter().filter(|c| c.last_connected.is_some()).cloned().collect();
             recent.sort_by_key(|c| std::cmp::Reverse(c.last_connected));
-            ui.label(RichText::new(tr("Recent connections")).weak().small());
+            let pal = ternarygrid_ui::pal(ui);
+            ui.label(RichText::new(tr("Connections")).size(ternarygrid_ui::style::SMALL).color(pal.text_faint));
             if recent.is_empty() {
-                ui.weak(tr("None yet"));
+                ui.label(RichText::new(tr("Connections you open appear here.")).color(pal.text_muted));
             }
             for c in recent.into_iter().take(6) {
                 let detail = crate::nav::connection_detail(&c);
@@ -137,7 +162,7 @@ pub fn show(ui: &mut Ui, cx: &mut AppContext) {
             let scripts = recent_scripts(ui, ro);
             if !scripts.is_empty() {
                 ui.add_space(10.0);
-                ui.label(RichText::new(tr("Recent scripts")).weak().small());
+                ui.label(RichText::new(tr("Scripts")).size(ternarygrid_ui::style::SMALL).color(pal.text_faint));
                 for s in scripts.into_iter().take(6) {
                     let dir = s.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
                     let r = recent_row(ui, icon::FILE_SQL, None, ternarygrid_icons::SKY, &s.relative, &dir);

@@ -606,6 +606,7 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
         ui.separator();
         ui.label(tr("X"));
         egui::ComboBox::from_id_salt("ternarygrid_chart_x")
+            .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(column_name(columns, config.x_column, tr("(row number)")))
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut config.x_column, None, tr("(row number)"));
@@ -648,6 +649,7 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
         );
         ui.label(tr("Series"));
         egui::ComboBox::from_id_salt("ternarygrid_chart_series")
+            .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(column_name(columns, config.series_column, tr("(none)")))
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut config.series_column, None, tr("(none)"));
@@ -657,6 +659,7 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
             });
         ui.label(tr("Aggregate"));
         egui::ComboBox::from_id_salt("ternarygrid_chart_agg")
+            .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(tr(config.aggregate.label()))
             .show_ui(ui, |ui| {
                 for a in ChartAggregate::ALL {
