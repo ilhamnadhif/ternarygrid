@@ -104,19 +104,6 @@ impl HistoryTab {
     }
 }
 
-/// `n` with thousands separators ("2,914").
-fn grouped(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 fn status_color(s: QueryStatus, p: &ternarygrid_ui::Palette) -> egui::Color32 {
     match s {
         QueryStatus::Ok => p.ok,
@@ -193,7 +180,7 @@ impl TabView for HistoryTab {
             if let Some(e) = &self.error {
                 look::error(ui, e);
             }
-            let (shown, total) = (grouped(self.entries.len() as u64), grouped(self.total));
+            let (shown, total) = (look::grouped_number(self.entries.len() as f64, true), look::grouped_number(self.total as f64, true));
             ui.label(RichText::new(trf("{} of {} entries", &[&shown, &total])).size(12.0).color(pal.text_faint));
         });
         let sel_entry = self.selected.and_then(|i| self.entries.get(i).cloned());

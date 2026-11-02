@@ -13,8 +13,8 @@
 use super::diagram::{ColumnDisplay, ErDiagram, ErNote, Notation};
 use super::export::{MarkerShape, marker_segments, unique_child};
 use super::geometry::{
-    COMMENT_FONT, COMMENT_HEIGHT, CORNER_RADIUS, HEADER_FONT, HEADER_HEIGHT, PAD_X, ROW_FONT,
-    ROW_HEIGHT, SCHEMA_FONT, TableGeometry,
+    COMMENT_FONT, COMMENT_HEIGHT, CORNER_RADIUS, HEADER_FONT, HEADER_HEIGHT, HEADER_ICON_WIDTH,
+    PAD_X, ROW_FONT, ROW_HEIGHT, SCHEMA_FONT, TableGeometry,
 };
 use super::model::{DiffStatus, ErRelation, ErTable, ErTableKind};
 use super::scene::{ErScene, SceneTable};
@@ -889,7 +889,7 @@ fn toolbar(
                 state.set_view(v);
             };
             // Narrow tabs: the last buttons without their labels, no counts.
-            let narrow = ui.available_width() < 1080.0;
+            let narrow = ui.available_width() < 1000.0;
             if kit::icon_button_ex(
                 ui,
                 icon::MAGNIFYING_GLASS_MINUS,
@@ -1075,6 +1075,8 @@ fn context_menu_ui(
     use ternarygrid_ui::kit::with_icon;
     let p = ternarygrid_ui::pal(ui);
     let mut action = None;
+    // 230 points wide with the menu's padding, as designed.
+    ui.set_min_width(220.0);
     // An item: its icon and text (in red for the destructive ones).
     let mut item = |ui: &mut Ui, glyph: &str, text: &str, a: MenuAction, danger: bool| {
         let label = egui::RichText::new(with_icon(glyph, text));
@@ -1813,7 +1815,7 @@ fn paint_table(
             false,
             f32::INFINITY,
         );
-        let name_x = left + 18.0 * zoom;
+        let name_x = left + HEADER_ICON_WIDTH * zoom;
         let schema = t.schema.as_deref().filter(|s| !s.is_empty());
         let schema_w = match (schema, font_px(SCHEMA_FONT, zoom)) {
             (Some(s), Some(spx)) => {
@@ -1895,7 +1897,7 @@ fn paint_table(
                         pos2(ix, cy),
                         Align2::LEFT_CENTER,
                         glyph,
-                        (px * 0.92 * 2.0).round() / 2.0,
+                        (px * (11.0 / ROW_FONT) * 2.0).round() / 2.0,
                         color,
                         false,
                         f32::INFINITY,
@@ -1931,7 +1933,7 @@ fn paint_table(
                         pos2(right, cy),
                         Align2::RIGHT_CENTER,
                         &col.data_type,
-                        (px * 0.875 * 2.0).round() / 2.0,
+                        (px * (10.5 / ROW_FONT) * 2.0).round() / 2.0,
                         pal.weak,
                         true,
                         (right - type_x).max(8.0),

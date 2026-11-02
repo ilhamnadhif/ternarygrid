@@ -205,14 +205,14 @@ fn number_dyn(ui: &mut Ui, v: &mut f64, range: std::ops::RangeInclusive<f64>, in
 }
 
 /// `v` as the settings show it: whole numbers with thousands separators ("100,000").
-fn grouped_number(v: f64, integral: bool) -> String {
+pub fn grouped_number(v: f64, integral: bool) -> String {
     if !integral && v.fract() != 0.0 {
         return format!("{}", (v * 100.0).round() / 100.0);
     }
     let digits = format!("{}", v.round().abs() as u64);
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

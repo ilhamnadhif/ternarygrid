@@ -1025,9 +1025,9 @@ impl TableDesignerTab {
         egui::Frame::new().inner_margin(Margin::symmetric(16, 10)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                ui.set_min_height(style::CONTROL_H);
-                ui.label(RichText::new(tr("Table")).size(12.5).color(p.text_muted));
-                field(ui, &mut self.model.name, ("td_name", self.uid), 220.0, style::CONTROL_H, tr("table name"), false);
+                ui.set_min_height(30.0);
+                ui.label(RichText::new(tr("Table")).size(13.0).color(p.text_muted));
+                field(ui, &mut self.model.name, ("td_name", self.uid), 220.0, 30.0, tr("table name"), false);
                 let schema = self.schema.schema.clone().unwrap_or_default();
                 let conn = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default();
                 ui.label(RichText::new(trf("in {} ({})", &[&schema, &conn])).size(12.0).color(p.text_faint));
@@ -1037,7 +1037,7 @@ impl TableDesignerTab {
                 if ui.add_enabled_ui(can, |ui| kit::button_ex(ui, kit::Kind::Primary, Some(icon::PLAY), label, true)).inner.clicked() {
                     self.confirm = true;
                 }
-                if ui.add_enabled_ui(!stmts.is_empty(), |ui| kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), true)).inner.clicked() {
+                if ui.add_enabled_ui(!stmts.is_empty(), |ui| kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FILE_CODE), tr("Open in SQL editor"), true)).inner.clicked() {
                     cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: Some(self.schema.clone()), text: Some(script_text(&stmts)) });
                 }
                 if !self.is_create() {
@@ -1058,7 +1058,7 @@ impl TableDesignerTab {
         if issues.is_empty() && self.exec_error.is_none() {
             return;
         }
-        egui::Frame::new().inner_margin(Margin { left: 16, right: 16, top: 8, bottom: 2 }).show(ui, |ui| {
+        egui::Frame::new().inner_margin(Margin::symmetric(16, 8)).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             for i in issues.iter().take(4) {
                 warning_line(ui, i);
@@ -1206,8 +1206,8 @@ impl TableDesignerTab {
                                 focus |= field(ui, &mut c.name, ("td_cn", uid, cu), f32::INFINITY, FIELD_H, "", false).gained_focus();
                             });
                             row.col(|ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                let w = (ui.available_width() - 24.0).max(40.0);
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let w = (ui.available_width() - 30.0).max(40.0);
                                 focus |= field(ui, &mut c.type_text, ("td_ct", uid, cu), w, FIELD_H, "", true).gained_focus();
                                 let b = kit::icon_button_ex(ui, icon::CARET_DOWN, tr("Common types"), false, 22.0);
                                 egui::Popup::menu(&b).show(|ui| {
@@ -1832,7 +1832,8 @@ impl TableDesignerTab {
         }
         if let Some(lang) = &self.lang {
             let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-            ternarygrid_editor::CodeView::new(&text, lang, &theme).id_salt(("td_ddl", self.uid)).show(ui);
+            let options = plain_code();
+            ternarygrid_editor::CodeView::new(&text, lang, &theme).options(&options).id_salt(("td_ddl", self.uid)).show(ui);
         }
     }
 
@@ -1869,7 +1870,8 @@ impl TableDesignerTab {
                             ui.set_min_size(vec2(w, h));
                             if let Some(lang) = lang {
                                 let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-                                ternarygrid_editor::CodeView::new(&text, lang, &theme).id_salt(("td_confirm_ddl", uid)).show(ui);
+                                let options = plain_code();
+                                ternarygrid_editor::CodeView::new(&text, lang, &theme).options(&options).id_salt(("td_confirm_ddl", uid)).show(ui);
                             }
                         });
                     });
@@ -1936,6 +1938,11 @@ impl TableDesignerTab {
     }
 
     #[doc(hidden)]
+    /// Select the column at `index` (as a click on its row).
+    pub fn select_column(&mut self, index: usize) {
+        self.selected = Some(index);
+    }
+
     pub fn set_table_name(&mut self, name: &str) {
         self.model.name = name.to_string();
     }
@@ -2051,11 +2058,25 @@ const FIELD_H: f32 = 26.0;
 
 /// A single-line field `h` tall (monospace for SQL), outlined like the mockups' inputs, with
 /// the kit's focus halo.
+/// A read-only code view as the designs show code: line numbers, no fold markers, no marked
+/// words or current line.
+fn plain_code() -> ternarygrid_editor::EditorOptions {
+    let mut options = ternarygrid_editor::EditorOptions::read_only_viewer();
+    options.folding = false;
+    options.mark_occurrences = false;
+    options.highlight_current_line = false;
+    // 21 points a line, as the design's code.
+    options.line_spacing = 5.0;
+    options
+}
+
 pub(crate) fn field(ui: &mut Ui, text: &mut String, id: impl Hash + std::fmt::Debug, width: f32, h: f32, hint: &str, mono: bool) -> Response {
     let p = ternarygrid_ui::pal(ui);
     ui.scope(|ui| {
         ui.visuals_mut().widgets.inactive.bg_stroke.color = p.border;
-        let mut edit = egui::TextEdit::singleline(text).id_salt(id).desired_width(width).min_size(vec2(0.0, h)).vertical_align(Align::Center).margin(Margin::symmetric(8, 2));
+        // A selected row keeps its text colours (only the fill shows the selection).
+        ui.visuals_mut().override_text_color = None;
+        let mut edit = egui::TextEdit::singleline(text).id_salt(id).desired_width(width).min_size(vec2(0.0, h)).vertical_align(Align::Center).margin(Margin::symmetric(10, 2));
         if !hint.is_empty() {
             edit = edit.hint_text(RichText::new(hint).color(p.text_faint));
         }
@@ -2306,16 +2327,22 @@ impl TabView for TableDesignerTab {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
             return;
         }
-        // The toolbar and its problems, the pages, the page and the DDL preview at the bottom.
+        // The toolbar and its problems, the pages, the page and the DDL preview at the bottom,
+        // edge to edge.
+        ui.spacing_mut().item_spacing.y = 0.0;
         self.toolbar(ui, cx);
         self.pages_ui(ui);
         let p = ternarygrid_ui::pal(ui);
         egui::Panel::bottom(egui::Id::new(("td_preview", self.uid)))
             .resizable(true)
-            .default_size(230.0)
+            .default_size(250.0)
             .size_range(80.0..=f32::INFINITY)
             .frame(egui::Frame::new().fill(p.canvas))
-            .show(ui, |ui| self.preview_ui(ui));
+            .show(ui, |ui| {
+                // The panel keeps its height (egui's panels shrink to their contents).
+                ui.set_min_height(ui.max_rect().height());
+                self.preview_ui(ui)
+            });
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| match self.page {
             Page::Columns => self.columns_page(ui),
             page => {

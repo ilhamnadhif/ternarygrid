@@ -217,7 +217,9 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
         }
         ScheduleMode::Cron => {
             ui.horizontal(|ui| {
-                look::text_field(ui, &mut s.cron, 200.0, "m h dom mon dow", true);
+                // The syntax is explained on the field's hover (the design shows only the field).
+                look::text_field(ui, &mut s.cron, 200.0, "m h dom mon dow", true)
+                    .on_hover_text(tr("minute hour day-of-month month day-of-week, e.g. 30 9 * * 1-5 (also @hourly, @daily, @weekly, @monthly)"));
                 let b = kit::button_ex(ui, Kind::Ghost, Some(icon::CARET_DOWN), tr("Examples"), true);
                 egui::Popup::menu(&b).show(|ui| {
                     for expr in CRON_PRESETS {
@@ -228,12 +230,6 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
                     }
                 });
             });
-            ui.add(
-                egui::Label::new(
-                    RichText::new(tr("minute hour day-of-month month day-of-week, e.g. 30 9 * * 1-5 (also @hourly, @daily, @weekly, @monthly)")).size(12.0).color(p.text_faint),
-                )
-                .wrap(),
-            );
         }
         ScheduleMode::Interval => {
             row(ui, tr("Every"), |ui| {

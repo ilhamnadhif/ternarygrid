@@ -268,8 +268,10 @@ fn blocking<T: Send + 'static>(cx: &AppContext, work: impl FnOnce() -> Result<T,
 
 /// Width of the label column: 220 points, less in a half-width group.
 fn label_w(ui: &Ui) -> f32 {
+    // In a half-width group the label column leaves the controls 196 points (a three-option
+    // segmented control) instead of overflowing the group as the mockup does.
     let w = ui.available_width();
-    if w < 600.0 { (w * 0.42).clamp(120.0, 165.0) } else { 220.0 }
+    if w < 600.0 { (w - 16.0 - 196.0).clamp(110.0, 165.0) } else { 220.0 }
 }
 
 /// What "Search settings" looks for (lower case), kept for the frame in the ui's memory.
