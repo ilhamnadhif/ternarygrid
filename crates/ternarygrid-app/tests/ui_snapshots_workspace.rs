@@ -533,6 +533,16 @@ fn shots(s: &mut Shots) {
             s.shot("set_network_form");
         }
     }
+    // A select open (the menu look of the drop-downs): the formatter of the SQL editor.
+    s.click("SQL editor");
+    s.frames(3);
+    let found = s.h.query_all_by_role(egui::accesskit::Role::ComboBox).next().map(|n| n.click()).is_some();
+    if found {
+        s.frames(6);
+        s.shot("set_select");
+        s.h.key_press(egui::Key::Escape);
+        s.frames(3);
+    }
     // "Search settings": the sections with a match and their counts, the matches marked.
     {
         // The settings' own search: the text field at the top of their side navigation (right

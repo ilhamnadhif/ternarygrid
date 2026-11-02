@@ -441,7 +441,7 @@ fn combo<T: PartialEq + Copy>(ui: &mut Ui, id: &str, value: &mut T, options: &[(
 fn combo_dyn(ui: &mut Ui, id: &str, current: &mut Option<usize>, labels: &[&str], width: f32) -> bool {
     let mut changed = false;
     let text = current.and_then(|i| labels.get(i).copied()).unwrap_or("");
-    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).width(width).selected_text(text).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).width(width).selected_text(text).show_ui(ui, |ui| {
         kit::menu_look(ui, width);
         for (i, l) in labels.iter().enumerate() {
             let mut on = *current == Some(i);

@@ -88,15 +88,20 @@ impl TabView for ErrorLogTab {
             // The select at the height of the design's fields, its text 11 points in.
             ui.spacing_mut().interact_size.y = 30.0;
             ui.spacing_mut().button_padding = egui::vec2(11.0, 5.0);
-            egui::ComboBox::from_id_salt("error_log_level").icon(ternarygrid_ui::kit::combo_caret).width(190.0).selected_text(tr(level_label(self.level))).show_ui(ui, |ui| {
-                ternarygrid_ui::kit::menu_look(ui, 190.0);
-                for l in [Level::ERROR, Level::WARN, Level::INFO] {
-                    let mut on = self.level == l;
-                    if ternarygrid_ui::kit::menu_check(ui, &mut on, tr(level_label(l))).clicked() {
-                        self.level = l;
+            egui::ComboBox::from_id_salt("error_log_level")
+                .icon(ternarygrid_ui::kit::combo_caret)
+                .popup_style(egui::containers::menu::menu_style.into())
+                .width(190.0)
+                .selected_text(tr(level_label(self.level)))
+                .show_ui(ui, |ui| {
+                    ternarygrid_ui::kit::menu_look(ui, 190.0);
+                    for l in [Level::ERROR, Level::WARN, Level::INFO] {
+                        let mut on = self.level == l;
+                        if ternarygrid_ui::kit::menu_check(ui, &mut on, tr(level_label(l))).clicked() {
+                            self.level = l;
+                        }
                     }
-                }
-            });
+                });
             ternarygrid_ui::kit::search_field(ui, egui::Id::new("error_log_search"), &mut self.search, tr("Search"), 260.0);
             if ternarygrid_ui::kit::ghost(ui, Some(icon::COPY), tr("Copy")).on_hover_text(tr("Copy the shown entries")).clicked() {
                 let text: Vec<String> = self.visible().iter().rev().map(|e| e.line()).collect();

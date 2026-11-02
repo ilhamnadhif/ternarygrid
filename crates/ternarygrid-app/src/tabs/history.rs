@@ -153,32 +153,38 @@ impl TabView for HistoryTab {
             ui.spacing_mut().button_padding = egui::vec2(11.0, 5.0);
             changed |= kit::search_field(ui, egui::Id::new("hist_search"), &mut self.text, tr("Search SQL text…"), 320.0).changed();
             let conn_name = self.connection.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("All connections").to_string());
-            egui::ComboBox::from_id_salt("hist_conn").icon(kit::combo_caret).width(180.0).selected_text(conn_name).show_ui(ui, |ui| {
-                kit::menu_look(ui, 180.0);
-                let mut on = self.connection.is_none();
-                if kit::menu_check(ui, &mut on, tr("All connections")).clicked() && self.connection.is_some() {
-                    self.connection = None;
-                    changed = true;
-                }
-                for c in cx.conns.configs() {
-                    let mut on = self.connection.as_deref() == Some(c.id.as_str());
-                    if kit::menu_check(ui, &mut on, &c.name).clicked() && on {
-                        self.connection = Some(c.id.clone());
+            egui::ComboBox::from_id_salt("hist_conn").icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).width(180.0).selected_text(conn_name).show_ui(
+                ui,
+                |ui| {
+                    kit::menu_look(ui, 180.0);
+                    let mut on = self.connection.is_none();
+                    if kit::menu_check(ui, &mut on, tr("All connections")).clicked() && self.connection.is_some() {
+                        self.connection = None;
                         changed = true;
                     }
-                }
-            });
+                    for c in cx.conns.configs() {
+                        let mut on = self.connection.as_deref() == Some(c.id.as_str());
+                        if kit::menu_check(ui, &mut on, &c.name).clicked() && on {
+                            self.connection = Some(c.id.clone());
+                            changed = true;
+                        }
+                    }
+                },
+            );
             let st = self.status.map(status_label).unwrap_or(tr("Any status"));
-            egui::ComboBox::from_id_salt("hist_status").icon(kit::combo_caret).width(140.0).selected_text(st).show_ui(ui, |ui| {
-                kit::menu_look(ui, 140.0);
-                for s in [None, Some(QueryStatus::Ok), Some(QueryStatus::Error), Some(QueryStatus::Cancelled)] {
-                    let mut on = self.status == s;
-                    if kit::menu_check(ui, &mut on, s.map(status_label).unwrap_or(tr("Any status"))).clicked() && on {
-                        self.status = s;
-                        changed = true;
+            egui::ComboBox::from_id_salt("hist_status").icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).width(140.0).selected_text(st).show_ui(
+                ui,
+                |ui| {
+                    kit::menu_look(ui, 140.0);
+                    for s in [None, Some(QueryStatus::Ok), Some(QueryStatus::Error), Some(QueryStatus::Cancelled)] {
+                        let mut on = self.status == s;
+                        if kit::menu_check(ui, &mut on, s.map(status_label).unwrap_or(tr("Any status"))).clicked() && on {
+                            self.status = s;
+                            changed = true;
+                        }
                     }
-                }
-            });
+                },
+            );
             changed |= ternarygrid_ui::parts::segmented(
                 ui,
                 &mut self.period,

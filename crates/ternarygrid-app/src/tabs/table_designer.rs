@@ -2128,6 +2128,8 @@ pub(crate) fn select<R>(
         ui.set_max_width(width);
         egui::ComboBox::from_id_salt(id)
             .icon(kit::combo_caret)
+            // egui's menu frame and plain items (a combo's own style draws them as buttons).
+            .popup_style(egui::containers::menu::menu_style.into())
             .selected_text(text)
             .width(width)
             .truncate()

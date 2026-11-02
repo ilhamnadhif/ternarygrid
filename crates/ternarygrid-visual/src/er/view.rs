@@ -844,6 +844,8 @@ fn toolbar_combo<R>(
         ui.visuals_mut().widgets.inactive.bg_stroke.color = p.border;
         egui::ComboBox::from_id_salt(id)
             .icon(ternarygrid_ui::kit::combo_caret)
+            // egui's menu frame and plain items (a combo's own style draws them as buttons).
+            .popup_style(egui::containers::menu::menu_style.into())
             .selected_text(text)
             .width(width)
             .show_ui(ui, |ui| {

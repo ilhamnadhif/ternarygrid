@@ -240,15 +240,18 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
         ScheduleMode::Interval => {
             row(ui, tr("Every"), |ui| {
                 ui.add_sized(egui::vec2(80.0, ternarygrid_ui::style::CONTROL_H), egui::DragValue::new(&mut s.every).range(1..=100_000).speed(1));
-                egui::ComboBox::from_id_salt("sched_unit").icon(kit::combo_caret).selected_text(s.unit.label()).show_ui(ui, |ui| {
-                    kit::menu_look(ui, 140.0);
-                    for u in IntervalUnit::ALL {
-                        let mut on = s.unit == u;
-                        if kit::menu_check(ui, &mut on, u.label()).clicked() {
-                            s.unit = u;
+                egui::ComboBox::from_id_salt("sched_unit").icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(s.unit.label()).show_ui(
+                    ui,
+                    |ui| {
+                        kit::menu_look(ui, 140.0);
+                        for u in IntervalUnit::ALL {
+                            let mut on = s.unit == u;
+                            if kit::menu_check(ui, &mut on, u.label()).clicked() {
+                                s.unit = u;
+                            }
                         }
-                    }
-                });
+                    },
+                );
             });
         }
         ScheduleMode::Daily => {
@@ -603,14 +606,19 @@ impl TaskEditor {
                 ui.horizontal(|ui| {
                     let candidates: Vec<&TaskDef> = tasks.iter().filter(|t| Some(&t.id) != own_id.as_ref()).collect();
                     let label = self.add_step.as_ref().and_then(|id| candidates.iter().find(|t| &t.id == id)).map(|t| t.path()).unwrap_or_else(|| tr("Choose a task…").to_string());
-                    egui::ComboBox::from_id_salt("task_add_step").icon(kit::combo_caret).selected_text(label).width(260.0).show_ui(ui, |ui| {
-                        kit::menu_look(ui, 260.0);
-                        for t in &candidates {
-                            if kit::menu_item(ui, Some(kind_icon(&t.kind)), &t.path(), "").clicked() {
-                                self.add_step = Some(t.id.clone());
+                    egui::ComboBox::from_id_salt("task_add_step")
+                        .icon(kit::combo_caret)
+                        .popup_style(egui::containers::menu::menu_style.into())
+                        .selected_text(label)
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            kit::menu_look(ui, 260.0);
+                            for t in &candidates {
+                                if kit::menu_item(ui, Some(kind_icon(&t.kind)), &t.path(), "").clicked() {
+                                    self.add_step = Some(t.id.clone());
+                                }
                             }
-                        }
-                    });
+                        });
                     if ui.add_enabled_ui(self.add_step.is_some(), |ui| kit::button_ex(ui, Kind::Secondary, Some(icon::PLUS), tr("Add step"), true)).inner.clicked()
                         && let Some(id) = self.add_step.take()
                     {
