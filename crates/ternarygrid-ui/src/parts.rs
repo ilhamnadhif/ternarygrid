@@ -311,16 +311,19 @@ pub fn callout(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: im
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 ui.label(RichText::new(tone.icon()).font(style::icon_font(16.0)).color(color));
-                let right_w = 0.0;
                 ui.vertical(|ui| {
-                    ui.set_max_width((ui.available_width() - right_w).max(80.0));
                     ui.spacing_mut().item_spacing.y = 2.0;
                     if let Some(t) = title {
                         ui.label(RichText::new(t).font(style::semibold(ui.ctx(), style::body_size(ui.ctx()))).color(p.text));
                     }
                     ui.add(egui::Label::new(RichText::new(body).color(p.text)).wrap().selectable(true));
+                    // Extra content (buttons) under the text at the right; nothing when empty
+                    // (a right-to-left layout beside the text would take the panel's height).
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.allocate_ui_with_layout(vec2(ui.available_width(), 0.0), Layout::right_to_left(Align::Min), add);
+                    });
                 });
-                ui.with_layout(Layout::right_to_left(Align::Center), add);
             });
         })
         .response
