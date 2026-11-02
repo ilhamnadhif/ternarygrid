@@ -463,13 +463,13 @@ impl ObjectEditorTab {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.horizontal(|ui| {
                     ui.set_min_height(30.0);
-                    if kit::button_full(ui, kit::Kind::Secondary, Some(icon::FILE_SQL), tr("Open in SQL editor"), true, false).clicked() {
+                    if kit::button_full(ui, kit::Kind::Secondary, Some(icon::FILE_CODE), tr("Open in SQL editor"), true, false).clicked() {
                         cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: Some(self.obj.schema_ref()), text: Some(text.clone()) });
                     }
                     if kit::button_full(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), true, false).clicked() {
                         ui.ctx().copy_text(text.clone());
                     }
-                    if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TEXT_ALIGN_LEFT), tr("Format"), true, formatted)
+                    if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TEXT_AA), tr("Format"), true, formatted)
                         .on_hover_text(tr("Show the DDL formatted with the SQL editor's formatter settings"))
                         .clicked()
                     {
