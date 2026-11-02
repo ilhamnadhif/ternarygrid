@@ -1,10 +1,13 @@
 //! Preferences tab: every section of `settings.json`, the keymap editor,
-//! connection types, AI and secret storage.
+//! connection types, AI and secret storage. A side navigation (with a search
+//! that finds sections by their settings) and, at the right, the section's
+//! settings in titled groups.
 
 use crate::command::AppCommand;
 use crate::cx::AppContext;
 use crate::keys::{Action, IS_MAC, Keymap, Shortcut};
 use crate::tabs::TabView;
+use crate::tabs::tasks::look;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use ternarygrid_config::settings::{AiEffort, AiProvider, BlankLineDelimiter, KeywordCase, NavigatorSort, ResultsLayout, RowDensity, SecretBackend, SortFilterMode, Theme};
@@ -12,6 +15,8 @@ use ternarygrid_config::{KeymapPreset, SecretsManager};
 use ternarygrid_core::config::{ConnectionType, NavigatorView};
 use ternarygrid_core::value::{BinaryFormat, BoolStyle};
 use ternarygrid_core::{Secret, tr, trf};
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts::{self, Tone};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -64,7 +69,7 @@ impl Section {
 
     fn icon(self) -> &'static str {
         match self {
-            Section::General => icon::SLIDERS,
+            Section::General => icon::GEAR,
             Section::Editor => icon::FILE_SQL,
             Section::Results => icon::TABLE,
             Section::Execution => icon::PLAY,
@@ -72,16 +77,119 @@ impl Section {
             Section::Navigator => icon::TREE_STRUCTURE,
             Section::Keyboard => icon::KEYBOARD,
             Section::ConnectionTypes => icon::TAG,
-            Section::NetworkProfiles => icon::SHARE_NETWORK,
+            Section::NetworkProfiles => icon::GLOBE,
             Section::Ai => icon::SPARKLE,
-            Section::Security => icon::LOCK_KEY,
+            Section::Security => icon::LOCK,
             Section::Accessibility => icon::EYE,
+        }
+    }
+
+    /// The settings of the section (what "Search settings" finds it by).
+    fn keywords(self) -> &'static [&'static str] {
+        match self {
+            Section::General => &[
+                "Appearance",
+                "Theme",
+                "Light",
+                "Dark",
+                "Font size",
+                "Zoom",
+                "Time zone",
+                "Reopen the editors of the last session on start",
+                "Ask before quitting with unsaved changes",
+                "Check for updates automatically (at start and every few hours)",
+            ],
+            Section::Editor => &[
+                "Font size",
+                "Tab size",
+                "Statement delimiter",
+                "Blank line ends a statement",
+                "Auto-save interval",
+                "Insert spaces instead of tabs",
+                "Show line numbers",
+                "Code folding (statements, block comments)",
+                "Highlight occurrences of the word under the cursor",
+                "Highlight the current line",
+                "Wrap long lines",
+                "Close quotes automatically",
+                "Close brackets automatically",
+                "Check spelling in comments and strings",
+                "Autocomplete",
+                "Delay",
+                "Minimum characters",
+                "Maximum proposals",
+                "Keyword case",
+                "Formatter",
+                "Indent width",
+                "Lines between statements",
+                "Maximum line length",
+                "Indent with tabs",
+                "Commas at the start of lines",
+                "New line before AND / OR",
+                "Parameters and variables",
+            ],
+            Section::Results => &[
+                "Rows fetched per page",
+                "Sorting and filtering",
+                "Confirm \"fetch all\" above",
+                "Auto-refresh interval",
+                "Results position",
+                "Row height",
+                "Maximum result tabs",
+                "Open each query in a new result tab",
+                "Show row numbers",
+                "Memory per result set",
+                "Memory for all result sets",
+                "Maximum text length",
+                "NULL text",
+                "Date format",
+                "Time format",
+                "Timestamp format",
+                "Binary values",
+                "Booleans",
+                "Float decimals",
+                "Show fractional seconds",
+                "Thousands separator",
+            ],
+            Section::Execution => &[
+                "Query timeout",
+                "Stop the script on the first error",
+                "Confirm DELETE / UPDATE without WHERE, DROP and TRUNCATE",
+                "Smart commit: switch to manual commit before data changes",
+            ],
+            Section::History => &["Record executed queries", "Mask passwords in recorded statements", "Keep at most", "Keep for", "Clear the whole history"],
+            Section::Navigator => {
+                &["Order", "Default view of new connections", "Show system schemas and objects", "Show user@host next to connection names", "Expand a connection after connecting"]
+            }
+            Section::Keyboard => &["Preset", "Shortcut", "Reset all"],
+            Section::ConnectionTypes => &["Colour", "Production", "Auto-commit by default", "Confirm statements that change data or schema", "Confirm saving data changes"],
+            Section::NetworkProfiles => &["SSH", "Proxy", "Tunnel"],
+            Section::Ai => &["Provider", "Model", "Base URL", "Maximum answer length", "Effort", "API key", "Send table and column names as context", "Allow sending sample rows"],
+            Section::Security => &["Secret storage", "Lock the vault after", "Master password", "Keychain", "Encrypted file"],
+            Section::Accessibility => &["High contrast", "Reduce motion", "Always show the keyboard focus", "Run scheduled tasks while TernaryGrid is open"],
+        }
+    }
+
+    /// The section is found by `query` (lower case): its name or one of its settings.
+    fn matches(self, query: &str) -> bool {
+        query.is_empty() || self.label().to_lowercase().contains(query) || self.keywords().iter().any(|k| tr(k).to_lowercase().contains(query))
+    }
+
+    /// A line under the section's title.
+    fn intro(self) -> Option<&'static str> {
+        match self {
+            Section::NetworkProfiles => Some(tr("Reusable SSH tunnel and proxy settings; connections pick a profile on their SSH page.")),
+            Section::Ai => Some(tr("The assistant sends your question, and optionally schema details, to the provider you configure. Nothing is sent while it is disabled.")),
+            Section::Security => Some(tr("Passwords and API keys are never written to configuration files.")),
+            _ => None,
         }
     }
 }
 
 pub struct SettingsTab {
     section: Section,
+    /// "Search settings": sections shown in the navigation.
+    search: String,
     keymap: Option<Keymap>,
     key_filter: String,
     recording: Option<Action>,
@@ -116,6 +224,7 @@ impl Default for SettingsTab {
     fn default() -> Self {
         SettingsTab {
             section: Section::General,
+            search: String::new(),
             keymap: None,
             key_filter: String::new(),
             recording: None,
@@ -142,31 +251,72 @@ fn blocking<T: Send + 'static>(cx: &AppContext, work: impl FnOnce() -> Result<T,
     cx.backend.spawn(async move { tokio::task::spawn_blocking(work).await.unwrap_or_else(|e| Err(e.to_string())) })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Form pieces
+// ---------------------------------------------------------------------------------------------
+
+/// Width of the label column: 220 points, less in a half-width group.
+fn label_w(ui: &Ui) -> f32 {
+    let w = ui.available_width();
+    if w < 600.0 { (w * 0.42).clamp(120.0, 165.0) } else { 220.0 }
+}
+
+/// A setting: its label in the label column, then the control.
 fn row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
-    ui.label(label);
-    let changed = add(ui);
-    ui.end_row();
-    changed
+    let w = label_w(ui);
+    parts::form_row(ui, label, w, add)
+}
+
+/// [`row`] with a muted line of explanation under the control.
+fn row_sub(ui: &mut Ui, label: &str, sub: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let w = label_w(ui);
+    let p = ternarygrid_ui::pal(ui);
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(egui::vec2(w, ternarygrid_ui::style::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(w);
+            ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
+        });
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            let c = ui.horizontal(add).inner;
+            ui.label(RichText::new(sub).size(12.0).color(p.text_muted));
+            c
+        })
+        .inner
+    })
+    .inner
+}
+
+/// Content indented to the controls' column (check boxes under the fields).
+fn indented(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let w = label_w(ui);
+    ui.horizontal_top(|ui| {
+        ui.add_space(w + ui.spacing().item_spacing.x);
+        ui.vertical(add).inner
+    })
+    .inner
 }
 
 fn check(ui: &mut Ui, value: &mut bool, label: &str) -> bool {
-    let c = ui.checkbox(value, label).changed();
-    ui.end_row();
+    look::checkbox(ui, value, label).changed()
+}
+
+/// Check boxes in a column, 10 points apart.
+fn checks(ui: &mut Ui, items: Vec<(&mut bool, &str)>) -> bool {
+    let mut c = false;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 10.0;
+        for (v, l) in items {
+            c |= check(ui, v, l);
+        }
+    });
     c
 }
 
-fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
-    let mut changed = false;
-    egui::Grid::new(id).num_columns(2).spacing([16.0, 8.0]).min_col_width(220.0).show(ui, |ui| {
-        changed = add(ui);
-    });
-    changed
-}
-
-fn combo<T: PartialEq + Copy>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, &str)]) -> bool {
+fn combo<T: PartialEq + Copy>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, &str)], width: f32) -> bool {
     let mut changed = false;
     let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| *l).unwrap_or("");
-    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).width(width).selected_text(current).show_ui(ui, |ui| {
         for (v, l) in options {
             if ui.selectable_value(value, *v, *l).changed() {
                 changed = true;
@@ -176,143 +326,226 @@ fn combo<T: PartialEq + Copy>(ui: &mut Ui, id: &str, value: &mut T, options: &[(
     changed
 }
 
-fn num<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range: std::ops::RangeInclusive<T>, suffix: &str) -> bool {
-    ui.add(egui::DragValue::new(value).range(range).suffix(suffix)).changed()
+fn num<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range: std::ops::RangeInclusive<T>, unit: &str) -> bool {
+    look::number(ui, value, range, unit).changed()
 }
 
-fn heading(ui: &mut Ui, text: &str) {
-    ui.add_space(12.0);
-    ui.label(ternarygrid_ui::kit::section_title(ui, text));
-    ui.add_space(4.0);
+fn text(ui: &mut Ui, value: &mut String, width: f32, mono: bool) -> bool {
+    look::text_field(ui, value, width, "", mono).changed()
+}
+
+/// Two groups side by side (equal widths, 14 points apart).
+fn two(ui: &mut Ui, left: impl FnOnce(&mut Ui) -> bool, right: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let mut c = false;
+    let gap = 14.0;
+    let w = ((ui.available_width() - gap) / 2.0).floor();
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(w);
+            c |= left(ui);
+        });
+        ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(w);
+            c |= right(ui);
+        });
+    });
+    c
+}
+
+fn group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+    parts::group(ui, (!title.is_empty()).then_some(title), None, add)
+}
+
+fn group_sub(ui: &mut Ui, title: &str, sub: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+    parts::group(ui, Some(title), Some(sub), add)
+}
+
+/// A small colour square (connection types).
+fn swatch(ui: &mut Ui, color: egui::Color32, side: f32) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+    let r = if side > 16.0 { ternarygrid_ui::style::RADIUS } else { 3 };
+    ui.painter().rect(rect, r, color, egui::Stroke::new(1.0, if side > 16.0 { p.border } else { egui::Color32::TRANSPARENT }), egui::StrokeKind::Inside);
+    resp
+}
+
+/// A row of a list at the left of a section (connection types, network profiles): 32 points,
+/// the selected one on the soft accent.
+fn list_item(ui: &mut Ui, selected: bool, label: &str, lead: impl FnOnce(&mut Ui, egui::Rect), right: Option<&str>) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label));
+    if selected {
+        ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, p.accent_soft);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, p.hover);
+    }
+    lead(ui, egui::Rect::from_min_size(egui::pos2(rect.left() + 10.0, rect.center().y - 8.0), egui::vec2(16.0, 16.0)));
+    let size = ternarygrid_ui::style::body_size(ui.ctx());
+    ui.painter().text(egui::pos2(rect.left() + 36.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(size), p.text);
+    if let Some(r) = right {
+        ui.painter().text(egui::pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, r, egui::FontId::proportional(11.5), p.text_faint);
+    }
+    resp
 }
 
 impl SettingsTab {
     fn general(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let s = &mut cx.settings.general;
-        grid(ui, "set_general", |ui| {
+        let mut c = group(ui, tr("Appearance"), |ui| {
             let mut c = false;
-            c |= row(ui, tr("Time zone"), |ui| {
-                let choices = crate::conn::time_zone_choices();
-                let items: Vec<_> = choices.iter().map(|(v, l)| (*v, l.as_str())).collect();
-                combo(ui, "set_time_zone", &mut s.time_zone, &items)
-            });
-            c |= row(ui, tr("Theme"), |ui| combo(ui, "set_theme", &mut s.theme, &[(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))]));
-            c |= row(ui, tr("Font size"), |ui| num(ui, &mut s.ui_font_size, 8.0..=32.0, " pt"));
+            c |= row(ui, tr("Theme"), |ui| parts::segmented(ui, &mut s.theme, &[(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))]));
+            c |= row(ui, tr("Font size"), |ui| num(ui, &mut s.ui_font_size, 8.0..=32.0, tr("pt")));
             c |= row(ui, tr("Zoom"), |ui| {
                 let mut pct = (s.ui_scale * 100.0).round();
-                let ch = num(ui, &mut pct, 50.0..=300.0, " %");
+                let ch = num(ui, &mut pct, 50.0..=300.0, "%");
                 s.ui_scale = pct / 100.0;
                 ch
             });
-            ui.label("");
-            c |= check(ui, &mut s.restore_session, tr("Reopen the editors of the last session on start"));
-            ui.label("");
-            c |= check(ui, &mut s.confirm_exit_with_unsaved, tr("Ask before quitting with unsaved changes"));
-            ui.label("");
+            c
+        });
+        c |= group(ui, tr("Time"), |ui| {
+            row_sub(ui, tr("Time zone"), tr("Dates and times in results are shown in this zone."), |ui| {
+                let choices = crate::conn::time_zone_choices();
+                let items: Vec<_> = choices.iter().map(|(v, l)| (*v, l.as_str())).collect();
+                combo(ui, "set_time_zone", &mut s.time_zone, &items, 320.0)
+            })
+        });
+        c |= group(ui, tr("Start and quit"), |ui| {
             let u = &mut cx.settings.updates;
             let mut auto = u.check_automatically == Some(true);
+            let mut c = checks(
+                ui,
+                vec![
+                    (&mut s.restore_session, tr("Reopen the editors of the last session on start")),
+                    (&mut s.confirm_exit_with_unsaved, tr("Ask before quitting with unsaved changes")),
+                ],
+            );
             if check(ui, &mut auto, tr("Check for updates automatically (at start and every few hours)")) {
                 u.check_automatically = Some(auto);
                 c = true;
             }
             c
-        })
+        });
+        c
     }
 
     fn editor(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let e = &mut cx.settings.editor;
         let case_opts = [(KeywordCase::Upper, tr("UPPER")), (KeywordCase::Lower, tr("lower")), (KeywordCase::Preserve, tr("As typed"))];
-        let mut c = grid(ui, "set_editor", |ui| {
+        let mut c = group(ui, tr("Editing"), |ui| {
             let mut c = false;
-            c |= row(ui, tr("Font size"), |ui| num(ui, &mut e.font_size, 8.0..=40.0, " pt"));
-            c |= row(ui, tr("Tab size"), |ui| num(ui, &mut e.tab_size, 1..=16, ""));
-            c |= row(ui, tr("Statement delimiter"), |ui| ui.add(egui::TextEdit::singleline(&mut e.statement_delimiter).desired_width(60.0)).changed());
+            ui.horizontal(|ui| {
+                let w = label_w(ui);
+                c |= parts::form_row(ui, tr("Font size"), w, |ui| num(ui, &mut e.font_size, 8.0..=40.0, tr("pt")));
+                ui.add_space(16.0);
+                c |= parts::form_row(ui, tr("Tab size"), 80.0, |ui| num(ui, &mut e.tab_size, 1..=16, ""));
+            });
+            c |= row(ui, tr("Statement delimiter"), |ui| text(ui, &mut e.statement_delimiter, 60.0, true));
             c |= row(ui, tr("Blank line ends a statement"), |ui| {
-                combo(
+                parts::segmented(
                     ui,
-                    "set_blank",
                     &mut e.blank_line_delimiter,
                     &[(BlankLineDelimiter::Never, tr("Never")), (BlankLineDelimiter::Smart, tr("Smart")), (BlankLineDelimiter::Always, tr("Always"))],
                 )
             });
-            c |= row(ui, tr("Auto-save interval"), |ui| num(ui, &mut e.auto_save_interval_secs, 0..=3600, " s"));
-            for (v, l) in [
-                (&mut e.insert_spaces, tr("Insert spaces instead of tabs")),
-                (&mut e.line_numbers, tr("Show line numbers")),
-                (&mut e.folding, tr("Code folding (statements, block comments)")),
-                (&mut e.mark_occurrences, tr("Highlight occurrences of the word under the cursor")),
-                (&mut e.highlight_current_line, tr("Highlight the current line")),
-                (&mut e.word_wrap, tr("Wrap long lines")),
-                (&mut e.auto_close_quotes, tr("Close quotes automatically")),
-                (&mut e.auto_close_brackets, tr("Close brackets automatically")),
-                (&mut e.spell_check, tr("Check spelling in comments and strings")),
-            ] {
-                ui.label("");
-                c |= check(ui, v, l);
-            }
-            c
-        });
-        heading(ui, tr("Autocomplete"));
-        let a = &mut e.autocomplete;
-        c |= grid(ui, "set_autocomplete", |ui| {
-            let mut c = false;
-            ui.label("");
-            c |= check(ui, &mut a.enabled, tr("Enable autocomplete"));
-            ui.label("");
-            c |= check(ui, &mut a.auto_activate_on_letters, tr("Open automatically while typing"));
-            ui.label("");
-            c |= check(ui, &mut a.insert_single_proposal, tr("Insert a single proposal directly"));
-            c |= row(ui, tr("Delay"), |ui| num(ui, &mut a.delay_ms, 0..=2000, " ms"));
-            c |= row(ui, tr("Minimum characters"), |ui| num(ui, &mut a.min_chars, 0..=5, ""));
-            c |= row(ui, tr("Maximum proposals"), |ui| num(ui, &mut a.max_items, 10..=1000, ""));
-            c |= row(ui, tr("Keyword case"), |ui| combo(ui, "set_ac_case", &mut a.keyword_case, &case_opts));
-            c
-        });
-        heading(ui, tr("Formatter"));
-        let f = &mut e.format;
-        c |= grid(ui, "set_format", |ui| {
-            let mut c = false;
-            {
-                use ternarygrid_config::settings::FormatterKind as K;
-                c |= row(ui, tr("Formatter"), |ui| {
-                    combo(ui, "set_fmt_kind", &mut f.formatter, &[(K::Default, tr("Default")), (K::Compact, tr("Compact")), (K::External, tr("External command"))])
-                });
-                if f.formatter == K::External {
-                    c |= row(ui, tr("Command"), |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut f.external_command).hint_text("pg_format -").desired_width(320.0))
-                            .on_hover_text(tr("Gets the SQL on standard input and writes the formatted SQL to standard output"))
-                            .changed()
+            c |= row(ui, tr("Auto-save interval"), |ui| num(ui, &mut e.auto_save_interval_secs, 0..=3600, "s"));
+            c |= indented(ui, |ui| {
+                let mut c = false;
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 40.0;
+                    let w = ((ui.available_width() - 40.0) / 2.0).max(120.0);
+                    ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        c |= checks(
+                            ui,
+                            vec![
+                                (&mut e.insert_spaces, tr("Insert spaces instead of tabs")),
+                                (&mut e.line_numbers, tr("Show line numbers")),
+                                (&mut e.folding, tr("Code folding (statements, block comments)")),
+                                (&mut e.mark_occurrences, tr("Highlight occurrences of the word under the cursor")),
+                                (&mut e.highlight_current_line, tr("Highlight the current line")),
+                            ],
+                        );
                     });
-                }
-            }
-            c |= row(ui, tr("Keyword case"), |ui| combo(ui, "set_fmt_case", &mut f.keyword_case, &case_opts));
-            c |= row(ui, tr("Indent width"), |ui| num(ui, &mut f.indent_width, 1..=8, ""));
-            c |= row(ui, tr("Lines between statements"), |ui| num(ui, &mut f.lines_between_statements, 0..=4, ""));
-            c |= row(ui, tr("Maximum line length"), |ui| num(ui, &mut f.max_line_length, 40..=400, ""));
-            ui.label("");
-            c |= check(ui, &mut f.use_tabs, tr("Indent with tabs"));
-            ui.label("");
-            c |= check(ui, &mut f.comma_first, tr("Commas at the start of lines"));
-            ui.label("");
-            c |= check(ui, &mut f.newline_before_and_or, tr("New line before AND / OR"));
-            ui.label("");
-            c |= check(ui, &mut f.statement_only, tr("Without a selection, format only the statement under the cursor"));
+                    ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        c |= checks(
+                            ui,
+                            vec![
+                                (&mut e.word_wrap, tr("Wrap long lines")),
+                                (&mut e.auto_close_quotes, tr("Close quotes automatically")),
+                                (&mut e.auto_close_brackets, tr("Close brackets automatically")),
+                                (&mut e.spell_check, tr("Check spelling in comments and strings")),
+                            ],
+                        );
+                    });
+                });
+                c
+            });
             c
         });
-        heading(ui, tr("Parameters and variables"));
+        let a = &mut e.autocomplete;
+        let f = &mut e.format;
+        c |= two(
+            ui,
+            |ui| {
+                group(ui, tr("Autocomplete"), |ui| {
+                    let mut c = checks(
+                        ui,
+                        vec![
+                            (&mut a.enabled, tr("Enable autocomplete")),
+                            (&mut a.auto_activate_on_letters, tr("Open automatically while typing")),
+                            (&mut a.insert_single_proposal, tr("Insert a single proposal directly")),
+                        ],
+                    );
+                    c |= row(ui, tr("Delay"), |ui| num(ui, &mut a.delay_ms, 0..=2000, "ms"));
+                    c |= row(ui, tr("Minimum characters"), |ui| num(ui, &mut a.min_chars, 0..=5, ""));
+                    c |= row(ui, tr("Maximum proposals"), |ui| num(ui, &mut a.max_items, 10..=1000, ""));
+                    c |= row(ui, tr("Keyword case"), |ui| parts::segmented_small(ui, &mut a.keyword_case, &case_opts));
+                    c
+                })
+            },
+            |ui| {
+                group(ui, tr("Formatter"), |ui| {
+                    let mut c = false;
+                    {
+                        use ternarygrid_config::settings::FormatterKind as K;
+                        c |= row(ui, tr("Formatter"), |ui| {
+                            combo(ui, "set_fmt_kind", &mut f.formatter, &[(K::Default, tr("Default")), (K::Compact, tr("Compact")), (K::External, tr("External command"))], 180.0)
+                        });
+                        if f.formatter == K::External {
+                            c |= row(ui, tr("Command"), |ui| {
+                                look::text_field(ui, &mut f.external_command, ui.available_width().min(260.0), "pg_format -", true)
+                                    .on_hover_text(tr("Gets the SQL on standard input and writes the formatted SQL to standard output"))
+                                    .changed()
+                            });
+                        }
+                    }
+                    c |= row(ui, tr("Keyword case"), |ui| parts::segmented_small(ui, &mut f.keyword_case, &case_opts));
+                    c |= row(ui, tr("Indent width"), |ui| num(ui, &mut f.indent_width, 1..=8, ""));
+                    c |= row(ui, tr("Lines between statements"), |ui| num(ui, &mut f.lines_between_statements, 0..=4, ""));
+                    c |= row(ui, tr("Maximum line length"), |ui| num(ui, &mut f.max_line_length, 40..=400, ""));
+                    c |= checks(
+                        ui,
+                        vec![
+                            (&mut f.use_tabs, tr("Indent with tabs")),
+                            (&mut f.comma_first, tr("Commas at the start of lines")),
+                            (&mut f.newline_before_and_or, tr("New line before AND / OR")),
+                            (&mut f.statement_only, tr("Without a selection, format only the statement under the cursor")),
+                        ],
+                    );
+                    c
+                })
+            },
+        );
         let p = &mut e.parameters;
-        c |= grid(ui, "set_params", |ui| {
+        c |= group(ui, tr("Parameters and variables"), |ui| {
             let mut c = false;
-            ui.label("");
-            c |= check(ui, &mut p.enabled, tr("Enable parameters"));
-            ui.label("");
-            c |= check(ui, &mut p.named_colon, tr(":name parameters"));
-            ui.label("");
-            c |= check(ui, &mut p.dollar_brace, tr("${name} variables"));
-            ui.label("");
-            c |= check(ui, &mut p.question_mark, tr("? positional parameters"));
-            ui.label("");
-            c |= check(ui, &mut p.prompt_for_values, tr("Ask for values before executing"));
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 60.0;
+                c |= checks(ui, vec![(&mut p.enabled, tr("Enable parameters")), (&mut p.named_colon, tr(":name parameters")), (&mut p.dollar_brace, tr("${name} variables"))]);
+                c |= checks(ui, vec![(&mut p.question_mark, tr("? positional parameters")), (&mut p.prompt_for_values, tr("Ask for values before executing"))]);
+            });
             c
         });
         c
@@ -320,92 +553,116 @@ impl SettingsTab {
 
     fn results(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let r = &mut cx.settings.results;
-        let mut c = grid(ui, "set_results", |ui| {
+        let mut c = group(ui, tr("Fetching"), |ui| {
             let mut c = false;
             c |= row(ui, tr("Rows fetched per page"), |ui| num(ui, &mut r.fetch_size, 10..=100_000, ""));
-            c |= row(ui, tr("Results position"), |ui| {
-                combo(ui, "set_layout", &mut r.layout, &[(ResultsLayout::Bottom, tr("Below the editor")), (ResultsLayout::Right, tr("Right of the editor"))])
-            });
-            c |= row(ui, tr("Row height"), |ui| combo(ui, "set_density", &mut r.row_density, &[(RowDensity::Compact, tr("Compact")), (RowDensity::Normal, tr("Normal"))]));
             c |= row(ui, tr("Sorting and filtering"), |ui| {
-                combo(ui, "set_sortmode", &mut r.sort_filter_mode, &[(SortFilterMode::Server, tr("On the server (re-query)")), (SortFilterMode::Client, tr("On fetched rows"))])
+                parts::segmented(ui, &mut r.sort_filter_mode, &[(SortFilterMode::Server, tr("On the server (re-query)")), (SortFilterMode::Client, tr("On fetched rows"))])
             });
-            c |= row(ui, tr("Maximum result tabs"), |ui| num(ui, &mut r.max_result_tabs, 1..=100, ""));
-            c |= row(ui, tr("Auto-refresh interval"), |ui| num(ui, &mut r.auto_refresh_secs, 0..=3600, " s"));
-            c |= row(ui, tr("Memory per result set"), |ui| num(ui, &mut r.store_memory_limit_mb, 16..=16_384, " MB"));
-            c |= row(ui, tr("Memory for all result sets"), |ui| num(ui, &mut r.global_memory_limit_mb, 64..=65_536, " MB"));
             c |= row(ui, tr("Confirm \"fetch all\" above"), |ui| num(ui, &mut r.confirm_fetch_all_above, 0..=100_000_000, tr(" rows")));
-            c |= row(ui, tr("Maximum text length"), |ui| num(ui, &mut r.max_text_length, 64..=10_000_000, ""));
-            ui.label("");
-            c |= check(ui, &mut r.open_each_query_in_new_tab, tr("Open each query in a new result tab"));
-            ui.label("");
-            c |= check(ui, &mut r.show_row_numbers, tr("Show row numbers"));
+            c |= row(ui, tr("Auto-refresh interval"), |ui| num(ui, &mut r.auto_refresh_secs, 0..=3600, "s"));
             c
         });
-        heading(ui, tr("Value formats"));
-        let f = &mut r.format;
-        c |= grid(ui, "set_valfmt", |ui| {
+        c |= group(ui, tr("Layout"), |ui| {
             let mut c = false;
-            c |= row(ui, tr("NULL text"), |ui| ui.add(egui::TextEdit::singleline(&mut f.null_text).desired_width(120.0)).changed());
-            c |= row(ui, tr("Date format"), |ui| ui.add(egui::TextEdit::singleline(&mut f.date_format).desired_width(160.0)).changed());
-            c |= row(ui, tr("Time format"), |ui| ui.add(egui::TextEdit::singleline(&mut f.time_format).desired_width(160.0)).changed());
-            c |= row(ui, tr("Timestamp format"), |ui| ui.add(egui::TextEdit::singleline(&mut f.datetime_format).desired_width(200.0)).changed());
-            c |= row(ui, tr("Binary values"), |ui| {
-                combo(ui, "set_bin", &mut f.binary_format, &[(BinaryFormat::Hex, tr("Hexadecimal")), (BinaryFormat::Base64, "Base64"), (BinaryFormat::Text, tr("Text"))])
+            c |= row(ui, tr("Results position"), |ui| {
+                parts::segmented(ui, &mut r.layout, &[(ResultsLayout::Bottom, tr("Below the editor")), (ResultsLayout::Right, tr("Right of the editor"))])
             });
-            c |= row(ui, tr("Booleans"), |ui| {
-                combo(ui, "set_bool", &mut f.bool_style, &[(BoolStyle::TrueFalse, "true / false"), (BoolStyle::Checkbox, "☑ / ☐"), (BoolStyle::OneZero, "1 / 0")])
-            });
-            c |= row(ui, tr("Float decimals"), |ui| {
-                let mut on = f.float_max_decimals.is_some();
-                let mut n = f.float_max_decimals.unwrap_or(6);
-                let mut ch = ui.checkbox(&mut on, tr("Limit")).changed();
-                if on {
-                    ch |= num(ui, &mut n, 0..=20, "");
-                }
-                f.float_max_decimals = on.then_some(n);
-                ch
-            });
-            ui.label("");
-            c |= check(ui, &mut f.show_fractional_seconds, tr("Show fractional seconds"));
-            ui.label("");
-            c |= check(ui, &mut f.thousands_separator, tr("Thousands separator"));
+            c |= row(ui, tr("Row height"), |ui| parts::segmented(ui, &mut r.row_density, &[(RowDensity::Compact, tr("Compact")), (RowDensity::Normal, tr("Normal"))]));
+            c |= row(ui, tr("Maximum result tabs"), |ui| num(ui, &mut r.max_result_tabs, 1..=100, ""));
+            c |= checks(ui, vec![(&mut r.open_each_query_in_new_tab, tr("Open each query in a new result tab")), (&mut r.show_row_numbers, tr("Show row numbers"))]);
             c
         });
+        let (store_mb, global_mb, max_text) = (&mut r.store_memory_limit_mb, &mut r.global_memory_limit_mb, &mut r.max_text_length);
+        let f = &mut r.format;
+        c |= two(
+            ui,
+            |ui| {
+                group(ui, tr("Memory"), |ui| {
+                    let mut c = false;
+                    c |= row(ui, tr("Memory per result set"), |ui| num(ui, store_mb, 16..=16_384, "MB"));
+                    c |= row(ui, tr("Memory for all result sets"), |ui| num(ui, global_mb, 64..=65_536, "MB"));
+                    c |= row(ui, tr("Maximum text length"), |ui| num(ui, max_text, 64..=10_000_000, ""));
+                    c
+                })
+            },
+            |ui| {
+                group(ui, tr("Value formats"), |ui| {
+                    let mut c = false;
+                    let field_w = |ui: &Ui| ui.available_width().min(220.0);
+                    c |= row(ui, tr("NULL text"), |ui| text(ui, &mut f.null_text, 120.0, true));
+                    c |= row(ui, tr("Date format"), |ui| {
+                        let w = field_w(ui);
+                        text(ui, &mut f.date_format, w, true)
+                    });
+                    c |= row(ui, tr("Time format"), |ui| {
+                        let w = field_w(ui);
+                        text(ui, &mut f.time_format, w, true)
+                    });
+                    c |= row(ui, tr("Timestamp format"), |ui| {
+                        let w = field_w(ui);
+                        text(ui, &mut f.datetime_format, w, true)
+                    });
+                    c |= row(ui, tr("Binary values"), |ui| {
+                        parts::segmented_small(
+                            ui,
+                            &mut f.binary_format,
+                            &[(BinaryFormat::Hex, tr("Hexadecimal")), (BinaryFormat::Base64, "Base64"), (BinaryFormat::Text, tr("Text"))],
+                        )
+                    });
+                    c |= row(ui, tr("Booleans"), |ui| {
+                        parts::segmented_small(ui, &mut f.bool_style, &[(BoolStyle::TrueFalse, "true / false"), (BoolStyle::Checkbox, "☑ / ☐"), (BoolStyle::OneZero, "1 / 0")])
+                    });
+                    c |= row(ui, tr("Float decimals"), |ui| {
+                        let mut on = f.float_max_decimals.is_some();
+                        let mut n = f.float_max_decimals.unwrap_or(6);
+                        let mut ch = check(ui, &mut on, tr("Limit"));
+                        if on {
+                            ch |= num(ui, &mut n, 0..=20, "");
+                        }
+                        f.float_max_decimals = on.then_some(n);
+                        ch
+                    });
+                    c |= checks(ui, vec![(&mut f.show_fractional_seconds, tr("Show fractional seconds")), (&mut f.thousands_separator, tr("Thousands separator"))]);
+                    c
+                })
+            },
+        );
         c
     }
 
     fn execution(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let e = &mut cx.settings.execution;
-        grid(ui, "set_exec", |ui| {
-            let mut c = false;
-            c |= row(ui, tr("Query timeout"), |ui| num(ui, &mut e.query_timeout_secs, 0..=86_400, tr(" s (0 = none)")));
-            ui.label("");
-            c |= check(ui, &mut e.stop_on_error, tr("Stop the script on the first error"));
-            ui.label("");
-            c |= check(ui, &mut e.confirm_dangerous_statements, tr("Confirm DELETE / UPDATE without WHERE, DROP and TRUNCATE"));
-            ui.label("");
-            c |= check(ui, &mut e.smart_commit, tr("Smart commit: switch to manual commit before data changes"));
+        let c = group(ui, "", |ui| {
+            let mut c = row(ui, tr("Query timeout"), |ui| num(ui, &mut e.query_timeout_secs, 0..=86_400, tr(" s (0 = none)")));
+            c |= checks(
+                ui,
+                vec![
+                    (&mut e.stop_on_error, tr("Stop the script on the first error")),
+                    (&mut e.confirm_dangerous_statements, tr("Confirm DELETE / UPDATE without WHERE, DROP and TRUNCATE")),
+                    (&mut e.smart_commit, tr("Smart commit: switch to manual commit before data changes")),
+                ],
+            );
             c
-        })
+        });
+        look::callout(ui, Tone::Info, None, tr("Production connections ask before running statements that change data, whatever is set here: see Connection types."), |_| {});
+        c
     }
 
     fn history(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let h = &mut cx.settings.history;
-        let c = grid(ui, "set_hist", |ui| {
-            let mut c = false;
-            ui.label("");
-            c |= check(ui, &mut h.enabled, tr("Record executed queries"));
-            ui.label("");
-            c |= check(ui, &mut h.redact_secrets, tr("Mask passwords in recorded statements"));
+        let store = cx.services.history.clone();
+        let mut clear = false;
+        let c = group(ui, "", |ui| {
+            let mut c = checks(ui, vec![(&mut h.enabled, tr("Record executed queries")), (&mut h.redact_secrets, tr("Mask passwords in recorded statements"))]);
             c |= row(ui, tr("Keep at most"), |ui| num(ui, &mut h.max_entries, 0..=10_000_000, tr(" entries")));
             c |= row(ui, tr("Keep for"), |ui| num(ui, &mut h.max_age_days, 0..=36_500, tr(" days")));
+            if store.is_some() {
+                clear = kit::button_ex(ui, Kind::Danger, Some(icon::TRASH), tr("Clear the whole history"), true).clicked();
+            }
             c
         });
-        ui.add_space(8.0);
-        if let Some(store) = cx.services.history.clone()
-            && ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Clear the whole history"))).clicked()
-        {
+        if clear && let Some(store) = store {
             match store.lock().clear(None) {
                 Ok(n) => cx.toasts.success(trf("Deleted {} history entries", &[&n])),
                 Err(e) => cx.toasts.error(tr("Cannot clear the history"), Some(e.to_string())),
@@ -416,47 +673,56 @@ impl SettingsTab {
 
     fn navigator(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let n = &mut cx.settings.navigator;
-        grid(ui, "set_nav", |ui| {
+        group(ui, "", |ui| {
             let mut c = false;
             c |= row(ui, tr("Order"), |ui| {
-                combo(ui, "set_navsort", &mut n.sort, &[(NavigatorSort::Alphabetical, tr("Alphabetical")), (NavigatorSort::Natural, tr("As reported by the database"))])
+                parts::segmented(ui, &mut n.sort, &[(NavigatorSort::Alphabetical, tr("Alphabetical")), (NavigatorSort::Natural, tr("As reported by the database"))])
             });
             c |= row(ui, tr("Default view of new connections"), |ui| {
-                combo(ui, "set_navview", &mut n.default_view, &[(NavigatorView::Simple, tr("Simple")), (NavigatorView::Advanced, tr("Advanced"))])
+                parts::segmented(ui, &mut n.default_view, &[(NavigatorView::Simple, tr("Simple")), (NavigatorView::Advanced, tr("Advanced"))])
             });
-            ui.label("");
-            c |= check(ui, &mut n.show_system_objects, tr("Show system schemas and objects"));
-            ui.label("");
-            c |= check(ui, &mut n.show_connection_details, tr("Show user@host next to connection names"));
-            ui.label("");
-            c |= check(ui, &mut n.expand_on_connect, tr("Expand a connection after connecting"));
+            c |= checks(
+                ui,
+                vec![
+                    (&mut n.show_system_objects, tr("Show system schemas and objects")),
+                    (&mut n.show_connection_details, tr("Show user@host next to connection names")),
+                    (&mut n.expand_on_connect, tr("Expand a connection after connecting")),
+                ],
+            );
             c
         })
     }
 
     fn keyboard(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let km = self.keymap.get_or_insert_with(|| cx.keymap.clone());
+        let pal = ternarygrid_ui::pal(ui);
         let mut changed = false;
         ui.horizontal(|ui| {
-            ui.label(tr("Preset"));
+            ui.label(RichText::new(tr("Preset")).color(pal.text_muted));
             let mut preset = km.preset();
-            if combo(ui, "set_preset", &mut preset, &[(KeymapPreset::TernaryGrid, "TernaryGrid"), (KeymapPreset::Dbeaver, "DBeaver")]) {
+            if parts::segmented(ui, &mut preset, &[(KeymapPreset::TernaryGrid, "TernaryGrid"), (KeymapPreset::Dbeaver, "DBeaver")]) {
                 km.set_preset(preset);
                 changed = true;
             }
-            if ui.button(tr("Reset all")).clicked() {
+            if kit::button_ex(ui, Kind::Secondary, None, tr("Reset all"), true).clicked() {
                 km.reset_all();
                 changed = true;
             }
-            ui.add(egui::TextEdit::singleline(&mut self.key_filter).hint_text(tr("Filter…")).desired_width(180.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                kit::search_field(ui, egui::Id::new("set_keys_filter"), &mut self.key_filter, tr("Filter…"), 240.0);
+            });
         });
         let conflicts = km.conflicts();
         if !conflicts.is_empty() {
-            let color = crate::theme::warning_color(ui.visuals().dark_mode);
-            for cf in conflicts.iter().take(5) {
-                let names: Vec<&str> = cf.actions.iter().map(|a| crate::keys::action_label(*a)).collect();
-                ui.label(RichText::new(format!("{} {} — {}", icon::WARNING, cf.shortcut.format(IS_MAC), names.join(", "))).color(color));
-            }
+            let lines: Vec<String> = conflicts
+                .iter()
+                .take(5)
+                .map(|cf| {
+                    let names: Vec<&str> = cf.actions.iter().map(|a| crate::keys::action_label(*a)).collect();
+                    trf("{} is bound to several actions: {}.", &[&cf.shortcut.format(IS_MAC), &names.join(", ")])
+                })
+                .collect();
+            look::callout(ui, Tone::Warning, None, &lines.join("\n"), |_| {});
         }
         // Recording a new shortcut: the next key press with a non-modifier key.
         if let Some(action) = self.recording {
@@ -478,43 +744,60 @@ impl SettingsTab {
             }
         }
         let filter = self.key_filter.to_lowercase();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("set_keys").num_columns(4).striped(true).spacing([12.0, 4.0]).show(ui, |ui| {
-                ui.strong(tr("Action"));
-                ui.strong(tr("Category"));
-                ui.strong(tr("Shortcut"));
-                ui.label("");
-                ui.end_row();
-                for a in Action::ALL {
-                    let label = crate::keys::action_label(*a);
-                    let keys: Vec<String> = km.shortcuts(*a).iter().map(|s| s.format(IS_MAC)).collect();
-                    if !filter.is_empty() && !label.to_lowercase().contains(&filter) && !keys.join(" ").to_lowercase().contains(&filter) {
-                        continue;
-                    }
-                    ui.label(label);
-                    ui.weak(tr(a.category().label()));
-                    if self.recording == Some(*a) {
-                        ui.label(RichText::new(tr("Press a key combination… (Esc cancels)")).italics());
-                    } else {
-                        ui.monospace(if keys.is_empty() { "—".to_string() } else { keys.join("   ") });
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.small_button(ternarygrid_icons::ic(icon::RECORD)).on_hover_text(tr("Record a shortcut")).clicked() {
-                            self.recording = Some(*a);
-                        }
-                        if ui.small_button(ternarygrid_icons::ic(icon::ARROW_COUNTER_CLOCKWISE)).on_hover_text(tr("Reset to default")).clicked() {
-                            km.reset(*a);
-                            changed = true;
-                        }
-                        if ui.small_button(ternarygrid_icons::ic(icon::X)).on_hover_text(tr("Remove the shortcut")).clicked() {
-                            km.unbind(*a);
-                            changed = true;
-                        }
-                    });
-                    ui.end_row();
+        let actions: Vec<Action> = Action::ALL
+            .iter()
+            .copied()
+            .filter(|a| {
+                let label = crate::keys::action_label(*a);
+                let keys: Vec<String> = km.shortcuts(*a).iter().map(|s| s.format(IS_MAC)).collect();
+                filter.is_empty() || label.to_lowercase().contains(&filter) || keys.join(" ").to_lowercase().contains(&filter)
+            })
+            .collect();
+        let cols = [
+            look::Col::new(tr("Action"), look::Width::Initial(260.0)),
+            look::Col::new(tr("Category"), look::Width::Initial(150.0)),
+            look::Col::new(tr("Shortcut"), look::Width::Initial(260.0)),
+            look::Col::new("", look::Width::Rest(96.0)),
+        ];
+        let recording = self.recording;
+        let mut record = None;
+        look::table(ui, "set_keys", &cols, actions.len(), |row, i| {
+            let a = actions[i];
+            row.set_selected(recording == Some(a));
+            let keys: Vec<String> = km.shortcuts(a).iter().map(|s| s.format(IS_MAC)).collect();
+            look::cell(row, false, |ui| {
+                look::cell_text(ui, crate::keys::action_label(a));
+            });
+            look::cell(row, false, |ui| {
+                look::cell_text(ui, RichText::new(tr(a.category().label())).color(pal.text_muted));
+            });
+            look::cell(row, false, |ui| {
+                if recording == Some(a) {
+                    look::cell_text(ui, RichText::new(tr("Press a key combination… (Esc cancels)")).italics().color(pal.accent_text));
+                } else if keys.is_empty() {
+                    look::cell_text(ui, look::mono(ui, "—", pal.text_faint));
+                } else {
+                    look::cell_text(ui, look::mono(ui, &keys.join("   "), pal.text));
+                }
+            });
+            look::cell(row, false, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if kit::icon_button_ex(ui, icon::RECORD, tr("Record a shortcut"), recording == Some(a), 24.0).clicked() {
+                    record = Some(a);
+                }
+                if kit::icon_button_ex(ui, icon::ARROW_COUNTER_CLOCKWISE, tr("Reset to default"), false, 24.0).clicked() {
+                    km.reset(a);
+                    changed = true;
+                }
+                if kit::icon_button_ex(ui, icon::X, tr("Remove the shortcut"), false, 24.0).clicked() {
+                    km.unbind(a);
+                    changed = true;
                 }
             });
         });
+        if record.is_some() {
+            self.recording = record;
+        }
         if changed {
             cx.settings.keymap = km.to_config();
         }
@@ -524,20 +807,30 @@ impl SettingsTab {
 
     fn connection_types(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let types = cx.conns.connection_types();
-        let mut changed = false;
+        let pal = ternarygrid_ui::pal(ui);
         ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(180.0);
+            ui.spacing_mut().item_spacing.x = 20.0;
+            ui.allocate_ui_with_layout(egui::vec2(200.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(200.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
                 for (i, t) in types.iter().enumerate() {
-                    let marker = crate::theme::rgb(t.color);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("■").color(marker));
-                        if ui.selectable_label(self.selected_type == i, &t.name).clicked() {
-                            self.selected_type = i;
-                        }
-                    });
+                    let color = crate::theme::rgb(t.color);
+                    if list_item(
+                        ui,
+                        self.selected_type == i,
+                        &t.name,
+                        |ui, r| {
+                            let sq = egui::Rect::from_center_size(r.center(), egui::vec2(12.0, 12.0));
+                            ui.painter().rect_filled(sq, 3, color);
+                        },
+                        None,
+                    )
+                    .clicked()
+                    {
+                        self.selected_type = i;
+                    }
                 }
-                if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("New type"))).clicked() {
+                if kit::button_ex(ui, Kind::Ghost, Some(icon::PLUS), tr("New type"), true).clicked() {
                     let mut t = ConnectionType::development();
                     t.id = format!("custom-{}", uuid::Uuid::new_v4().simple());
                     t.name = tr("Custom").to_string();
@@ -546,27 +839,48 @@ impl SettingsTab {
                     self.selected_type = types.len();
                 }
             });
-            ui.separator();
             let Some(mut t) = types.get(self.selected_type).cloned() else { return };
             ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 14.0;
                 let builtin = ConnectionType::builtins().iter().any(|b| b.id == t.id);
-                let mut c = grid(ui, "set_ctype", |ui| {
+                let used = cx.conns.configs().iter().filter(|c| c.connection_type == t.id).count();
+                let mut reset = false;
+                let title = t.name.clone();
+                let mut c = group(ui, &title, |ui| {
                     let mut c = false;
-                    c |= row(ui, tr("Name"), |ui| ui.add(egui::TextEdit::singleline(&mut t.name).desired_width(200.0)).changed());
-                    c |= row(ui, tr("Colour"), |ui| ui.color_edit_button_srgb(&mut t.color).changed());
-                    ui.label("");
-                    c |= check(ui, &mut t.auto_commit, tr("Auto-commit by default"));
-                    ui.label("");
-                    c |= check(ui, &mut t.confirm_execute, tr("Confirm statements that change data or schema"));
-                    ui.label("");
-                    c |= check(ui, &mut t.confirm_data_change, tr("Confirm saving data changes"));
-                    ui.label("");
-                    c |= check(ui, &mut t.confirm_dangerous, tr("Confirm dangerous statements"));
+                    c |= row(ui, tr("Name"), |ui| text(ui, &mut t.name, 260.0, false));
+                    c |= row(ui, tr("Colour"), |ui| {
+                        let mut color = crate::theme::rgb(t.color);
+                        swatch(ui, color, 28.0);
+                        let b = kit::button_ex(ui, Kind::Secondary, None, tr("Change…"), true);
+                        let mut ch = false;
+                        egui::Popup::from_toggle_button_response(&b).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                            if egui::color_picker::color_picker_color32(ui, &mut color, egui::color_picker::Alpha::Opaque) {
+                                t.color = [color.r(), color.g(), color.b()];
+                                ch = true;
+                            }
+                        });
+                        ch
+                    });
+                    c |= checks(
+                        ui,
+                        vec![
+                            (&mut t.auto_commit, tr("Auto-commit by default")),
+                            (&mut t.confirm_execute, tr("Confirm statements that change data or schema")),
+                            (&mut t.confirm_data_change, tr("Confirm saving data changes")),
+                            (&mut t.confirm_dangerous, tr("Confirm dangerous statements")),
+                        ],
+                    );
+                    ui.horizontal(|ui| {
+                        let label = if builtin { tr("Reset to default") } else { tr("Delete type") };
+                        let kind = if builtin { Kind::Secondary } else { Kind::Danger };
+                        reset = kit::button_ex(ui, kind, None, label, true).clicked();
+                        let note = if builtin { trf("Built-in type: {} connection(s) use it.", &[&used]) } else { trf("{} connection(s) use it.", &[&used]) };
+                        ui.label(RichText::new(note).color(pal.text_muted));
+                    });
                     c
                 });
-                ui.add_space(6.0);
-                let label = if builtin { tr("Reset to default") } else { tr("Delete type") };
-                if ui.button(label).clicked() {
+                if reset {
                     let n = cx.conns.store.remove_connection_type(&t.id);
                     if n > 0 {
                         cx.toasts.info(trf("{} connection(s) now use the Development type", &[&n]));
@@ -578,33 +892,58 @@ impl SettingsTab {
                 if c {
                     cx.conns.store.set_connection_type(t.clone());
                     cx.conns.dirty = true;
-                    changed = true;
                 }
+                // How the type marks its connections: the navigator row, the tab, the top bar.
+                let marker = crate::theme::connection_marker(t.color);
+                let sample = cx.conns.configs().iter().find(|c| c.connection_type == t.id).map(|c| (c.name.clone(), c.kind));
+                let sample_kind = sample.as_ref().map(|s| s.1);
+                group(ui, tr("How it looks"), |ui| {
+                    preview_row(ui, sample.as_ref().map_or(tr("connection"), |s| s.0.as_str()), sample_kind, marker);
+                    preview_tab(ui, "script.sql", marker);
+                    match marker {
+                        Some(m) => {
+                            kit::pill(ui, &t.name.to_uppercase(), m);
+                        }
+                        None => {
+                            ui.label(RichText::new(tr("Connections of this type are not marked.")).color(pal.text_muted));
+                        }
+                    }
+                    false
+                });
             });
         });
-        let _ = changed;
         false
     }
 
     fn network_profiles(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         use ternarygrid_core::config::{NetworkProfile, ProxyConfig, SecretSlot, SshConfig};
-        ui.label(tr("Reusable SSH tunnel and proxy settings; connections pick a profile on their SSH page."));
-        ui.add_space(4.0);
         let profiles = cx.conns.store.network_profiles.clone();
+        let pal = ternarygrid_ui::pal(ui);
         ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(200.0);
+            ui.spacing_mut().item_spacing.x = 20.0;
+            ui.allocate_ui_with_layout(egui::vec2(220.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(220.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
                 for p in &profiles {
                     let used = cx.conns.configs().iter().filter(|c| c.network_profile.as_deref() == Some(p.id.as_str())).count();
                     let sel = self.profile.as_ref().is_some_and(|x| x.id == p.id);
-                    if ui.selectable_label(sel, format!("{} {}  ({used})", icon::SHARE_NETWORK, p.name)).clicked() {
+                    let lead = |ui: &mut Ui, r: egui::Rect| {
+                        ui.painter().text(
+                            r.center(),
+                            egui::Align2::CENTER_CENTER,
+                            icon::GLOBE,
+                            ternarygrid_ui::style::icon_font(15.0),
+                            if sel { pal.accent_text } else { pal.text_muted },
+                        );
+                    };
+                    if list_item(ui, sel, &p.name, lead, Some(trf("{} used", &[&used]).as_str())).clicked() {
                         self.profile = Some(p.clone());
                         self.profile_ssh_password.clear();
                         self.profile_ssh_passphrase.clear();
                         self.profile_proxy_password.clear();
                     }
                 }
-                if ui.button((ternarygrid_icons::ic(icon::PLUS), tr("New profile"))).clicked() {
+                if kit::button_ex(ui, Kind::Ghost, Some(icon::PLUS), tr("New profile"), true).clicked() {
                     self.profile = Some(NetworkProfile {
                         id: uuid::Uuid::new_v4().to_string(),
                         name: tr("New profile").to_string(),
@@ -613,27 +952,27 @@ impl SettingsTab {
                     });
                 }
             });
-            ui.separator();
             let Some(mut profile) = self.profile.take() else {
-                ui.weak(tr("Select or create a profile."));
+                ui.label(RichText::new(tr("Select or create a profile.")).color(pal.text_muted));
                 return;
             };
             let p = &mut profile;
             let mut deleted = false;
             ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(tr("Name"));
-                    ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(240.0));
+                ui.spacing_mut().item_spacing.y = 14.0;
+                row(ui, tr("Name"), |ui| text(ui, &mut p.name, 300.0, false));
+                group(ui, "SSH", |ui| {
+                    let ssh = p.ssh.get_or_insert_with(SshConfig::default);
+                    crate::dialogs::connection::ssh_form(ui, "profile_ssh", ssh, &mut self.profile_ssh_password, &mut self.profile_ssh_passphrase);
+                    false
                 });
-                heading(ui, "SSH");
-                let ssh = p.ssh.get_or_insert_with(SshConfig::default);
-                crate::dialogs::connection::ssh_form(ui, "profile_ssh", ssh, &mut self.profile_ssh_password, &mut self.profile_ssh_passphrase);
-                heading(ui, tr("Proxy"));
-                let proxy = p.proxy.get_or_insert_with(ProxyConfig::default);
-                crate::dialogs::connection::proxy_form(ui, "profile_proxy", proxy, &mut self.profile_proxy_password);
-                ui.add_space(6.0);
+                group(ui, tr("Proxy"), |ui| {
+                    let proxy = p.proxy.get_or_insert_with(ProxyConfig::default);
+                    crate::dialogs::connection::proxy_form(ui, "profile_proxy", proxy, &mut self.profile_proxy_password);
+                    false
+                });
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Save profile")).strong()).clicked() {
+                    if kit::button_ex(ui, Kind::Primary, None, tr("Save profile"), false).clicked() {
                         let id = p.id.clone();
                         let ssh_save = p.ssh.as_ref().is_some_and(|s| s.enabled && s.save_credentials);
                         let proxy_save = p.proxy.as_ref().is_some_and(|s| s.enabled && s.save_credentials);
@@ -661,7 +1000,7 @@ impl SettingsTab {
                         cx.conns.dirty = true;
                         cx.toasts.success(tr("Profile saved"));
                     }
-                    if ui.button(tr("Delete profile")).clicked() {
+                    if kit::button_ex(ui, Kind::Danger, None, tr("Delete profile"), false).clicked() {
                         let n = cx.conns.store.remove_network_profile(&p.id);
                         for slot in [SecretSlot::SshPassword, SecretSlot::SshPassphrase, SecretSlot::ProxyPassword] {
                             let _ = cx.conns.secrets.delete(&ternarygrid_config::profile_secret_key(&p.id, slot));
@@ -688,28 +1027,23 @@ impl SettingsTab {
             self.ai_key_saved = cx.services.secrets.read().ai_api_key(provider.id()).ok().flatten().is_some();
             self.ai_key_loaded = Some(provider);
         }
-        ui.label(tr("The assistant sends your question, and optionally schema details, to the provider you configure. Nothing is sent while it is disabled."));
-        ui.add_space(4.0);
         let a = &mut cx.settings.ai;
-        let mut c = grid(ui, "set_ai", |ui| {
-            let mut c = false;
-            ui.label("");
-            c |= check(ui, &mut a.enabled, tr("Enable the AI assistant"));
+        let mut c = group(ui, "", |ui| {
+            let mut c = parts::switch(ui, &mut a.enabled, tr("Enable the AI assistant"), None).changed();
             c |= row(ui, tr("Provider"), |ui| {
-                combo(ui, "set_ai_prov", &mut a.provider, &[(AiProvider::Anthropic, "Anthropic Claude"), (AiProvider::OpenAiCompatible, tr("OpenAI-compatible server"))])
+                parts::segmented(ui, &mut a.provider, &[(AiProvider::Anthropic, "Anthropic Claude"), (AiProvider::OpenAiCompatible, tr("OpenAI-compatible server"))])
             });
-            c |= row(ui, tr("Model"), |ui| ui.add(egui::TextEdit::singleline(&mut a.model).desired_width(240.0)).changed());
+            c |= row(ui, tr("Model"), |ui| text(ui, &mut a.model, 300.0, true));
             c |= row(ui, tr("Base URL"), |ui| {
                 let mut v = a.base_url.clone().unwrap_or_default();
-                let ch = ui.add(egui::TextEdit::singleline(&mut v).hint_text(tr("(provider default)")).desired_width(300.0)).changed();
+                let ch = look::text_field(ui, &mut v, 300.0, tr("(provider default)"), false).changed();
                 a.base_url = if v.trim().is_empty() { None } else { Some(v.trim().to_string()) };
                 ch
             });
             c |= row(ui, tr("Maximum answer length"), |ui| num(ui, &mut a.max_tokens, 256..=128_000, tr(" tokens")));
             c |= row(ui, tr("Effort"), |ui| {
-                combo(
+                parts::segmented(
                     ui,
-                    "set_ai_eff",
                     &mut a.effort,
                     &[
                         (AiEffort::Low, tr("Low")),
@@ -720,42 +1054,48 @@ impl SettingsTab {
                     ],
                 )
             });
-            ui.label("");
-            c |= check(ui, &mut a.include_schema_context, tr("Send table and column names as context"));
-            ui.label("");
-            c |= check(ui, &mut a.send_sample_data, tr("Allow sending sample rows"));
-            ui.label("");
-            c |= check(ui, &mut a.agent_queries, tr("Let the assistant run read-only queries (their results are sent to the AI service)"));
             c
         });
-        heading(ui, tr("API key"));
-        ui.horizontal(|ui| {
-            let hint = if self.ai_key_saved { tr("(saved — enter a new key to replace it)") } else { tr("(not set)") };
-            ui.add(egui::TextEdit::singleline(&mut self.ai_key).password(true).hint_text(hint).desired_width(300.0));
-            if ui.add_enabled(!self.ai_key.trim().is_empty(), egui::Button::new(tr("Save key"))).clicked() {
-                let key = Secret::new(self.ai_key.trim().to_string());
-                let r = cx.services.secrets.read().set_ai_api_key(provider.id(), Some(&key));
-                match r {
-                    Ok(()) => {
-                        self.ai_key.clear();
-                        self.ai_key_saved = true;
-                        cx.toasts.success(tr("API key saved securely"));
-                    }
-                    Err(e) if crate::dialogs::vault::unlock_after_failed_write(cx, &e) => {}
-                    Err(e) => cx.toasts.error(tr("Cannot store the API key"), Some(e.to_string())),
-                }
-            }
-            if self.ai_key_saved && ui.button(tr("Remove key")).clicked() {
-                let r = cx.services.secrets.read().set_ai_api_key(provider.id(), None);
-                match r {
-                    Ok(()) => self.ai_key_saved = false,
-                    Err(e) => {
-                        crate::dialogs::vault::unlock_after_failed_write(cx, &e);
-                    }
-                }
-            }
+        c |= group(ui, tr("What it may send"), |ui| {
+            checks(
+                ui,
+                vec![
+                    (&mut a.include_schema_context, tr("Send table and column names as context")),
+                    (&mut a.send_sample_data, tr("Allow sending sample rows")),
+                    (&mut a.agent_queries, tr("Let the assistant run read-only queries (their results are sent to the AI service)")),
+                ],
+            )
         });
-        c |= false;
+        group(ui, tr("API key"), |ui| {
+            row(ui, tr("API key"), |ui| {
+                let hint = if self.ai_key_saved { tr("(saved — enter a new key to replace it)") } else { tr("(not set)") };
+                look::password_field(ui, &mut self.ai_key, 360.0, hint);
+                let can_save = !self.ai_key.trim().is_empty();
+                if ui.add_enabled_ui(can_save, |ui| kit::button_ex(ui, Kind::Primary, None, tr("Save key"), true)).inner.clicked() {
+                    let key = Secret::new(self.ai_key.trim().to_string());
+                    let r = cx.services.secrets.read().set_ai_api_key(provider.id(), Some(&key));
+                    match r {
+                        Ok(()) => {
+                            self.ai_key.clear();
+                            self.ai_key_saved = true;
+                            cx.toasts.success(tr("API key saved securely"));
+                        }
+                        Err(e) if crate::dialogs::vault::unlock_after_failed_write(cx, &e) => {}
+                        Err(e) => cx.toasts.error(tr("Cannot store the API key"), Some(e.to_string())),
+                    }
+                }
+                if self.ai_key_saved && kit::button_ex(ui, Kind::Danger, None, tr("Remove key"), true).clicked() {
+                    let r = cx.services.secrets.read().set_ai_api_key(provider.id(), None);
+                    match r {
+                        Ok(()) => self.ai_key_saved = false,
+                        Err(e) => {
+                            crate::dialogs::vault::unlock_after_failed_write(cx, &e);
+                        }
+                    }
+                }
+                false
+            })
+        });
         c
     }
 
@@ -776,40 +1116,42 @@ impl SettingsTab {
         }
         let busy = self.secrets_job.is_some();
         let current = cx.services.secrets.read().backend();
-        ui.label(tr("Passwords and API keys are never written to configuration files."));
-        ui.add_space(4.0);
-        let changed = grid(ui, "set_sec", |ui| {
-            let mut c = false;
-            ui.label(tr("Secret storage"));
-            ui.label(match current {
-                SecretBackend::Keychain => tr("Operating system keychain"),
-                SecretBackend::EncryptedFile => tr("Encrypted file with master password"),
+        let pal = ternarygrid_ui::pal(ui);
+        let changed = group(ui, tr("Secret storage"), |ui| {
+            row(ui, tr("Secret storage"), |ui| {
+                kit::pill(
+                    ui,
+                    match current {
+                        SecretBackend::Keychain => tr("Operating system keychain"),
+                        SecretBackend::EncryptedFile => tr("Encrypted file with master password"),
+                    },
+                    pal.accent_text,
+                );
+                false
             });
-            ui.end_row();
-            c |= row(ui, tr("Lock the vault after"), |ui| num(ui, &mut cx.settings.security.auto_lock_minutes, 0..=1440, tr(" min idle (0 = never)")));
-            c
+            row(ui, tr("Lock the vault after"), |ui| num(ui, &mut cx.settings.security.auto_lock_minutes, 0..=1440, tr(" min idle (0 = never)")))
         });
-        ui.add_space(8.0);
         let target = match current {
             SecretBackend::Keychain => SecretBackend::EncryptedFile,
             SecretBackend::EncryptedFile => SecretBackend::Keychain,
         };
         let need_master = target == SecretBackend::EncryptedFile;
-        heading(
-            ui,
-            match target {
-                SecretBackend::EncryptedFile => tr("Move secrets to an encrypted file"),
-                SecretBackend::Keychain => tr("Move secrets to the keychain"),
-            },
-        );
-        if need_master {
-            grid(ui, "set_sec_new", |ui| {
-                row(ui, tr("New master password"), |ui| ui.add(egui::TextEdit::singleline(&mut self.new_master).password(true)).changed());
-                row(ui, tr("Repeat password"), |ui| ui.add(egui::TextEdit::singleline(&mut self.new_master2).password(true)).changed());
-                false
-            });
-        }
-        if ui.add_enabled(!busy, egui::Button::new(tr("Move secrets"))).clicked() {
+        let (title, sub) = match target {
+            SecretBackend::EncryptedFile => {
+                (tr("Move secrets to an encrypted file"), tr("Saved passwords and API keys move from the keychain into one file encrypted with your master password."))
+            }
+            SecretBackend::Keychain => (tr("Move secrets to the keychain"), tr("Saved passwords and API keys move from the encrypted file into the operating system keychain.")),
+        };
+        let mut move_clicked = false;
+        group_sub(ui, title, sub, |ui| {
+            if need_master {
+                row(ui, tr("New master password"), |ui| look::password_field(ui, &mut self.new_master, 300.0, "").changed());
+                row(ui, tr("Repeat password"), |ui| look::password_field(ui, &mut self.new_master2, 300.0, "").changed());
+            }
+            move_clicked = ui.add_enabled_ui(!busy, |ui| kit::button_ex(ui, Kind::Secondary, None, tr("Move secrets"), false)).inner.clicked();
+            false
+        });
+        if move_clicked {
             let keys = {
                 let mut k = cx.conns.store.all_secret_keys();
                 for p in [AiProvider::Anthropic, AiProvider::OpenAiCompatible] {
@@ -840,14 +1182,18 @@ impl SettingsTab {
             }
         }
         if current == SecretBackend::EncryptedFile {
-            heading(ui, tr("Change master password"));
-            grid(ui, "set_sec_chg", |ui| {
-                row(ui, tr("Current password"), |ui| ui.add(egui::TextEdit::singleline(&mut self.old_master).password(true)).changed());
-                row(ui, tr("New master password"), |ui| ui.add(egui::TextEdit::singleline(&mut self.new_master).password(true)).changed());
-                row(ui, tr("Repeat password"), |ui| ui.add(egui::TextEdit::singleline(&mut self.new_master2).password(true)).changed());
+            let (mut change, mut lock) = (false, false);
+            group(ui, tr("Change master password"), |ui| {
+                row(ui, tr("Current password"), |ui| look::password_field(ui, &mut self.old_master, 300.0, "").changed());
+                row(ui, tr("New master password"), |ui| look::password_field(ui, &mut self.new_master, 300.0, "").changed());
+                row(ui, tr("Repeat password"), |ui| look::password_field(ui, &mut self.new_master2, 300.0, "").changed());
+                ui.horizontal(|ui| {
+                    change = ui.add_enabled_ui(!busy, |ui| kit::button_ex(ui, Kind::Secondary, None, tr("Change password"), false)).inner.clicked();
+                    lock = kit::button_ex(ui, Kind::Ghost, Some(icon::LOCK), tr("Lock now"), false).clicked();
+                });
                 false
             });
-            if ui.add_enabled(!busy, egui::Button::new(tr("Change password"))).clicked() {
+            if change {
                 let mgr: parking_lot::RwLockReadGuard<'_, SecretsManager> = cx.services.secrets.read();
                 if self.new_master.is_empty() || self.new_master != self.new_master2 {
                     self.message = Some(Err(tr("The passwords do not match.").to_string()));
@@ -861,23 +1207,18 @@ impl SettingsTab {
                     self.message = Some(Err(tr("The vault is not active.").to_string()));
                 }
             }
-            if ui.button((ternarygrid_icons::ic(icon::LOCK), tr("Lock now"))).clicked()
-                && let Some(v) = cx.services.secrets.read().vault()
-            {
+            if lock && let Some(v) = cx.services.secrets.read().vault() {
                 v.lock();
             }
         }
         if busy {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.weak(tr("Working…"));
-            });
+            parts::spinner_label(ui, tr("Working…"));
         }
         match &self.message {
             Some(Ok(m)) => {
-                ui.label(RichText::new(m).color(crate::theme::success_color(ui.visuals().dark_mode)));
+                look::callout(ui, Tone::Success, None, m, |_| {});
             }
-            Some(Err(e)) => crate::widgets::error_box(ui, e),
+            Some(Err(e)) => look::error(ui, e),
             None => {}
         }
         changed | moved
@@ -885,19 +1226,102 @@ impl SettingsTab {
 
     fn accessibility(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let a = &mut cx.settings.accessibility;
-        grid(ui, "set_a11y", |ui| {
+        group(ui, "", |ui| {
+            ui.spacing_mut().item_spacing.y = 14.0;
             let mut c = false;
-            ui.label("");
-            c |= check(ui, &mut a.high_contrast, tr("High contrast"));
-            ui.label("");
-            c |= check(ui, &mut a.reduce_motion, tr("Reduce motion"));
-            ui.label("");
-            c |= check(ui, &mut a.focus_indicator, tr("Always show the keyboard focus"));
-            ui.label("");
+            c |= look::checkbox_sub(ui, &mut a.high_contrast, tr("High contrast"), Some(tr("Stronger borders and text, for bright rooms and low vision."))).changed();
+            c |= look::checkbox_sub(ui, &mut a.reduce_motion, tr("Reduce motion"), Some(tr("No fading or sliding windows and pop-ups."))).changed();
+            c |= look::checkbox_sub(ui, &mut a.focus_indicator, tr("Always show the keyboard focus"), Some(tr("A ring around the focused control, also after mouse clicks.")))
+                .changed();
             c |= check(ui, &mut cx.settings.tasks.scheduler_enabled, tr("Run scheduled tasks while TernaryGrid is open"));
             c
         })
     }
+
+    /// The side navigation: search, sections, the settings folder and reset.
+    fn sections_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
+        let mut changed = false;
+        ui.spacing_mut().item_spacing.y = 2.0;
+        kit::search_field(ui, egui::Id::new("settings_search"), &mut self.search, tr("Search settings"), ui.available_width());
+        ui.add_space(8.0);
+        let query = self.search.trim().to_lowercase();
+        let shown: Vec<Section> = Section::ALL.iter().copied().filter(|s| s.matches(&query)).collect();
+        if !shown.is_empty() && !shown.contains(&self.section) {
+            self.section = shown[0];
+        }
+        if shown.is_empty() {
+            let p = ternarygrid_ui::pal(ui);
+            ui.add_space(4.0);
+            ui.label(RichText::new(tr("No setting matches.")).color(p.text_muted));
+        }
+        for s in shown {
+            if kit::nav_item(ui, s.icon(), s.label(), self.section == s).clicked() {
+                self.section = s;
+                self.message = None;
+                self.recording = None;
+            }
+        }
+        ui.add_space(12.0);
+        let dir = cx.services.paths.config_dir().to_path_buf();
+        if kit::ghost(ui, Some(icon::FOLDER_OPEN), tr("Open settings folder")).on_hover_text(dir.display().to_string()).clicked() {
+            let _ = open::that_detached(&dir);
+        }
+        if self.confirm_reset {
+            let p = ternarygrid_ui::pal(ui);
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(RichText::new(tr("Reset every setting to its default? Connections, scripts and passwords are kept.")).color(p.text_muted)).wrap());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if kit::button_ex(ui, Kind::Danger, None, tr("Reset"), true).clicked() {
+                    reset_settings(cx.settings);
+                    self.keymap = None;
+                    self.confirm_reset = false;
+                    self.message = Some(Ok(tr("The settings were reset to their defaults.").to_string()));
+                    changed = true;
+                }
+                if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), true).clicked() {
+                    self.confirm_reset = false;
+                }
+            });
+        } else if kit::ghost(ui, Some(icon::ARROW_COUNTER_CLOCKWISE), tr("Reset all settings…")).clicked() {
+            self.confirm_reset = true;
+        }
+        changed
+    }
+}
+
+/// A navigator row as it looks for a connection of the type (its stripe).
+fn preview_row(ui: &mut Ui, name: &str, kind: Option<ternarygrid_core::DbKind>, marker: Option<egui::Color32>) {
+    let p = ternarygrid_ui::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(280.0, 26.0), egui::Sense::hover());
+    let painter = ui.painter();
+    if let Some(m) = marker {
+        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + 4.0), egui::pos2(rect.left() + 3.0, rect.bottom() - 4.0)), 2, m);
+    }
+    let cy = rect.center().y;
+    painter.text(egui::pos2(rect.left() + 14.0, cy), egui::Align2::CENTER_CENTER, icon::CARET_RIGHT, ternarygrid_ui::style::icon_font(11.0), p.text_faint);
+    let logo = egui::Rect::from_center_size(egui::pos2(rect.left() + 32.0, cy), egui::vec2(16.0, 16.0));
+    let kind = kind.unwrap_or(ternarygrid_core::DbKind::Postgres);
+    if !crate::dblogo::paint(ui, kind, logo, crate::theme::logo_color(kind, ui.visuals().dark_mode)) {
+        ui.painter().text(logo.center(), egui::Align2::CENTER_CENTER, crate::nav::db_icon(kind), ternarygrid_ui::style::icon_font(15.0), p.text_muted);
+    }
+    let font = ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()));
+    let r = ui.painter().text(egui::pos2(rect.left() + 46.0, cy), egui::Align2::LEFT_CENTER, name, font, p.text);
+    ui.painter().circle_filled(egui::pos2(r.right() + 9.0, cy), 3.5, p.ok);
+}
+
+/// A tab as it looks for a connection of the type (the line along its top).
+fn preview_tab(ui: &mut Ui, label: &str, marker: Option<egui::Color32>) {
+    let p = ternarygrid_ui::pal(ui);
+    let font = egui::FontId::proportional(ternarygrid_ui::style::body_size(ui.ctx()));
+    let g = ui.painter().layout_no_wrap(label.to_string(), font, p.text);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(g.size().x + 50.0, 34.0), egui::Sense::hover());
+    let top = egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
+    ui.painter().rect(rect, top, p.canvas, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+    let line = marker.unwrap_or(p.accent);
+    ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left() + 8.0, rect.top()), egui::pos2(rect.right() - 8.0, rect.top() + 3.0)), 1, line);
+    ui.painter().text(egui::pos2(rect.left() + 22.0, rect.center().y), egui::Align2::CENTER_CENTER, icon::FILE_SQL, ternarygrid_ui::style::icon_font(14.0), p.text_muted);
+    ui.painter().galley(egui::pos2(rect.left() + 36.0, rect.center().y - g.size().y / 2.0), g, p.text);
 }
 
 impl TabView for SettingsTab {
@@ -915,44 +1339,25 @@ impl TabView for SettingsTab {
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let mut changed = false;
-        egui::Panel::left("settings_sections").resizable(false).exact_size(210.0).show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for s in Section::ALL {
-                if ternarygrid_ui::kit::nav_item(ui, s.icon(), s.label(), self.section == s).clicked() {
-                    self.section = s;
-                    self.message = None;
-                    self.recording = None;
-                }
-            }
-            ui.add_space(12.0);
-            let dir = cx.services.paths.config_dir().to_path_buf();
-            if ternarygrid_ui::kit::ghost(ui, Some(icon::FOLDER_OPEN), tr("Open settings folder")).on_hover_text(dir.display().to_string()).clicked() {
-                let _ = open::that_detached(&dir);
-            }
-            if self.confirm_reset {
-                ui.label(tr("Reset every setting to its default? Connections, scripts and passwords are kept."));
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Reset")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        reset_settings(cx.settings);
-                        self.keymap = None;
-                        self.confirm_reset = false;
-                        self.message = Some(Ok(tr("The settings were reset to their defaults.").to_string()));
-                        changed = true;
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        self.confirm_reset = false;
-                    }
-                });
-            } else if ternarygrid_ui::kit::ghost(ui, Some(icon::ARROW_COUNTER_CLOCKWISE), tr("Reset all settings…")).clicked() {
-                self.confirm_reset = true;
-            }
+        let p = ternarygrid_ui::pal(ui);
+        let nav_frame = egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin::symmetric(10, 14)).stroke(egui::Stroke::NONE);
+        let nav = egui::Panel::left("settings_sections").resizable(false).exact_size(230.0).frame(nav_frame).show(ui, |ui| {
+            changed |= self.sections_ui(ui, cx);
         });
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new(self.section.label()).font(ternarygrid_ui::style::semibold(ui.ctx(), 18.0)));
-            ui.add_space(8.0);
+        let r = nav.response.rect;
+        ui.painter().vline(r.right(), r.y_range(), egui::Stroke::new(1.0, p.border));
+        let content_frame = egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin { left: 28, right: 12, top: 20, bottom: 0 });
+        egui::CentralPanel::default().frame(content_frame).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ternarygrid_ui::style::form_spacing(ui);
+                ui.set_max_width((ui.available_width() - 16.0).min(860.0));
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.label(RichText::new(self.section.label()).font(ternarygrid_ui::style::semibold(ui.ctx(), 19.0)).color(p.text));
+                if let Some(intro) = self.section.intro() {
+                    ui.add(egui::Label::new(RichText::new(intro).color(p.text_muted)).wrap());
+                }
+                ui.add_space(10.0);
+                ui.spacing_mut().item_spacing.y = 14.0;
                 changed |= match self.section {
                     Section::General => self.general(ui, cx),
                     Section::Editor => self.editor(ui, cx),
@@ -967,6 +1372,12 @@ impl TabView for SettingsTab {
                     Section::Security => self.security(ui, cx),
                     Section::Accessibility => self.accessibility(ui, cx),
                 };
+                if self.section != Section::Security
+                    && let Some(Ok(m)) = &self.message
+                {
+                    look::callout(ui, Tone::Success, None, m, |_| {});
+                }
+                ui.add_space(20.0);
             });
         });
         if changed {

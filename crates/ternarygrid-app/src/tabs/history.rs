@@ -4,6 +4,7 @@
 use crate::command::AppCommand;
 use crate::cx::AppContext;
 use crate::tabs::TabView;
+use crate::tabs::tasks::look;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use std::time::{Duration, Instant};
@@ -103,6 +104,14 @@ impl HistoryTab {
     }
 }
 
+fn status_color(s: QueryStatus, p: &ternarygrid_ui::Palette) -> egui::Color32 {
+    match s {
+        QueryStatus::Ok => p.ok,
+        QueryStatus::Error => p.err,
+        QueryStatus::Cancelled => p.warn,
+    }
+}
+
 fn status_label(s: QueryStatus) -> &'static str {
     match s {
         QueryStatus::Ok => tr("Success"),
@@ -132,98 +141,148 @@ impl TabView for HistoryTab {
             ui.ctx().request_repaint_after(Duration::from_millis(260).saturating_sub(t.elapsed()));
         }
         let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.label(icon::MAGNIFYING_GLASS);
-            changed |= ui.add(egui::TextEdit::singleline(&mut self.text).hint_text(tr("Search SQL text…")).desired_width(260.0)).changed();
+        let pal = ternarygrid_ui::pal(ui);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ternarygrid_ui::parts::toolbar(ui, |ui| {
+            changed |= ternarygrid_ui::kit::search_field(ui, egui::Id::new("hist_search"), &mut self.text, tr("Search SQL text…"), 300.0).changed();
             let conn_name = self.connection.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("All connections").to_string());
-            egui::ComboBox::from_id_salt("hist_conn").icon(ternarygrid_ui::kit::combo_caret).selected_text(conn_name).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("hist_conn").icon(ternarygrid_ui::kit::combo_caret).width(170.0).selected_text(conn_name).show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut self.connection, None, tr("All connections")).changed();
                 for c in cx.conns.configs() {
                     changed |= ui.selectable_value(&mut self.connection, Some(c.id.clone()), &c.name).changed();
                 }
             });
             let st = self.status.map(status_label).unwrap_or(tr("Any status"));
-            egui::ComboBox::from_id_salt("hist_status").icon(ternarygrid_ui::kit::combo_caret).selected_text(st).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("hist_status").icon(ternarygrid_ui::kit::combo_caret).width(130.0).selected_text(st).show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut self.status, None, tr("Any status")).changed();
                 for s in [QueryStatus::Ok, QueryStatus::Error, QueryStatus::Cancelled] {
                     changed |= ui.selectable_value(&mut self.status, Some(s), status_label(s)).changed();
                 }
             });
-            for (p, l) in [(Period::Day, tr("24 hours")), (Period::Week, tr("7 days")), (Period::Month, tr("30 days")), (Period::All, tr("All"))] {
-                if ui.selectable_label(self.period == p, l).clicked() && self.period != p {
-                    self.period = p;
-                    changed = true;
+            changed |= ternarygrid_ui::parts::segmented(
+                ui,
+                &mut self.period,
+                &[(Period::Day, tr("24 hours")), (Period::Week, tr("7 days")), (Period::Month, tr("30 days")), (Period::All, tr("All"))],
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ternarygrid_ui::kit::icon_button(ui, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked() {
+                    self.reload(cx);
                 }
-            }
-            if ui.button(ternarygrid_icons::ic(icon::ARROW_CLOCKWISE)).on_hover_text(tr("Refresh")).clicked() {
-                self.reload(cx);
-            }
+            });
         });
         if changed {
             self.dirty_at = Some(Instant::now());
         }
-        if let Some(e) = &self.error {
-            crate::widgets::error_box(ui, e);
-        }
-        ui.weak(trf("{} of {} entries", &[&self.entries.len(), &self.total]));
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            if let Some(e) = &self.error {
+                look::error(ui, e);
+            }
+            ui.label(RichText::new(trf("{} of {} entries", &[&self.entries.len(), &self.total])).size(12.0).color(pal.text_faint));
+        });
         let sel_entry = self.selected.and_then(|i| self.entries.get(i).cloned());
         let names: std::collections::HashMap<String, String> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
-        let rows: Vec<Vec<String>> = self
-            .entries
-            .iter()
-            .map(|e| {
-                let when =
-                    chrono::DateTime::from_timestamp_millis(e.timestamp_ms).map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
-                let conn = e.connection_id.as_ref().and_then(|c| names.get(c).cloned()).or_else(|| e.connection_name.clone()).unwrap_or_default();
-                vec![
-                    when,
-                    conn,
-                    e.duration_ms.map(|d| crate::widgets::format_duration(Duration::from_millis(d))).unwrap_or_default(),
-                    e.rows.map(|r| r.to_string()).unwrap_or_default(),
-                    status_label(e.status).to_string(),
-                    e.sql.split_whitespace().collect::<Vec<_>>().join(" "),
-                ]
-            })
-            .collect();
-        let detail_h = if sel_entry.is_some() { 160.0 } else { 0.0 };
-        let avail = ui.available_height() - detail_h;
-        ui.allocate_ui(egui::vec2(ui.available_width(), avail.max(80.0)), |ui| {
-            let r = crate::widgets::simple_table(ui, "history_table", &[tr("Time"), tr("Connection"), tr("Duration"), tr("Rows"), tr("Status"), tr("SQL")], &rows, self.selected);
-            if let Some(i) = r.clicked {
-                self.selected = Some(i);
-            }
-            if let Some(i) = r.double_clicked
-                && let Some(e) = self.entries.get(i).cloned()
-            {
-                self.open_in_editor(cx, &e);
-            }
-            if let Some(i) = r.context_row {
-                self.selected = Some(i);
-            }
-        });
-        if let Some(e) = sel_entry {
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button((ternarygrid_icons::ic(icon::FILE_SQL), tr("Open in SQL editor"))).clicked() {
-                    self.open_in_editor(cx, &e);
-                }
-                if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).clicked() {
-                    ui.ctx().copy_text(e.sql.clone());
-                }
-                if ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Delete"))).clicked() {
-                    if let Some(store) = cx.services.history.clone() {
-                        let _ = store.lock().delete(&[e.id]);
+        let detail_h = if sel_entry.is_some() { 170.0 } else { 0.0 };
+        let avail = (ui.available_height() - detail_h).max(80.0);
+        let cols = [
+            look::Col::new(tr("Time"), look::Width::Initial(170.0)),
+            look::Col::new(tr("Connection"), look::Width::Initial(130.0)),
+            look::Col::new(tr("Duration"), look::Width::Initial(90.0)).right(),
+            look::Col::new(tr("Rows"), look::Width::Initial(80.0)).right(),
+            look::Col::new(tr("Status"), look::Width::Initial(100.0)),
+            look::Col::new(tr("SQL"), look::Width::Rest(160.0)),
+        ];
+        let mut clicked = None;
+        let mut open = None;
+        let selected = self.selected;
+        let entries = &self.entries;
+        ui.allocate_ui(egui::vec2(ui.available_width(), avail), |ui| {
+            // The table takes the room above the details: they stay at the bottom.
+            ui.set_min_height(avail);
+            egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 0 }).show(ui, |ui| {
+                look::table(ui, "history_table", &cols, entries.len(), |row, i| {
+                    let e = &entries[i];
+                    row.set_selected(selected == Some(i));
+                    let when = chrono::DateTime::from_timestamp_millis(e.timestamp_ms)
+                        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_default();
+                    let conn = e.connection_id.as_ref().and_then(|c| names.get(c).cloned()).or_else(|| e.connection_name.clone()).unwrap_or_default();
+                    look::cell(row, false, |ui| {
+                        look::cell_text(ui, look::mono(ui, &when, pal.text_muted));
+                    });
+                    look::cell(row, false, |ui| {
+                        look::cell_text(ui, conn);
+                    });
+                    look::cell(row, true, |ui| {
+                        look::cell_text(ui, e.duration_ms.map(|d| crate::widgets::format_duration(Duration::from_millis(d))).unwrap_or_default());
+                    });
+                    look::cell(row, true, |ui| {
+                        look::cell_text(ui, e.rows.map(|r| r.to_string()).unwrap_or_else(|| "—".into()));
+                    });
+                    look::cell(row, false, |ui| {
+                        look::cell_text(ui, RichText::new(status_label(e.status)).color(status_color(e.status, &pal)));
+                    });
+                    look::cell(row, false, |ui| {
+                        let sql = e.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let r = look::cell_text(ui, look::mono(ui, &sql, pal.text));
+                        if e.sql.len() > 120 {
+                            r.on_hover_text(e.sql.chars().take(4000).collect::<String>());
+                        }
+                    });
+                    let resp = row.response();
+                    if resp.clicked() || resp.secondary_clicked() {
+                        clicked = Some(i);
                     }
-                    self.selected = None;
-                    self.reload(cx);
-                }
-                if let Some(err) = &e.error_message {
-                    ui.label(RichText::new(err.lines().next().unwrap_or("")).color(crate::theme::error_color(ui.visuals().dark_mode)));
-                }
+                    if resp.double_clicked() {
+                        open = Some(i);
+                    }
+                });
             });
-            egui::ScrollArea::vertical().id_salt("hist_sql").max_height(120.0).show(ui, |ui| {
-                let mut t = e.sql.as_str();
-                ui.add(egui::TextEdit::multiline(&mut t).code_editor().desired_width(f32::INFINITY));
+        });
+        if let Some(i) = clicked {
+            self.selected = Some(i);
+        }
+        if let Some(i) = open
+            && let Some(e) = self.entries.get(i).cloned()
+        {
+            self.open_in_editor(cx, &e);
+        }
+        if let Some(e) = sel_entry {
+            let frame = egui::Frame::new()
+                .fill(pal.surface)
+                .stroke(egui::Stroke::new(1.0, pal.border))
+                .corner_radius(ternarygrid_ui::style::RADIUS_LG)
+                .inner_margin(12)
+                .outer_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 12 });
+            frame.show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 10.0;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Secondary, Some(icon::FILE_SQL), tr("Open in SQL editor"), true).clicked() {
+                        self.open_in_editor(cx, &e);
+                    }
+                    if ternarygrid_ui::kit::ghost(ui, Some(icon::COPY), tr("Copy")).clicked() {
+                        ui.ctx().copy_text(e.sql.clone());
+                    }
+                    if ternarygrid_ui::kit::ghost(ui, Some(icon::TRASH), tr("Delete")).clicked() {
+                        if let Some(store) = cx.services.history.clone() {
+                            let _ = store.lock().delete(&[e.id]);
+                        }
+                        self.selected = None;
+                        self.reload(cx);
+                    }
+                    if let Some(err) = &e.error_message {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(RichText::new(err.lines().next().unwrap_or("")).color(pal.err)).truncate());
+                        });
+                    }
+                });
+                let conn = e.connection_id.clone().filter(|c| cx.conns.is_connected(c));
+                ui.allocate_ui(egui::vec2(ui.available_width(), 96.0), |ui| match conn {
+                    Some(conn) => crate::tabs::code(ui, cx, &conn, ("hist_sql", e.id), &e.sql),
+                    None => crate::widgets::code_view(ui, ("hist_sql", e.id), &e.sql, &[]),
+                });
             });
         }
     }

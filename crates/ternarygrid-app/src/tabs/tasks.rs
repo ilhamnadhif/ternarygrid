@@ -9,6 +9,7 @@
 
 mod draft;
 mod editor;
+pub(crate) mod look;
 mod system;
 
 pub use draft::{
@@ -24,13 +25,14 @@ use crate::tabs::dbtools::spawn_blocking;
 use chrono::{DateTime, Local};
 use editor::{EditorAction, TaskEditor};
 use egui::{Color32, RichText, Ui};
-use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use ternarygrid_core::{DbResult, tr, trf};
 use ternarygrid_tasks::{MessageLevel, Progress, RunLog, RunStatus, RunningInfo, TaskDef, TaskEvent, TaskRun, Trigger};
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts::Tone;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 
@@ -61,13 +63,14 @@ pub fn trigger_label(t: Trigger) -> &'static str {
     }
 }
 
-fn status_style(s: RunStatus, dark: bool) -> (&'static str, Color32) {
+/// The colour of a run's status text.
+fn status_color(s: RunStatus, p: &ternarygrid_ui::Palette) -> Color32 {
     match s {
-        RunStatus::Running => (icon::HOURGLASS, if dark { Color32::from_rgb(120, 170, 255) } else { Color32::from_rgb(30, 90, 200) }),
-        RunStatus::Succeeded => (icon::CHECK_CIRCLE, crate::theme::success_color(dark)),
-        RunStatus::Failed => (icon::X_CIRCLE, crate::theme::error_color(dark)),
-        RunStatus::Cancelled => (icon::PROHIBIT, crate::theme::warning_color(dark)),
-        RunStatus::Skipped => (icon::MINUS_CIRCLE, Color32::GRAY),
+        RunStatus::Running => p.accent_text,
+        RunStatus::Succeeded => p.ok,
+        RunStatus::Failed => p.err,
+        RunStatus::Cancelled => p.warn,
+        RunStatus::Skipped => p.text_faint,
     }
 }
 
@@ -821,12 +824,11 @@ impl TasksTab {
         if cx.settings.tasks.scheduler_enabled {
             return;
         }
-        let color = crate::theme::warning_color(ui.visuals().dark_mode);
-        egui::Frame::group(ui.style()).stroke(egui::Stroke::new(1.0, color)).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(icon::WARNING).color(color));
-                ui.label(tr("Scheduled runs are turned off: tasks run only when you start them (or through the system scheduler). Turn on \"Run scheduled tasks while TernaryGrid is open\" in the settings."));
-                if ui.button((ternarygrid_icons::ic(icon::GEAR), tr("Open settings"))).clicked() {
+        egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 0 }).show(ui, |ui| {
+            let text = tr("Scheduled runs are turned off: tasks run only when you start them (or through the system scheduler). Turn on \"Run scheduled tasks while TernaryGrid is open\" in the settings.");
+            let bw = kit::button_width(ui, Some(icon::GEAR), tr("Open settings"), true);
+            look::callout_with(ui, Tone::Warning, text, bw, |ui| {
+                if kit::button_ex(ui, Kind::Secondary, Some(icon::GEAR), tr("Open settings"), true).clicked() {
                     cx.push(AppCommand::OpenSettings);
                 }
             });
@@ -839,8 +841,9 @@ impl TasksTab {
         let one = sel.len() == 1;
         let any = !sel.is_empty();
         let can_run = cx.services.scheduler.is_some();
-        ui.horizontal_wrapped(|ui| {
-            ui.menu_button((ternarygrid_icons::ic(icon::PLUS), tr("New task")), |ui| {
+        ternarygrid_ui::parts::toolbar(ui, |ui| {
+            let new = kit::button_ex(ui, Kind::Primary, Some(icon::PLUS), tr("New task"), true);
+            egui::Popup::menu(&new).show(|ui| {
                 for k in NewTaskKind::ALL {
                     if ui.button(format!("{} {}", k.icon(), k.label())).clicked() {
                         self.open_new_task(cx, k);
@@ -852,22 +855,23 @@ impl TasksTab {
                     ui.add_enabled(false, egui::Button::new(format!("{glyph} {label}"))).on_disabled_hover_text(tr("Created with \"Save as task\" in the transfer wizards"));
                 }
             });
-            if ui.add_enabled(one, egui::Button::new((ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Edit")))).clicked() {
+            let ghost = |ui: &mut Ui, enabled: bool, glyph: Option<&str>, label: &str| ui.add_enabled_ui(enabled, |ui| kit::button_ex(ui, Kind::Ghost, glyph, label, true)).inner;
+            if ghost(ui, one, Some(icon::PENCIL_SIMPLE), tr("Edit")).clicked() {
                 self.edit_task(&sel[0]);
             }
-            if ui.add_enabled(any, egui::Button::new((ternarygrid_icons::ic(icon::COPY), tr("Duplicate")))).clicked() {
+            if ghost(ui, any, Some(icon::COPY), tr("Duplicate")).clicked() {
                 self.duplicate(cx, sel.clone());
             }
-            if ui.add_enabled(any, egui::Button::new((ternarygrid_icons::ic(icon::TRASH), tr("Delete")))).clicked() {
+            if ghost(ui, any, Some(icon::TRASH), tr("Delete")).clicked() {
                 self.confirm_delete = Some(sel.clone());
             }
             let all_enabled = any && sel.iter().all(|id| self.task(id).is_some_and(|t| t.enabled));
-            let (glyph, label) = if all_enabled { (icon::TOGGLE_LEFT, tr("Disable")) } else { (icon::TOGGLE_RIGHT, tr("Enable")) };
-            if ui.add_enabled(any, egui::Button::new(format!("{glyph} {label}"))).clicked() {
+            let label = if all_enabled { tr("Disable") } else { tr("Enable") };
+            if ghost(ui, any, None, label).clicked() {
                 self.set_enabled(cx, sel.clone(), !all_enabled);
             }
-            ui.separator();
-            let r = ui.add_enabled(any && can_run, egui::Button::new((ternarygrid_icons::ic(icon::PLAY), tr("Run now"))));
+            kit::vdivider(ui, 18.0);
+            let r = ui.add_enabled_ui(any && can_run, |ui| kit::button_ex(ui, Kind::Secondary, Some(icon::PLAY), tr("Run now"), true)).inner;
             if !can_run {
                 r.clone().on_disabled_hover_text(tr("Tasks cannot be run: the task scheduler is not available."));
             }
@@ -875,22 +879,24 @@ impl TasksTab {
                 self.run_tasks(cx, sel.clone());
             }
             let any_running = sel.iter().any(|id| running.contains(id));
-            if ui.add_enabled(any_running, egui::Button::new((ternarygrid_icons::ic(icon::STOP), tr("Cancel run")))).clicked() {
+            if ghost(ui, any_running, Some(icon::STOP), tr("Cancel run")).clicked() {
                 self.cancel_runs(cx, &sel);
             }
-            ui.separator();
+            kit::vdivider(ui, 18.0);
             let export_label = if any { tr("Export selected…") } else { tr("Export all…") };
-            if ui.add_enabled(!self.tasks.is_empty(), egui::Button::new(format!("{} {export_label}", icon::UPLOAD_SIMPLE))).clicked() {
+            if ghost(ui, !self.tasks.is_empty(), Some(icon::UPLOAD_SIMPLE), export_label).clicked() {
                 self.export(cx, sel.clone());
             }
-            if ui.button((ternarygrid_icons::ic(icon::DOWNLOAD_SIMPLE), tr("Import…"))).clicked() {
+            if ghost(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import…")).clicked() {
                 self.import(cx);
             }
-            ui.separator();
-            if ui.button(ternarygrid_icons::ic(icon::ARROW_CLOCKWISE)).on_hover_text(tr("Refresh")).clicked() {
-                self.reload_all(cx);
-            }
-            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text(tr("Filter…")).desired_width(160.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let w = (ui.available_width() - 40.0).clamp(90.0, 190.0);
+                kit::search_field(ui, egui::Id::new("tasks_filter"), &mut self.filter, tr("Filter…"), w);
+                if kit::icon_button(ui, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked() {
+                    self.reload_all(cx);
+                }
+            });
         });
     }
 
@@ -910,17 +916,23 @@ impl TasksTab {
     }
 
     fn folders_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.strong(tr("Folders"));
-            if ui.small_button(ternarygrid_icons::ic(icon::FOLDER_PLUS)).on_hover_text(tr("New folder")).clicked() {
-                self.folder_prompt = Some(FolderPrompt { rename: None, parent: self.folder.clone(), name: String::new() });
-            }
+            ui.add_space(14.0);
+            look::small_heading(ui, tr("Folders"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(4.0);
+                if kit::icon_button_ex(ui, icon::PLUS, tr("New folder"), false, 22.0).clicked() {
+                    self.folder_prompt = Some(FolderPrompt { rename: None, parent: self.folder.clone(), name: String::new() });
+                }
+            });
         });
-        ui.separator();
+        ui.add_space(4.0);
         let folders = self.folders.clone();
         egui::ScrollArea::vertical().id_salt("tasks_folders").auto_shrink([false, false]).show(ui, |ui| {
-            let total = self.tasks.len();
-            if ui.selectable_label(self.folder.is_none(), format!("{} {}  ({total})", icon::LIST_CHECKS, tr("All tasks"))).clicked() {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let total = self.tasks.len().to_string();
+            if look::tree_row(ui, 0, None, icon::LIST_CHECKS, tr("All tasks"), Some(&total), self.folder.is_none(), false).resp.clicked() {
                 self.folder = None;
             }
             for (i, f) in folders.iter().enumerate() {
@@ -930,41 +942,34 @@ impl TasksTab {
                 let depth = f.matches('/').count();
                 let name = f.rsplit('/').next().unwrap_or(f).to_string();
                 let has_children = folders.get(i + 1).is_some_and(|n| n.starts_with(&format!("{f}/")));
-                let count = self.tasks.iter().filter(|t| in_folder(t, f)).count();
-                ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 14.0);
-                    if has_children {
-                        let collapsed = self.collapsed.contains(f);
-                        if ui.small_button(if collapsed { icon::CARET_RIGHT } else { icon::CARET_DOWN }).clicked() {
-                            if collapsed {
-                                self.collapsed.remove(f);
-                            } else {
-                                self.collapsed.insert(f.clone());
-                            }
-                        }
+                let count = self.tasks.iter().filter(|t| in_folder(t, f)).count().to_string();
+                let open = self.folder.as_deref() == Some(f.as_str());
+                let collapsed = self.collapsed.contains(f);
+                let caret = has_children.then_some(!collapsed);
+                let row = look::tree_row(ui, depth, caret, if open { icon::FOLDER_OPEN } else { icon::FOLDER }, &name, Some(&count), open, false);
+                if row.caret {
+                    if collapsed {
+                        self.collapsed.remove(f);
                     } else {
-                        ui.add_space(18.0);
+                        self.collapsed.insert(f.clone());
                     }
-                    let open = self.folder.as_deref() == Some(f.as_str());
-                    let r = ui.selectable_label(open, format!("{} {name}  ({count})", if open { icon::FOLDER_OPEN } else { icon::FOLDER }));
-                    if r.clicked() {
-                        self.folder = Some(f.clone());
+                } else if row.resp.clicked() {
+                    self.folder = Some(f.clone());
+                }
+                row.resp.context_menu(|ui| {
+                    if ui.button((ternarygrid_icons::ic(icon::FOLDER_PLUS), tr("New sub-folder…"))).clicked() {
+                        self.folder_prompt = Some(FolderPrompt { rename: None, parent: Some(f.clone()), name: String::new() });
+                        ui.close();
                     }
-                    r.context_menu(|ui| {
-                        if ui.button((ternarygrid_icons::ic(icon::FOLDER_PLUS), tr("New sub-folder…"))).clicked() {
-                            self.folder_prompt = Some(FolderPrompt { rename: None, parent: Some(f.clone()), name: String::new() });
-                            ui.close();
-                        }
-                        if ui.button((ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Rename…"))).clicked() {
-                            self.folder_prompt = Some(FolderPrompt { rename: Some(f.clone()), parent: None, name: name.clone() });
-                            ui.close();
-                        }
-                        if ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Delete folder"))).on_hover_text(tr("Its tasks move to the parent folder")).clicked() {
-                            let path = f.clone();
-                            self.folder_op(cx, move |s| s.delete_folder(&path));
-                            ui.close();
-                        }
-                    });
+                    if ui.button((ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Rename…"))).clicked() {
+                        self.folder_prompt = Some(FolderPrompt { rename: Some(f.clone()), parent: None, name: name.clone() });
+                        ui.close();
+                    }
+                    if ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Delete folder"))).on_hover_text(tr("Its tasks move to the parent folder")).clicked() {
+                        let path = f.clone();
+                        self.folder_op(cx, move |s| s.delete_folder(&path));
+                        ui.close();
+                    }
                 });
             }
         });
@@ -973,187 +978,166 @@ impl TasksTab {
     fn list_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let visible: Vec<TaskDef> = self.visible().into_iter().cloned().collect();
         if let Some(e) = &self.runs_error {
-            crate::widgets::error_box(ui, &trf("Cannot read the run history: {}", &[e]));
+            look::error(ui, &trf("Cannot read the run history: {}", &[e]));
         }
         if visible.is_empty() {
-            ui.add_space(30.0);
-            ui.vertical_centered(|ui| {
-                ui.label(if self.tasks.is_empty() { tr("No tasks yet.") } else { tr("No task matches.") });
-                ui.weak(tr("Tasks save SQL scripts, backups, schema compares and shell commands so that they can run on demand or on a schedule."));
-            });
+            let title = if self.tasks.is_empty() { tr("No tasks yet.") } else { tr("No task matches.") };
+            kit::empty_state(
+                ui,
+                icon::LIST_CHECKS,
+                title,
+                tr("Tasks save SQL scripts, backups, schema compares and shell commands so that they can run on demand or on a schedule."),
+                |_| {},
+            );
             return;
         }
         let running: HashMap<String, RunningInfo> = cx.services.scheduler.as_ref().map(|s| s.running().into_iter().map(|r| (r.task_id.clone(), r)).collect()).unwrap_or_default();
         let next_runs: BTreeMap<String, DateTime<Local>> = cx.services.scheduler.as_ref().map(|s| s.next_runs()).unwrap_or_default();
         let scheduling = cx.settings.tasks.scheduler_enabled;
         let show_folder = self.folder.is_none();
-        let dark = ui.visuals().dark_mode;
+        let pal = ternarygrid_ui::pal(ui);
         let folders = self.folders.clone();
         let modifiers = ui.input(|i| i.modifiers);
-        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
         let mut actions: Vec<RowAction> = Vec::new();
         let now = Local::now();
-        TableBuilder::new(ui)
-            .id_salt("tasks_table")
-            .striped(true)
-            .resizable(true)
-            .sense(egui::Sense::click())
-            .auto_shrink([false, false])
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(26.0))
-            .column(Column::auto().at_least(170.0).at_most(420.0).clip(true).resizable(true))
-            .column(Column::auto().at_least(90.0).clip(true).resizable(true))
-            .column(Column::auto().at_least(130.0).at_most(320.0).clip(true).resizable(true))
-            .column(Column::auto().at_least(120.0).clip(true).resizable(true))
-            .column(Column::remainder().at_least(150.0).clip(true))
-            .header(row_h + 2.0, |mut h| {
-                h.col(|ui| {
-                    ui.label(icon::POWER).on_hover_text(tr("Enabled"));
-                });
-                for title in [tr("Name"), tr("Type"), tr("Schedule"), tr("Next run"), tr("Last run")] {
-                    h.col(|ui| {
-                        ui.strong(title);
-                    });
+        let cols = [
+            look::Col::new("", look::Width::Exact(34.0)),
+            look::Col::new(tr("Name"), look::Width::Initial(250.0)),
+            look::Col::new(tr("Type"), look::Width::Initial(130.0)),
+            look::Col::new(tr("Schedule"), look::Width::Initial(160.0)),
+            look::Col::new(tr("Next run"), look::Width::Initial(100.0)),
+            look::Col::new(tr("Last run"), look::Width::Rest(160.0)),
+        ];
+        look::table(ui, "tasks_table", &cols, visible.len(), |row, i| {
+            let t = &visible[i];
+            row.set_selected(self.selected.iter().any(|s| s == &t.id));
+            look::cell(row, false, |ui| {
+                let mut on = t.enabled;
+                if look::checkbox(ui, &mut on, "").on_hover_text(tr("Enabled: the scheduler runs the task on its schedule")).changed() {
+                    actions.push(RowAction::Enable(vec![t.id.clone()], on));
                 }
-            })
-            .body(|body| {
-                body.rows(row_h, visible.len(), |mut row| {
-                    let i = row.index();
-                    let t = &visible[i];
-                    row.set_selected(self.selected.iter().any(|s| s == &t.id));
-                    row.col(|ui| {
-                        let mut on = t.enabled;
-                        if ui.checkbox(&mut on, "").on_hover_text(tr("Enabled: the scheduler runs the task on its schedule")).changed() {
-                            actions.push(RowAction::Enable(vec![t.id.clone()], on));
-                        }
-                    });
-                    row.col(|ui| {
-                        let text = if show_folder && t.folder.is_some() { format!("{} {}", kind_icon(&t.kind), t.path()) } else { format!("{} {}", kind_icon(&t.kind), t.name) };
-                        let mut rt = RichText::new(text);
-                        if !t.enabled {
-                            rt = rt.weak();
-                        }
-                        let r = ui.add(egui::Label::new(rt).truncate().selectable(false));
-                        if let Some(d) = &t.description {
-                            r.on_hover_text(d);
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.label(kind_label(&t.kind));
-                    });
-                    row.col(|ui| match &t.schedule {
-                        Some(s) => {
-                            ui.add(egui::Label::new(s.describe()).truncate().selectable(false));
-                            if t.os_scheduler {
-                                ui.label(RichText::new(icon::CLOCK).weak()).on_hover_text(trf("Also registered with {}", &[&scheduler_name()]));
-                            }
-                        }
-                        None => {
-                            ui.weak(tr("Manual"));
-                        }
-                    });
-                    row.col(|ui| {
-                        let next = if !t.enabled {
-                            None
-                        } else if let Some(n) = next_runs.get(&t.id) {
-                            Some((*n, false))
-                        } else {
-                            t.schedule.as_ref().and_then(|s| {
-                                let anchor = self.latest.get(&t.id).map(|r| r.started.with_timezone(&Local)).unwrap_or_else(|| t.updated.with_timezone(&Local));
-                                s.next_after_skipping(&anchor.min(now), &now).map(|n| (n, true))
-                            })
-                        };
-                        match next {
-                            Some((n, false)) => {
-                                ui.label(when(n));
-                            }
-                            Some((n, true)) => {
-                                let hint = if scheduling { tr("Expected; the scheduler has not planned it yet") } else { tr("Scheduled runs are turned off") };
-                                ui.label(RichText::new(when(n)).weak()).on_hover_text(hint);
-                            }
-                            None => {
-                                ui.weak("—");
-                            }
-                        }
-                    });
-                    row.col(|ui| {
-                        if let Some(r) = running.get(&t.id) {
-                            let (glyph, color) = status_style(RunStatus::Running, dark);
-                            let elapsed = (chrono::Utc::now() - r.started).to_std().unwrap_or_default();
-                            let mut text = format!("{glyph} {} {}", tr("Running"), crate::widgets::format_duration(elapsed));
-                            if let Some(p) = self.progress.get(&r.run_id) {
-                                match p.total {
-                                    Some(total) if total > 0 => text.push_str(&format!(" · {}/{}", p.done, total)),
-                                    _ if p.done > 0 => text.push_str(&format!(" · {}", p.done)),
-                                    _ => {}
-                                }
-                            }
-                            ui.label(RichText::new(text).color(color));
-                        } else if let Some(l) = self.latest.get(&t.id) {
-                            let (glyph, color) = status_style(l.status, dark);
-                            let r = ui
-                                .label(RichText::new(format!("{glyph} {} · {} · {}", status_label(l.status), when(l.started.with_timezone(&Local)), run_duration(l))).color(color));
-                            if let Some(e) = &l.error {
-                                r.on_hover_text(e);
-                            }
-                        } else {
-                            ui.weak(tr("never"));
-                        }
-                    });
-                    let resp = row.response();
-                    if resp.clicked() {
-                        actions.push(RowAction::Click(i, t.id.clone()));
-                    }
-                    if resp.double_clicked() {
-                        actions.push(RowAction::Edit(t.id.clone()));
-                    }
-                    let targets = if self.selected.iter().any(|s| s == &t.id) { self.selected.clone() } else { vec![t.id.clone()] };
-                    resp.context_menu(|ui| {
-                        if ui.button((ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Edit…"))).clicked() {
-                            actions.push(RowAction::Edit(t.id.clone()));
-                            ui.close();
-                        }
-                        if ui.button((ternarygrid_icons::ic(icon::PLAY), tr("Run now"))).clicked() {
-                            actions.push(RowAction::Run(targets.clone()));
-                            ui.close();
-                        }
-                        if running.contains_key(&t.id) && ui.button((ternarygrid_icons::ic(icon::STOP), tr("Cancel run"))).clicked() {
-                            actions.push(RowAction::Cancel(targets.clone()));
-                            ui.close();
-                        }
-                        if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Duplicate"))).clicked() {
-                            actions.push(RowAction::Duplicate(targets.clone()));
-                            ui.close();
-                        }
-                        let label = if t.enabled { tr("Disable") } else { tr("Enable") };
-                        if ui.button(format!("{} {label}", if t.enabled { icon::TOGGLE_LEFT } else { icon::TOGGLE_RIGHT })).clicked() {
-                            actions.push(RowAction::Enable(targets.clone(), !t.enabled));
-                            ui.close();
-                        }
-                        ui.menu_button((ternarygrid_icons::ic(icon::FOLDER), tr("Move to")), |ui| {
-                            if ui.button(tr("(top level)")).clicked() {
-                                actions.push(RowAction::Move(targets.clone(), None));
-                                ui.close();
-                            }
-                            for f in &folders {
-                                if ui.button(format!("{} {f}", icon::FOLDER)).clicked() {
-                                    actions.push(RowAction::Move(targets.clone(), Some(f.clone())));
-                                    ui.close();
-                                }
-                            }
-                        });
-                        if ui.button((ternarygrid_icons::ic(icon::UPLOAD_SIMPLE), tr("Export…"))).clicked() {
-                            actions.push(RowAction::Export(targets.clone()));
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Delete…"))).clicked() {
-                            actions.push(RowAction::Delete(targets.clone()));
-                            ui.close();
-                        }
-                    });
-                });
             });
+            look::cell(row, false, |ui| {
+                ui.label(RichText::new(kind_icon(&t.kind)).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.text_muted));
+                let name = if show_folder && t.folder.is_some() { t.path() } else { t.name.clone() };
+                let r = look::cell_text(ui, RichText::new(name).color(if t.enabled { pal.text } else { pal.text_faint }));
+                if let Some(d) = &t.description {
+                    r.on_hover_text(d);
+                }
+            });
+            look::cell(row, false, |ui| {
+                look::cell_text(ui, RichText::new(kind_label(&t.kind)).color(pal.text_muted));
+            });
+            look::cell(row, false, |ui| match &t.schedule {
+                Some(s) => {
+                    look::cell_text(ui, RichText::new(s.describe()).color(pal.text_muted));
+                    if t.os_scheduler {
+                        ui.label(RichText::new(icon::CLOCK).color(pal.text_faint)).on_hover_text(trf("Also registered with {}", &[&scheduler_name()]));
+                    }
+                }
+                None => {
+                    look::cell_text(ui, RichText::new(tr("Manual")).color(pal.text_muted));
+                }
+            });
+            look::cell(row, false, |ui| {
+                let next = if !t.enabled {
+                    None
+                } else if let Some(n) = next_runs.get(&t.id) {
+                    Some((*n, false))
+                } else {
+                    t.schedule.as_ref().and_then(|s| {
+                        let anchor = self.latest.get(&t.id).map(|r| r.started.with_timezone(&Local)).unwrap_or_else(|| t.updated.with_timezone(&Local));
+                        s.next_after_skipping(&anchor.min(now), &now).map(|n| (n, true))
+                    })
+                };
+                match next {
+                    Some((n, false)) => {
+                        look::cell_text(ui, look::mono(ui, &when(n), pal.text_muted));
+                    }
+                    Some((n, true)) => {
+                        let hint = if scheduling { tr("Expected; the scheduler has not planned it yet") } else { tr("Scheduled runs are turned off") };
+                        look::cell_text(ui, look::mono(ui, &when(n), pal.text_faint)).on_hover_text(hint);
+                    }
+                    None => {
+                        look::cell_text(ui, look::mono(ui, "—", pal.text_faint));
+                    }
+                }
+            });
+            look::cell(row, false, |ui| {
+                if let Some(r) = running.get(&t.id) {
+                    let elapsed = (chrono::Utc::now() - r.started).to_std().unwrap_or_default();
+                    let mut text = format!("{} {}", tr("Running"), crate::widgets::format_duration(elapsed));
+                    if let Some(p) = self.progress.get(&r.run_id) {
+                        match p.total {
+                            Some(total) if total > 0 => text.push_str(&format!(" · {}/{}", p.done, total)),
+                            _ if p.done > 0 => text.push_str(&format!(" · {}", p.done)),
+                            _ => {}
+                        }
+                    }
+                    look::cell_text(ui, RichText::new(text).color(status_color(RunStatus::Running, &pal)));
+                } else if let Some(l) = self.latest.get(&t.id) {
+                    let text = format!("{} · {} · {}", status_label(l.status), when(l.started.with_timezone(&Local)), run_duration(l));
+                    let r = look::cell_text(ui, RichText::new(text).color(status_color(l.status, &pal)));
+                    if let Some(e) = &l.error {
+                        r.on_hover_text(e);
+                    }
+                } else {
+                    look::cell_text(ui, RichText::new(tr("never")).color(pal.text_faint));
+                }
+            });
+            let resp = row.response();
+            if resp.clicked() {
+                actions.push(RowAction::Click(i, t.id.clone()));
+            }
+            if resp.double_clicked() {
+                actions.push(RowAction::Edit(t.id.clone()));
+            }
+            let targets = if self.selected.iter().any(|s| s == &t.id) { self.selected.clone() } else { vec![t.id.clone()] };
+            resp.context_menu(|ui| {
+                if ui.button((ternarygrid_icons::ic(icon::PENCIL_SIMPLE), tr("Edit…"))).clicked() {
+                    actions.push(RowAction::Edit(t.id.clone()));
+                    ui.close();
+                }
+                if ui.button((ternarygrid_icons::ic(icon::PLAY), tr("Run now"))).clicked() {
+                    actions.push(RowAction::Run(targets.clone()));
+                    ui.close();
+                }
+                if running.contains_key(&t.id) && ui.button((ternarygrid_icons::ic(icon::STOP), tr("Cancel run"))).clicked() {
+                    actions.push(RowAction::Cancel(targets.clone()));
+                    ui.close();
+                }
+                if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Duplicate"))).clicked() {
+                    actions.push(RowAction::Duplicate(targets.clone()));
+                    ui.close();
+                }
+                let label = if t.enabled { tr("Disable") } else { tr("Enable") };
+                if ui.button(format!("{} {label}", if t.enabled { icon::TOGGLE_LEFT } else { icon::TOGGLE_RIGHT })).clicked() {
+                    actions.push(RowAction::Enable(targets.clone(), !t.enabled));
+                    ui.close();
+                }
+                ui.menu_button((ternarygrid_icons::ic(icon::FOLDER), tr("Move to")), |ui| {
+                    if ui.button(tr("(top level)")).clicked() {
+                        actions.push(RowAction::Move(targets.clone(), None));
+                        ui.close();
+                    }
+                    for f in &folders {
+                        if ui.button(format!("{} {f}", icon::FOLDER)).clicked() {
+                            actions.push(RowAction::Move(targets.clone(), Some(f.clone())));
+                            ui.close();
+                        }
+                    }
+                });
+                if ui.button((ternarygrid_icons::ic(icon::UPLOAD_SIMPLE), tr("Export…"))).clicked() {
+                    actions.push(RowAction::Export(targets.clone()));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Delete…"))).clicked() {
+                    actions.push(RowAction::Delete(targets.clone()));
+                    ui.close();
+                }
+            });
+        });
         for a in actions {
             match a {
                 RowAction::Click(i, id) => {
@@ -1190,80 +1174,70 @@ impl TasksTab {
     }
 
     fn history_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let pal = ternarygrid_ui::pal(ui);
         let Some(focus) = self.focus.clone() else {
-            ui.weak(tr("Select a task to see its runs."));
+            ui.add_space(12.0);
+            ui.label(RichText::new(tr("Select a task to see its runs.")).color(pal.text_muted));
             return;
         };
         let name = self.task(&focus).map(|t| t.path()).unwrap_or_default();
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.strong(trf("Run history — {}", &[&name]));
+            ui.label(RichText::new(trf("Run history — {}", &[&name])).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
             if self.runs_job.is_some() {
-                ui.spinner();
+                ui.add(egui::Spinner::new().size(14.0).color(pal.accent_text));
             }
-            if ui.small_button(ternarygrid_icons::ic(icon::ARROW_CLOCKWISE)).on_hover_text(tr("Refresh")).clicked() {
-                self.reload_runs = true;
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if kit::icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 24.0).clicked() {
+                    self.reload_runs = true;
+                }
+            });
         });
+        ui.add_space(8.0);
         if self.history.is_empty() {
-            ui.weak(if self.runs_job.is_some() { tr("Loading…") } else { tr("The task has not run yet.") });
+            ui.label(RichText::new(if self.runs_job.is_some() { tr("Loading…") } else { tr("The task has not run yet.") }).color(pal.text_muted));
             return;
         }
-        let dark = ui.visuals().dark_mode;
         let shown = self.selected_run.clone().filter(|id| self.history.iter().any(|r| &r.run_id == id)).unwrap_or_else(|| self.history[0].run_id.clone());
         let mut clicked = None;
         let width = ui.available_width();
-        egui::Panel::left(egui::Id::new("tasks_history_runs")).resizable(true).default_size(width * 0.5).show(ui, |ui| {
-            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-            TableBuilder::new(ui)
-                .id_salt("tasks_history_table")
-                .striped(true)
-                .resizable(true)
-                .sense(egui::Sense::click())
-                .auto_shrink([false, false])
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::auto().at_least(100.0).clip(true))
-                .column(Column::auto().at_least(80.0).clip(true))
-                .column(Column::auto().at_least(110.0).clip(true))
-                .column(Column::auto().at_least(60.0).clip(true))
-                .column(Column::remainder().at_least(100.0).clip(true))
-                .header(row_h + 2.0, |mut h| {
-                    for title in [tr("Status"), tr("Trigger"), tr("Started"), tr("Duration"), tr("Message")] {
-                        h.col(|ui| {
-                            ui.strong(title);
-                        });
-                    }
-                })
-                .body(|body| {
-                    body.rows(row_h, self.history.len(), |mut row| {
-                        let r = &self.history[row.index()];
-                        row.set_selected(r.run_id == shown);
-                        let (glyph, color) = status_style(r.status, dark);
-                        row.col(|ui| {
-                            ui.label(RichText::new(format!("{glyph} {}", status_label(r.status))).color(color));
-                        });
-                        row.col(|ui| {
-                            ui.label(trigger_label(r.trigger));
-                        });
-                        row.col(|ui| {
-                            ui.label(when(r.started.with_timezone(&Local)));
-                        });
-                        row.col(|ui| {
-                            ui.label(run_duration(r));
-                        });
-                        row.col(|ui| {
-                            let msg = r.error.clone().or_else(|| r.messages.last().map(|m| m.text.clone())).unwrap_or_default();
-                            ui.add(egui::Label::new(msg.lines().next().unwrap_or_default()).truncate().selectable(false));
-                        });
-                        if row.response().clicked() {
-                            clicked = Some(r.run_id.clone());
-                        }
-                    });
+        let runs_frame = egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 8, top: 0, bottom: 10 });
+        egui::Panel::left(egui::Id::new("tasks_history_runs")).resizable(true).default_size(width * 0.56).frame(runs_frame).show(ui, |ui| {
+            let cols = [
+                look::Col::new(tr("Status"), look::Width::Initial(100.0)),
+                look::Col::new(tr("Trigger"), look::Width::Initial(100.0)),
+                look::Col::new(tr("Started"), look::Width::Initial(150.0)),
+                look::Col::new(tr("Duration"), look::Width::Initial(80.0)),
+                look::Col::new(tr("Message"), look::Width::Rest(100.0)),
+            ];
+            look::table(ui, "tasks_history_table", &cols, self.history.len(), |row, i| {
+                let r = &self.history[i];
+                row.set_selected(r.run_id == shown);
+                look::cell(row, false, |ui| {
+                    look::cell_text(ui, RichText::new(status_label(r.status)).color(status_color(r.status, &pal)));
                 });
+                look::cell(row, false, |ui| {
+                    look::cell_text(ui, trigger_label(r.trigger));
+                });
+                look::cell(row, false, |ui| {
+                    look::cell_text(ui, look::mono(ui, &r.started.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string(), pal.text_muted));
+                });
+                look::cell(row, false, |ui| {
+                    look::cell_text(ui, run_duration(r));
+                });
+                look::cell(row, false, |ui| {
+                    let msg = r.error.clone().or_else(|| r.messages.last().map(|m| m.text.clone())).unwrap_or_default();
+                    look::cell_text(ui, msg.lines().next().unwrap_or_default());
+                });
+                if row.response().clicked() {
+                    clicked = Some(r.run_id.clone());
+                }
+            });
         });
         if let Some(id) = clicked {
             self.selected_run = Some(id);
         }
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin { left: 10, right: 0, top: 0, bottom: 10 })).show(ui, |ui| {
             if let Some(run) = self.history.iter().find(|r| r.run_id == shown).cloned() {
                 self.run_details_ui(ui, cx, &run);
             }
@@ -1271,26 +1245,29 @@ impl TasksTab {
     }
 
     fn run_details_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, run: &TaskRun) {
-        let dark = ui.visuals().dark_mode;
-        let (glyph, color) = status_style(run.status, dark);
+        let pal = ternarygrid_ui::pal(ui);
+        ui.spacing_mut().item_spacing.y = 8.0;
+        let color = status_color(run.status, &pal);
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(format!("{glyph} {}", status_label(run.status))).color(color).strong());
-            ui.weak(format!("{} · {}", run.started.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"), run_duration(run)));
+            ui.label(RichText::new(status_label(run.status)).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(color));
+            let mut facts = format!("{} · {}", run.started.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"), run_duration(run));
             if let Some(rows) = run.rows {
-                ui.weak(trf("{} row(s)", &[&rows]));
+                facts.push_str(&format!(" · {}", trf("{} row(s)", &[&rows])));
             }
+            ui.label(RichText::new(facts).size(12.0).color(pal.text_faint));
             if run.status == RunStatus::Running {
                 if let Some(p) = self.progress.get(&run.run_id) {
                     match p.total {
                         Some(total) if total > 0 => {
-                            ui.add(egui::ProgressBar::new((p.done as f32 / total as f32).clamp(0.0, 1.0)).desired_width(140.0).text(format!("{} / {}", p.done, total)));
+                            ternarygrid_ui::parts::progress(ui, (p.done as f32 / total as f32).clamp(0.0, 1.0), 120.0);
+                            ui.label(RichText::new(format!("{} / {}", p.done, total)).size(12.0).color(pal.text_muted));
                         }
                         _ => {
-                            ui.spinner();
+                            ui.add(egui::Spinner::new().size(14.0).color(pal.accent_text));
                         }
                     }
                 }
-                if ui.small_button((ternarygrid_icons::ic(icon::STOP), tr("Cancel run"))).clicked()
+                if kit::ghost(ui, Some(icon::STOP), tr("Cancel run")).clicked()
                     && let Some(s) = cx.services.scheduler.as_ref()
                 {
                     s.cancel(&run.run_id);
@@ -1298,21 +1275,21 @@ impl TasksTab {
             }
         });
         if let Some(e) = &run.error {
-            crate::widgets::error_box(ui, e);
+            look::error(ui, e);
         }
         if !run.output_files.is_empty() {
-            ui.label(tr("Output files"));
+            look::small_heading(ui, tr("Output files"));
             for f in &run.output_files {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(f.display().to_string()).monospace());
-                    if ui.small_button(ternarygrid_icons::ic(icon::ARROW_SQUARE_OUT)).on_hover_text(tr("Open")).clicked() {
+                    ui.label(look::mono(ui, &f.display().to_string(), pal.text));
+                    if kit::icon_button_ex(ui, icon::ARROW_SQUARE_OUT, tr("Open"), false, 22.0).clicked() {
                         let p = f.clone();
                         cx.backend.spawn_detached(async move {
                             let _ = open::that_detached(p);
                         });
                     }
                     if let Some(dir) = f.parent().map(|d| d.to_path_buf())
-                        && ui.small_button(ternarygrid_icons::ic(icon::FOLDER_OPEN)).on_hover_text(tr("Open folder")).clicked()
+                        && kit::icon_button_ex(ui, icon::FOLDER_OPEN, tr("Open folder"), false, 22.0).clicked()
                     {
                         cx.backend.spawn_detached(async move {
                             let _ = open::that_detached(dir);
@@ -1322,38 +1299,35 @@ impl TasksTab {
             }
         }
         if let Some(steps) = self.children.get(&run.run_id).filter(|s| !s.is_empty()) {
-            ui.label(tr("Steps"));
+            look::small_heading(ui, tr("Steps"));
             for s in steps {
-                let (g, c) = status_style(s.status, dark);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(g).color(c));
+                    ui.label(RichText::new(status_label(s.status)).color(status_color(s.status, &pal)));
                     ui.label(&s.task_name);
-                    ui.weak(run_duration(s));
+                    ui.label(RichText::new(run_duration(s)).color(pal.text_faint));
                     if let Some(e) = &s.error {
-                        ui.add(egui::Label::new(RichText::new(e).color(crate::theme::error_color(dark))).truncate());
+                        ui.add(egui::Label::new(RichText::new(e).color(pal.err)).truncate());
                     }
                 });
             }
         }
-        ui.label(tr("Messages"));
+        look::small_heading(ui, tr("Messages"));
         if run.dropped_messages > 0 {
-            ui.weak(trf("{} message(s) were dropped from the middle of the log", &[&run.dropped_messages]));
+            ui.label(RichText::new(trf("{} message(s) were dropped from the middle of the log", &[&run.dropped_messages])).size(12.0).color(pal.text_faint));
         }
         egui::ScrollArea::both().id_salt(("task_run_messages", &run.run_id)).auto_shrink([false, false]).stick_to_bottom(run.status == RunStatus::Running).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             if run.messages.is_empty() {
-                ui.weak("—");
+                ui.label(RichText::new("—").color(pal.text_faint));
             }
             for m in &run.messages {
-                let (g, c) = match m.level {
-                    MessageLevel::Info => (icon::INFO, ui.visuals().text_color()),
-                    MessageLevel::Warning => (icon::WARNING, crate::theme::warning_color(dark)),
-                    MessageLevel::Error => (icon::X_CIRCLE, crate::theme::error_color(dark)),
+                let c = match m.level {
+                    MessageLevel::Info => pal.text_muted,
+                    MessageLevel::Warning => pal.warn,
+                    MessageLevel::Error => pal.err,
                 };
-                ui.horizontal_top(|ui| {
-                    ui.weak(m.time.with_timezone(&Local).format("%H:%M:%S").to_string());
-                    ui.label(RichText::new(g).color(c));
-                    ui.add(egui::Label::new(RichText::new(&m.text).monospace().color(c)).extend());
-                });
+                let line = format!("{}  {}", m.time.with_timezone(&Local).format("%H:%M:%S"), m.text);
+                ui.add(egui::Label::new(look::mono(ui, &line, c).size(11.5)).extend());
             }
         });
     }
@@ -1372,79 +1346,105 @@ impl TasksTab {
             }
         }
         if let Some(ids) = self.confirm_delete.clone() {
-            let mut close = false;
             let names: Vec<String> = ids.iter().filter_map(|id| self.task(id).map(|t| t.path())).collect();
             let os = ids.iter().any(|id| self.task(id).is_some_and(|t| t.os_scheduler));
-            let modal = egui::Modal::new(egui::Id::new("tasks_confirm_delete")).show(&ctx, |ui| {
-                ui.heading(tr("Delete tasks"));
-                ui.label(trf("Delete {} task(s)?", &[&names.len()]));
-                for n in names.iter().take(10) {
-                    ui.label(format!("• {n}"));
-                }
-                if names.len() > 10 {
-                    ui.weak(trf("… {} more", &[&(names.len() - 10)]));
-                }
-                ui.weak(tr("Deleted tasks are also removed from composite tasks. The run history is kept."));
-                if os {
-                    ui.weak(trf("Their {} entries are removed too.", &[&scheduler_name()]));
-                }
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Delete")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        self.delete(cx, ids.clone());
-                        close = true;
+            let (delete, cancel) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+            let dialog = ternarygrid_ui::parts::Dialog::new(tr("Delete tasks")).icon(icon::TRASH).width(480.0);
+            let (resp, ()) = dialog.show_modal(
+                &ctx,
+                egui::Id::new("tasks_confirm_delete"),
+                |ui| {
+                    let pal = ternarygrid_ui::pal(ui);
+                    let size = ternarygrid_ui::style::body_size(ui.ctx()) + 0.5;
+                    ui.label(RichText::new(trf("Delete {} task(s)?", &[&names.len()])).font(ternarygrid_ui::style::medium(ui.ctx(), size)).color(pal.text));
+                    for n in names.iter().take(10) {
+                        ui.label(format!("• {n}"));
                     }
-                    if ui.button(tr("Cancel")).clicked() {
-                        close = true;
+                    if names.len() > 10 {
+                        ui.label(RichText::new(trf("… {} more", &[&(names.len() - 10)])).color(pal.text_muted));
                     }
-                });
-            });
-            if close || modal.should_close() {
+                    ui.add(egui::Label::new(RichText::new(tr("Deleted tasks are also removed from composite tasks. The run history is kept.")).color(pal.text_muted)).wrap());
+                    if os {
+                        ui.add(egui::Label::new(RichText::new(trf("Their {} entries are removed too.", &[&scheduler_name()])).color(pal.text_muted)).wrap());
+                    }
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if look::danger_button(ui, Some(icon::TRASH), tr("Delete")).clicked() {
+                            delete.set(true);
+                        }
+                        if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            cancel.set(true);
+                        }
+                    });
+                },
+            );
+            if delete.get() {
+                self.delete(cx, ids.clone());
+            }
+            if delete.get() || cancel.get() || resp.close {
                 self.confirm_delete = None;
             }
         }
         if let Some(mut p) = self.folder_prompt.take() {
-            let mut keep = true;
-            let modal = egui::Modal::new(egui::Id::new("tasks_folder_prompt")).show(&ctx, |ui| {
-                ui.heading(if p.rename.is_some() { tr("Rename folder") } else { tr("New folder") });
-                if let Some(parent) = &p.parent {
-                    ui.weak(trf("Inside {}", &[parent]));
-                }
-                let r = ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(260.0).hint_text(tr("Folder name")));
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if !enter {
-                    r.request_focus();
-                }
-                let name = p.name.trim().trim_matches('/').to_string();
-                let ok = !name.is_empty();
-                ui.horizontal(|ui| {
-                    if (ui.add_enabled(ok, egui::Button::new(tr("OK"))).clicked() || (enter && ok)) && ok {
-                        match p.rename.clone() {
-                            Some(old) => {
-                                let new = match old.rsplit_once('/') {
-                                    Some((parent, _)) => format!("{parent}/{name}"),
-                                    None => name.clone(),
-                                };
-                                if self.folder.as_deref() == Some(old.as_str()) {
-                                    self.folder = Some(new.clone());
-                                }
-                                self.folder_op(cx, move |s| s.rename_folder(&old, &new).map(|_| ()));
-                            }
-                            None => {
-                                let path = match &p.parent {
-                                    Some(parent) => format!("{parent}/{name}"),
-                                    None => name.clone(),
-                                };
-                                self.folder_op(cx, move |s| s.create_folder(&path));
-                            }
+            let title = if p.rename.is_some() { tr("Rename folder") } else { tr("New folder") };
+            let name = p.name.trim().trim_matches('/').to_string();
+            let ok_enabled = !name.is_empty();
+            let (ok, cancel, enter) = (std::cell::Cell::new(false), std::cell::Cell::new(false), std::cell::Cell::new(false));
+            let parent = p.parent.clone();
+            let dialog = ternarygrid_ui::parts::Dialog::new(title).icon(icon::FOLDER).width(440.0);
+            let (resp, ()) = dialog.show_modal(
+                &ctx,
+                egui::Id::new("tasks_folder_prompt"),
+                |ui| {
+                    let pal = ternarygrid_ui::pal(ui);
+                    if let Some(parent) = &parent {
+                        ui.label(RichText::new(trf("Inside {}", &[parent])).color(pal.text_muted));
+                    }
+                    let r = look::text_field(ui, &mut p.name, ui.available_width(), tr("Folder name"), false);
+                    let pressed = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if pressed {
+                        enter.set(true);
+                    } else {
+                        r.request_focus();
+                    }
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled_ui(ok_enabled, |ui| kit::button_ex(ui, Kind::Primary, None, tr("OK"), false)).inner.clicked() {
+                            ok.set(true);
                         }
-                        keep = false;
+                        if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            cancel.set(true);
+                        }
+                    });
+                },
+            );
+            let name = p.name.trim().trim_matches('/').to_string();
+            let mut keep = !(cancel.get() || resp.close);
+            if (ok.get() || enter.get()) && !name.is_empty() {
+                match p.rename.clone() {
+                    Some(old) => {
+                        let new = match old.rsplit_once('/') {
+                            Some((parent, _)) => format!("{parent}/{name}"),
+                            None => name.clone(),
+                        };
+                        if self.folder.as_deref() == Some(old.as_str()) {
+                            self.folder = Some(new.clone());
+                        }
+                        self.folder_op(cx, move |s| s.rename_folder(&old, &new).map(|_| ()));
                     }
-                    if ui.button(tr("Cancel")).clicked() {
-                        keep = false;
+                    None => {
+                        let path = match &p.parent {
+                            Some(parent) => format!("{parent}/{name}"),
+                            None => name.clone(),
+                        };
+                        self.folder_op(cx, move |s| s.create_folder(&path));
                     }
-                });
-            });
-            if keep && !modal.should_close() {
+                }
+                keep = false;
+            }
+            if keep {
                 self.folder_prompt = Some(p);
             }
         }
@@ -1464,23 +1464,33 @@ impl TabView for TasksTab {
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if cx.services.tasks.is_none() {
-            crate::widgets::error_box(ui, tr("The task store is not available (see the warnings shown at start-up)."));
+            look::error(ui, tr("The task store is not available (see the warnings shown at start-up)."));
             return;
         }
         self.poll(cx);
+        ui.spacing_mut().item_spacing.y = 0.0;
         self.banner(ui, cx);
         if cx.services.scheduler.is_none() {
-            ui.weak(tr("Tasks cannot be run: the task scheduler is not available."));
+            egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 0 }).show(ui, |ui| {
+                look::callout(ui, Tone::Info, None, tr("Tasks cannot be run: the task scheduler is not available."), |_| {});
+            });
         }
         self.toolbar(ui, cx);
-        ui.separator();
-        egui::Panel::left(egui::Id::new("tasks_folder_panel")).resizable(true).default_size(190.0).show(ui, |ui| self.folders_ui(ui, cx));
+        let p = ternarygrid_ui::pal(ui);
+        let plain = egui::Frame::new().fill(p.canvas);
+        egui::Panel::left(egui::Id::new("tasks_folder_panel")).resizable(true).default_size(210.0).frame(plain).show(ui, |ui| self.folders_ui(ui, cx));
+        let history = egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin { left: 16, right: 16, top: 2, bottom: 0 });
         egui::Panel::bottom(egui::Id::new("tasks_history_panel"))
             .resizable(true)
-            .default_size((ui.available_height() * 0.42).max(160.0))
+            .default_size((ui.available_height() * 0.42).clamp(160.0, 300.0))
             .size_range(100.0..=f32::INFINITY)
+            .frame(history)
             .show(ui, |ui| self.history_ui(ui, cx));
-        egui::CentralPanel::default().show(ui, |ui| self.list_ui(ui, cx));
+        let list = egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin::symmetric(16, 12));
+        egui::CentralPanel::default().frame(list).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            self.list_ui(ui, cx)
+        });
         self.dialogs(ui, cx);
         if self.is_busy() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));

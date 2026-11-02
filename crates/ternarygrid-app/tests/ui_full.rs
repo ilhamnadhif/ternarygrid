@@ -699,6 +699,7 @@ fn menus_actions_commands_and_dialogs() {
 }
 
 /// Click the combo box on the row of `label`, then the option `option`.
+#[allow(dead_code)]
 fn combo_pick(h: &mut H, label: &str, option: &str) {
     pause(h);
     {
@@ -745,7 +746,10 @@ fn settings_grid_menu_and_editor_helpers() {
         frames(&mut h, 3);
         no_errors(&mut h, section);
     }
-    combo_pick(&mut h, "Theme", "Dark");
+    // The theme is a segmented control.
+    pause(&mut h);
+    h.query_all_by_label("Dark").find(|n| !on_toolbar(&h, n)).expect("the Dark theme segment").click();
+    frames(&mut h, 3);
     assert_eq!(h.ctx.theme(), egui::Theme::Dark, "dark theme applied");
     assert!(!has(&h, "Language"), "English only, no language choice: {:?}", labels(&h));
     no_errors(&mut h, "settings");
