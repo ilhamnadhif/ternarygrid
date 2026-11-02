@@ -49,6 +49,18 @@ impl ColumnFormat {
     }
 }
 
+/// The format of identifiers: no thousands separators.
+static IDENTIFIER: ColumnFormat = ColumnFormat { decimals: None, thousands_separator: Some(false), date_format: None, time_format: None, datetime_format: None };
+
+/// The format of column `col`'s cells: its own (`own`), else, for a key or a reference
+/// (an identifier, not an amount: `10421`, not `10,421`), no thousands separators.
+pub fn cell_format<'a>(model: &crate::model::ResultModel, col: usize, own: Option<&'a ColumnFormat>) -> Option<&'a ColumnFormat> {
+    own.or_else(|| {
+        let key = model.editability().as_ref().is_ok_and(|t| t.key_columns.contains(&col)) || model.foreign_key_for_column(col).is_some();
+        key.then_some(&IDENTIFIER)
+    })
+}
+
 /// Insert `,` thousands separators into the integer part of a plain number.
 pub fn group_thousands(s: &str) -> String {
     let (sign, rest) = match s.strip_prefix('-') {
@@ -179,7 +191,7 @@ mod tests {
 
     #[test]
     fn overrides() {
-        let o = FormatOptions::default();
+        let o = FormatOptions { thousands_separator: false, ..Default::default() };
         let c = ColumnFormat { decimals: Some(2), ..Default::default() };
         assert_eq!(format_value(&Value::Float(2.345), &o, Some(&c)), "2.35");
         assert_eq!(format_value(&Value::Int(3), &o, Some(&c)), "3.00");

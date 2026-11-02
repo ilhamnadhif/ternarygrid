@@ -20,6 +20,22 @@ use std::collections::BTreeSet;
 use ternarygrid_core::plan::QueryPlan;
 use ternarygrid_core::{tr, trf};
 
+/// "Color by": the metric of the plan's colours, a drop-down in the kit's menu look.
+pub(super) fn metric_combo(ui: &mut Ui, metric: &mut PlanMetric, salt: &str) {
+    egui::ComboBox::from_id_salt(salt)
+        .icon(ternarygrid_ui::kit::combo_caret)
+        .selected_text(tr(metric.label()))
+        .show_ui(ui, |ui| {
+            ternarygrid_ui::kit::menu_look(ui, 120.0);
+            for m in [PlanMetric::Auto, PlanMetric::Time, PlanMetric::Cost] {
+                if ternarygrid_ui::kit::menu_check(ui, &mut (*metric == m), tr(m.label())).clicked()
+                {
+                    *metric = m;
+                }
+            }
+        });
+}
+
 /// Direction of the plan tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -485,14 +501,7 @@ fn plan_toolbar(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) {
         }
         kit::vdivider(ui, 16.0);
         ui.label(egui::RichText::new(tr("Color by")).color(ternarygrid_ui::pal(ui).text_muted));
-        egui::ComboBox::from_id_salt("ternarygrid_plan_metric")
-            .icon(ternarygrid_ui::kit::combo_caret)
-            .selected_text(tr(state.metric.label()))
-            .show_ui(ui, |ui| {
-                for m in [PlanMetric::Auto, PlanMetric::Time, PlanMetric::Cost] {
-                    ui.selectable_value(&mut state.metric, m, tr(m.label()));
-                }
-            });
+        metric_combo(ui, &mut state.metric, "ternarygrid_plan_metric");
         if kit::icon_button_ex(ui, icon::CORNERS_OUT, tr("Zoom to fit"), false, 26.0).clicked() {
             state.fit_pending = true;
         }

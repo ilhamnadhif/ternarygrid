@@ -217,7 +217,7 @@ impl Default for FormatOptions {
             datetime_format: "%Y-%m-%d %H:%M:%S".into(),
             show_fractional_seconds: true,
             float_max_decimals: None,
-            thousands_separator: false,
+            thousands_separator: true,
             binary_format: BinaryFormat::Hex,
             binary_max_len: 64,
             max_text_len: 512,
@@ -1080,7 +1080,9 @@ mod tests {
 
     #[test]
     fn grid_shows_floats_and_text_as_copied() {
-        let o = FormatOptions::default();
+        // Grouped by default, as in the design; otherwise as copied.
+        assert_eq!(Value::Float(1932.78).display(&FormatOptions::default()), "1,932.78");
+        let o = FormatOptions { thousands_separator: false, ..Default::default() };
         assert_eq!(Value::Float(1932.7799999999997).display(&o), "1932.7799999999997");
         assert_eq!(Value::Float(0.1 + 0.2).display(&o), Value::Float(0.1 + 0.2).to_text());
         // Multi-line text keeps every line, joined by ¶.

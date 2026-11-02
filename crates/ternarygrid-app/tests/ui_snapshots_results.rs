@@ -1,8 +1,9 @@
 //! Screenshots of the results and object pages (the data grid, its filter bar,
 //! footer, views, side panels, menus and dialogs; the table, function, sequence
 //! and catalog object pages) in the real application window, rasterised on the
-//! CPU (no GPU needed), for comparing them with the design mockups. Not part of
-//! the normal test run:
+//! CPU (no GPU needed), for comparing them with the design mockups, looking like the
+//! macOS app (as `ui_snapshots_shell`: the menus in the system's menu bar, the window
+//! buttons at the left of the top bar). Not part of the normal test run:
 //!
 //! ```text
 //! cargo test -p ternarygrid-app --test ui_snapshots_results -- --ignored
@@ -174,7 +175,12 @@ impl Shots {
             .build_eframe(move |cc| {
                 ternarygrid_app::theme::setup_fonts(&cc.egui_ctx);
                 backend.set_context(cc.egui_ctx.clone());
-                TernaryGridApp::new(backend, conns, services, settings)
+                let mut app = TernaryGridApp::new(backend, conns, services, settings);
+                // As on macOS (the mockups): the menus in the system's menu bar, the window
+                // buttons at the left of the top bar (painted by `shot`, as the system draws them).
+                app.native_menu_bar = true;
+                app.titlebar_inset = ternarygrid_app::app::MAC_TITLEBAR_INSET;
+                app
             });
         ternarygrid_app::theme::apply_settings(&h.ctx, &h.state().settings);
         let theme = if theme == Theme::Dark { "dark" } else { "light" };
@@ -223,7 +229,8 @@ impl Shots {
         let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
         let size = self.h.ctx.content_rect().size() * ppp();
         let bg = self.h.ctx.global_style().visuals.panel_fill;
-        let img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        let mut img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        traffic_lights(&mut img, ppp());
         let path = self.dir.join(format!("{name}-{}.png", self.theme));
         img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
@@ -339,6 +346,25 @@ impl Shots {
             });
         }
         self.frames(4);
+    }
+}
+
+/// The macOS window buttons, as the system paints them over the top bar's left end.
+fn traffic_lights(img: &mut image::RgbaImage, ppp: f32) {
+    for (i, c) in [[0xff, 0x5f, 0x57], [0xfe, 0xbc, 0x2e], [0x28, 0xc8, 0x40]].iter().enumerate() {
+        let (cx, cy, r) = ((16.0 + 6.0 + 20.0 * i as f32) * ppp, 22.0 * ppp, 6.0 * ppp);
+        for y in (cy - r - 2.0) as u32..=(cy + r + 2.0) as u32 {
+            for x in (cx - r - 2.0) as u32..=(cx + r + 2.0) as u32 {
+                let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                let a = (r + 0.5 - d).clamp(0.0, 1.0);
+                if a > 0.0 {
+                    let px = img.get_pixel_mut(x, y);
+                    for k in 0..3 {
+                        px[k] = (c[k] as f32 * a + px[k] as f32 * (1.0 - a)).round() as u8;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -460,9 +486,10 @@ fn shots(s: &mut Shots) {
     run_sql(s, &conn, TRIGGER, false);
     run_sql(s, &conn, SETUP_MORE, true);
     s.close_tabs();
-    // A production connection: saving data asks first (the mockups' warning).
+    // A production connection named like the mockups': saving data asks first (their warning).
     {
         let mut cfg = s.h.state().conns.config(&conn).unwrap().clone();
+        cfg.name = "bantuin".into();
         cfg.connection_type = "prod".into();
         s.h.state_mut().conns.upsert(cfg);
         s.frames(2);
@@ -642,7 +669,10 @@ fn result_screens(s: &mut Shots, conn: &str) {
     s.data().view.grid.select_cell(2, 2);
     s.context_click(at);
     s.click_contains("Filter by value");
-    s.park_keep_menus(at + egui::vec2(200.0, 200.0));
+    // The pointer on the submenu's first item (it stays open, its item hovered as in the mockup).
+    let item = s.h.query_all_by_label_contains("Filter by value").last().expect("the item").rect();
+    s.park_keep_menus(egui::pos2(item.right() + 60.0, item.center().y));
+    s.park_keep_menus(egui::pos2(item.right() + 80.0, item.center().y));
     s.shot("res_cell_menu");
     s.escape();
     s.escape();
@@ -696,7 +726,7 @@ fn result_screens(s: &mut Shots, conn: &str) {
     let at = cell_at(s, 3, 2);
     s.context_click(at);
     s.click_contains("Generate SQL");
-    s.click("UPDATE");
+    s.click_contains("UPDATE");
     s.frames(20);
     s.shot("res_gen_sql");
     if has(&s.h, "Close window") {
