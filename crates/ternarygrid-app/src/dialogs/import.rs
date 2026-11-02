@@ -291,9 +291,9 @@ impl ImportDialog {
             ui.spacing_mut().item_spacing.y = 10.0;
             parts::form_row(ui, tr("Existing connections"), LABEL_W, |ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
-                ui.radio_value(&mut self.policy, DuplicatePolicy::Skip, tr("Skip"));
-                ui.radio_value(&mut self.policy, DuplicatePolicy::Replace, tr("Replace"));
-                ui.radio_value(&mut self.policy, DuplicatePolicy::KeepBoth, tr("Keep both"));
+                ternarygrid_ui::kit::radio_value(ui, &mut self.policy, DuplicatePolicy::Skip, tr("Skip"));
+                ternarygrid_ui::kit::radio_value(ui, &mut self.policy, DuplicatePolicy::Replace, tr("Replace"));
+                ternarygrid_ui::kit::radio_value(ui, &mut self.policy, DuplicatePolicy::KeepBoth, tr("Keep both"));
             });
             parts::form_row(ui, tr("Put into folder"), LABEL_W, |ui| add_field(ui, text_field(&mut self.folder_prefix, 260.0).hint_text(hint(ui, tr("(top level)")))));
             parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.keep_shell_commands, tr("Keep shell commands that run on connect / disconnect")));

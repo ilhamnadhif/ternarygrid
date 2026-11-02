@@ -1299,12 +1299,12 @@ impl AiAssistantTab {
         });
     }
 
-    /// A query the assistant ran: one line ("Ran a query · 3 row(s)") that opens on its result
-    /// and its SQL.
+    /// A query the assistant ran: one line ("Ran a query · 3 row(s)") over its result and its
+    /// SQL (open at first; the line folds it).
     fn step_ui(&self, ui: &mut Ui, cx: &mut AppContext, step: &ToolStep, id: (u64, usize, usize)) {
         let p = ternarygrid_ui::pal(ui);
         let open_id = egui::Id::new(("ai_step_open", id));
-        let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+        let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(true);
         egui::Frame::new().stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 8.0;

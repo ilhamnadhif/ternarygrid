@@ -92,7 +92,7 @@ pub(crate) fn steps(ui: &mut Ui, steps: &[&str], current: usize, reachable: usiz
 pub(crate) struct Footer<'a> {
     /// Back (enabled or not); `None` on the first page.
     pub back: Option<bool>,
-    /// Next (enabled or not); `None` on the last page, where the run button is the main one.
+    /// Next (enabled or not); `None` on the last page, the only one with the run button.
     pub next: Option<bool>,
     /// The run button's label and whether it can be clicked.
     pub run: (&'a str, bool),
@@ -114,7 +114,7 @@ fn enabled_button(ui: &mut Ui, enabled: bool, add: impl FnOnce(&mut Ui) -> Respo
     ui.add_enabled_ui(enabled, add).inner
 }
 
-/// Back · (error) · Save as task… · Run · Next, or the run button as the main one on the last page.
+/// Back · (error) · Save as task… · Next, and the run button instead of Next on the last page.
 pub(crate) fn footer(ui: &mut Ui, f: &Footer) -> Option<Clicked> {
     let p = style::pal(ui);
     let mut clicked = None;
@@ -128,9 +128,6 @@ pub(crate) fn footer(ui: &mut Ui, f: &Footer) -> Option<Clicked> {
             Some(next_ok) => {
                 if enabled_button(ui, next_ok, |ui| kit::button_ex(ui, Kind::Secondary, Some(icon::ARROW_RIGHT), tr("Next"), false)).clicked() {
                     clicked = Some(Clicked::Next);
-                }
-                if enabled_button(ui, f.run.1, |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::PLAY), f.run.0, false)).clicked() {
-                    clicked = Some(Clicked::Run);
                 }
             }
             None => {
@@ -267,25 +264,7 @@ pub(crate) fn check(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
 
 /// A radio button drawn like the mockups: an accent ring with a dot when selected.
 pub(crate) fn radio(ui: &mut Ui, selected: bool, label: &str) -> Response {
-    let p = style::pal(ui);
-    let enabled = ui.is_enabled();
-    let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(style::body_size(ui.ctx())), Color32::PLACEHOLDER);
-    let (rect, resp) = ui.allocate_exact_size(vec2(16.0 + 8.0 + g.size().x, 18.0), Sense::click());
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, enabled, selected, label));
-    if ui.is_rect_visible(rect) {
-        let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
-        let c = pos2(rect.left() + 8.0, rect.center().y);
-        let ring = if selected || (enabled && resp.hovered()) { p.accent } else { p.border_strong };
-        ui.painter().circle(c, 7.25, p.surface, Stroke::new(1.5, fade(ring)));
-        if selected {
-            ui.painter().circle_filled(c, 4.0, fade(p.accent));
-        }
-        if resp.has_focus() {
-            style::focus_halo(ui, Rect::from_center_size(c, vec2(16.0, 16.0)), 8);
-        }
-        ui.painter().galley(pos2(rect.left() + 24.0, rect.center().y - g.size().y / 2.0), g, fade(p.text));
-    }
-    resp
+    kit::radio(ui, selected, label)
 }
 
 /// [`radio`] over a value; returns true when it changed.

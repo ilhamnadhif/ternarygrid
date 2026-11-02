@@ -468,6 +468,20 @@ fn shots(s: &mut Shots) {
             s.shot("set_network_form");
         }
     }
+    // "Search settings": the sections with a match and their counts, the matches marked.
+    {
+        // The settings' own search: the text field at the top of their side navigation (right
+        // of the navigator's filter).
+        let nav = s.h.query_all_by_label("Network profiles").next().expect("the settings navigation").rect();
+        let n =
+            s.h.query_all_by_role(egui::accesskit::Role::TextInput)
+                .find(|n| n.rect().left() >= nav.left() - 20.0 && n.rect().right() <= nav.right() + 20.0 && n.rect().top() < nav.top())
+                .expect("the settings search");
+        n.focus();
+        n.type_text("time");
+    }
+    s.frames(6);
+    s.shot("set_search");
     s.close_tabs();
 
     // Tasks: a few tasks in folders, runs.

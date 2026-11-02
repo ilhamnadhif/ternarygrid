@@ -888,6 +888,8 @@ fn toolbar(
                 v.zoom_around(origin, center, factor, ZOOM_RANGE.0, ZOOM_RANGE.1);
                 state.set_view(v);
             };
+            // Narrow tabs: the last buttons without their labels, no counts.
+            let narrow = ui.available_width() < 1080.0;
             if kit::icon_button_ex(
                 ui,
                 icon::MAGNIFYING_GLASS_MINUS,
@@ -958,16 +960,19 @@ fn toolbar(
                 events.push(ErEvent::SettingsChanged);
             }
             kit::vdivider(ui, 18.0);
-            if kit::button_ex(
-                ui,
-                Kind::Ghost,
-                Some(icon::TREE_STRUCTURE),
-                tr("Auto layout"),
-                true,
-            )
-            .on_hover_text(tr("Arrange all tables automatically"))
-            .clicked()
-            {
+            let auto_layout = if narrow {
+                kit::icon_button_ex(ui, icon::TREE_STRUCTURE, tr("Auto layout"), false, 26.0)
+            } else {
+                kit::button_ex(
+                    ui,
+                    Kind::Ghost,
+                    Some(icon::TREE_STRUCTURE),
+                    tr("Auto layout"),
+                    true,
+                )
+                .on_hover_text(tr("Arrange all tables automatically"))
+            };
+            if auto_layout.clicked() {
                 diagram.relayout();
                 state.fit_pending = true;
                 events.push(ErEvent::TableMoved(
@@ -985,26 +990,41 @@ fn toolbar(
             {
                 state.show_minimap = !state.show_minimap;
             }
-            if kit::button_full(
-                ui,
-                Kind::Ghost,
-                Some(icon::PENCIL_SIMPLE),
-                tr("Edit mode"),
-                true,
-                state.edit_mode,
-            )
-            .on_hover_text(tr(
-                "Edit the schema from the diagram: create and change tables and foreign keys",
-            ))
-            .clicked()
-            {
+            let edit = if narrow {
+                kit::icon_button_ex(
+                    ui,
+                    icon::PENCIL_SIMPLE,
+                    tr("Edit mode"),
+                    state.edit_mode,
+                    26.0,
+                )
+            } else {
+                kit::button_full(
+                    ui,
+                    Kind::Ghost,
+                    Some(icon::PENCIL_SIMPLE),
+                    tr("Edit mode"),
+                    true,
+                    state.edit_mode,
+                )
+                .on_hover_text(tr(
+                    "Edit the schema from the diagram: create and change tables and foreign keys",
+                ))
+            };
+            if edit.clicked() {
                 state.edit_mode = !state.edit_mode;
             }
-            if kit::button_ex(ui, Kind::Ghost, Some(icon::EXPORT), tr("Export…"), true)
-                .on_hover_text(tr("Export image"))
-                .clicked()
-            {
+            let export = if narrow {
+                kit::icon_button_ex(ui, icon::EXPORT, tr("Export…"), false, 26.0)
+            } else {
+                kit::button_ex(ui, Kind::Ghost, Some(icon::EXPORT), tr("Export…"), true)
+                    .on_hover_text(tr("Export image"))
+            };
+            if export.clicked() {
                 events.push(ErEvent::ExportRequested);
+            }
+            if narrow {
+                return;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let counts = trf(

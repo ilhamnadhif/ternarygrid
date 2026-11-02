@@ -301,13 +301,14 @@ impl<'a> FilterBar<'a> {
                 let server_hint = tr("The database filters and sorts. The query runs again with your WHERE / ORDER BY, over all rows of the table.");
                 let client_hint = tr("TernaryGrid filters and sorts the rows already fetched, without asking the database. Fast, but only those rows.");
                 let on_server = ui
-                    .add_enabled(!redis, egui::RadioButton::new(server, tr("Server: in the database, over all rows")))
+                    .add_enabled_ui(!redis, |ui| ternarygrid_ui::kit::radio(ui, server, tr("Server: in the database, over all rows")))
+                    .inner
                     .on_hover_text(server_hint)
                     .on_disabled_hover_text(tr("Redis has no server side filter: its read commands take no condition."));
                 if on_server.clicked() {
                     grid.mode = DataMode::Server;
                 }
-                if ui.radio(!server, tr("Client: over the fetched rows")).on_hover_text(client_hint).clicked() {
+                if ternarygrid_ui::kit::radio(ui, !server, tr("Client: over the fetched rows")).on_hover_text(client_hint).clicked() {
                     grid.mode = DataMode::Client;
                 }
                 if crate::model::source_table(model.columns()).is_ok() {

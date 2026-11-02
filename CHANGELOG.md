@@ -3,6 +3,30 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.0 — unreleased
+
+### Changed
+- **A new, modern interface**, shared with TernaryWire and TernaryShell: a teal accent, quiet monochrome icons (logos, connection types and warnings keep their colours), clearer type, and a lighter dark theme. Every screen was redesigned: the SQL editor, results, object pages, dialogs, wizards, tools, settings, tasks, history, the ER diagram, the table designer and the AI assistant.
+- The toolbar is replaced by a **top bar**: the active connection › schema (click to switch), a search box for every command, object and script (`⇧⌘P`), a PRODUCTION badge for production connections, and the AI, theme and settings buttons; **Update** appears there only when a new version is out. On macOS the top bar is the window's title bar.
+- An **icon rail** on the left opens the Database Navigator, Projects, Query history and Tasks; background operations and Settings sit at its bottom. The **status bar** shows the connection, the schema, the transaction mode (with the number of pending statements; a click opens Pending transactions), the rows and the time of the last run, the time zone and the memory used.
+- Results have **one filter bar** (WHERE and ORDER BY with Apply) and **one footer**: rows and timing, Save and Discard only while there are changes, the views and the side panels. NULL is shown in faint italics, JSON and XML types in the column header.
+- The SQL editor has a **Run** button as its main action, quiet connection and schema pickers, result tabs with their row counts, a compact toolbar when the editor is narrow, and an error card with **Fix error**, which asks the AI assistant.
+- Object pages have a header with the object's place and name and underlined pages with counts (Columns 12, Indexes 3).
+- Dialogs, wizards and tool windows share one frame: an icon and a title, a stepper for wizards, and a footer for the buttons. The transfer wizards show their Run button on the last page; the app dims behind the tool window you are working in (a click on the app brings it back).
+- Settings has a side navigation; **Search settings** lists the sections with matching settings (with their number) and marks them on the page.
+- Check boxes, radio buttons, switches and segmented choices look the same everywhere; SSH and proxy settings show their fields only when they are turned on; the AI assistant shows the queries it ran opened on their result.
+
+### Removed
+- The old toolbar, Settings → Toolbar and the "Coloured icons" option. Every action is in the top bar, the rail, the context menus, the menus (File, Database, Tools, View, Help) and the search box.
+
+### Fixed
+- Read-only connections refuse writes in every driver, and more statements are recognised as writes (MongoDB writes and `$out`/`$merge`, Elasticsearch document endpoints, `RESET ALL`, MySQL `INTO OUTFILE`, several statements on one line).
+- Editing data: the server-side filter runs the WHERE shown in the filter box, changes that cannot identify their rows are refused, and a cell value is no longer accepted as an SQL expression when it could cut off the WHERE.
+- No silent data loss in transfers and compares: data compare refuses duplicate target keys, Replace never deletes rows it cannot insert again, and a failed migration drops the tables it created.
+- Transactions: Oracle EXPLAIN no longer commits, PostgreSQL metadata errors no longer abort your transaction, and the tools (schema compare apply, restore, maintenance, table designer, data sync) respect read-only connections and pending transactions.
+- Passwords stay out of error messages and history (`IDENTIFIED BY`, dollar quoting, Redis and MongoDB passwords); two TernaryGrid windows no longer lose vault changes; imported scheduled tasks come disabled.
+- Many smaller fixes in the SQLite, SQL Server, ClickHouse, Cassandra, Redis, MongoDB and Elasticsearch drivers, the editor (folds, find and replace, tab size) and the query builder.
+
 ## 0.5.2 — 2026-11-02
 
 ### Changed

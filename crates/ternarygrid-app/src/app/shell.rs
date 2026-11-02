@@ -317,7 +317,7 @@ impl TernaryGridApp {
                 egui::Popup::menu(&tz_button).show(|ui| {
                     let mut v = tz;
                     for (choice, label) in crate::conn::time_zone_choices() {
-                        changed |= ui.radio_value(&mut v, choice, label).changed();
+                        changed |= ternarygrid_ui::kit::radio_value(ui, &mut v, choice, label).changed();
                     }
                     self.settings.general.time_zone = v;
                 });

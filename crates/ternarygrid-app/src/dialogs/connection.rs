@@ -509,8 +509,8 @@ impl ConnectionDialog {
                 parts::form_row(ui, tr("Connect by"), LABEL_W, |ui| {
                     ui.spacing_mut().item_spacing.x = 16.0;
                     let before = sid;
-                    ui.radio_value(&mut sid, false, tr("Service name"));
-                    ui.radio_value(&mut sid, true, "SID");
+                    kit::radio_value(ui, &mut sid, false, tr("Service name"));
+                    kit::radio_value(ui, &mut sid, true, "SID");
                     if sid != before {
                         if sid {
                             let v = self.cfg.database.take().unwrap_or_default();
@@ -607,9 +607,9 @@ impl ConnectionDialog {
         });
         parts::form_row(ui, tr("Auto-commit"), LABEL_W, |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
-            ui.radio_value(&mut self.auto_commit_choice, 0, tr("Connection type default"));
-            ui.radio_value(&mut self.auto_commit_choice, 1, tr("On"));
-            ui.radio_value(&mut self.auto_commit_choice, 2, tr("Off (manual commit)"));
+            kit::radio_value(ui, &mut self.auto_commit_choice, 0, tr("Connection type default"));
+            kit::radio_value(ui, &mut self.auto_commit_choice, 1, tr("On"));
+            kit::radio_value(ui, &mut self.auto_commit_choice, 2, tr("Off (manual commit)"));
         });
         if self.cfg.kind.is_file_based() {
             return;
@@ -934,8 +934,8 @@ impl ConnectionDialog {
         });
         parts::form_row(ui, tr("Navigator view"), LABEL_W, |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
-            ui.radio_value(&mut self.cfg.navigator_view, NavigatorView::Advanced, tr("Advanced"));
-            ui.radio_value(&mut self.cfg.navigator_view, NavigatorView::Simple, tr("Simple"));
+            kit::radio_value(ui, &mut self.cfg.navigator_view, NavigatorView::Advanced, tr("Advanced"));
+            kit::radio_value(ui, &mut self.cfg.navigator_view, NavigatorView::Simple, tr("Simple"));
         });
     }
 }
@@ -1044,7 +1044,11 @@ fn host_port(ui: &mut Ui, id: &str, host: &mut String, port: &mut u16) {
 pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut String, passphrase: &mut String) {
     let narrow = |ui: &Ui| 280f32.min(rest(ui, 0.0));
     parts::form_row(ui, "", LABEL_W, |ui| parts::switch(ui, &mut ssh.enabled, tr("Use SSH tunnel"), None));
-    ui.add_enabled_ui(ssh.enabled, |ui| {
+    // Off: only the switch (the settings stay and come back when it is turned on).
+    if !ssh.enabled {
+        return;
+    }
+    ui.scope(|ui| {
         parts::form_row(ui, tr("SSH host"), LABEL_W, |ui| host_port(ui, id, &mut ssh.host, &mut ssh.port));
         parts::form_row(ui, tr("User"), LABEL_W, |ui| {
             let w = narrow(ui);
@@ -1055,13 +1059,13 @@ pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut Strin
             let is_pw = matches!(ssh.auth, SshAuth::Password);
             let is_key = matches!(ssh.auth, SshAuth::PublicKey { .. });
             let is_agent = matches!(ssh.auth, SshAuth::Agent);
-            if ui.radio(is_pw, tr("Password")).clicked() {
+            if kit::radio(ui, is_pw, tr("Password")).clicked() {
                 ssh.auth = SshAuth::Password;
             }
-            if ui.radio(is_key, tr("Private key")).clicked() && !is_key {
+            if kit::radio(ui, is_key, tr("Private key")).clicked() && !is_key {
                 ssh.auth = SshAuth::PublicKey { key_path: default_key_path() };
             }
-            if ui.radio(is_agent, tr("SSH agent")).clicked() {
+            if kit::radio(ui, is_agent, tr("SSH agent")).clicked() {
                 ssh.auth = SshAuth::Agent;
             }
         });
@@ -1111,11 +1115,14 @@ pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut Strin
 pub fn proxy_form(ui: &mut Ui, id: &str, proxy: &mut ProxyConfig, password: &mut String) {
     let narrow = |ui: &Ui| 280f32.min(rest(ui, 0.0));
     parts::form_row(ui, "", LABEL_W, |ui| parts::switch(ui, &mut proxy.enabled, tr("Use proxy"), None));
-    ui.add_enabled_ui(proxy.enabled, |ui| {
+    if !proxy.enabled {
+        return;
+    }
+    ui.scope(|ui| {
         parts::form_row(ui, tr("Type"), LABEL_W, |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
-            ui.radio_value(&mut proxy.kind, ProxyKind::Socks5, "SOCKS5");
-            ui.radio_value(&mut proxy.kind, ProxyKind::Http, "HTTP CONNECT");
+            kit::radio_value(ui, &mut proxy.kind, ProxyKind::Socks5, "SOCKS5");
+            kit::radio_value(ui, &mut proxy.kind, ProxyKind::Http, "HTTP CONNECT");
         });
         parts::form_row(ui, tr("Proxy host"), LABEL_W, |ui| host_port(ui, id, &mut proxy.host, &mut proxy.port));
         parts::form_row(ui, tr("User"), LABEL_W, |ui| {

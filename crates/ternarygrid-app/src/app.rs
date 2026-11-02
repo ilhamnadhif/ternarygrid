@@ -1514,7 +1514,7 @@ impl TernaryGridApp {
                 ui.menu_button((ternarygrid_icons::ic(icon::CIRCLE_HALF), tr("Theme")), |ui| {
                     use ternarygrid_config::settings::Theme;
                     for (t, label) in [(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))] {
-                        if ui.radio(state.theme == t, label).clicked() {
+                        if ternarygrid_ui::kit::radio(ui, state.theme == t, label).clicked() {
                             chosen.set(Some(M::Theme(t)));
                             ui.close();
                         }
@@ -1798,6 +1798,24 @@ impl eframe::App for TernaryGridApp {
         let raise = self.raise_popup.take();
         let pressed = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten());
         let mut clicked_popup = None;
+        // As in the design, the app dims behind the tool window being worked in. It still
+        // answers clicks (they move the focus back to it, and the dimming goes).
+        let focus = self.popup_focus.filter(|id| self.popups.iter().any(|t| t.id == *id));
+        let scrim_id = egui::Id::new("ternarygrid_popup_scrim");
+        let dim = ctx.animate_bool_with_time(scrim_id, focus.is_some(), 0.15);
+        let mut scrim_layer = None;
+        if dim > 0.0 {
+            let dark = ctx.global_style().visuals.dark_mode;
+            let scrim = if dark { egui::Color32::from_rgba_unmultiplied(8, 9, 12, 140) } else { egui::Color32::from_rgba_unmultiplied(30, 30, 45, 70) };
+            let rect = ctx.content_rect();
+            let shown = egui::Area::new(scrim_id)
+                .order(egui::Order::Middle)
+                .interactable(false)
+                .fixed_pos(rect.min)
+                .show(&ctx, |ui| ui.painter().rect_filled(rect, 0.0, scrim.gamma_multiply(dim)));
+            scrim_layer = Some(shown.response.layer_id);
+        }
+        let mut focused_layer = None;
         for tab in &mut self.popups {
             // The header of the dialogs (a taller one than a title bar): the tab's icon, its
             // title and its connection, and ×.
@@ -1843,6 +1861,11 @@ impl eframe::App for TernaryGridApp {
             {
                 ctx.move_to_top(shown.response.layer_id);
             }
+            if let Some(shown) = &shown
+                && focus == Some(tab.id)
+            {
+                focused_layer = Some(shown.response.layer_id);
+            }
             if let (Some(p), Some(shown)) = (pressed, &shown)
                 && shown.response.rect.contains(p)
             {
@@ -1855,6 +1878,11 @@ impl eframe::App for TernaryGridApp {
         }
         if pressed.is_some() {
             self.popup_focus = clicked_popup;
+        }
+        // The dimming over the other windows, the focused one right above it.
+        if let (Some(scrim), Some(window)) = (scrim_layer, focused_layer) {
+            ctx.move_to_top(scrim);
+            ctx.set_sublayer(scrim, window);
         }
 
         self.dialogs.show(&ctx, &mut cx);

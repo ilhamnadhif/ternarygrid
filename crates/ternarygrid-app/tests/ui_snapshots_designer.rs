@@ -395,12 +395,8 @@ fn ui_snapshots_designer() {
                 &["name", "orders", "revenue"],
                 &[["Eko Lestari", "10", "18,483.74"], ["Fajar Lestari", "6", "19,438.54"], ["Kartika Kurniawan", "11", "17,327.29"]],
             ));
-            s.frames(4);
-            if has(&s.h, "Ran a query · 3 row(s)") {
-                let n = s.h.query_all_by_label_contains("Ran a query · 3 row(s)").next().unwrap();
-                n.click();
-            }
-            s.frames(4);
+            // The step opens on its result.
+            s.frames(8);
             s.park_pointer();
             s.shot("ai_chat");
             s.ai().reset();

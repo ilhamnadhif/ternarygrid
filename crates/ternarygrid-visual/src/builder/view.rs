@@ -656,7 +656,7 @@ fn canvas(
                         if k == JoinKind::Full && !full_join && j.kind != k {
                             continue;
                         }
-                        if ui.radio(j.kind == k, tr(k.label())).clicked() {
+                        if ternarygrid_ui::kit::radio(ui, j.kind == k, tr(k.label())).clicked() {
                             j.kind = k;
                             ui.close();
                         }

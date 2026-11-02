@@ -43,8 +43,11 @@ hasil query jutaan baris tidak perlu muat di memori.
 - **Asisten AI** (opsional, dengan kunci API Anda sendiri: Anthropic, OpenAI, atau layanan yang
   kompatibel) di panel samping: mengenal skema, menulis dan menjelaskan SQL, menyimpan percakapannya,
   dan, jika diizinkan, menjalankan query read-only sendiri.
-- Antarmuka berbahasa Inggris, tema terang dan gelap (View → Theme atau tombol matahari / bulan di
-  status bar), pintasan dan toolbar yang bisa diubah, tanpa telemetri.
+- Antarmuka modern yang tenang, sama dengan TernaryWire dan TernaryShell: bar atas berisi koneksi ›
+  skema yang aktif dan kotak pencarian untuk setiap perintah, objek, dan script (`⇧⌘P`), rail ikon
+  (navigator, project, riwayat, task), dan status bar dengan mode transaksi. Antarmuka berbahasa
+  Inggris, tema terang dan gelap (View → Theme atau tombol matahari / bulan di bar atas), pintasan
+  yang bisa diubah, tanpa telemetri.
 - **Pembaruan otomatis** dari rilis GitHub (opsional), pasang dengan satu klik, dan catatan rilis setelah setiap pembaruan.
 
 <p>
@@ -152,13 +155,13 @@ pwsh scripts/bundle-windows.ps1                        # Windows: installer dan 
 3. Klik dua kali tabel di navigator untuk mengedit datanya; klik header kolom untuk mengurutkan
    (naik → turun → mati); `⌘S` menyimpan perubahan.
 
-Bahasa antarmuka dan tema diatur di **Settings → General**.
+Tema diatur di **Settings → General**.
 
 ## Pembaruan
 
 Jika Anda mengizinkan, TernaryGrid mencari rilis baru setiap kali dibuka dan setiap 6 jam. Versi baru
 membuka dialog berisi versi saat ini, versi baru, dan apa saja yang baru (jika ditemukan belakangan,
-muncul tombol **Update** di toolbar tanpa mengganggu pekerjaan Anda). Di Windows, **Download**
+muncul tombol **Update** di bar atas tanpa mengganggu pekerjaan Anda). Di Windows, **Download**
 mengunduh installer baru (jalankan di atas versi yang terpasang); di Linux membuka halaman rilis
 berisi paket-paketnya. Di macOS, **Install update**:
 

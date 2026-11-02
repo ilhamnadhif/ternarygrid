@@ -341,6 +341,46 @@ pub fn checkbox(ui: &mut Ui, on: &mut bool, label: impl Into<egui::WidgetText>) 
     resp
 }
 
+/// A radio button like the design's: an accent ring with a dot when selected.
+pub fn radio(ui: &mut Ui, selected: bool, label: impl Into<egui::WidgetText>) -> Response {
+    let p = style::pal(ui);
+    let enabled = ui.is_enabled();
+    let text: egui::WidgetText = label.into();
+    let label_text = text.text().to_string();
+    let galley = (!label_text.is_empty()).then(|| text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body));
+    let w = 16.0 + galley.as_ref().map_or(0.0, |g| 8.0 + g.size().x);
+    let h = galley.as_ref().map_or(18.0, |g| g.size().y.max(18.0));
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, enabled, selected, &label_text));
+    if ui.is_rect_visible(rect) {
+        let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+        let c = egui::pos2(rect.left() + 8.0, rect.center().y);
+        let ring = if selected || (enabled && resp.hovered()) { p.accent } else { p.border_strong };
+        ui.painter().circle(c, 7.25, p.surface, Stroke::new(1.5, fade(ring)));
+        if selected {
+            ui.painter().circle_filled(c, 4.0, fade(p.accent));
+        }
+        if resp.has_focus() {
+            style::focus_halo(ui, Rect::from_center_size(c, vec2(16.0, 16.0)), 8);
+        }
+        if let Some(g) = galley {
+            ui.painter().galley(egui::pos2(rect.left() + 24.0, rect.center().y - g.size().y / 2.0), g, fade(p.text));
+        }
+    }
+    resp
+}
+
+/// [`radio`] over a value, like `Ui::radio_value`: a click selects `value` (the response is
+/// marked changed).
+pub fn radio_value<T: PartialEq>(ui: &mut Ui, current: &mut T, value: T, label: impl Into<egui::WidgetText>) -> Response {
+    let mut resp = radio(ui, *current == value, label);
+    if resp.clicked() && *current != value {
+        *current = value;
+        resp.mark_changed();
+    }
+    resp
+}
+
 /// A full-width row of a side navigation (settings sections, panels): its icon and name, the
 /// selected one on a soft accent.
 pub fn nav_item(ui: &mut Ui, icon: &str, text: &str, selected: bool) -> Response {

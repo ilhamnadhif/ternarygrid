@@ -172,7 +172,15 @@ impl Section {
 
     /// The section is found by `query` (lower case): its name or one of its settings.
     fn matches(self, query: &str) -> bool {
-        query.is_empty() || self.label().to_lowercase().contains(query) || self.keywords().iter().any(|k| tr(k).to_lowercase().contains(query))
+        query.is_empty() || self.label().to_lowercase().contains(query) || self.hits(query) > 0
+    }
+
+    /// How many of the section's settings `query` (lower case) finds.
+    fn hits(self, query: &str) -> usize {
+        if query.is_empty() {
+            return 0;
+        }
+        self.keywords().iter().filter(|k| tr(k).to_lowercase().contains(query)).count()
     }
 
     /// A line under the section's title.
@@ -261,30 +269,70 @@ fn label_w(ui: &Ui) -> f32 {
     if w < 600.0 { (w * 0.42).clamp(120.0, 165.0) } else { 220.0 }
 }
 
+/// What "Search settings" looks for (lower case), kept for the frame in the ui's memory.
+fn search_id() -> egui::Id {
+    egui::Id::new("settings_search_query")
+}
+
+/// The content scrolls to the first setting found once after the search changed.
+fn scroll_id() -> egui::Id {
+    egui::Id::new("settings_search_scroll")
+}
+
+/// Draws a setting; one that "Search settings" finds gets a soft accent behind it.
+fn found(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let mut add = Some(add);
+    found_dyn(ui, label, &mut |ui| add.take().is_some_and(|a| a(ui)))
+}
+
+// Not generic: compiled once for the hundred settings that use it.
+fn found_dyn(ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
+    let query = ui.data(|d| d.get_temp::<String>(search_id())).unwrap_or_default();
+    if query.is_empty() || label.is_empty() || !label.to_lowercase().contains(&query) {
+        return add(ui);
+    }
+    let behind = ui.painter().add(egui::Shape::Noop);
+    let r = ui.scope(add);
+    let p = ternarygrid_ui::pal(ui);
+    let rect = r.response.rect.expand2(egui::vec2(8.0, 3.0));
+    ui.painter().set(behind, egui::Shape::rect_filled(rect, ternarygrid_ui::style::RADIUS, p.accent_soft));
+    if ui.data_mut(|d| d.remove_temp::<bool>(scroll_id())).unwrap_or(false) {
+        r.response.scroll_to_me(Some(egui::Align::Center));
+    }
+    r.inner
+}
+
 /// A setting: its label in the label column, then the control.
 fn row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
     let w = label_w(ui);
-    parts::form_row(ui, label, w, add)
+    found(ui, label, |ui| parts::form_row(ui, label, w, add))
 }
 
 /// [`row`] with a muted line of explanation under the control.
 fn row_sub(ui: &mut Ui, label: &str, sub: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let mut add = Some(add);
+    row_sub_dyn(ui, label, sub, &mut |ui| add.take().is_some_and(|a| a(ui)))
+}
+
+fn row_sub_dyn(ui: &mut Ui, label: &str, sub: &str, add: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
     let w = label_w(ui);
     let p = ternarygrid_ui::pal(ui);
-    ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(egui::vec2(w, ternarygrid_ui::style::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_min_width(w);
-            ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
-        });
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            let c = ui.horizontal(add).inner;
-            ui.label(RichText::new(sub).size(12.0).color(p.text_muted));
-            c
+    found(ui, label, |ui| {
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(egui::vec2(w, ternarygrid_ui::style::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_width(w);
+                ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
+            });
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let c = ui.horizontal(|ui| add(ui)).inner;
+                ui.label(RichText::new(sub).size(12.0).color(p.text_muted));
+                c
+            })
+            .inner
         })
         .inner
     })
-    .inner
 }
 
 /// Content indented to the controls' column (check boxes under the fields).
@@ -298,7 +346,7 @@ fn indented(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> bool) -> bool {
 }
 
 fn check(ui: &mut Ui, value: &mut bool, label: &str) -> bool {
-    look::checkbox(ui, value, label).changed()
+    found(ui, label, |ui| look::checkbox(ui, value, label).changed())
 }
 
 /// Check boxes in a column, 10 points apart.
@@ -336,6 +384,11 @@ fn text(ui: &mut Ui, value: &mut String, width: f32, mono: bool) -> bool {
 
 /// Two groups side by side (equal widths, 14 points apart).
 fn two(ui: &mut Ui, left: impl FnOnce(&mut Ui) -> bool, right: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let (mut left, mut right) = (Some(left), Some(right));
+    two_dyn(ui, &mut |ui| left.take().is_some_and(|f| f(ui)), &mut |ui| right.take().is_some_and(|f| f(ui)))
+}
+
+fn two_dyn(ui: &mut Ui, left: &mut dyn FnMut(&mut Ui) -> bool, right: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
     let mut c = false;
     let gap = 14.0;
     let w = ((ui.available_width() - gap) / 2.0).floor();
@@ -1242,9 +1295,13 @@ impl SettingsTab {
     fn sections_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let mut changed = false;
         ui.spacing_mut().item_spacing.y = 2.0;
+        let before = self.search.clone();
         kit::search_field(ui, egui::Id::new("settings_search"), &mut self.search, tr("Search settings"), ui.available_width());
         ui.add_space(8.0);
         let query = self.search.trim().to_lowercase();
+        if self.search != before {
+            ui.data_mut(|d| d.insert_temp(scroll_id(), !query.is_empty()));
+        }
         let shown: Vec<Section> = Section::ALL.iter().copied().filter(|s| s.matches(&query)).collect();
         if !shown.is_empty() && !shown.contains(&self.section) {
             self.section = shown[0];
@@ -1255,10 +1312,19 @@ impl SettingsTab {
             ui.label(RichText::new(tr("No setting matches.")).color(p.text_muted));
         }
         for s in shown {
-            if kit::nav_item(ui, s.icon(), s.label(), self.section == s).clicked() {
+            let item = kit::nav_item(ui, s.icon(), s.label(), self.section == s);
+            // While searching: how many of the section's settings match.
+            let hits = s.hits(&query);
+            if hits > 0 {
+                let p = ternarygrid_ui::pal(ui);
+                let at = egui::pos2(item.rect.right() - 10.0, item.rect.center().y);
+                ui.painter().text(at, egui::Align2::RIGHT_CENTER, hits.to_string(), egui::FontId::proportional(11.5), p.text_faint);
+            }
+            if item.clicked() {
                 self.section = s;
                 self.message = None;
                 self.recording = None;
+                ui.data_mut(|d| d.insert_temp(scroll_id(), !query.is_empty()));
             }
         }
         ui.add_space(12.0);
@@ -1346,6 +1412,8 @@ impl TabView for SettingsTab {
         });
         let r = nav.response.rect;
         ui.painter().vline(r.right(), r.y_range(), egui::Stroke::new(1.0, p.border));
+        let query = self.search.trim().to_lowercase();
+        ui.data_mut(|d| d.insert_temp(search_id(), query));
         let content_frame = egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin { left: 28, right: 12, top: 20, bottom: 0 });
         egui::CentralPanel::default().frame(content_frame).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {

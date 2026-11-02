@@ -113,25 +113,7 @@ pub(crate) fn checkbox(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
 /// A radio button drawn like the mockups (an accent ring with a dot). Returns its response;
 /// `clicked()` is the choice.
 pub(crate) fn radio(ui: &mut Ui, selected: bool, label: &str) -> Response {
-    let p = style::pal(ui);
-    let enabled = ui.is_enabled();
-    let g = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(style::body_size(ui.ctx())), Color32::PLACEHOLDER);
-    let (rect, resp) = ui.allocate_exact_size(vec2(16.0 + 8.0 + g.size().x, g.size().y.max(20.0)), Sense::click());
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, enabled, selected, label));
-    if ui.is_rect_visible(rect) {
-        let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
-        let c = pos2(rect.left() + 8.0, rect.center().y);
-        let ring = if selected || (enabled && resp.hovered()) { p.accent } else { p.border_strong };
-        ui.painter().circle(c, 7.25, p.surface, Stroke::new(1.5, fade(ring)));
-        if selected {
-            ui.painter().circle_filled(c, 4.0, fade(p.accent));
-        }
-        if resp.has_focus() {
-            style::focus_halo(ui, Rect::from_center_size(c, Vec2::splat(16.0)), 8);
-        }
-        ui.painter().galley(pos2(rect.left() + 24.0, rect.center().y - g.size().y / 2.0), g, fade(p.text));
-    }
-    resp
+    kit::radio(ui, selected, label)
 }
 
 /// [`radio`] for one value of `current`; true when it was chosen.

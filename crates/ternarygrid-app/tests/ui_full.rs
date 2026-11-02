@@ -1013,6 +1013,11 @@ fn tool_tabs_run() {
     assert!(h.state().popups.is_empty());
     nav_menu(&mut h, "customer", &["Export data"]);
     assert_eq!(h.state().popups.len(), 1);
+    // The defaults: Next to the last page, which runs it.
+    assert!(!has(&h, "Run export"), "run on the last page only");
+    for _ in 0..3 {
+        click(&mut h, "Next");
+    }
     click(&mut h, "Run export");
     // Named database (SQLite: the file) _ table _ date _ time.
     let date = chrono::Local::now().format("%Y%m%d").to_string();
@@ -1916,6 +1921,8 @@ fn ai_assistant_is_a_side_panel() {
     });
     frames(&mut h, 3);
     assert!(has(&h, "Ran a query · 1 rows"), "{:?}", labels(&h));
+    // Folded, its SQL's Run goes away: the Run left is the answer's.
+    click(&mut h, "Ran a query · 1 rows");
     click(&mut h, "Run");
     wait(&mut h, "the query run in a new editor", |h| tab_titles(h).iter().any(|t| t.starts_with("Script-")) && has(h, "Data grid, 1 rows"));
     no_errors(&mut h, "Run from the assistant");
