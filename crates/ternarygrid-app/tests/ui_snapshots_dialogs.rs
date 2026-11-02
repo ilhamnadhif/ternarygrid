@@ -158,7 +158,7 @@ impl Shots {
         let services = Services::ephemeral(&home.join("home"));
         let conns = ConnectionManager::new(ternarygrid_app::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
         let h = Harness::builder()
-            .with_size(egui::vec2(1400.0, 900.0))
+            .with_size(egui::vec2(1440.0, 900.0))
             .with_pixels_per_point(PPP)
             .with_max_steps(400)
             .with_step_dt(1.0 / 60.0)
@@ -225,12 +225,16 @@ impl Shots {
     /// Type `text` into the field at the right of the label `label`.
     fn type_right_of(&mut self, label: &str, text: &str) {
         {
-            let l = self.h.query_all_by_label(label).last().unwrap_or_else(|| panic!("no label {label:?}"));
-            let lr = l.rect();
+            // The label with a field on its row (a combo box may show the same text).
+            let fields: Vec<_> = self.h.query_all_by_role(egui::accesskit::Role::TextInput).chain(self.h.query_all_by_role(egui::accesskit::Role::PasswordInput)).collect();
             let f = self
                 .h
-                .query_all_by_role(egui::accesskit::Role::TextInput)
-                .find(|n| n.rect().left() > lr.left() && (n.rect().center().y - lr.center().y).abs() < 12.0)
+                .query_all_by_label(label)
+                .filter_map(|l| {
+                    let lr = l.rect();
+                    fields.iter().find(|n| n.rect().left() > lr.right() && (n.rect().center().y - lr.center().y).abs() < 12.0)
+                })
+                .next_back()
                 .unwrap_or_else(|| panic!("no field next to {label:?}"));
             f.click();
         }
@@ -255,6 +259,119 @@ impl Shots {
         }
         self.frames(4);
     }
+
+    /// Open the combo box at the right of the label `label`.
+    fn open_combo_right_of(&mut self, label: &str) {
+        {
+            let combos: Vec<_> = self.h.query_all_by_role(egui::accesskit::Role::ComboBox).collect();
+            let c = self
+                .h
+                .query_all_by_label(label)
+                .filter_map(|l| {
+                    let lr = l.rect();
+                    combos.iter().find(|n| n.rect().left() > lr.right() && (n.rect().center().y - lr.center().y).abs() < 12.0)
+                })
+                .next_back()
+                .unwrap_or_else(|| panic!("no combo box next to {label:?}"));
+            c.click();
+        }
+        self.frames(3);
+    }
+
+    /// Nothing has the keyboard focus (as in the design's pictures).
+    fn unfocus(&mut self) {
+        self.h.ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+        self.frames(2);
+    }
+
+    /// Wait until a widget whose label contains `text` is shown.
+    fn wait_label(&mut self, text: &str) {
+        let t = text.to_string();
+        self.wait(text, |h| h.query_all_by_label_contains(&t).next().is_some());
+    }
+
+    /// Empty the field at the right of the label `label` (select all, delete).
+    fn clear_right_of(&mut self, label: &str) {
+        self.type_right_of(label, "");
+        self.h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        self.frames(1);
+        self.h.key_press(egui::Key::Backspace);
+        self.frames(2);
+    }
+
+    /// Replace the text of the field at the right of the label `label`.
+    fn set_right_of(&mut self, label: &str, text: &str) {
+        self.clear_right_of(label);
+        self.h.event(egui::Event::Text(text.into()));
+        self.frames(2);
+    }
+}
+
+/// A DBeaver workspace with the connections of the design's import dialog (and two
+/// databases TernaryGrid does not support, for the notes).
+fn dbeaver_workspace(home: &Path) -> PathBuf {
+    let ws = home.join("DBeaverData/workspace6");
+    let dir = ws.join("General/.dbeaver");
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = r#"{
+      "folders": {"Clients": {}, "Data": {}},
+      "connections": {
+        "c1": {"provider": "postgresql", "driver": "postgres-jdbc", "name": "slypee-prod", "folder": "Clients",
+               "configuration": {"host": "10.0.4.12", "port": 5432, "database": "slypee", "user": "app"}},
+        "c2": {"provider": "postgresql", "driver": "postgres-jdbc", "name": "bantuin",
+               "configuration": {"host": "localhost", "port": 5432, "database": "bantuin"}},
+        "c3": {"provider": "mysql", "driver": "mysql8", "name": "tplus-staging", "folder": "Clients",
+               "configuration": {"host": "staging.db.internal", "port": 3306,
+                                 "events": {"BEFORE_CONNECT": {"enabled": true, "command": "ssh -fN staging-tunnel"}}}},
+        "c4": {"provider": "clickhouse", "driver": "com_clickhouse", "name": "analytics", "folder": "Data",
+               "configuration": {"host": "ch.internal", "port": 8123}},
+        "c5": {"provider": "generic", "driver": "sqlite_jdbc", "name": "local-notes", "configuration": {"database": "~/notes.db"}},
+        "c6": {"provider": "db2", "driver": "db2_iseries", "name": "legacy-db2", "configuration": {"host": "as400.internal"}},
+        "c7": {"provider": "generic", "driver": "firebird", "name": "old-firebird", "configuration": {"host": "fb.internal"}}
+      }
+    }"#;
+    std::fs::write(dir.join("data-sources.json"), json).unwrap();
+    ws
+}
+
+/// The PostgreSQL connection of the design's connection dialogs, set up page by page.
+fn slypee_prod() -> ternarygrid_core::config::ConnectionConfig {
+    use ternarygrid_core::config::*;
+    let mut pg = ConnectionConfig::new(ternarygrid_core::DbKind::Postgres, "slypee-prod");
+    pg.host = "10.0.4.12".into();
+    pg.user = Some("app".into());
+    pg.database = Some("slypee".into());
+    pg.connection_type = "prod".into();
+    pg.save_password = true;
+    pg.ssh = Some(SshConfig {
+        enabled: true,
+        host: "bastion.office.example.com".into(),
+        user: "ilham".into(),
+        auth: SshAuth::PublicKey { key_path: "~/.ssh/id_ed25519".into() },
+        save_credentials: true,
+        keepalive_secs: 30,
+        ..Default::default()
+    });
+    pg.proxy = Some(ProxyConfig { enabled: true, host: "proxy.office.example.com".into(), user: Some("ilham".into()), ..Default::default() });
+    pg.ssl = SslConfig { mode: SslMode::VerifyFull, ca_cert: Some("~/certs/rds-ca-2026.pem".into()), only_custom_ca: true, ..Default::default() };
+    pg.init.default_schema = Some("public".into());
+    pg.init.keep_alive_secs = 0;
+    pg.init.connect_timeout_secs = 10;
+    pg.init.query_timeout_secs = 30;
+    pg.init.separate_editor_connection = true;
+    pg.init.init_sql = "set statement_timeout = '30s';\nset search_path = public, extensions;\n".into();
+    pg.properties.insert("application_name".into(), "TernaryGrid".into());
+    pg.properties.insert("options".into(), "-c lock_timeout=5s".into());
+    pg.filters.schemas = NameFilter { enabled: true, include: vec!["public".into(), "billing".into()], exclude: vec!["pg_temp*".into()] };
+    pg.filters.tables = NameFilter { enabled: true, include: vec![], exclude: vec!["*_backup".into(), "tmp_*".into()] };
+    pg.folder = Some("Clients/Slypee".into());
+    pg.description = Some("Production replica, read mostly".into());
+    pg.color = Some([0xf2, 0x8b, 0x7d]);
+    pg
 }
 
 #[test]
@@ -267,35 +384,71 @@ fn ui_snapshots_dialogs() {
         std::fs::create_dir_all(&home).unwrap();
         let mut s = Shots::new(&home, root.clone(), theme);
 
-        // The sample database (connected) and a PostgreSQL connection that is not.
+        // The sample database (connected) and the PostgreSQL connections of the design (not).
         s.h.query_all_by_label_contains("Create sample database").next().unwrap().click();
         s.wait("the sample connection", |h| {
             let app = h.state();
             app.conns.configs().len() == 1 && app.conns.is_connected(&app.conns.configs()[0].id.clone())
         });
         let conn = s.h.state().conns.configs()[0].id.clone();
-        let mut pg = ternarygrid_core::config::ConnectionConfig::new(ternarygrid_core::DbKind::Postgres, "slypee-prod");
-        pg.host = "10.0.4.12".into();
-        pg.user = Some("app".into());
-        pg.database = Some("slypee".into());
-        pg.ssh = Some(ternarygrid_core::config::SshConfig {
-            enabled: true,
-            host: "bastion.office.example.com".into(),
-            user: "ilham".into(),
-            auth: ternarygrid_core::config::SshAuth::PublicKey { key_path: "~/.ssh/id_ed25519".into() },
-            ..Default::default()
-        });
-        pg.folder = Some("Clients".into());
+        let pg = slypee_prod();
         let pg_id = pg.id.clone();
-        s.h.state_mut().conns.upsert(pg);
+        {
+            use ternarygrid_core::config::{SecretSlot, secret_key};
+            let app = s.h.state_mut();
+            app.conns.secrets.set(&secret_key(&pg_id, SecretSlot::Password), &ternarygrid_core::Secret::new("secret-password")).unwrap();
+            app.conns.secrets.set(&secret_key(&pg_id, SecretSlot::ProxyPassword), &ternarygrid_core::Secret::new("proxy-pw")).unwrap();
+            app.conns.upsert(pg);
+            for (kind, name) in [(ternarygrid_core::DbKind::MySql, "tplus-staging"), (ternarygrid_core::DbKind::Postgres, "slypee-replica")] {
+                let mut c = ternarygrid_core::config::ConnectionConfig::new(kind, name);
+                c.host = "10.0.4.13".into();
+                c.folder = Some("Clients/Slypee".into());
+                app.conns.upsert(c);
+            }
+        }
         s.frames(3);
 
-        // New connection: Main, a missing name, the other pages, a SQLite file.
+        // New connection: Main (as filled in), a missing name after a failed test, a SQLite file.
         let ctx = s.h.ctx.clone();
         s.h.state_mut().dispatch_action(&ctx, Action::NewConnection);
+        s.frames(3);
+        for (label, text) in
+            [("Connection name", "bantuin"), ("Host", "db.bantuin.internal"), ("Port", "5432"), ("Database", "bantuin"), ("User", "app"), ("Password", "secret-pass!")]
+        {
+            s.set_right_of(label, text);
+        }
+        s.open_combo_right_of("Connection type");
+        s.click("Production");
+        s.unfocus();
         s.shot("conn_main");
+        s.reset();
+        s.h.state_mut().dispatch_action(&ctx, Action::NewConnection);
+        s.frames(3);
+        for (label, text) in [("Connection name", "x"), ("Host", "127.0.0.1"), ("Port", "1"), ("Database", "slypee"), ("User", "app"), ("Password", "secret")] {
+            s.set_right_of(label, text);
+        }
         s.click("Test connection");
+        s.wait_label("refused");
+        s.clear_right_of("Connection name");
+        s.click("Save");
         s.shot("conn_error");
+        s.reset();
+        s.h.state_mut().dispatch_action(&ctx, Action::NewConnection);
+        s.frames(3);
+        s.click("SQLite");
+        s.type_right_of("Connection name", "local-notes");
+        s.type_right_of("Database file", "~/notes.db");
+        s.unfocus();
+        s.shot("conn_sqlite");
+        s.reset();
+
+        // Edit connection: every page of slypee-prod.
+        {
+            let app = s.h.state_mut();
+            app.dialogs.edit_connection(&pg_id, &app.conns);
+        }
+        s.frames(3);
+        s.shot("conn_edit_main");
         for (page, name) in [
             ("SSH", "conn_ssh"),
             ("Proxy", "conn_proxy"),
@@ -308,26 +461,12 @@ fn ui_snapshots_dialogs() {
             s.click(page);
             s.shot(name);
         }
-        s.click("Main");
-        s.click("SQLite");
-        s.shot("conn_sqlite");
-        s.reset();
-
-        // Edit connection: SSH with a tunnel.
-        {
-            let app = s.h.state_mut();
-            app.dialogs.edit_connection(&pg_id, &app.conns);
-        }
-        s.frames(3);
-        s.shot("conn_edit_main");
-        s.click("SSH");
-        s.shot("conn_edit_ssh");
         s.reset();
 
         // Small modals.
         {
             let app = s.h.state_mut();
-            app.dialogs.open_credentials(&pg_id, vec![PromptField::Password, PromptField::SshPassphrase], &app.conns);
+            app.dialogs.open_credentials(&pg_id, vec![PromptField::Password, PromptField::SshPassword], &app.conns);
         }
         s.shot("credential");
         s.reset();
@@ -339,40 +478,112 @@ fn ui_snapshots_dialogs() {
         s.reset();
         s.h.state_mut().push_command(AppCommand::NewFolder { parent: Some("Clients".into()) });
         s.frames(3);
-        s.h.event(egui::Event::Text("x/y".into()));
+        s.h.event(egui::Event::Text("Slypee".into()));
         s.shot("folder_new");
         s.reset();
-        s.h.state_mut().push_command(AppCommand::DeleteFolder("Clients".into()));
+        s.h.state_mut().push_command(AppCommand::DeleteFolder("Clients/Slypee".into()));
         s.shot("folder_delete");
         s.reset();
-        s.h.state_mut().push_command(AppCommand::ImportConnections);
+        let ws = dbeaver_workspace(&home);
+        s.h.state_mut().dialogs.import = Some(ternarygrid_app::dialogs::import::ImportDialog::with_workspace(ws));
         s.frames(3);
-        s.shot("import_dbeaver");
-        s.click("URL");
-        s.type_right_of("URL", "postgres://app@db.bantuin.internal:5432/bantuin");
+        s.shot("import_start");
         s.click("Find connections");
         s.shot("import_found");
+        s.reset();
+        {
+            // A vault saved before: unlock it.
+            let path = home.join("vault-saved.bin");
+            ternarygrid_config::VaultStore::new(path.clone()).create(&ternarygrid_core::Secret::new("master-password")).unwrap();
+            let vault = Arc::new(ternarygrid_config::VaultStore::new(path));
+            *s.h.state().services.secrets.write() = ternarygrid_config::SecretsManager::with_vault(vault);
+            s.h.state_mut().dialogs.vault_open = true;
+        }
+        s.frames(3);
+        s.h.event(egui::Event::Text("master-pw".into()));
+        s.shot("vault");
         s.reset();
         {
             let vault = Arc::new(ternarygrid_config::VaultStore::new(home.join("vault.bin")));
             *s.h.state().services.secrets.write() = ternarygrid_config::SecretsManager::with_vault(vault);
             s.h.state_mut().dialogs.vault_open = true;
         }
+        s.frames(3);
+        s.type_right_of("Master password", "master-pw");
+        s.type_right_of("Repeat password", "master");
+        s.click("Create");
         s.shot("vault_create");
         s.reset();
 
         // Objects and databases.
         s.h.state_mut().push_command(AppCommand::DropObjects {
             connection: conn.clone(),
-            objects: vec![ObjectRef::table(Some("main".into()), "product"), ObjectRef::table(Some("main".into()), "customer")],
+            objects: vec![
+                ObjectRef::table(Some("main".into()), "tmp_import_2024"),
+                ObjectRef::table(Some("main".into()), "tmp_import_2025"),
+                ObjectRef::new(ternarygrid_core::meta::ObjectKind::View, Some("main".into()), "v_old_orders"),
+            ],
         });
         s.shot("drop");
         s.reset();
+        s.h.state_mut().push_command(AppCommand::NewDatabase { connection: conn.clone() });
+        s.frames(3);
+        s.h.event(egui::Event::Text("analytics_2026".into()));
+        s.shot("create_db");
+        s.reset();
         s.h.state_mut().push_command(AppCommand::NewSchema { connection: conn.clone(), database: None });
+        s.frames(3);
+        s.h.event(egui::Event::Text("reporting".into()));
         s.shot("create_schema");
         s.reset();
         s.h.state_mut().push_command(AppCommand::EditDatabase { connection: conn.clone(), database: "main".into(), rename: false });
         s.shot("edit_db");
+        s.reset();
+
+        // Unsaved changes: a table designer with a change, closed.
+        s.h.state_mut().push_command(AppCommand::CreateTable { connection: conn.clone(), schema: ternarygrid_core::meta::SchemaRef::new(None, Some("main".into())) });
+        s.frames(6);
+        {
+            let f = s.h.query_all_by_role(egui::accesskit::Role::TextInput).find(|n| n.rect().left() > 400.0 && n.rect().top() > 120.0).expect("a field of the table designer");
+            f.click();
+        }
+        s.frames(2);
+        s.h.event(egui::Event::Text("orders".into()));
+        s.frames(3);
+        {
+            let app = s.h.state_mut();
+            let (_, tab) = app.dock.find_active_focused().expect("the designer");
+            let id = tab.id;
+            app.ask_close(id);
+        }
+        s.shot("unsaved");
+        // (The designer asks about its changes itself when it is closed: it stays open.)
+        s.click("Cancel");
+        s.reset();
+
+        // Background operations.
+        let (export_id, backup_id) = {
+            let app = s.h.state_mut();
+            let export = app.ops.start("Export orders");
+            export.progress.set(28_400, Some(48_210));
+            export.progress.set_message("orders");
+            let backup = app.ops.start("Backup of bantuin");
+            backup.progress.set_message("pg_dump running");
+            let import = app.ops.start("Import into customer");
+            app.ops.finish(import.id, OpState::Succeeded("1,204 rows imported".into()));
+            let migrate = app.ops.start("Migrate 4 tables");
+            app.ops.finish(migrate.id, OpState::Failed("payments: duplicate key value violates unique constraint".into()));
+            app.ops.panel_open = true;
+            (export.id, backup.id)
+        };
+        s.shot("operations");
+        {
+            let app = s.h.state_mut();
+            app.ops.cancel_all();
+            for id in [export_id, backup_id] {
+                app.ops.finish(id, OpState::Cancelled);
+            }
+        }
         s.reset();
 
         // Pending transactions, disconnect and quit with them.
@@ -404,45 +615,46 @@ fn ui_snapshots_dialogs() {
         s.click("Cancel");
         s.reset();
         // (The SQL editor asks about its own unsaved script and transaction when it is closed.)
+        let running = s.h.state_mut().ops.start("Export orders");
         s.h.state_mut().push_command(AppCommand::Quit);
         s.h.step();
         s.h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
         s.h.step();
         s.shot("quit");
         s.click("Cancel");
-        s.reset();
-
-        // Background operations.
-        {
-            let app = s.h.state_mut();
-            let export = app.ops.start("Export orders");
-            export.progress.set(28_400, Some(48_210));
-            export.progress.set_message("orders");
-            let backup = app.ops.start("Backup of bantuin");
-            backup.progress.set_message("pg_dump running");
-            let import = app.ops.start("Import into customer");
-            app.ops.finish(import.id, OpState::Succeeded("1,204 rows imported".into()));
-            let migrate = app.ops.start("Migrate 4 tables");
-            app.ops.finish(migrate.id, OpState::Failed("payments: duplicate key value violates unique constraint".into()));
-            app.ops.panel_open = true;
-        }
-        s.shot("operations");
-        s.h.state_mut().ops.cancel_all();
+        s.h.state_mut().ops.finish(running.id, OpState::Cancelled);
         s.reset();
 
         // Updates, tips, about, drivers, shortcuts.
         s.h.state_mut().updates.show_whats_new();
         s.shot("whats_new");
         s.reset();
-        s.h.state_mut().updates.available = Some(ternarygrid_app::updates::Release {
+        let release = ternarygrid_app::updates::Release {
             version: "0.6.0".into(),
             url: "https://github.com/ilhamnadhif/ternarygrid/releases/tag/v0.6.0".into(),
-            notes: "### Changed\n- A new, quieter interface: top bar, icon rail and status bar.\n- One filter bar and one footer for results.".into(),
+            notes: "- A new, quieter interface: top bar, icon rail and status bar.\n- One filter bar and one footer for results.".into(),
             date: Some("2026-11-10".into()),
             ..Default::default()
-        });
+        };
+        s.h.state_mut().updates.available = Some(release.clone());
         s.shot("update_available");
         s.reset();
+        #[cfg(target_os = "macos")]
+        {
+            {
+                let app = s.h.state_mut();
+                app.updates.preview_install(&app.backend, release.clone(), Some((32_925_286, 51_694_796)));
+            }
+            s.shot("updating");
+            s.click("Hide");
+            {
+                let app = s.h.state_mut();
+                app.updates.preview_install(&app.backend, release.clone(), None);
+            }
+            s.shot("update_ready");
+            s.click("Later");
+            s.reset();
+        }
         {
             let app = s.h.state_mut();
             app.settings.updates.check_automatically = None;
@@ -451,6 +663,7 @@ fn ui_snapshots_dialogs() {
         }
         s.shot("update_ask");
         s.reset();
+        s.h.state_mut().settings.general.show_tips = true;
         s.h.state_mut().show_tip();
         s.shot("tip");
         s.reset();

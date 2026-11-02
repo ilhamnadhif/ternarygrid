@@ -1,6 +1,6 @@
 //! Connection wizard (FR-C1..C8): create, edit, test connections.
 
-use super::{LABEL_W, add_field, cancel_button, caption, error_text, hint, muted, number_field, opt_field, rest, right, status_line, text_field, text_width};
+use super::{LABEL_W, add_field, cancel_button, error_text, form_row, hint, mono_hint, muted, number_field, opt_field, rest, right, status_line, sub_text, text_field, text_width};
 use crate::backend::Job;
 use crate::conn::{ConnectionManager, Credentials};
 use crate::cx::AppContext;
@@ -293,7 +293,7 @@ impl ConnectionDialog {
         let action = Cell::new(None::<FooterAction>);
         let id = Id::new(("conn_dlg", &self.cfg.id));
         let mut open = self.open;
-        let (resp, _) = Dialog::new(&title).icon(icon::PLUGS_CONNECTED).width(width).body_padding(Margin::ZERO).show_window(
+        let (resp, _) = Dialog::new(&title).icon(icon::PLUG).width(width).body_padding(Margin::ZERO).show_window(
             ctx,
             id,
             &mut open,
@@ -301,11 +301,11 @@ impl ConnectionDialog {
             |ui| self.body(ui, cx, body_h),
             Some(&mut |ui: &mut Ui| {
                 let main = if is_new { tr("Save and connect") } else { tr("Save") };
-                let right_w = kit::button_width(ui, Some(icon::PLUGS_CONNECTED), main, false)
+                let right_w = kit::button_width(ui, Some(icon::PLUG), main, false)
                     + if is_new { kit::button_width(ui, None, tr("Save"), false) + 8.0 } else { 0.0 }
                     + kit::button_width(ui, None, tr("Cancel"), false)
                     + 24.0;
-                if ui.add_enabled_ui(!testing, |ui| kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Test connection"))).inner.clicked() {
+                if ui.add_enabled_ui(!testing, |ui| kit::secondary(ui, Some(icon::PLUG), tr("Test connection"))).inner.clicked() {
                     action.set(Some(FooterAction::Test));
                 }
                 if testing {
@@ -317,7 +317,7 @@ impl ConnectionDialog {
                 }
                 right(ui, |ui| {
                     if is_new {
-                        if kit::primary_icon(ui, icon::PLUGS_CONNECTED, main).clicked() {
+                        if kit::primary_icon(ui, icon::PLUG, main).clicked() {
                             action.set(Some(FooterAction::SaveAndConnect));
                         }
                         if kit::secondary(ui, None, tr("Save")).clicked() {
@@ -332,6 +332,7 @@ impl ConnectionDialog {
                 });
             }),
         );
+        super::dim_behind(ctx, resp.layer);
         let mut close = crate::widgets::escape_closes(ctx, resp.layer);
         match action.get() {
             Some(FooterAction::Test) => {
@@ -372,6 +373,7 @@ impl ConnectionDialog {
         }
         let page_rect = egui::Rect::from_min_max(egui::pos2(x, rect.top()), rect.max);
         let mut pui = ui.new_child(UiBuilder::new().id_salt("conn_page").max_rect(page_rect).layout(Layout::top_down(Align::Min)));
+        pui.spacing_mut().item_spacing.y = 0.0;
         self.page_tabs(&mut pui);
         let page = self.page;
         egui::ScrollArea::vertical().id_salt(("conn_page_scroll", page as u8)).auto_shrink([false, false]).show(&mut pui, |ui| {
@@ -383,7 +385,7 @@ impl ConnectionDialog {
                     Page::Ssh => self.ssh_page(ui, cx),
                     Page::Proxy => self.proxy_page(ui, cx),
                     Page::Ssl => self.ssl_page(ui),
-                    Page::Init => self.init_page(ui),
+                    Page::Init => self.init_page(ui, cx.conns.registry.get(self.cfg.kind).map(|d| d.dialect())),
                     Page::Properties => self.properties_page(ui),
                     Page::Filters => self.filters_page(ui),
                     Page::General => self.general_page(ui, cx),
@@ -395,8 +397,9 @@ impl ConnectionDialog {
     /// The databases and the compatible products, with a filter.
     fn kind_list(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let w = ui.available_width();
+        ui.spacing_mut().item_spacing.y = 0.0;
         kit::search_field(ui, Id::new(("conn_kind_filter", &self.cfg.id)), &mut self.kind_filter, tr("Filter databases"), w);
-        ui.add_space(8.0);
+        ui.add_space(10.0);
         let needle = self.kind_filter.trim().to_lowercase();
         let matches = |name: &str| needle.is_empty() || name.to_lowercase().contains(&needle);
         egui::ScrollArea::vertical().id_salt("conn_kinds_scroll").auto_shrink([false, false]).show(ui, |ui| {
@@ -457,16 +460,16 @@ impl ConnectionDialog {
 
     fn main_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let kind = self.cfg.kind;
-        parts::form_row(ui, tr("Connection name"), LABEL_W, |ui| add_field(ui, text_field(&mut self.cfg.name, f32::INFINITY).hint_text(hint(ui, kind.display_name()))));
+        form_row(ui, tr("Connection name"), |ui| add_field(ui, text_field(&mut self.cfg.name, f32::INFINITY).hint_text(hint(ui, kind.display_name()))));
         if let Some(m) = self.invalid(Field::Name) {
             error_text(ui, m);
         }
         if kind.is_file_based() {
-            parts::form_row(ui, tr("Database file"), LABEL_W, |ui| {
+            form_row(ui, tr("Database file"), |ui| {
                 let reserve = kit::button_width(ui, Some(icon::FOLDER_OPEN), tr("Browse…"), false) + kit::button_width(ui, None, tr("New…"), false) + 16.0;
                 let w = rest(ui, reserve);
                 let mut path = self.cfg.file_path.clone().unwrap_or_default();
-                if add_field(ui, text_field(&mut path, w).font(egui::TextStyle::Monospace)).changed() {
+                if add_field(ui, text_field(&mut path, w).font(egui::FontId::monospace(12.5))).changed() {
                     self.cfg.file_path = Some(path);
                 }
                 if kit::secondary(ui, Some(icon::FOLDER_OPEN), tr("Browse…")).on_hover_text(tr("Open existing file")).clicked()
@@ -490,10 +493,10 @@ impl ConnectionDialog {
                 error_text(ui, m);
             }
         } else {
-            parts::form_row(ui, tr("Host"), LABEL_W, |ui| {
+            form_row(ui, tr("Host"), |ui| {
                 let w = rest(ui, 80.0 + text_width(ui, tr("Port")) + 16.0);
                 add_field(ui, text_field(&mut self.cfg.host, w));
-                ui.label(RichText::new(tr("Port")).color(style::pal(ui).text_muted));
+                ui.label(RichText::new(tr("Port")).size(12.5).color(style::pal(ui).text_muted));
                 let mut port = self.cfg.port.map(|p| p.to_string()).unwrap_or_default();
                 let default = kind.default_port().map(|p| p.to_string()).unwrap_or_default();
                 if add_field(ui, text_field(&mut port, 80.0).hint_text(hint(ui, &default))).changed() {
@@ -506,7 +509,7 @@ impl ConnectionDialog {
             if kind == DbKind::Oracle {
                 // A service name (the usual) or the SID of an older database.
                 let mut sid = self.cfg.properties.contains_key("sid");
-                parts::form_row(ui, tr("Connect by"), LABEL_W, |ui| {
+                form_row(ui, tr("Connect by"), |ui| {
                     ui.spacing_mut().item_spacing.x = 16.0;
                     let before = sid;
                     kit::radio_value(ui, &mut sid, false, tr("Service name"));
@@ -524,7 +527,7 @@ impl ConnectionDialog {
             if kind == DbKind::MongoDb {
                 // Atlas and other hosted clusters: `mongodb+srv://` (hosts from DNS, port unused).
                 let mut srv = self.cfg.properties.get("srv").is_some_and(|v| v == "true");
-                parts::form_row(ui, "", LABEL_W, |ui| {
+                form_row(ui, "", |ui| {
                     if ternarygrid_ui::kit::checkbox(ui, &mut srv, tr("DNS seed list (mongodb+srv, Atlas)")).changed() {
                         if srv {
                             self.cfg.properties.insert("srv".into(), "true".into());
@@ -535,7 +538,7 @@ impl ConnectionDialog {
                 });
             }
             let sid = kind == DbKind::Oracle && self.cfg.properties.contains_key("sid");
-            parts::form_row(ui, if sid { "SID" } else { tr(kind.database_label()) }, LABEL_W, |ui| {
+            form_row(ui, if sid { "SID" } else { tr(kind.database_label()) }, |ui| {
                 let mut db = if sid { self.cfg.properties.get("sid").cloned().unwrap_or_default() } else { self.cfg.database.clone().unwrap_or_default() };
                 let h = if sid { "ORCL" } else { kind.default_database().unwrap_or("") };
                 if add_field(ui, text_field(&mut db, f32::INFINITY).hint_text(hint(ui, h))).changed() {
@@ -546,7 +549,7 @@ impl ConnectionDialog {
                     }
                 }
             });
-            parts::form_row(ui, tr("Authentication"), LABEL_W, |ui| {
+            form_row(ui, tr("Authentication"), |ui| {
                 egui::ComboBox::from_id_salt("auth_method").icon(kit::combo_caret).width(200.0).selected_text(auth_label(&self.cfg.auth)).show_ui(ui, |ui| {
                     let mut options = vec![AuthMethod::Password, AuthMethod::Prompt];
                     if kind.is_postgres_family() {
@@ -564,33 +567,33 @@ impl ConnectionDialog {
                 });
             });
             if !matches!(self.cfg.auth, AuthMethod::None) {
-                parts::form_row(ui, tr("User"), LABEL_W, |ui| opt_field(ui, &mut self.cfg.user, "", f32::INFINITY, false));
+                form_row(ui, tr("User"), |ui| opt_field(ui, &mut self.cfg.user, "", f32::INFINITY, false));
             }
             match &mut self.cfg.auth {
                 AuthMethod::Password => {
                     let save = &mut self.cfg.save_password;
                     let password = &mut self.password;
-                    parts::form_row(ui, tr("Password"), LABEL_W, |ui| {
+                    form_row(ui, tr("Password"), |ui| {
                         let w = rest(ui, text_width(ui, tr("Save password")) + 34.0);
                         add_field(ui, text_field(password, w).password(true));
                         ternarygrid_ui::kit::checkbox(ui, save, tr("Save password"));
                     });
                 }
                 AuthMethod::Command { command } => {
-                    parts::form_row(ui, tr("Password command"), LABEL_W, |ui| {
-                        add_field(ui, text_field(command, f32::INFINITY).font(egui::TextStyle::Monospace).hint_text(hint(ui, "security find-generic-password -w -s db")))
+                    form_row(ui, tr("Password command"), |ui| {
+                        add_field(ui, text_field(command, f32::INFINITY).font(egui::FontId::monospace(12.5)).hint_text(mono_hint(ui, "security find-generic-password -w -s db")))
                     });
                 }
                 AuthMethod::Pgpass => {
-                    parts::form_row(ui, "", LABEL_W, |ui| muted(ui, tr("The password is read from ~/.pgpass (or PGPASSFILE).")));
+                    form_row(ui, "", |ui| muted(ui, tr("The password is read from ~/.pgpass (or PGPASSFILE).")));
                 }
                 _ => {}
             }
             if cx.conns.registry.get(kind).is_some_and(|d| d.info().capabilities.multiple_databases) {
-                parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.cfg.init.show_all_databases, tr("Show all databases")));
+                form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.cfg.init.show_all_databases, tr("Show all databases")));
             }
         }
-        parts::form_row(ui, tr("Connection type"), LABEL_W, |ui| {
+        form_row(ui, tr("Connection type"), |ui| {
             let types = cx.conns.connection_types();
             let current = types.iter().find(|t| t.id == self.cfg.connection_type).map(|t| t.name.clone()).unwrap_or_default();
             egui::ComboBox::from_id_salt("conn_type").icon(kit::combo_caret).width(180.0).selected_text(tr(&current)).show_ui(ui, |ui| {
@@ -602,10 +605,9 @@ impl ConnectionDialog {
                     });
                 }
             });
-            ui.add_space(4.0);
             ternarygrid_ui::kit::checkbox(ui, &mut self.cfg.read_only, tr("Read-only"));
         });
-        parts::form_row(ui, tr("Auto-commit"), LABEL_W, |ui| {
+        form_row(ui, tr("Auto-commit"), |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
             kit::radio_value(ui, &mut self.auto_commit_choice, 0, tr("Connection type default"));
             kit::radio_value(ui, &mut self.auto_commit_choice, 1, tr("On"));
@@ -614,19 +616,19 @@ impl ConnectionDialog {
         if self.cfg.kind.is_file_based() {
             return;
         }
-        let open = parts::form_row(ui, "", LABEL_W, |ui| super::disclosure(ui, Id::new(("conn_url", &self.cfg.id)), tr("Connect with a URL"), false));
+        let open = form_row(ui, "", |ui| super::disclosure(ui, Id::new(("conn_url", &self.cfg.id)), tr("Connect with a URL"), false));
         if !open {
             return;
         }
-        parts::form_row(ui, "", LABEL_W, |ui| {
+        form_row(ui, "", |ui| {
             let w = rest(ui, kit::button_width(ui, None, tr("Apply"), false) + 8.0);
-            add_field(ui, text_field(&mut self.url, w).font(egui::TextStyle::Monospace).hint_text(hint(ui, url_example(self.cfg.kind))));
+            add_field(ui, text_field(&mut self.url, w).font(egui::FontId::monospace(12.5)).hint_text(mono_hint(ui, url_example(self.cfg.kind))));
             if kit::secondary(ui, None, tr("Apply")).clicked() {
                 self.apply_url();
             }
         });
         if let Some(e) = &self.url_error {
-            parts::form_row(ui, "", LABEL_W, |ui| error_text(ui, e));
+            form_row(ui, "", |ui| error_text(ui, e));
         }
     }
 
@@ -666,10 +668,7 @@ impl ConnectionDialog {
 
     fn network_profile_selector(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let profiles: Vec<(String, String)> = cx.conns.store.network_profiles.iter().map(|p| (p.id.clone(), p.name.clone())).collect();
-        if profiles.is_empty() && self.cfg.network_profile.is_none() {
-            return false;
-        }
-        parts::form_row(ui, tr("Network profile"), LABEL_W, |ui| {
+        form_row(ui, tr("Network profile"), |ui| {
             let current = self
                 .cfg
                 .network_profile
@@ -685,7 +684,7 @@ impl ConnectionDialog {
             });
         });
         if self.cfg.network_profile.is_some() {
-            parts::form_row(ui, "", LABEL_W, |ui| muted(ui, tr("SSH and proxy settings come from the network profile (Settings → Network profiles).")));
+            form_row(ui, "", |ui| muted(ui, tr("SSH and proxy settings come from the network profile (Settings → Network profiles).")));
             true
         } else {
             false
@@ -713,27 +712,29 @@ impl ConnectionDialog {
 
     fn ssl_page(&mut self, ui: &mut Ui) {
         let ssl = &mut self.cfg.ssl;
-        form_row_top(ui, tr("SSL mode"), |ui| {
-            ui.spacing_mut().item_spacing.y = 6.0;
-            let items: Vec<(SslMode, &str)> = SslMode::ALL.iter().map(|m| (*m, m.label())).collect();
-            parts::segmented(ui, &mut ssl.mode, &items);
-            muted(
-                ui,
-                match ssl.mode {
-                    SslMode::Disable => tr("No encryption."),
-                    SslMode::Prefer => tr("Encrypt when the server supports it; the certificate is not verified."),
-                    SslMode::Require => tr("Always encrypt; the certificate is not verified."),
-                    SslMode::VerifyCa => tr("Always encrypt and verify the certificate chain."),
-                    SslMode::VerifyFull => tr("Always encrypt and verify the certificate chain and host name."),
-                },
-            );
+        form_row(ui, tr("SSL mode"), |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let items: Vec<(SslMode, &str)> = SslMode::ALL.iter().map(|m| (*m, m.label())).collect();
+                parts::segmented(ui, &mut ssl.mode, &items);
+                sub_text(
+                    ui,
+                    match ssl.mode {
+                        SslMode::Disable => tr("No encryption."),
+                        SslMode::Prefer => tr("Encrypt when the server supports it; the certificate is not verified."),
+                        SslMode::Require => tr("Always encrypt; the certificate is not verified."),
+                        SslMode::VerifyCa => tr("Always encrypt and verify the certificate chain."),
+                        SslMode::VerifyFull => tr("Always encrypt and verify the certificate chain and host name."),
+                    },
+                );
+            });
         });
         for (label, field, h) in [
             (tr("CA certificate"), &mut ssl.ca_cert, ""),
             (tr("Client certificate"), &mut ssl.client_cert, tr("optional")),
             (tr("Client key"), &mut ssl.client_key, tr("optional")),
         ] {
-            parts::form_row(ui, label, LABEL_W, |ui| {
+            form_row(ui, label, |ui| {
                 let w = rest(ui, 36.0);
                 opt_field(ui, field, h, w, true);
                 if kit::icon_button(ui, icon::FOLDER_OPEN, tr("Choose file")).clicked()
@@ -743,52 +744,48 @@ impl ConnectionDialog {
                 }
             });
         }
-        parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut ssl.only_custom_ca, tr("Trust only this CA (ignore system certificates)")));
+        form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut ssl.only_custom_ca, tr("Trust only this CA (ignore system certificates)")));
     }
 
-    fn init_page(&mut self, ui: &mut Ui) {
+    fn init_page(&mut self, ui: &mut Ui, dialect: Option<std::sync::Arc<dyn ternarygrid_core::Dialect>>) {
         let init = &mut self.cfg.init;
         let gap = 28.0;
-        let col_w = ((ui.available_width() - gap) / 2.0).floor();
-        let label_w = 130.0;
+        // The columns share the width as in the design (the left one a little wider).
+        let left_w = ((ui.available_width() - gap) * 0.513).floor();
+        let right_w = ui.available_width() - gap - left_w;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
-            ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(col_w);
+            ui.allocate_ui_with_layout(vec2(left_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(left_w);
                 ui.spacing_mut().item_spacing.y = 12.0;
-                let field_w = |ui: &Ui, w: f32| w.min(ui.available_width());
-                parts::form_row(ui, tr("Default schema"), label_w, |ui| {
-                    let w = field_w(ui, 200.0);
-                    opt_field(ui, &mut init.default_schema, "", w, false)
-                });
-                parts::form_row(ui, tr("Keep-alive (s)"), label_w, |ui| number_field(ui, "init_keepalive", &mut init.keep_alive_secs, 0..=3600, 90.0));
-                parts::form_row(ui, tr("Connect timeout (s)"), label_w, |ui| number_field(ui, "init_connect_timeout", &mut init.connect_timeout_secs, 1..=600, 90.0));
-                parts::form_row(ui, tr("Query timeout (s)"), label_w, |ui| number_field(ui, "init_query_timeout", &mut init.query_timeout_secs, 0..=86_400, 90.0));
-                parts::form_row(ui, tr("Fetch size"), label_w, |ui| {
+                // 200 wide, short of the right column.
+                let schema_w = (left_w + gap - LABEL_W - 16.0 - 6.0).min(200.0);
+                form_row(ui, tr("Default schema"), |ui| opt_field(ui, &mut init.default_schema, "", schema_w, false));
+                form_row(ui, tr("Keep-alive (s)"), |ui| number_field(ui, "init_keepalive", &mut init.keep_alive_secs, 0..=3600, 90.0));
+                form_row(ui, tr("Connect timeout (s)"), |ui| number_field(ui, "init_connect_timeout", &mut init.connect_timeout_secs, 1..=600, 90.0));
+                form_row(ui, tr("Query timeout (s)"), |ui| number_field(ui, "init_query_timeout", &mut init.query_timeout_secs, 0..=86_400, 90.0));
+                form_row(ui, tr("Fetch size"), |ui| {
                     let mut fs = init.fetch_size.map(|f| f.to_string()).unwrap_or_default();
-                    let w = field_w(ui, 140.0);
-                    if add_field(ui, text_field(&mut fs, w).hint_text(hint(ui, tr("global setting")))).changed() {
+                    if add_field(ui, text_field(&mut fs, 140.0).hint_text(hint(ui, tr("global setting")))).changed() {
                         init.fetch_size = fs.trim().parse().ok();
                     }
                 });
             });
-            ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(col_w);
+            ui.allocate_ui_with_layout(vec2(right_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(right_w);
                 ui.spacing_mut().item_spacing.y = 12.0;
                 ternarygrid_ui::kit::checkbox(ui, &mut init.separate_editor_connection, tr("Separate connection for each SQL editor"));
                 ternarygrid_ui::kit::checkbox(ui, &mut init.show_system_objects, tr("Show system objects"));
-                parts::form_row(ui, tr("Before connect"), 110.0, |ui| {
+                form_row(ui, tr("Before connect"), |ui| {
                     opt_field(ui, &mut init.shell_before_connect, tr("Shell command"), f32::INFINITY, true).on_hover_text(tr("Shell command before connect"))
                 });
-                parts::form_row(ui, tr("After disconnect"), 110.0, |ui| {
+                form_row(ui, tr("After disconnect"), |ui| {
                     opt_field(ui, &mut init.shell_after_disconnect, tr("Shell command"), f32::INFINITY, true).on_hover_text(tr("Shell command after disconnect"))
                 });
             });
         });
         ui.label(RichText::new(tr("Initialization SQL (run after every connect)")).color(style::pal(ui).text_muted));
-        parts::code_frame()(ui).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
-            ui.add(egui::TextEdit::multiline(&mut init.init_sql).code_editor().frame(egui::Frame::NONE).margin(Margin::ZERO).desired_rows(5).desired_width(f32::INFINITY));
-        });
+        super::code_editor(ui, "init_sql", dialect, &mut init.init_sql, 3);
     }
 
     fn properties_page(&mut self, ui: &mut Ui) {
@@ -799,7 +796,7 @@ impl ConnectionDialog {
         let cols = [super::Column::new(tr("Property"), super::W::Px(220.0)), super::Column::new(tr("Value"), super::W::Fr(1.0)), super::Column::new("", super::W::Px(44.0))];
         let props = &mut self.cfg.properties;
         let new_prop = &mut self.new_prop;
-        super::table(ui, "conn_props", &cols, keys.len() + 1, 38.0, f32::INFINITY, |ui, row, col| {
+        super::table(ui, "conn_props", &cols, keys.len() + 1, 36.0, f32::INFINITY, |ui, row, col| {
             let Some(row) = row else { return };
             match (keys.get(row), col) {
                 (Some(k), 0) => {
@@ -807,7 +804,7 @@ impl ConnectionDialog {
                 }
                 (Some(k), 1) => {
                     if let Some(v) = props.get_mut(k) {
-                        add_field(ui, text_field(v, f32::INFINITY).font(egui::TextStyle::Monospace));
+                        add_field(ui, text_field(v, f32::INFINITY).font(egui::FontId::monospace(12.5)).min_size(vec2(0.0, 26.0)));
                     }
                 }
                 (Some(k), _) => {
@@ -816,10 +813,10 @@ impl ConnectionDialog {
                     }
                 }
                 (None, 0) => {
-                    add_field(ui, text_field(&mut new_prop.0, f32::INFINITY).hint_text(hint(ui, tr("name"))));
+                    add_field(ui, text_field(&mut new_prop.0, f32::INFINITY).min_size(vec2(0.0, 26.0)).hint_text(hint(ui, tr("name"))));
                 }
                 (None, 1) => {
-                    add_field(ui, text_field(&mut new_prop.1, f32::INFINITY).hint_text(hint(ui, tr("value"))));
+                    add_field(ui, text_field(&mut new_prop.1, f32::INFINITY).min_size(vec2(0.0, 26.0)).hint_text(hint(ui, tr("value"))));
                 }
                 (None, _) => {
                     if kit::icon_button_ex(ui, icon::PLUS, tr("Add"), false, 24.0).clicked() {
@@ -842,24 +839,35 @@ impl ConnectionDialog {
         let p = style::pal(ui);
         let id = self.cfg.id.clone();
         let f = &mut self.cfg.filters;
-        ui.spacing_mut().item_spacing.y = 10.0;
-        for (label, filter) in [
+        let used = |f: &NameFilter| f.enabled || !f.include.is_empty() || !f.exclude.is_empty();
+        // Databases, routines and other objects: one line until one is used or asked for.
+        let more_id = Id::new(("conn_filter_more", &id));
+        let more = used(&f.databases) || used(&f.routines) || used(&f.other) || ui.data(|d| d.get_temp::<bool>(more_id)).unwrap_or(false);
+        for (i, (label, filter)) in [
             (tr("Schemas"), &mut f.schemas),
             (tr("Tables"), &mut f.tables),
             (tr("Views"), &mut f.views),
             (tr("Databases"), &mut f.databases),
             (tr("Procedures and functions"), &mut f.routines),
             (tr("Other objects"), &mut f.other),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if i >= 3 && !more {
+                continue;
+            }
             let open_id = Id::new(("conn_filter_open", &id, label));
-            let used = filter.enabled || !filter.include.is_empty() || !filter.exclude.is_empty();
-            let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(used);
+            let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(true);
             kit::card(ui).corner_radius(CornerRadius::same(style::RADIUS_LG)).inner_margin(Margin::same(12)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 10.0;
+                // The title row is as tall as the switch (19 points), not a control.
+                let control_h = ui.spacing().interact_size.y;
+                ui.spacing_mut().interact_size.y = 19.0;
                 ui.horizontal(|ui| {
                     let title = ui.painter().layout_no_wrap(label.to_string(), style::semibold(ui.ctx(), 13.0), p.text);
-                    let (r, resp) = ui.allocate_exact_size(vec2(title.size().x + 22.0, 24.0), Sense::click());
+                    let (r, resp) = ui.allocate_exact_size(vec2(title.size().x + 20.0, 19.0), Sense::click());
                     resp.widget_info(|| WidgetInfo::selected(WidgetType::CollapsingHeader, true, open, label));
                     let caret = if open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
                     ui.painter().text(egui::pos2(r.left() + 6.0, r.center().y), Align2::CENTER_CENTER, caret, style::icon_font(12.0), p.text_faint);
@@ -868,7 +876,7 @@ impl ConnectionDialog {
                         open = !open;
                         ui.data_mut(|d| d.insert_temp(open_id, open));
                     }
-                    if !open && !used {
+                    if !open && !used(filter) {
                         ui.label(RichText::new(tr("(no filter)")).size(12.0).color(p.text_faint));
                     }
                     // The switch at the right edge (laid out left to right: its label after it).
@@ -876,33 +884,42 @@ impl ConnectionDialog {
                     ui.add_space((ui.available_width() - switch_w).max(0.0));
                     parts::switch(ui, &mut filter.enabled, tr("Enable filter"), None);
                 });
+                ui.spacing_mut().interact_size.y = control_h;
                 if open {
-                    ui.add_enabled_ui(filter.enabled, |ui| {
-                        ui.horizontal(|ui| {
-                            let w = ((ui.available_width() - 8.0) / 2.0).floor();
-                            let mut inc = filter.include.join(", ");
-                            let mut exc = filter.exclude.join(", ");
-                            if add_field(ui, text_field(&mut inc, w).font(egui::TextStyle::Monospace).hint_text(hint(ui, tr("Include, e.g. app_*"))))
-                                .on_hover_text(tr("Include"))
-                                .changed()
-                            {
-                                filter.include = split_patterns(&inc);
-                            }
-                            if add_field(ui, text_field(&mut exc, w).font(egui::TextStyle::Monospace).hint_text(hint(ui, tr("Exclude, e.g. *_old, tmp_*"))))
-                                .on_hover_text(tr("Exclude"))
-                                .changed()
-                            {
-                                filter.exclude = split_patterns(&exc);
-                            }
-                        });
+                    ui.horizontal(|ui| {
+                        let w = ((ui.available_width() - 8.0) / 2.0).floor();
+                        let mut inc = filter.include.join(", ");
+                        let mut exc = filter.exclude.join(", ");
+                        if add_field(ui, text_field(&mut inc, w).font(egui::FontId::monospace(12.5)).hint_text(mono_hint(ui, tr("Include, e.g. app_*"))))
+                            .on_hover_text(tr("Include"))
+                            .changed()
+                        {
+                            filter.include = split_patterns(&inc);
+                        }
+                        if add_field(ui, text_field(&mut exc, w).font(egui::FontId::monospace(12.5)).hint_text(mono_hint(ui, tr("Exclude, e.g. *_old, tmp_*"))))
+                            .on_hover_text(tr("Exclude"))
+                            .changed()
+                        {
+                            filter.exclude = split_patterns(&exc);
+                        }
                     });
+                }
+            });
+        }
+        if !more {
+            ui.horizontal(|ui| {
+                let names = [tr("Databases"), tr("Procedures and functions"), tr("Other objects")].join(" · ");
+                let r = ui.add(egui::Label::new(RichText::new(names).size(12.5).color(p.text_muted)).sense(Sense::click())).on_hover_text(tr("Show these filters"));
+                ui.label(RichText::new(tr("(no filter)")).size(12.0).color(p.text_faint));
+                if r.clicked() {
+                    ui.data_mut(|d| d.insert_temp(more_id, true));
                 }
             });
         }
     }
 
     fn general_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        parts::form_row(ui, tr("Folder"), LABEL_W, |ui| {
+        form_row(ui, tr("Folder"), |ui| {
             let mut folder = self.cfg.folder.clone().unwrap_or_default();
             let w = rest(ui, 52.0);
             if add_field(ui, text_field(&mut folder, w).hint_text(hint(ui, tr("none")))).changed() {
@@ -916,23 +933,31 @@ impl ConnectionDialog {
                 }
             });
         });
-        form_row_top(ui, tr("Description"), |ui| {
+        form_row(ui, tr("Description"), |ui| {
             let mut d = self.cfg.description.clone().unwrap_or_default();
-            if add_field(ui, egui::TextEdit::multiline(&mut d).margin(Margin::symmetric(10, 6)).desired_rows(2).desired_width(f32::INFINITY)).changed() {
+            let edit = egui::TextEdit::multiline(&mut d)
+                .margin(Margin::symmetric(13, 6))
+                .min_size(vec2(0.0, 56.0))
+                .vertical_align(Align::Center)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY);
+            if add_field(ui, edit).changed() {
                 self.cfg.description = if d.is_empty() { None } else { Some(d) };
             }
         });
-        parts::form_row(ui, tr("Colour"), LABEL_W, |ui| {
+        form_row(ui, tr("Colour"), |ui| {
             let mut use_color = self.cfg.color.is_some();
-            if ternarygrid_ui::kit::checkbox(ui, &mut use_color, tr("Custom colour")).changed() {
-                self.cfg.color = if use_color { Some([120, 160, 220]) } else { None };
-            }
+            super::row_lead(ui, &mut |ui| {
+                if ternarygrid_ui::kit::checkbox(ui, &mut use_color, tr("Custom colour")).changed() {
+                    self.cfg.color = if use_color { Some([120, 160, 220]) } else { None };
+                }
+            });
             if let Some(c) = &mut self.cfg.color {
                 ui.spacing_mut().interact_size = vec2(28.0, 28.0);
                 ui.color_edit_button_srgb(c);
             }
         });
-        parts::form_row(ui, tr("Navigator view"), LABEL_W, |ui| {
+        form_row(ui, tr("Navigator view"), |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
             kit::radio_value(ui, &mut self.cfg.navigator_view, NavigatorView::Advanced, tr("Advanced"));
             kit::radio_value(ui, &mut self.cfg.navigator_view, NavigatorView::Simple, tr("Simple"));
@@ -944,27 +969,12 @@ fn split_patterns(s: &str) -> Vec<String> {
     s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
 }
 
-/// A form row whose control is taller than one line: the label at its top.
-fn form_row_top<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let p = style::pal(ui);
-    ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(vec2(LABEL_W, style::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_min_width(LABEL_W);
-            ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
-        });
-        ui.vertical(add).inner
-    })
-    .inner
-}
-
 /// A caption of the database list.
 fn list_caption(ui: &mut Ui, text: &str, top: f32) {
-    ui.add_space(top);
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        caption(ui, text);
-    });
-    ui.add_space(3.0);
+    let p = style::pal(ui);
+    let g = ui.painter().layout_no_wrap(text.to_uppercase(), style::semibold(ui.ctx(), 11.0), p.text_faint);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), top + g.size().y + 4.0), Sense::hover());
+    ui.painter().galley(egui::pos2(rect.left() + 10.0, rect.top() + top), g, p.text_faint);
 }
 
 /// One entry of the database list: logo and name, the chosen one on a soft accent.
@@ -1036,25 +1046,25 @@ fn default_key_path() -> String {
 fn host_port(ui: &mut Ui, id: &str, host: &mut String, port: &mut u16) {
     let w = rest(ui, 80.0 + text_width(ui, tr("Port")) + 16.0);
     add_field(ui, text_field(host, w));
-    ui.label(RichText::new(tr("Port")).color(style::pal(ui).text_muted));
+    ui.label(RichText::new(tr("Port")).size(12.5).color(style::pal(ui).text_muted));
     number_field(ui, (id, "port"), port, 1..=65535, 80.0);
 }
 
 /// SSH tunnel settings form (connection dialog and network profiles).
 pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut String, passphrase: &mut String) {
     let narrow = |ui: &Ui| 280f32.min(rest(ui, 0.0));
-    parts::form_row(ui, "", LABEL_W, |ui| parts::switch(ui, &mut ssh.enabled, tr("Use SSH tunnel"), None));
+    form_row(ui, "", |ui| parts::switch(ui, &mut ssh.enabled, tr("Use SSH tunnel"), None));
     // Off: only the switch (the settings stay and come back when it is turned on).
     if !ssh.enabled {
         return;
     }
     ui.scope(|ui| {
-        parts::form_row(ui, tr("SSH host"), LABEL_W, |ui| host_port(ui, id, &mut ssh.host, &mut ssh.port));
-        parts::form_row(ui, tr("User"), LABEL_W, |ui| {
+        form_row(ui, tr("SSH host"), |ui| host_port(ui, id, &mut ssh.host, &mut ssh.port));
+        form_row(ui, tr("User"), |ui| {
             let w = narrow(ui);
             add_field(ui, text_field(&mut ssh.user, w))
         });
-        parts::form_row(ui, tr("Authentication"), LABEL_W, |ui| {
+        form_row(ui, tr("Authentication"), |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
             let is_pw = matches!(ssh.auth, SshAuth::Password);
             let is_key = matches!(ssh.auth, SshAuth::PublicKey { .. });
@@ -1071,37 +1081,37 @@ pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut Strin
         });
         match &mut ssh.auth {
             SshAuth::Password => {
-                parts::form_row(ui, tr("Password"), LABEL_W, |ui| {
+                form_row(ui, tr("Password"), |ui| {
                     let w = narrow(ui);
                     add_field(ui, text_field(password, w).password(true))
                 });
             }
             SshAuth::PublicKey { key_path } => {
-                parts::form_row(ui, tr("Private key file"), LABEL_W, |ui| {
+                form_row(ui, tr("Private key file"), |ui| {
                     let w = rest(ui, 36.0);
-                    add_field(ui, text_field(key_path, w).font(egui::TextStyle::Monospace));
+                    add_field(ui, text_field(key_path, w).font(egui::FontId::monospace(12.5)));
                     if kit::icon_button(ui, icon::FOLDER_OPEN, tr("Choose file")).clicked()
                         && let Some(p) = rfd::FileDialog::new().pick_file()
                     {
                         *key_path = p.display().to_string();
                     }
                 });
-                parts::form_row(ui, tr("Passphrase"), LABEL_W, |ui| {
+                form_row(ui, tr("Passphrase"), |ui| {
                     let w = narrow(ui);
                     add_field(ui, text_field(passphrase, w).password(true))
                 });
             }
             SshAuth::Agent => {}
         }
-        parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut ssh.save_credentials, tr("Save credentials")));
-        parts::form_row(ui, tr("Local port"), LABEL_W, |ui| {
+        form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut ssh.save_credentials, tr("Save credentials")));
+        form_row(ui, tr("Local port"), |ui| {
             let mut lp = ssh.local_port.map(|p| p.to_string()).unwrap_or_default();
             if add_field(ui, text_field(&mut lp, 140.0).hint_text(hint(ui, tr("automatic")))).changed() {
                 ssh.local_port = lp.trim().parse().ok();
             }
         });
-        parts::form_row(ui, tr("Keep-alive (s)"), LABEL_W, |ui| number_field(ui, (id, "keepalive"), &mut ssh.keepalive_secs, 0..=3600, 90.0));
-        parts::form_row(ui, tr("Host key check"), LABEL_W, |ui| {
+        form_row(ui, tr("Keep-alive (s)"), |ui| number_field(ui, (id, "keepalive"), &mut ssh.keepalive_secs, 0..=3600, 90.0));
+        form_row(ui, tr("Host key check"), |ui| {
             egui::ComboBox::from_id_salt((id, "hostkey")).icon(kit::combo_caret).width(240.0).selected_text(host_key_label(ssh.host_key_policy)).show_ui(ui, |ui| {
                 for p in [HostKeyPolicy::AcceptNew, HostKeyPolicy::Strict, HostKeyPolicy::AcceptAll] {
                     ui.selectable_value(&mut ssh.host_key_policy, p, host_key_label(p));
@@ -1114,26 +1124,26 @@ pub fn ssh_form(ui: &mut Ui, id: &str, ssh: &mut SshConfig, password: &mut Strin
 /// Proxy settings form (connection dialog and network profiles).
 pub fn proxy_form(ui: &mut Ui, id: &str, proxy: &mut ProxyConfig, password: &mut String) {
     let narrow = |ui: &Ui| 280f32.min(rest(ui, 0.0));
-    parts::form_row(ui, "", LABEL_W, |ui| parts::switch(ui, &mut proxy.enabled, tr("Use proxy"), None));
+    form_row(ui, "", |ui| parts::switch(ui, &mut proxy.enabled, tr("Use proxy"), None));
     if !proxy.enabled {
         return;
     }
     ui.scope(|ui| {
-        parts::form_row(ui, tr("Type"), LABEL_W, |ui| {
+        form_row(ui, tr("Type"), |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
             kit::radio_value(ui, &mut proxy.kind, ProxyKind::Socks5, "SOCKS5");
             kit::radio_value(ui, &mut proxy.kind, ProxyKind::Http, "HTTP CONNECT");
         });
-        parts::form_row(ui, tr("Proxy host"), LABEL_W, |ui| host_port(ui, id, &mut proxy.host, &mut proxy.port));
-        parts::form_row(ui, tr("User"), LABEL_W, |ui| {
+        form_row(ui, tr("Proxy host"), |ui| host_port(ui, id, &mut proxy.host, &mut proxy.port));
+        form_row(ui, tr("User"), |ui| {
             let w = narrow(ui);
             opt_field(ui, &mut proxy.user, "", w, false)
         });
-        parts::form_row(ui, tr("Password"), LABEL_W, |ui| {
+        form_row(ui, tr("Password"), |ui| {
             let w = narrow(ui);
             add_field(ui, text_field(password, w).password(true))
         });
-        parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut proxy.save_credentials, tr("Save credentials")));
+        form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut proxy.save_credentials, tr("Save credentials")));
     });
 }
 

@@ -94,12 +94,13 @@ impl Toasts {
         let dark = ctx.theme() == egui::Theme::Dark;
         let p = ternarygrid_ui::palette(dark);
         let mut close: Option<usize> = None;
-        // Centred above the status bar and the result toolbar: not over the side panels'
-        // buttons (Value: Apply, Set NULL) or the fetch buttons at the right.
-        egui::Area::new(Id::new("ternarygrid_toasts")).anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -76.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-            ui.set_width(380.0);
+        // Above the status bar and the result toolbar, about the middle (where the design has
+        // them): not over the side panels' buttons (Value: Apply, Set NULL) or the fetch
+        // buttons at the right. The text is 380 points wide.
+        egui::Area::new(Id::new("ternarygrid_toasts")).anchor(Align2::CENTER_BOTTOM, egui::vec2(14.0, -76.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            ui.set_width(408.0);
             ui.spacing_mut().item_spacing.y = 8.0;
-            for (i, t) in self.items.iter().enumerate().rev() {
+            for (i, t) in self.items.iter().enumerate() {
                 let (glyph, color) = match t.kind {
                     ToastKind::Info => (icon::INFO, p.accent_text),
                     ToastKind::Success => (icon::CHECK_CIRCLE, p.ok),
@@ -112,7 +113,7 @@ impl Toasts {
                     .stroke(Stroke::new(1.0, p.border))
                     .corner_radius(CornerRadius::same(ternarygrid_ui::style::RADIUS_LG))
                     .shadow(ui.visuals().popup_shadow)
-                    .inner_margin(Margin { left: 14, right: 10, top: 12, bottom: 12 });
+                    .inner_margin(Margin { left: 14, right: 12, top: 12, bottom: 12 });
                 card.show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal_top(|ui| {
@@ -129,7 +130,7 @@ impl Toasts {
                             }
                             if let Some(path) = &t.reveal {
                                 let label = if cfg!(target_os = "macos") { tr("Show in Finder") } else { tr("Show in folder") };
-                                if ui.add(egui::Link::new(RichText::new(label).size(12.0).color(p.accent_text))).clicked() {
+                                if ui.add(egui::Link::new(RichText::new(label).size(12.0).underline().color(p.accent_text))).clicked() {
                                     reveal(path);
                                 }
                             }

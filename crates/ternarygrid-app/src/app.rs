@@ -317,6 +317,14 @@ impl TernaryGridApp {
         }
     }
 
+    /// Ask before closing the tab `id` (screenshots of the question).
+    #[doc(hidden)]
+    pub fn ask_close(&mut self, id: u64) {
+        if !self.close_confirm.contains(&id) {
+            self.close_confirm.push(id);
+        }
+    }
+
     /// "Discard the unsaved changes of … and close?" for the first waiting tab.
     fn close_confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(&id) = self.close_confirm.first() else { return };
@@ -332,7 +340,7 @@ impl TernaryGridApp {
             (tr("Uncommitted transaction"), ternarygrid_core::trf("\"{}\" has uncommitted changes; closing it rolls them back.", &[&title]), tr("Roll back and close"))
         };
         let answer = std::cell::Cell::new(None::<bool>);
-        let (resp, _) = Dialog::new(heading).icon(icon::WARNING).width(460.0).show_modal(
+        let (resp, _) = Dialog::new(heading).icon(icon::WARNING).width(460.0).body_padding(dialogs::BODY).show_modal(
             ctx,
             egui::Id::new(("confirm_close", id)),
             |ui| dialogs::body_text(ui, &text),
@@ -397,7 +405,7 @@ impl TernaryGridApp {
             decided = Some(true);
         } else {
             let (answer, reviewed) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false));
-            let (resp, _) = Dialog::new(tr("Uncommitted transactions")).icon(icon::WARNING).width(520.0).show_modal(
+            let (resp, _) = Dialog::new(tr("Uncommitted transactions")).icon(icon::WARNING).width(520.0).body_padding(dialogs::BODY).show_modal(
                 ctx,
                 egui::Id::new("confirm_disconnect"),
                 |ui| {
@@ -1616,22 +1624,26 @@ impl eframe::App for TernaryGridApp {
             let pending = crate::pending_tx::collect(&self.dock, &self.conns);
             let running = self.ops.running();
             let (answer, reviewed) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false));
-            let (resp, _) = Dialog::new(tr("Quit TernaryGrid?")).icon(icon::WARNING).width(560.0).show_modal(
+            let (resp, _) = Dialog::new(tr("Quit TernaryGrid?")).icon(icon::WARNING).width(560.0).body_padding(dialogs::BODY).show_modal(
                 &ctx,
                 egui::Id::new("confirm_quit"),
                 |ui| {
                     let p = ternarygrid_ui::pal(ui);
                     if !dirty.is_empty() {
                         dialogs::strong(ui, tr("These tabs have unsaved changes:"));
-                        let tabs: Vec<String> = dirty.iter().take(10).map(|t| format!("•  {t}")).collect();
-                        ui.add(egui::Label::new(RichText::new(tabs.join("     ")).color(p.text_muted)).wrap());
+                        let tabs: Vec<String> = dirty.iter().take(10).map(|t| format!("• {t}")).collect();
+                        ui.add(egui::Label::new(RichText::new(tabs.join(" ")).color(p.text_muted)).wrap());
                     }
                     if !pending.is_empty() {
                         dialogs::strong(ui, tr("These connections have uncommitted transactions; quitting rolls them back:"));
                         dialogs::bullets(ui, pending.iter().take(10).map(|p| format!("{} — {}", p.conn_name, p.owner)), p.text_muted);
                     }
                     if running > 0 {
-                        let text = ternarygrid_core::trf("{} operation(s) are still running (export, import, migration …); quitting stops them half way.", &[&running]);
+                        let text = if running == 1 {
+                            tr("1 operation is still running (export, import, migration …); quitting stops it half way.").to_string()
+                        } else {
+                            ternarygrid_core::trf("{} operations are still running (export, import, migration …); quitting stops them half way.", &[&running])
+                        };
                         dialogs::note(ui, ternarygrid_ui::parts::Tone::Warning, &text);
                     }
                 },
@@ -1886,8 +1898,8 @@ impl eframe::App for TernaryGridApp {
         }
 
         self.dialogs.show(&ctx, &mut cx);
-        // Beside its button at the bottom of the rail, above the status bar.
-        let at = egui::pos2(shell::RAIL_W + 8.0, ctx.content_rect().bottom() - shell::STATUS_H - 8.0);
+        // Beside its button at the bottom of the rail, where the design has it.
+        let at = egui::pos2(shell::RAIL_W + 10.0, ctx.content_rect().bottom() - shell::STATUS_H - 66.0);
         self.ops.window(&ctx, at);
         if self.updates.ui(&ctx, &self.backend, &mut self.settings, &mut self.toasts) {
             self.save_settings();
@@ -1912,6 +1924,8 @@ impl eframe::App for TernaryGridApp {
             let items = crate::pending_tx::collect(&self.dock, &self.conns);
             self.pending_tx.show(&ctx, &self.backend, &items);
         }
+        // As in the design, the app is dimmed behind the dialog windows.
+        dialogs::dim_topmost(&ctx);
         if let Some(job) = &mut self.diagnostics {
             match job.poll() {
                 Some(Ok(path)) => {

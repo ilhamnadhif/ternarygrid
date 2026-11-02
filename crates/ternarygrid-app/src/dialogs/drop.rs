@@ -123,14 +123,15 @@ impl DropDialog {
         let error = self.error.clone();
         let count = self.objects.len();
         let cascade = &mut self.cascade;
-        let (resp, _) = Dialog::new(tr("Drop objects")).icon(icon::TRASH).subtitle(&place).width(580.0).show_modal(
+        let (resp, _) = Dialog::new(tr("Drop objects")).icon(icon::TRASH).subtitle(&place).width(580.0).body_padding(super::BODY).show_modal(
             ctx,
             egui::Id::new(("drop_objects", &self.conn)),
             |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
-                ui.add(egui::Label::new(RichText::new(trf("Drop {} object(s)? This cannot be undone.", &[&count])).font(style::medium(ui.ctx(), 13.5))).wrap());
+                let question = if count == 1 { tr("Drop 1 object? This cannot be undone.").to_string() } else { trf("Drop {} objects? This cannot be undone.", &[&count]) };
+                ui.add(egui::Label::new(RichText::new(question).font(style::medium(ui.ctx(), 13.5))).wrap());
                 ternarygrid_ui::kit::checkbox(ui, cascade, tr("Cascade (also drop dependent objects)"));
-                super::sql_preview(ui, "drop_sql", Some(dialect.clone()), script.trim_end(), 240.0);
+                super::sql_preview(ui, "drop_sql", Some(dialect.clone()), script.trim_end(), 240.0, true);
                 if read_only {
                     crate::dialogs::error_note(ui, tr("The connection is read-only."));
                 }
@@ -145,7 +146,7 @@ impl DropDialog {
                 }
             },
             |ui| {
-                if kit::button_ex(ui, Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), false).clicked() {
+                if kit::button_ex(ui, Kind::Ghost, Some(icon::FILE_CODE), tr("Open in SQL editor"), false).clicked() {
                     editor.set(true);
                 }
                 super::right(ui, |ui| {

@@ -208,11 +208,12 @@ impl Dialogs {
                 about_body,
                 None,
             );
+            dim_behind(ctx, resp.layer);
             self.about_open = open && !crate::widgets::escape_closes(ctx, resp.layer);
         }
         if self.drivers_open {
             let mut open = true;
-            let (resp, _) = Dialog::new(tr("Database drivers")).icon(icon::PLUGS).width(900.0).body_padding(Margin::symmetric(20, 16)).show_window(
+            let (resp, _) = Dialog::new(tr("Database drivers")).icon(icon::PLUG).width(900.0).body_padding(Margin::symmetric(20, 16)).show_window(
                 ctx,
                 Id::new("ternarygrid_drivers"),
                 &mut open,
@@ -220,6 +221,7 @@ impl Dialogs {
                 |ui| drivers_body(ui, cx),
                 None,
             );
+            dim_behind(ctx, resp.layer);
             self.drivers_open = open && !crate::widgets::escape_closes(ctx, resp.layer);
         }
         if self.shortcuts_open {
@@ -246,6 +248,7 @@ impl Dialogs {
                 cx.push(AppCommand::OpenSettings);
                 open = false;
             }
+            dim_behind(ctx, resp.layer);
             self.shortcuts_open = open && !crate::widgets::escape_closes(ctx, resp.layer);
         }
         if self.palette_open {
@@ -263,7 +266,7 @@ impl Dialogs {
             let cancel = Cell::new(false);
             let title = trf("Connect to {}", &[&p.conn_name]);
             let target = p.target.clone();
-            let (resp, _) = Dialog::new(&title).icon(icon::KEY).subtitle(&target).width(460.0).show_window(
+            let (resp, _) = Dialog::new(&title).icon(icon::KEY).subtitle(&target).width(460.0).body_padding(BODY).show_window(
                 ctx,
                 Id::new(("cred_prompt", &p.conn_id)),
                 &mut open,
@@ -278,7 +281,7 @@ impl Dialogs {
                             PromptField::SshPassphrase => (tr("Key passphrase"), &mut p.ssh_passphrase),
                             PromptField::ProxyPassword => (tr("Proxy password"), &mut p.proxy_password),
                         };
-                        let r = parts::form_row(ui, label, LABEL_W, |ui| add_field(ui, text_field(value, f32::INFINITY).password(true)));
+                        let r = form_row(ui, label, |ui| add_field(ui, text_field(value, f32::INFINITY).password(true)));
                         // Enter first: re-focusing would hide that the field lost focus.
                         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             submit.set(true);
@@ -290,11 +293,11 @@ impl Dialogs {
                             first = false;
                         }
                     }
-                    parts::form_row(ui, "", LABEL_W, |ui| ternarygrid_ui::kit::checkbox(ui, &mut p.save, tr("Save password")));
+                    form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut p.save, tr("Save password")));
                 },
                 Some(&mut |ui: &mut Ui| {
                     right(ui, |ui| {
-                        if kit::primary_icon(ui, icon::PLUGS_CONNECTED, tr("Connect")).clicked() {
+                        if kit::primary_icon(ui, icon::PLUG, tr("Connect")).clicked() {
                             submit.set(true);
                         }
                         if cancel_button(ui).clicked() {
@@ -303,6 +306,7 @@ impl Dialogs {
                     });
                 }),
             );
+            dim_behind(ctx, resp.layer);
             if cancel.get() {
                 done.push(i);
             }
@@ -366,11 +370,12 @@ impl Dialogs {
                 let target = split_folder(&path).0.map(str::to_string).unwrap_or_else(|| tr("the top level").to_string());
                 let title = trf("Delete the folder \"{}\"?", &[&split_folder(&path).1]);
                 let error = d.error.clone();
-                let (resp, _) = Dialog::new(&title).icon(icon::FOLDER).width(480.0).show_modal(
+                let (resp, _) = Dialog::new(&title).icon(icon::FOLDER).width(480.0).body_padding(BODY).show_modal(
                     ctx,
                     Id::new("ternarygrid_folder"),
                     |ui| {
-                        body_text(ui, &trf("Its {} connection(s) and its subfolders move to {}. No connection is deleted.", &[&n, &target]));
+                        ui.spacing_mut().item_spacing.y = 10.0;
+                        body_text_lh(ui, &trf("Its {} connection(s) and its subfolders move to {}. No connection is deleted.", &[&n, &target]), 1.5);
                         if let Some(e) = &error {
                             crate::dialogs::error_note(ui, e);
                         }
@@ -424,7 +429,7 @@ impl Dialogs {
                 let enter = Cell::new(false);
                 let valid = Cell::new(false);
                 let label = if matches!(action, FolderAction::New { .. }) { tr("Create") } else { tr("Rename") };
-                let (resp, _) = Dialog::new(title).icon(icon::FOLDER).width(420.0).show_modal(
+                let (resp, _) = Dialog::new(title).icon(icon::FOLDER).width(420.0).body_padding(BODY).show_modal(
                     ctx,
                     Id::new("ternarygrid_folder"),
                     |ui| {
@@ -495,7 +500,7 @@ impl Dialogs {
         let disconnect = Cell::new(false);
         let delete = Cell::new(false);
         let cancel = Cell::new(false);
-        let (resp, _) = Dialog::new(tr("Delete connection")).icon(icon::TRASH).width(480.0).show_modal(
+        let (resp, _) = Dialog::new(tr("Delete connection")).icon(icon::TRASH).width(480.0).body_padding(BODY).show_modal(
             ctx,
             Id::new("delete_conn"),
             |ui| {
@@ -547,21 +552,14 @@ fn connection_target(cfg: &ternarygrid_core::config::ConnectionConfig) -> String
     s
 }
 
-/// The body of About: the app icon, name, version and the promises.
+/// The body of About: the app's tile, name, version and the promises.
 fn about_body(ui: &mut Ui) {
     let p = style::pal(ui);
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
-        match app_icon(ui.ctx()) {
-            Some(tex) => {
-                egui::Image::new((tex.id(), Vec2::splat(64.0))).corner_radius(16).paint_at(ui, rect);
-            }
-            None => {
-                ui.painter().rect_filled(rect, CornerRadius::same(16), p.accent);
-                ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon::GRID_FOUR, style::icon_font(34.0), Color32::WHITE);
-            }
-        }
+        ui.painter().rect_filled(rect, CornerRadius::same(16), p.accent);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon::TABLE, style::icon_font(34.0), Color32::WHITE);
         ui.add_space(8.0);
         ui.label(RichText::new("TernaryGrid").font(style::semibold(ui.ctx(), 22.0)).color(p.text));
         ui.label(RichText::new(format!("{} {}", tr("Version"), env!("CARGO_PKG_VERSION"))).size(12.5).color(p.text_muted));
@@ -571,27 +569,13 @@ fn about_body(ui: &mut Ui) {
     });
 }
 
-/// The app's icon as a texture (loaded once).
-fn app_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let id = Id::new("ternarygrid_app_icon");
-    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
-        return Some(t);
-    }
-    let img = image::load_from_memory(include_bytes!("../../assets/icon-256.png")).ok()?.into_rgba8();
-    let size = [img.width() as usize, img.height() as usize];
-    let tex = ctx.load_texture("ternarygrid_app_icon", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR);
-    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
-    Some(tex)
-}
-
 /// The capability table of the built-in drivers.
 fn drivers_body(ui: &mut Ui, cx: &mut AppContext) {
     let p = style::pal(ui);
     ui.spacing_mut().item_spacing.y = 12.0;
     muted(ui, tr("Drivers are built into TernaryGrid (no downloads) and written in Rust; SQLite is an embedded engine."));
-    let mut kinds = cx.conns.registry.kinds();
-    kinds.sort_by_key(|k| k.display_name());
-    let kinds: Vec<_> = kinds.into_iter().filter(|k| cx.conns.registry.get(*k).is_some()).collect();
+    // In the order of the new connection dialog's list.
+    let kinds: Vec<_> = ternarygrid_core::DbKind::ALL.into_iter().filter(|k| cx.conns.registry.get(*k).is_some()).collect();
     let cols = [
         Column::new(tr("Database"), W::Fr(1.3)),
         Column::new(tr("Driver"), W::Fr(1.4)),
@@ -623,7 +607,7 @@ fn drivers_body(ui: &mut Ui, cx: &mut AppContext) {
                 ui.label(RichText::new(k.display_name()).font(style::medium(ui.ctx(), 13.0)).color(p.text));
             }
             1 => {
-                ui.label(RichText::new(info.name).monospace().size(12.0).color(p.text_muted)).on_hover_text(info.description);
+                ui.label(RichText::new(driver_library(k).unwrap_or(info.name)).monospace().size(12.0).color(p.text_muted)).on_hover_text(info.description);
             }
             2 => yes(ui, c.transactions),
             3 => {
@@ -641,6 +625,23 @@ fn drivers_body(ui: &mut Ui, cx: &mut AppContext) {
         }
     });
     ui.label(RichText::new(tr("Not available: Oracle, Db2, Firebird, H2 and Trino (no Rust network driver yet).")).size(12.0).color(p.text_faint));
+}
+
+/// The Rust library (or protocol) a built-in driver speaks through.
+fn driver_library(kind: ternarygrid_core::DbKind) -> Option<&'static str> {
+    use ternarygrid_core::DbKind as K;
+    Some(match kind {
+        K::Postgres | K::CockroachDb => "tokio-postgres",
+        K::MySql | K::MariaDb => "mysql_async",
+        K::Sqlite => "rusqlite (embedded)",
+        K::SqlServer => "tiberius",
+        K::Oracle => "oracledb (thin)",
+        K::ClickHouse | K::Elasticsearch => "HTTP",
+        K::Cassandra => "scylla",
+        K::MongoDb => "mongodb",
+        K::Redis => "redis",
+        _ => return None,
+    })
 }
 
 /// The groups of shortcuts, as in the settings.
@@ -693,13 +694,13 @@ fn shortcuts_body(ui: &mut Ui, cx: &mut AppContext, filter: &mut String) {
                         ui.label(RichText::new(*group).font(style::semibold(ui.ctx(), 12.0)).color(p.text_faint));
                         ui.spacing_mut().item_spacing.y = 0.0;
                         for (label, keys) in rows {
-                            let (rect, _) = ui.allocate_exact_size(vec2(col_w, 33.0), Sense::hover());
+                            let (rect, _) = ui.allocate_exact_size(vec2(col_w, 29.0), Sense::hover());
                             ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, line));
-                            ui.painter().text(egui::pos2(rect.left(), rect.center().y), Align2::LEFT_CENTER, *label, egui::FontId::proportional(13.0), p.text);
+                            ui.painter().text(egui::pos2(rect.left(), rect.center().y - 0.5), Align2::LEFT_CENTER, *label, egui::FontId::proportional(13.0), p.text);
                             let mut x = rect.right();
                             for k in keys.iter().rev() {
                                 let g = ui.painter().layout_no_wrap(k.clone(), style::medium(ui.ctx(), style::SMALL), p.text_muted);
-                                let r = Rect::from_min_size(egui::pos2(x - g.size().x - 10.0, rect.center().y - 9.0), vec2(g.size().x + 10.0, 18.0));
+                                let r = Rect::from_min_size(egui::pos2(x - g.size().x - 12.0, rect.center().y - 10.5), vec2(g.size().x + 12.0, 20.0));
                                 ui.painter().rect(r, CornerRadius::same(4), p.surface, Stroke::new(1.0, p.border_strong), StrokeKind::Inside);
                                 ui.painter().galley(r.center() - g.size() / 2.0, g, p.text_muted);
                                 x = r.left() - 6.0;
@@ -720,10 +721,53 @@ fn shortcuts_body(ui: &mut Ui, cx: &mut AppContext, filter: &mut String) {
 /// Width of the label column in the dialogs' forms.
 pub const LABEL_W: f32 = 150.0;
 
-/// Controls as tall as the design kit's (28 px) with `gap` between the rows.
+/// The padding of a dialog's body (the design's `18px 20px`).
+pub const BODY: Margin = Margin { left: 20, right: 20, top: 18, bottom: 18 };
+
+/// Controls as tall as the design kit's with `gap` between the rows.
 pub fn form_spacing(ui: &mut Ui, gap: f32) {
     style::form_spacing(ui);
     ui.spacing_mut().item_spacing.y = gap;
+}
+
+/// A form row as in the design: the label (muted) in a column of [`LABEL_W`], 6 points
+/// below the top of the row, then the controls 16 points to its right, side by side.
+pub fn form_row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    form_row_w(ui, label, LABEL_W, add)
+}
+
+/// [`form_row`] with a label column of `label_w`.
+pub fn form_row_w<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let mut add = Some(add);
+    let mut out = None;
+    form_row_dyn(ui, label, label_w, &mut |ui| out = add.take().map(|a| a(ui)));
+    out.expect("a form row runs once")
+}
+
+// Not generic: compiled once for every form row.
+fn form_row_dyn(ui: &mut Ui, label: &str, label_w: f32, add: &mut dyn FnMut(&mut Ui)) {
+    let p = style::pal(ui);
+    // As tall as the controls (a row of radio buttons is shorter than a field), which
+    // are centred on each other.
+    let control_h = ui.spacing().interact_size.y;
+    ui.spacing_mut().interact_size.y = 0.0;
+    ui.horizontal_top(|ui| {
+        let gap = ui.spacing().item_spacing.x;
+        ui.spacing_mut().item_spacing.x = 16.0;
+        ui.allocate_ui_with_layout(vec2(label_w, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.set_width(label_w);
+            if !label.is_empty() {
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
+            }
+        });
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = control_h;
+            add(ui)
+        });
+    });
+    ui.spacing_mut().interact_size.y = control_h;
 }
 
 /// The frame of [`Dialog`] windows, for windows that are laid out by hand
@@ -737,6 +781,38 @@ pub fn window_frame(ctx: &egui::Context) -> egui::Frame {
         .corner_radius(CornerRadius::same(RADIUS_LG + 2))
         .shadow(ctx.global_style().visuals.window_shadow)
         .inner_margin(Margin::ZERO)
+}
+
+/// The id of the dimming behind dialog windows.
+const SCRIM: &str = "ternarygrid_dialog_scrim";
+
+/// As in the design, the app is dimmed behind a dialog window (`layer`): asks for it this
+/// frame; [`dim_topmost`] dims behind the topmost one. Unlike a modal's backdrop, the app
+/// still answers clicks.
+pub fn dim_behind(ctx: &egui::Context, layer: Option<egui::LayerId>) {
+    if let Some(layer) = layer {
+        ctx.data_mut(|d| d.get_temp_mut_or_default::<Vec<egui::LayerId>>(Id::new(SCRIM)).push(layer));
+    }
+}
+
+/// Dims the app under the topmost dialog window that asked for it this frame (once a
+/// frame, after every dialog).
+pub fn dim_topmost(ctx: &egui::Context) {
+    let layers = ctx.data_mut(|d| d.remove_temp::<Vec<egui::LayerId>>(Id::new(SCRIM))).unwrap_or_default();
+    let top = ctx.memory(|m| m.areas().top_layer_id(egui::Order::Middle));
+    let Some(window) = top.filter(|t| layers.contains(t)).or_else(|| layers.last().copied()) else { return };
+    let dark = ctx.global_style().visuals.dark_mode;
+    let scrim = if dark { Color32::from_rgba_unmultiplied(8, 9, 12, 140) } else { Color32::from_rgba_unmultiplied(30, 30, 45, 71) };
+    let rect = ctx.content_rect();
+    let shown = egui::Area::new(Id::new(SCRIM)).order(egui::Order::Middle).interactable(false).fixed_pos(rect.min).show(ctx, |ui| ui.painter().rect_filled(rect, 0.0, scrim));
+    ctx.move_to_top(shown.response.layer_id);
+    ctx.set_sublayer(shown.response.layer_id, window);
+}
+
+/// The first item of a row, centred on the controls after it (a row starts as tall as
+/// a line of text: what comes first would sit above their middle).
+pub fn row_lead(ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)) {
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), CONTROL_H), Layout::left_to_right(Align::Center), |ui| add(ui));
 }
 
 /// Lay out `add` from the right edge (the main actions of a footer: primary first).
@@ -754,10 +830,15 @@ pub fn hint(ui: &Ui, text: &str) -> RichText {
     RichText::new(text).color(style::pal(ui).text_faint)
 }
 
+/// A hint in monospace (the placeholder of a monospace field).
+pub fn mono_hint(ui: &Ui, text: &str) -> RichText {
+    hint(ui, text).font(egui::FontId::monospace(12.5))
+}
+
 /// A single-line text field as tall as the other controls, `width` wide
 /// (`f32::INFINITY`: the rest of the row). Add it with [`add_field`].
 pub fn text_field(text: &mut dyn egui::TextBuffer, width: f32) -> egui::TextEdit<'_> {
-    egui::TextEdit::singleline(text).margin(Margin::symmetric(10, 5)).min_size(vec2(0.0, CONTROL_H)).vertical_align(Align::Center).desired_width(width)
+    egui::TextEdit::singleline(text).margin(Margin { left: 13, right: 13, top: 5, bottom: 5 }).min_size(vec2(0.0, CONTROL_H)).vertical_align(Align::Center).desired_width(width)
 }
 
 /// Add a field (see [`text_field`]) with the focus halo of the design kit.
@@ -772,10 +853,8 @@ pub fn add_field(ui: &mut Ui, edit: egui::TextEdit<'_>) -> Response {
 /// A field for an optional text: empty is `None`.
 pub fn opt_field(ui: &mut Ui, value: &mut Option<String>, hint_text: &str, width: f32, mono: bool) -> Response {
     let mut text = value.clone().unwrap_or_default();
-    let mut edit = text_field(&mut text, width).hint_text(hint(ui, hint_text));
-    if mono {
-        edit = edit.font(egui::TextStyle::Monospace);
-    }
+    let mut edit = text_field(&mut text, width);
+    edit = if mono { edit.font(egui::FontId::monospace(12.5)).hint_text(mono_hint(ui, hint_text)) } else { edit.hint_text(hint(ui, hint_text)) };
     let r = add_field(ui, edit);
     if r.changed() {
         *value = Some(text).filter(|t| !t.is_empty());
@@ -827,6 +906,26 @@ pub fn body_text(ui: &mut Ui, text: &str) -> Response {
     ui.add(egui::Label::new(RichText::new(text).size(13.5).color(p.text)).wrap())
 }
 
+/// [`body_text`] with lines `factor` times the text size apart.
+pub fn body_text_lh(ui: &mut Ui, text: &str, factor: f32) -> Response {
+    let p = style::pal(ui);
+    label_lh(ui, RichText::new(text).color(p.text), egui::FontId::proportional(13.5), factor, false)
+}
+
+/// A wrapping label in `font` whose lines are `factor` times its size apart with the text
+/// in the middle of each line, like CSS `line-height` (egui puts the extra space under it).
+pub fn label_lh(ui: &mut Ui, text: RichText, font: egui::FontId, factor: f32, selectable: bool) -> Response {
+    let lh = (font.size * factor * 2.0).floor() / 2.0;
+    let row = ui.fonts_mut(|f| f.row_height(&font));
+    let half = ((lh - row) / 2.0).max(0.0);
+    // Room for the lines; the text drawn half the extra height lower, inside it.
+    let text = egui::WidgetText::from(text.font(font).line_height(Some(lh)));
+    let galley = text.into_galley(ui, Some(egui::TextWrapMode::Wrap), ui.available_width(), egui::TextStyle::Body);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    let mut child = ui.new_child(UiBuilder::new().max_rect(rect.translate(vec2(0.0, half))).layout(Layout::top_down(Align::Min)));
+    child.add(egui::Label::new(galley).selectable(selectable))
+}
+
 /// Wrapping muted text (explanations).
 pub fn muted(ui: &mut Ui, text: &str) -> Response {
     let p = style::pal(ui);
@@ -845,16 +944,26 @@ pub fn error_text(ui: &mut Ui, text: &str) -> Response {
     ui.add(egui::Label::new(RichText::new(text).size(12.5).color(p.err)).wrap())
 }
 
-/// A small caption in capitals (DATABASE, COMPATIBLE).
-pub fn caption(ui: &mut Ui, text: &str) -> Response {
-    let p = style::pal(ui);
-    ui.label(RichText::new(text.to_uppercase()).font(style::semibold(ui.ctx(), 11.0)).color(p.text_faint))
-}
-
 /// One bullet line per item.
 pub fn bullets(ui: &mut Ui, items: impl IntoIterator<Item = String>, color: Color32) {
     for item in items {
-        ui.add(egui::Label::new(RichText::new(format!("•  {item}")).color(color)).wrap());
+        ui.add(egui::Label::new(RichText::new(format!("• {item}")).color(color)).wrap());
+    }
+}
+
+/// The fill of a [`note`] of `tone`, as in the design.
+fn note_fill(ui: &Ui, tone: Tone) -> Color32 {
+    let p = style::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    let rgb = |d: u32, l: u32| {
+        let c = if dark { d } else { l };
+        Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+    };
+    match tone {
+        Tone::Info => p.accent_soft,
+        Tone::Warning => rgb(0x3f3826, 0xfbf3df),
+        Tone::Error => rgb(0x4a3a40, 0xfbe9e7),
+        Tone::Success => rgb(0x253b2b, 0xe3f4e7),
     }
 }
 
@@ -864,15 +973,17 @@ pub fn note(ui: &mut Ui, tone: Tone, text: &str) -> Response {
     let p = style::pal(ui);
     let color = tone.color(&p);
     egui::Frame::new()
-        .fill(tone.fill(ui))
+        .fill(note_fill(ui, tone))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin { left: 12, right: 12, top: 10, bottom: 10 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(RichText::new(tone.icon()).font(style::icon_font(16.0)).color(color));
-                ui.add(egui::Label::new(RichText::new(text).size(12.5).color(p.text)).wrap().selectable(true));
+                // The icon level with the first line (the icon font sits a little low).
+                let (r, _) = ui.allocate_exact_size(vec2(16.0, 18.0), Sense::hover());
+                ui.painter().text(egui::pos2(r.center().x, r.top() + 8.0), Align2::CENTER_CENTER, tone.icon(), style::icon_font(16.0), color);
+                ui.vertical(|ui| label_lh(ui, RichText::new(text).color(p.text), egui::FontId::proportional(12.5), 1.45, true));
             });
         })
         .response
@@ -883,39 +994,9 @@ pub fn error_note(ui: &mut Ui, text: &str) -> Response {
     note(ui, Tone::Error, text)
 }
 
-/// A red filled button for the destructive action of a confirmation.
+/// The red filled button of a destructive confirmation.
 pub fn danger_button(ui: &mut Ui, icon: Option<&str>, text: &str) -> Response {
-    let p = style::pal(ui);
-    let dark = ui.visuals().dark_mode;
-    let base = if dark { Color32::from_rgb(0xc4, 0x35, 0x2b) } else { p.err };
-    let size = style::body_size(ui.ctx());
-    let width = kit::button_width(ui, icon, text, false);
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, CONTROL_H), Sense::click());
-    let enabled = ui.is_enabled();
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, text));
-    if ui.is_rect_visible(rect) {
-        let hovered = enabled && resp.hovered();
-        let fill = if hovered { crate::theme::darken(base, 0.12) } else { base };
-        let fill = if enabled { fill } else { fill.gamma_multiply(0.5) };
-        let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(RADIUS), fill);
-        if resp.has_focus() {
-            painter.rect_stroke(rect.expand(2.0), CornerRadius::same(RADIUS + 2), Stroke::new(1.5, base), StrokeKind::Outside);
-        }
-        let color = if enabled { Color32::WHITE } else { Color32::from_white_alpha(170) };
-        let text_g = painter.layout_no_wrap(text.to_string(), style::medium(ui.ctx(), size), color);
-        let icon_g = icon.map(|i| painter.layout_no_wrap(i.to_string(), style::icon_font(size + 2.0), color));
-        let gap = if icon_g.is_some() { 6.0 } else { 0.0 };
-        let content = text_g.size().x + icon_g.as_ref().map_or(0.0, |g| g.size().x) + gap;
-        let mut x = rect.center().x - content / 2.0;
-        if let Some(g) = icon_g {
-            let w = g.size().x;
-            painter.galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, color);
-            x += w + gap;
-        }
-        painter.galley(egui::pos2(x, rect.center().y - text_g.size().y / 2.0), text_g, color);
-    }
-    resp
+    kit::button_ex(ui, Kind::DangerFilled, icon, text, false)
 }
 
 /// A status line (test result, error) in a footer: its icon and text in at
@@ -924,7 +1005,7 @@ pub fn status_line(ui: &mut Ui, tone: Tone, text: &str, max_w: f32) -> Response 
     let p = style::pal(ui);
     let c = tone.color(&p);
     ui.allocate_ui_with_layout(vec2(max_w.max(60.0), CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.spacing_mut().item_spacing.x = 8.0;
         ui.label(RichText::new(tone.icon()).font(style::icon_font(15.0)).color(c));
         let first = text.lines().next().unwrap_or_default().to_string();
         let mut job = egui::text::LayoutJob::single_section(first, egui::TextFormat { font_id: egui::FontId::proportional(12.5), color: c, ..Default::default() });
@@ -944,7 +1025,7 @@ pub fn disclosure(ui: &mut Ui, id: Id, label: &str, default_open: bool) -> bool 
     let p = style::pal(ui);
     let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(default_open);
     let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(12.5), p.text_muted);
-    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 22.0, 24.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 22.0, 16.0), Sense::click());
     resp.widget_info(|| WidgetInfo::selected(WidgetType::CollapsingHeader, true, open, label));
     let color = if resp.hovered() { p.text } else { p.text_muted };
     let caret = if open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
@@ -966,22 +1047,96 @@ pub fn db_logo(ui: &mut Ui, kind: ternarygrid_core::DbKind, size: f32) -> Respon
     }
 }
 
-/// Read-only SQL in a bordered frame, highlighted in `dialect`, at most `max_h` high.
-pub fn sql_preview(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, dialect: Option<std::sync::Arc<dyn ternarygrid_core::Dialect>>, text: &str, max_h: f32) {
+/// Read-only SQL in a bordered frame, highlighted in `dialect`, at most `max_h` high (see
+/// [`code_block`]).
+pub fn sql_preview(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, dialect: Option<std::sync::Arc<dyn ternarygrid_core::Dialect>>, text: &str, max_h: f32, gutter: bool) {
+    let mut t = text;
+    code_block(ui, Id::new(id), dialect, &mut t, gutter, 1, max_h);
+}
+
+/// Editable SQL in a bordered frame with line numbers, at least `min_lines` high.
+pub fn code_editor(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    dialect: Option<std::sync::Arc<dyn ternarygrid_core::Dialect>>,
+    text: &mut String,
+    min_lines: usize,
+) -> Response {
+    code_block(ui, Id::new(id), dialect, text, true, min_lines, f32::INFINITY)
+}
+
+/// SQL as in the design's code blocks: a bordered frame (radius 8, 10 points above and
+/// below), 12.5 point monospace on 20 point lines highlighted in `dialect`, and the line
+/// numbers in a gutter (`gutter`) or 12 points of padding at the left.
+fn code_block(
+    ui: &mut Ui,
+    id: Id,
+    dialect: Option<std::sync::Arc<dyn ternarygrid_core::Dialect>>,
+    text: &mut dyn egui::TextBuffer,
+    gutter: bool,
+    min_lines: usize,
+    max_h: f32,
+) -> Response {
     use ternarygrid_editor::EditorLanguage;
-    let tokens = dialect.map(|d| crate::sqllang::SqlLanguage::new(d).highlight(text)).unwrap_or_default();
+    let p = style::pal(ui);
     let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
-    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| ui.fonts_mut(|f| f.layout_job(crate::sqllang::highlight_job(buf.as_str(), &tokens, &theme, font.clone())));
-    parts::code_frame()(ui).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        egui::ScrollArea::both().id_salt(id).max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-            let mut t = text;
-            ui.add(
-                egui::TextEdit::multiline(&mut t).code_editor().frame(egui::Frame::NONE).margin(Margin::ZERO).desired_rows(1).desired_width(f32::INFINITY).layouter(&mut layouter),
-            );
-        });
-    });
+    let font = egui::FontId::monospace(12.5);
+    let lang = dialect.map(crate::sqllang::SqlLanguage::new);
+    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+        let code = buf.as_str();
+        let tokens = lang.as_ref().map(|l| l.highlight(code)).unwrap_or_default();
+        let mut job = crate::sqllang::highlight_job(code, &tokens, &theme, font.clone());
+        if job.sections.is_empty() {
+            job.append("", 0.0, egui::TextFormat { font_id: font.clone(), color: p.text, ..Default::default() });
+        }
+        for s in &mut job.sections {
+            s.format.line_height = Some(20.0);
+            s.format.valign = Align::Center;
+        }
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    let lines = text.as_str().split('\n').count().max(min_lines);
+    // egui leaves a line's extra height under its text: the code moves down by half of it,
+    // so it sits in the middle of its 20 points like the line numbers.
+    let half = ((20.0 - ui.fonts_mut(|f| f.row_height(&font))) / 2.0).round() as i8;
+    let (left, right) = if gutter { (0, 12) } else { (12, 12) };
+    let margin = Margin { left, right, top: 10 + half, bottom: 10 - half };
+    egui::Frame::new()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(margin)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::both()
+                .id_salt(id)
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        if gutter {
+                            // The numbers right-aligned in 32 points, 14 points before the code.
+                            let (g, _) = ui.allocate_exact_size(vec2(46.0, lines as f32 * 20.0), Sense::hover());
+                            for i in 0..lines {
+                                let y = g.top() + 20.0 * i as f32 + 10.0 - half as f32;
+                                ui.painter().text(egui::pos2(g.left() + 32.0, y), Align2::RIGHT_CENTER, (i + 1).to_string(), font.clone(), p.text_faint);
+                            }
+                        }
+                        let edit = egui::TextEdit::multiline(text).id(id.with("text")).code_editor().frame(egui::Frame::NONE).margin(Margin::ZERO);
+                        ui.add(edit.desired_rows(1).desired_width(f32::INFINITY).layouter(&mut layouter))
+                    })
+                    .inner
+                })
+                .inner
+        })
+        .inner
+}
+
+/// A line under a control (what an option means): 12 points, muted.
+pub fn sub_text(ui: &mut Ui, text: &str) -> Response {
+    let p = style::pal(ui);
+    label_lh(ui, RichText::new(text).color(p.text_muted), egui::FontId::proportional(12.0), 1.4, false)
 }
 
 /// The width of a table column.
@@ -1021,9 +1176,10 @@ fn table_colors(ui: &Ui) -> (Color32, Color32) {
     }
 }
 
-/// A bordered table as in the mockups: a header row on the header colour, striped
-/// rows of `row_h` (scrolling past `max_h`). `cell(ui, Some(row), col)` draws a
-/// cell; `cell(ui, None, col)` the header of a column without a title.
+/// A bordered table as in the mockups: a header row (32 points and a hairline) on the
+/// header colour, striped rows of `row_h` and a hairline (scrolling past `max_h`).
+/// `cell(ui, Some(row), col)` draws a cell; `cell(ui, None, col)` the header of a
+/// column without a title.
 pub fn table(
     ui: &mut Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
@@ -1033,9 +1189,13 @@ pub fn table(
     max_h: f32,
     mut cell: impl FnMut(&mut Ui, Option<usize>, usize),
 ) {
+    table_dyn(ui, Id::new(id), cols, rows, row_h, max_h, &mut cell);
+}
+
+// Not generic: compiled once for every table.
+fn table_dyn(ui: &mut Ui, id: Id, cols: &[Column<'_>], rows: usize, row_h: f32, max_h: f32, cell: &mut dyn FnMut(&mut Ui, Option<usize>, usize)) {
     let p = style::pal(ui);
     let (line, stripe) = table_colors(ui);
-    let id = Id::new(id);
     parts::bordered(ui).show(ui, |ui| {
         let w = ui.available_width();
         ui.set_width(w);
@@ -1046,7 +1206,7 @@ pub fn table(
             .iter()
             .map(|c| match c.width {
                 W::Px(px) => px,
-                W::Fr(f) => ((w - fixed).max(0.0) * f / fr).floor(),
+                W::Fr(f) => (w - fixed).max(0.0) * f / fr,
             })
             .collect();
         let mut draw_row = |ui: &mut Ui, rect: Rect, row: Option<usize>| {
@@ -1068,14 +1228,14 @@ pub fn table(
                 cell(&mut child, row, c);
             }
         };
-        let (head, _) = ui.allocate_exact_size(vec2(w, 32.0), Sense::hover());
+        let (head, _) = ui.allocate_exact_size(vec2(w, 33.0), Sense::hover());
         ui.painter().rect_filled(head, CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, p.header);
         ui.painter().hline(head.x_range(), head.bottom() - 0.5, Stroke::new(1.0, p.border));
-        draw_row(ui, head, None);
+        draw_row(ui, head.with_max_y(head.bottom() - 1.0), None);
         egui::ScrollArea::vertical().id_salt(id.with("rows")).max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             for r in 0..rows {
-                let (rect, _) = ui.allocate_exact_size(vec2(w, row_h), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(vec2(w, row_h + 1.0), Sense::hover());
                 if !ui.is_rect_visible(rect) {
                     continue;
                 }
@@ -1083,10 +1243,8 @@ pub fn table(
                     let radius = if r + 1 == rows { CornerRadius { nw: 0, ne: 0, sw: 7, se: 7 } } else { CornerRadius::ZERO };
                     ui.painter().rect_filled(rect, radius, stripe);
                 }
-                if r + 1 < rows {
-                    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, line));
-                }
-                draw_row(ui, rect, Some(r));
+                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, line));
+                draw_row(ui, rect.with_max_y(rect.bottom() - 1.0), Some(r));
             }
         });
     });
