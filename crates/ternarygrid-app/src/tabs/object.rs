@@ -5,7 +5,7 @@ use crate::backend::{Backend, Loadable};
 use crate::command::{AppCommand, ObjectPage};
 use crate::conn::session::SessionHandle;
 use crate::cx::AppContext;
-use crate::tabs::TabView;
+use crate::tabs::{EmbeddedView, TabView};
 use crate::widgets;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
@@ -33,6 +33,8 @@ pub struct ObjectEditorTab {
     pub obj: ObjectRef,
     pub page: ObjectPage,
     table_page: TablePage,
+    /// The page tab that opened the properties (Columns, Indexes), underlined instead of Properties.
+    via: Option<TablePage>,
     props: Loadable<Vec<Property>>,
     table: Loadable<Arc<TableDef>>,
     ddl: Loadable<String>,
@@ -40,7 +42,7 @@ pub struct ObjectEditorTab {
     stats: Loadable<Vec<Property>>,
     selected_row: Option<usize>,
     /// Data page, created on first use.
-    pub data: Option<Box<dyn crate::tabs::EmbeddedView>>,
+    pub data: Option<crate::results::data_tab::TableDataView>,
     /// Diagram page (the table and its related ones), created on first use.
     diagram: Option<crate::tabs::er::ErTab>,
     /// Virtual model of the table being edited (virtual key, dictionary, virtual columns).
@@ -57,6 +59,7 @@ impl ObjectEditorTab {
             obj,
             page,
             table_page: TablePage::Columns,
+            via: None,
             props: Loadable::NotLoaded,
             table: Loadable::NotLoaded,
             ddl: Loadable::NotLoaded,
@@ -154,6 +157,7 @@ impl ObjectEditorTab {
             for (page, label, n) in sub_pages {
                 if pill_tab(ui, label, n.as_deref(), self.table_page == page).clicked() {
                     self.table_page = page;
+                    self.via = None;
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -190,12 +194,14 @@ impl ObjectEditorTab {
                         ]
                     })
                     .collect();
-                let r = widgets::simple_table(
+                use widgets::CellStyle as S;
+                let r = widgets::styled_table(
                     ui,
                     "obj_cols",
                     &["#", tr("Name"), tr("Type"), tr("Null"), tr("Default"), tr("Auto"), tr("Collation"), tr("Comment")],
                     &rows,
                     self.selected_row,
+                    &[S::Faint, S::Plain, S::Mono, S::Muted, S::MonoMuted, S::Ok, S::Muted, S::Muted],
                 );
                 if let Some(i) = r.clicked {
                     self.selected_row = Some(i);
@@ -212,7 +218,8 @@ impl ObjectEditorTab {
                 for c in &t.checks {
                     rows.push(vec![c.name.clone().unwrap_or_default(), "CHECK".into(), c.expression.clone()]);
                 }
-                widgets::simple_table(ui, "obj_cons", &[tr("Name"), tr("Type"), tr("Definition")], &rows, None);
+                use widgets::CellStyle as S;
+                widgets::styled_table(ui, "obj_cons", &[tr("Name"), tr("Type"), tr("Definition")], &rows, None, &[S::Plain, S::Chip, S::Mono]);
             }
             TablePage::ForeignKeys | TablePage::References => {
                 let list = if self.table_page == TablePage::ForeignKeys { &t.foreign_keys } else { &t.referenced_by };
@@ -230,12 +237,14 @@ impl ObjectEditorTab {
                         ]
                     })
                     .collect();
-                let r = widgets::simple_table(
+                use widgets::CellStyle as S;
+                let r = widgets::styled_table(
                     ui,
                     "obj_fks",
                     &[tr("Name"), tr("Table"), tr("Columns"), tr("References"), tr("Referenced columns"), tr("On update"), tr("On delete")],
                     &rows,
                     None,
+                    &[S::Plain, S::Plain, S::Mono, S::Plain, S::Mono, S::Plain, S::Plain],
                 );
                 if let Some(i) = r.double_clicked
                     && let Some(fk) = list.get(i)
@@ -270,7 +279,15 @@ impl ObjectEditorTab {
                         ]
                     })
                     .collect();
-                widgets::simple_table(ui, "obj_idx", &[tr("Name"), tr("Kind"), tr("Method"), tr("Columns"), tr("Predicate"), tr("Definition")], &rows, None);
+                use widgets::CellStyle as S;
+                widgets::styled_table(
+                    ui,
+                    "obj_idx",
+                    &[tr("Name"), tr("Kind"), tr("Method"), tr("Columns"), tr("Predicate"), tr("Definition")],
+                    &rows,
+                    None,
+                    &[S::Plain, S::Chip, S::Plain, S::Mono, S::Mono, S::MonoMuted],
+                );
             }
             TablePage::Triggers => {
                 let rows: Vec<Vec<String>> = t
@@ -287,7 +304,15 @@ impl ObjectEditorTab {
                         ]
                     })
                     .collect();
-                widgets::simple_table(ui, "obj_trg", &[tr("Name"), tr("Timing"), tr("Events"), tr("Level"), tr("Enabled"), tr("Definition")], &rows, None);
+                use widgets::CellStyle as S;
+                widgets::styled_table(
+                    ui,
+                    "obj_trg",
+                    &[tr("Name"), tr("Timing"), tr("Events"), tr("Level"), tr("Enabled"), tr("Definition")],
+                    &rows,
+                    None,
+                    &[S::Plain, S::Plain, S::Plain, S::Plain, S::Ok, S::MonoMuted],
+                );
             }
             TablePage::VirtualModel => {
                 let key = ternarygrid_config::project::VirtualTableKey::of(&self.obj);
@@ -465,7 +490,7 @@ impl ObjectEditorTab {
                     ]
                 })
                 .collect();
-            let r = widgets::simple_table(ui, "obj_deps", &[tr("Direction"), tr("Kind"), tr("Object"), tr("Dependency")], &rows, None);
+            let r = widgets::styled_table(ui, "obj_deps", &[tr("Direction"), tr("Kind"), tr("Object"), tr("Dependency")], &rows, None, &[widgets::CellStyle::Chip]);
             if let Some(i) = r.double_clicked
                 && let Some(d) = deps.get(i)
             {
@@ -499,19 +524,113 @@ impl ObjectEditorTab {
 }
 
 impl ObjectEditorTab {
+    /// The header: on one line the icon, the name (semibold), where it is (muted) and its
+    /// size (faint), Back / Forward of foreign key navigation, Refresh and ⋯ at the right;
+    /// under it the pages, underlined, with the counts of columns and indexes.
+    fn header_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
+        let frame = egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 10, bottom: 0 });
+        let header = frame.show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let width = ui.available_width();
+            ui.allocate_ui_with_layout(egui::vec2(width, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_height(30.0);
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(RichText::new(crate::nav::kind_icon(self.obj.kind)).font(ternarygrid_ui::style::icon_font(18.0)).color(p.text_muted));
+                let name = match &self.obj.signature {
+                    Some(sig) if sig.starts_with('(') => format!("{}{sig}", self.obj.name),
+                    _ => self.obj.name.clone(),
+                };
+                ui.label(RichText::new(name).font(ternarygrid_ui::style::semibold(ui.ctx(), 15.0)).color(p.text));
+                // Where it is: database › schema (› table for a column, an index, a trigger).
+                let place: Vec<&str> = [&self.obj.database, &self.obj.schema, &self.obj.table].into_iter().flatten().map(String::as_str).collect();
+                if !place.is_empty() {
+                    ui.label(RichText::new(place.join("  ›  ")).size(12.5).color(p.text_muted));
+                }
+                if let Some(t) = self.table.get() {
+                    let mut facts = Vec::new();
+                    if let Some(r) = t.row_estimate.filter(|r| *r >= 0) {
+                        facts.push(ternarygrid_core::trf("≈ {} rows", &[&ternarygrid_grid::format::group_thousands(&r.to_string())]));
+                    }
+                    if let Some(b) = t.size_bytes {
+                        facts.push(widgets::format_bytes(b));
+                    }
+                    if !facts.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(facts.join(" · ")).size(12.5).color(p.text_faint));
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More actions"), false, 30.0);
+                    egui::Popup::menu(&more).show(|ui| crate::nav::object_menu(ui, cx, &self.conn.clone(), &self.obj.clone(), false));
+                    if kit::icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 30.0).clicked() {
+                        self.refresh();
+                        match (self.page, self.diagram.as_mut(), self.data.as_mut()) {
+                            (ObjectPage::Diagram, Some(d), _) => d.reload(cx),
+                            // The data page reloads its rows (asking first when edits are pending).
+                            (ObjectPage::Data, _, Some(d)) => {
+                                let _ = d.on_action(crate::keys::Action::Refresh, cx);
+                            }
+                            _ => {}
+                        }
+                        cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: Some(self.obj.clone()), schema: None });
+                    }
+                    // Back / forward of foreign key navigation on the data page.
+                    if let (ObjectPage::Data, Some(d)) = (self.page, self.data.as_mut()) {
+                        d.header_ui(ui, cx);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(egui::vec2(width, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add_space(-6.0);
+                let def = self.table.get().cloned();
+                let count = |n: Option<usize>| n.filter(|n| *n > 0).map(|n| n.to_string());
+                let mut pages: Vec<(ObjectPage, Option<TablePage>, &str, Option<String>)> = vec![(ObjectPage::Properties, None, tr("Properties"), None)];
+                if self.obj.kind.has_data() {
+                    pages.push((ObjectPage::Data, None, tr("Data"), None));
+                }
+                pages.push((ObjectPage::Ddl, None, tr("DDL"), None));
+                if def.is_some() {
+                    pages.push((ObjectPage::Properties, Some(TablePage::Columns), tr("Columns"), count(def.as_ref().map(|t| t.columns.len()))));
+                    if self.obj.kind.is_table_like() {
+                        pages.push((ObjectPage::Properties, Some(TablePage::Indexes), tr("Indexes"), count(def.as_ref().map(|t| t.indexes.len()))));
+                    }
+                }
+                pages.push((ObjectPage::Dependencies, None, tr("Dependencies"), None));
+                if self.obj.kind.has_data() {
+                    pages.push((ObjectPage::Statistics, None, tr("Statistics"), None));
+                }
+                if self.obj.kind.is_table_like() {
+                    pages.push((ObjectPage::Diagram, None, tr("ER diagram"), None));
+                }
+                for (page, sub, label, n) in pages {
+                    // Columns and Indexes are the property pages of those names, one click away.
+                    let selected = self.page == page && (page != ObjectPage::Properties || self.via == sub && sub.is_none_or(|s| s == self.table_page));
+                    if kit::underline_tab(ui, None, label, n.as_deref(), selected, 34.0).clicked() {
+                        self.page = page;
+                        self.via = sub;
+                        if let Some(s) = sub {
+                            self.table_page = s;
+                        }
+                    }
+                }
+            });
+        });
+        // The line under the tabs (the selected one's underline sits on it).
+        ui.painter().hline(ui.max_rect().x_range(), header.response.rect.bottom() + 0.5, egui::Stroke::new(1.0, p.border));
+        // The page right under the line.
+        ui.add_space(1.0 - ui.spacing().item_spacing.y);
+    }
+
     fn page_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         match self.page {
             ObjectPage::Properties => self.properties_page(ui, cx),
             ObjectPage::Data => {
-                if self.data.is_none() {
-                    self.data = crate::tabs::make_table_data_view(cx, &self.conn, &self.obj);
-                }
-                match &mut self.data {
-                    Some(d) => d.ui(ui, cx),
-                    None => {
-                        ui.weak(tr("The data editor is not available."));
-                    }
-                }
+                let data = self.data.get_or_insert_with(|| crate::results::data_tab::TableDataView::new(self.conn.clone(), self.obj.clone(), None));
+                EmbeddedView::ui(data, ui, cx);
             }
             ObjectPage::Ddl => self.ddl_page(ui, cx),
             ObjectPage::Dependencies => self.deps_page(ui, cx),
@@ -578,72 +697,14 @@ impl TabView for ObjectEditorTab {
             self.refresh();
         }
         self.invalidations = seen;
-        let p = ternarygrid_ui::pal(ui);
-        // Title: the object's place (faint) and its name; its size; the actions on the right.
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.add_space(4.0);
-            ui.label(RichText::new(crate::nav::kind_icon(self.obj.kind)).color(p.text_muted));
-            for part in [&self.obj.schema, &self.obj.table].into_iter().flatten() {
-                ui.label(RichText::new(part).color(p.text_muted));
-                ui.label(RichText::new(icon::CARET_RIGHT).size(11.0).color(p.text_faint));
-            }
-            let name = match &self.obj.signature {
-                Some(sig) if sig.starts_with('(') => format!("{}{sig}", self.obj.name),
-                _ => self.obj.name.clone(),
-            };
-            ui.label(RichText::new(name).font(ternarygrid_ui::style::semibold(ui.ctx(), 15.0)).color(p.text));
-            if let Some(t) = self.table.get() {
-                let mut facts = Vec::new();
-                if let Some(r) = t.row_estimate.filter(|r| *r >= 0) {
-                    facts.push(ternarygrid_core::trf("≈ {} rows", &[&ternarygrid_grid::format::group_thousands(&r.to_string())]));
-                }
-                if let Some(b) = t.size_bytes {
-                    facts.push(widgets::format_bytes(b));
-                }
-                if !facts.is_empty() {
-                    ui.label(RichText::new(facts.join(" · ")).color(p.text_faint));
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let more = kit::icon_button(ui, icon::DOTS_THREE, tr("More actions"));
-                egui::Popup::menu(&more).show(|ui| crate::nav::object_menu(ui, cx, &self.conn.clone(), &self.obj.clone(), false));
-                // The data page has the grid's own Refresh.
-                if self.page != ObjectPage::Data && kit::icon_button(ui, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked() {
-                    self.refresh();
-                    if let (ObjectPage::Diagram, Some(d)) = (self.page, self.diagram.as_mut()) {
-                        d.reload(cx);
-                    }
-                    cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: Some(self.obj.clone()), schema: None });
-                }
-                // Back / forward of foreign key navigation on the data page.
-                if let (ObjectPage::Data, Some(d)) = (self.page, self.data.as_mut()) {
-                    d.header_ui(ui, cx);
-                }
-            });
-        });
-        let tabs = ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let mut pages = vec![(ObjectPage::Properties, tr("Properties"))];
-            if self.obj.kind.has_data() {
-                pages.push((ObjectPage::Data, tr("Data")));
-            }
-            pages.push((ObjectPage::Ddl, tr("DDL")));
-            pages.push((ObjectPage::Dependencies, tr("Dependencies")));
-            if self.obj.kind.has_data() {
-                pages.push((ObjectPage::Statistics, tr("Statistics")));
-            }
-            if self.obj.kind.is_table_like() {
-                pages.push((ObjectPage::Diagram, tr("Diagram")));
-            }
-            for (page, label) in pages {
-                if kit::underline_tab(ui, None, label, None, self.page == page, 32.0).clicked() {
-                    self.page = page;
-                }
-            }
-        });
-        ui.painter().hline(ui.max_rect().x_range(), tabs.response.rect.bottom() - 0.5, egui::Stroke::new(1.0, p.border));
+        // The table's definition gives the facts and the counts of the header (on every page).
+        if self.obj.kind.is_table_like() || matches!(self.obj.kind, ObjectKind::View | ObjectKind::MaterializedView) {
+            let session = self.session(cx);
+            let obj = self.obj.clone();
+            Self::load(&mut self.table, cx.backend, session, move |s| async move { s.lock().await.table_definition(&obj).await.map(Arc::new) });
+        }
+        self.header_ui(ui, cx);
+        // The pages other than Data and Diagram sit 16 px off the edges, as the mockups' tables.
         // The pages other than Data and Diagram sit 16 px off the edges, as the mockups' tables.
         let padded = !matches!(self.page, ObjectPage::Data | ObjectPage::Diagram);
         let pad = if padded { egui::Margin { left: 16, right: 16, top: 6, bottom: 8 } } else { egui::Margin::ZERO };

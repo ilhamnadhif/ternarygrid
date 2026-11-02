@@ -3,7 +3,7 @@
 use crate::calc::{CalcStats, compute_stats, format_number};
 use crate::grid::{DataGridState, Selection};
 use crate::model::ResultModel;
-use egui::Ui;
+use egui::{RichText, Ui};
 use ternarygrid_core::{Value, tr, trf};
 
 /// Cells analysed at most.
@@ -98,6 +98,15 @@ impl<'a> CalcPanel<'a> {
             return;
         }
         let s = s.clone();
+        // What is counted: "14 cells of total selected".
+        let cols = self.grid.selected_columns();
+        let faint = ternarygrid_ui::pal(ui).text_faint;
+        let what = match cols.as_slice() {
+            [c] => trf("{} cells of {} selected", &[&crate::format::group_thousands(&s.count.to_string()), &self.model.column_name(*c)]),
+            _ => trf("{} cells selected", &[&crate::format::group_thousands(&s.count.to_string())]),
+        };
+        ui.label(RichText::new(what).size(12.0).color(faint));
+        ui.add_space(6.0);
         let count = |name: &'static str, v: usize| StatRow { name, shown: crate::format::group_thousands(&v.to_string()), copy: v.to_string() };
         let plain = |name: &'static str, v: String| StatRow { name, shown: v.clone(), copy: v };
         let fmt_v = |v: &Option<Value>| v.as_ref().map(|v| v.to_text().into_owned()).unwrap_or_default();
@@ -121,9 +130,9 @@ impl<'a> CalcPanel<'a> {
         }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             stats_table(ui, &rows, self.state);
-            ui.add_space(4.0);
+            ui.add_space(10.0);
             let keys = if cfg!(target_os = "macos") { "⌘C" } else { "Ctrl+C" };
-            ui.weak(trf("Copy: click a row and press {}, or the copy button at its end, or right-click.", &[&keys]));
+            ui.add(egui::Label::new(RichText::new(trf("Copy: click a row and press {}, or the copy button at its end, or right-click.", &[&keys])).size(11.5).color(faint)).wrap());
             if s.truncated {
                 ui.add_space(4.0);
                 ui.weak(trf("Only the first {} cells were analysed", &[&crate::format::group_thousands(&MAX_CALC_CELLS.to_string())]));
@@ -140,14 +149,17 @@ fn stats_table(ui: &mut Ui, rows: &[StatRow], state: &mut CalcPanelState) {
     use egui::{Align2, Sense, Stroke, TextStyle, pos2, vec2};
     use egui_phosphor::regular as icon;
     let theme = crate::theme::GridTheme::from_visuals(ui.visuals());
-    let row_h = ui.text_style_height(&TextStyle::Body) + 8.0;
+    let pal = ternarygrid_ui::pal(ui);
+    // The mockups' table: a 32 high header, rows of 30 (and their lines), the value column 1.2 : 1.
+    let (head_h, row_h) = (33.0, 31.0);
     let width = ui.available_width();
-    let name_w = (width * 0.42).clamp(90.0, 170.0);
+    let name_w = (width / 2.2).clamp(90.0, 200.0);
     let font = TextStyle::Body.resolve(ui.style());
-    let mono = TextStyle::Monospace.resolve(ui.style());
+    let head_font = ternarygrid_ui::style::semibold(ui.ctx(), 12.0);
+    let mono = egui::FontId::monospace(12.0);
     let line = Stroke::new(1.0, theme.line);
     let now = ui.input(|i| i.time);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, row_h * (rows.len() + 1) as f32), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(width, head_h + row_h * rows.len() as f32), Sense::hover());
     // The table takes the keyboard focus on a click: ⌘C copies its selection, not the grid's.
     let table_id = ui.id().with("calc_table");
     let table = ui.interact(rect, table_id, Sense::click());
@@ -155,17 +167,18 @@ fn stats_table(ui: &mut Ui, rows: &[StatRow], state: &mut CalcPanelState) {
     state.selected.retain(|n| rows.iter().any(|r| r.name == n));
     let mut copy: Option<(String, Option<String>)> = None; // (text, function that shows "Copied")
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, theme.bg);
-    let header = egui::Rect::from_min_size(rect.min, vec2(width, row_h));
-    painter.rect_filled(header, 0.0, theme.header_bg);
-    painter.text(pos2(header.left() + 6.0, header.center().y), Align2::LEFT_CENTER, tr("Function"), font.clone(), theme.header_text);
-    painter.text(pos2(header.left() + name_w + 6.0, header.center().y), Align2::LEFT_CENTER, tr("Value"), font.clone(), theme.header_text);
+    painter.rect_filled(rect, 8, theme.bg);
+    let header = egui::Rect::from_min_size(rect.min, vec2(width, head_h));
+    painter.rect_filled(header, egui::CornerRadius { nw: 8, ne: 8, ..Default::default() }, theme.header_bg);
+    painter.hline(header.x_range(), header.bottom() - 0.5, Stroke::new(1.0, pal.border));
+    painter.text(pos2(header.left() + 10.0, header.center().y - 0.5), Align2::LEFT_CENTER, tr("Function"), head_font.clone(), pal.text_muted);
+    painter.text(pos2(header.left() + name_w + 10.0, header.center().y - 0.5), Align2::LEFT_CENTER, tr("Value"), head_font, pal.text_muted);
     let all_text = || rows.iter().map(|r| format!("{}\t{}", r.name, r.copy)).collect::<Vec<_>>().join("\n");
     for (i, row) in rows.iter().enumerate() {
-        let r = egui::Rect::from_min_size(pos2(rect.left(), rect.top() + row_h * (i + 1) as f32), vec2(width, row_h));
+        let r = egui::Rect::from_min_size(pos2(rect.left(), rect.top() + head_h + row_h * i as f32), vec2(width, row_h));
         let resp = ui.interact(r, table_id.with(("row", i)), Sense::click());
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{}: {}", row.name, row.shown)));
-        let button = egui::Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, row_h - 4.0));
+        let button = egui::Rect::from_center_size(pos2(r.right() - 18.0, r.center().y), vec2(22.0, 22.0));
         let button_resp = ui.interact(button, table_id.with(("copy", i)), Sense::click());
         let selected = state.selected.iter().any(|n| n == row.name);
         let hovered = resp.hovered() || button_resp.hovered();
@@ -178,20 +191,26 @@ fn stats_table(ui: &mut Ui, rows: &[StatRow], state: &mut CalcPanelState) {
         } else {
             theme.bg
         };
-        painter.rect_filled(r, 0.0, fill);
-        painter.text(pos2(r.left() + 6.0, r.center().y), Align2::LEFT_CENTER, row.name, font.clone(), theme.weak);
+        let last = i + 1 == rows.len();
+        painter.rect_filled(r, if last { egui::CornerRadius { sw: 8, se: 8, ..Default::default() } } else { egui::CornerRadius::ZERO }, fill);
+        painter.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, row.name, font.clone(), theme.text);
         let just_copied = state.copied.as_ref().is_some_and(|(n, t)| n == row.name && now - t < 1.2);
-        let value_right = if hovered || just_copied { button.left() - 4.0 } else { r.right() - 4.0 };
-        let value_rect = egui::Rect::from_min_max(pos2(r.left() + name_w + 6.0, r.top()), pos2(value_right, r.bottom()));
+        // The copy button at the end of the hovered and the selected rows.
+        let show_button = hovered || selected;
+        let value_right = if show_button || just_copied { button.left() - 4.0 } else { r.right() - 4.0 };
+        let value_rect = egui::Rect::from_min_max(pos2(r.left() + name_w + 10.0, r.top()), pos2(value_right, r.bottom()));
         let galley = painter.layout(row.shown.clone(), mono.clone(), theme.text, f32::INFINITY);
         painter.with_clip_rect(value_rect).galley(pos2(value_rect.left(), r.center().y - galley.size().y / 2.0), galley, theme.text);
         if just_copied {
             let ok = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
             painter.text(pos2(r.right() - 6.0, r.center().y), Align2::RIGHT_CENTER, format!("{} {}", icon::CHECK, tr("Copied")), font.clone(), ok);
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-        } else if hovered {
-            let color = if button_resp.hovered() { theme.text } else { theme.weak };
-            painter.text(button.center(), Align2::CENTER_CENTER, icon::COPY, font.clone(), color);
+        } else if show_button {
+            let color = if button_resp.hovered() { theme.text } else { pal.text_muted };
+            if button_resp.hovered() {
+                painter.rect_filled(button, 6, pal.hover);
+            }
+            painter.text(button.center(), Align2::CENTER_CENTER, icon::COPY, ternarygrid_ui::style::icon_font(12.0), color);
         }
         if button_resp.on_hover_text(tr("Copy value")).clicked() {
             copy = Some((row.copy.clone(), Some(row.name.to_string())));
@@ -245,12 +264,11 @@ fn stats_table(ui: &mut Ui, rows: &[StatRow], state: &mut CalcPanelState) {
         ui.ctx().copy_text(text);
         state.copied = name.map(|n| (n, now));
     }
-    for i in 1..=rows.len() {
-        let y = rect.top() + row_h * i as f32;
+    for i in 1..rows.len() {
+        let y = rect.top() + head_h + row_h * i as f32 - 0.5;
         painter.hline(rect.x_range(), y, line);
     }
-    painter.vline(rect.left() + name_w, rect.y_range(), line);
-    painter.rect_stroke(rect, 0.0, if focused { Stroke::new(1.0, ui.visuals().selection.stroke.color.gamma_multiply(0.6)) } else { line }, egui::StrokeKind::Inside);
+    painter.rect_stroke(rect, 8, if focused { Stroke::new(1.0, pal.accent) } else { Stroke::new(1.0, pal.border) }, egui::StrokeKind::Inside);
 }
 
 #[cfg(test)]

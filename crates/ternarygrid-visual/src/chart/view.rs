@@ -129,11 +129,13 @@ fn show_plot(ui: &mut Ui, data: &ChartData, config: &ChartConfig, state: &mut Ch
         .x_axis_label(data.x_label.clone())
         .y_axis_label(data.y_label.clone())
         .allow_scroll(false)
+        // Horizontal lines only, as the mockups' charts.
+        .show_grid([false, true])
         .y_axis_formatter(|m: GridMark, _r: &std::ops::RangeInclusive<f64>| compact(m.value, 2));
     if multi {
         plot = plot.legend(
             Legend::default()
-                .position(Corner::LeftTop)
+                .position(Corner::RightTop)
                 .background_alpha(0.85),
         );
     }
@@ -597,20 +599,54 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
     use ternarygrid_ui::{kit, parts};
     let before = config.clone();
     ui.spacing_mut().item_spacing.y = 10.0;
-    // The chart type: one icon group.
-    let segments: Vec<kit::Segment> = ChartKind::ALL
-        .iter()
-        .map(|k| kit::Segment {
-            icon: k.icon(),
-            tooltip: tr(k.label()),
-            on: config.kind == *k,
-        })
-        .collect();
-    if let Some(i) = kit::button_group(ui, &segments)
-        .iter()
-        .position(|r| r.clicked())
+    // The chart type: one pill of icons, the chosen one raised.
     {
-        config.kind = ChartKind::ALL[i];
+        let p = ternarygrid_ui::pal(ui);
+        let (bw, bh, pad, gap) = (30.0, 24.0, 2.0, 2.0);
+        let n = ChartKind::ALL.len() as f32;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(n * bw + (n - 1.0) * gap + 2.0 * pad, bh + 2.0 * pad),
+            egui::Sense::hover(),
+        );
+        ui.painter().rect_filled(rect, 7, p.subtle);
+        for (i, k) in ChartKind::ALL.iter().enumerate() {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + pad + i as f32 * (bw + gap), rect.top() + pad),
+                egui::vec2(bw, bh),
+            );
+            let resp = ui.interact(r, ui.id().with(("chart_kind", i)), egui::Sense::click());
+            let on = config.kind == *k;
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, tr(k.label()))
+            });
+            let resp = resp.on_hover_text(tr(k.label()));
+            if on {
+                ui.painter().rect(
+                    r,
+                    5,
+                    p.surface,
+                    egui::Stroke::new(1.0, p.border),
+                    egui::StrokeKind::Inside,
+                );
+            } else if resp.hovered() {
+                ui.painter().rect_filled(r, 5, p.hover);
+            }
+            let color = if on || resp.hovered() {
+                p.text
+            } else {
+                p.text_muted
+            };
+            ui.painter().text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                k.icon(),
+                ternarygrid_ui::style::icon_font(15.0),
+                color,
+            );
+            if resp.clicked() {
+                config.kind = *k;
+            }
+        }
     }
     let lw = 74.0;
     let width = (ui.available_width() - lw - 8.0).max(80.0);

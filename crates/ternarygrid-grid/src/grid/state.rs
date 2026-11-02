@@ -114,6 +114,13 @@ pub(crate) struct Runtime {
     pub editing: Option<EditSession>,
     pub drag: Drag,
     pub glyphs: GlyphCache,
+    /// Glyphs of monospace values (UUIDs, JSON), of the small faint values (binary) and
+    /// of the row numbers.
+    pub glyphs_mono: GlyphCache,
+    pub glyphs_small: GlyphCache,
+    pub glyphs_rownum: GlyphCache,
+    /// The scroll bars show until then (input time) after a scroll.
+    pub bars_until: f64,
     /// Row count at which FetchMore was last emitted.
     pub fetch_requested_at: Option<usize>,
     /// Store that count belongs to (a refresh brings a new store, with the same count again).

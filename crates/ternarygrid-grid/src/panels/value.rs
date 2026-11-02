@@ -3,7 +3,7 @@
 use crate::grid::{DataGridState, GridAction, GridOptions};
 use crate::model::{ResultModel, RowKey};
 use crate::valueview::{array_lines, byte_size_text, decode_image, detect_image, hex_dump, pretty_json, pretty_xml, split_ewkt};
-use egui::{CollapsingHeader, RichText, ScrollArea, TextEdit, TextureHandle, TextureOptions, Ui};
+use egui::{RichText, ScrollArea, TextEdit, TextureHandle, TextureOptions, Ui};
 use ternarygrid_core::{DataKind, Value, tr, trf};
 
 /// How a value is presented.
@@ -33,7 +33,6 @@ type CellKey = (RowKey, usize, u64);
 type Preview = (TextureHandle, [u32; 2], &'static str);
 
 /// State of the value panel.
-#[derive(Default)]
 pub struct ValuePanelState {
     /// Presentation mode.
     pub mode: ValueMode,
@@ -49,6 +48,27 @@ pub struct ValuePanelState {
     image_key: Option<CellKey>,
     image: Option<Result<Preview, String>>,
     last_value: Option<(Option<CellKey>, Value)>,
+    /// Nodes of the JSON tree opened or closed by hand (path → open).
+    tree_open: std::collections::HashMap<String, bool>,
+}
+
+impl Default for ValuePanelState {
+    fn default() -> Self {
+        ValuePanelState {
+            mode: ValueMode::Auto,
+            // Long values wrap at the panel's edge.
+            wrap: true,
+            edit_key: None,
+            edit_store: 0,
+            edit_text: String::new(),
+            edit_dirty: false,
+            error: None,
+            image_key: None,
+            image: None,
+            last_value: None,
+            tree_open: Default::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for ValuePanelState {
@@ -65,36 +85,82 @@ pub struct ValuePanel<'a> {
     state: &'a mut ValuePanelState,
 }
 
-fn json_tree(ui: &mut Ui, key: &str, v: &serde_json::Value, budget: &mut usize, depth: usize) {
+/// Colours of the JSON tree: text, faint (counts), strings and other values.
+struct TreeColors {
+    text: egui::Color32,
+    faint: egui::Color32,
+    value: egui::Color32,
+}
+
+impl TreeColors {
+    fn new(ui: &Ui) -> Self {
+        let p = ternarygrid_ui::pal(ui);
+        let value = if ui.visuals().dark_mode { egui::Color32::from_rgb(0xe6, 0xa9, 0x6b) } else { egui::Color32::from_rgb(0xa5, 0x53, 0x1a) };
+        TreeColors { text: p.text, faint: p.text_faint, value }
+    }
+}
+
+/// One node of the JSON tree and its children: lines of 22 in monospace 12, 16 more
+/// in per level; objects and arrays open and close with their arrow (the first two
+/// levels open), their size faint after them.
+#[allow(clippy::too_many_arguments)]
+fn json_tree(ui: &mut Ui, open: &mut std::collections::HashMap<String, bool>, c: &TreeColors, path: &str, key: &str, v: &serde_json::Value, budget: &mut usize, depth: usize) {
     if *budget == 0 {
         return;
     }
     *budget -= 1;
+    let font = egui::FontId::monospace(12.0);
+    let indent = depth as f32 * 16.0;
+    let mut job = egui::text::LayoutJob::default();
+    let mut add = |s: &str, color: egui::Color32| job.append(s, 0.0, egui::TextFormat::simple(font.clone(), color));
+    let (children, summary, brackets) = match v {
+        serde_json::Value::Object(map) => (Some(map.len()), trf("{} keys", &[&map.len()]), "{}"),
+        serde_json::Value::Array(items) => (Some(items.len()), items.len().to_string(), "[ ]"),
+        _ => (None, String::new(), ""),
+    };
+    let is_open = children.is_some() && *open.get(path).unwrap_or(&(depth < 2));
+    match children {
+        Some(_) => {
+            add(if is_open { "▾ " } else { "▸ " }, c.text);
+            if key.is_empty() {
+                add(brackets, c.text);
+            } else if matches!(v, serde_json::Value::Array(_)) {
+                add(&format!("{key} {brackets}"), c.text);
+            } else {
+                add(key, c.text);
+            }
+            add(&format!(" {summary}"), c.faint);
+        }
+        None => {
+            add(&format!("{key}: "), c.text);
+            let text = match v {
+                serde_json::Value::String(s) => format!("\"{s}\""),
+                o => o.to_string(),
+            };
+            add(&text, c.value);
+        }
+    }
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(indent + galley.size().x + 8.0, 22.0), if children.is_some() { egui::Sense::click() } else { egui::Sense::hover() });
+    ui.painter().galley(egui::pos2(rect.left() + indent, rect.center().y - galley.size().y / 2.0), galley, c.text);
+    if resp.clicked() {
+        open.insert(path.to_string(), !is_open);
+    }
+    if !is_open {
+        return;
+    }
     match v {
         serde_json::Value::Object(map) => {
-            CollapsingHeader::new(format!("{key} {{{}}}", map.len())).id_salt((key, depth, *budget)).default_open(depth < 2).show(ui, |ui| {
-                for (k, child) in map {
-                    json_tree(ui, k, child, budget, depth + 1);
-                }
-            });
+            for (k, child) in map {
+                json_tree(ui, open, c, &format!("{path}.{k}"), k, child, budget, depth + 1);
+            }
         }
         serde_json::Value::Array(items) => {
-            CollapsingHeader::new(format!("{key} [{}]", items.len())).id_salt((key, depth, *budget)).default_open(depth < 2).show(ui, |ui| {
-                for (i, child) in items.iter().enumerate().take(5000) {
-                    json_tree(ui, &format!("[{i}]"), child, budget, depth + 1);
-                }
-            });
+            for (i, child) in items.iter().enumerate().take(5000) {
+                json_tree(ui, open, c, &format!("{path}[{i}]"), &i.to_string(), child, budget, depth + 1);
+            }
         }
-        other => {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{key}:")).strong());
-                let text = match other {
-                    serde_json::Value::String(s) => format!("\"{s}\""),
-                    o => o.to_string(),
-                };
-                ui.add(egui::Label::new(RichText::new(text).monospace()).wrap());
-            });
-        }
+        _ => {}
     }
 }
 
@@ -195,24 +261,34 @@ impl<'a> ValuePanel<'a> {
                     state.error = None;
                 }
                 // As tall as the text (up to the panel): Apply / Revert / Set NULL right below it.
-                ScrollArea::both().auto_shrink([false, true]).max_height(ui.available_height() - 36.0).show(ui, |ui| {
+                ScrollArea::both().auto_shrink([false, true]).max_height((ui.available_height() - 40.0).max(180.0)).show(ui, |ui| {
                     let te = TextEdit::multiline(&mut state.edit_text)
                         .desired_width(if state.wrap { ui.available_width() } else { f32::INFINITY })
                         .desired_rows(8)
-                        .font(egui::TextStyle::Monospace);
+                        .min_size(egui::vec2(0.0, 180.0))
+                        .margin(egui::Margin::symmetric(12, 10))
+                        .font(egui::FontId::monospace(12.5));
                     let resp = if cell_editable {
                         ui.add(te)
                     } else {
                         let mut ro = state.edit_text.as_str();
-                        ui.add(TextEdit::multiline(&mut ro).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace))
+                        ui.add(
+                            TextEdit::multiline(&mut ro)
+                                .desired_width(f32::INFINITY)
+                                .min_size(egui::vec2(0.0, 180.0))
+                                .margin(egui::Margin::symmetric(12, 10))
+                                .font(egui::FontId::monospace(12.5)),
+                        )
                     };
                     if resp.changed() {
                         state.edit_dirty = true;
                         state.error = None;
                     }
                 });
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     use ternarygrid_ui::kit;
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     if cell_editable {
                         let dirty = state.edit_dirty;
                         let apply = ui.add_enabled_ui(dirty, |ui| kit::button_full(ui, kit::Kind::Primary, None, tr("Apply"), true, false).clicked()).inner;
@@ -263,12 +339,16 @@ impl<'a> ValuePanel<'a> {
             }
             ValueMode::JsonTree => match serde_json::from_str::<serde_json::Value>(&value.to_text()) {
                 Ok(j) => {
-                    ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                        let mut budget = 20_000usize;
-                        json_tree(ui, "$", &j, &mut budget, 0);
-                        if budget == 0 {
-                            ui.weak(tr("(tree truncated)"));
-                        }
+                    ternarygrid_ui::parts::bordered(ui).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                        ScrollArea::both().auto_shrink([false, true]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let mut budget = 20_000usize;
+                            let colors = TreeColors::new(ui);
+                            json_tree(ui, &mut state.tree_open, &colors, "", "", &j, &mut budget, 0);
+                            if budget == 0 {
+                                ui.weak(tr("(tree truncated)"));
+                            }
+                        });
                     });
                 }
                 Err(e) => {
@@ -287,10 +367,7 @@ impl<'a> ValuePanel<'a> {
             }
             ValueMode::Hex => {
                 if let Value::Bytes(b) = &value {
-                    ui.horizontal(|ui| {
-                        ui.weak(byte_size_text(b.len()));
-                        save_button(ui, &mut actions, row, col, detect_image(b).map_or("bin", |k| k.extension()));
-                    });
+                    size_row(ui, &mut actions, row, col, b);
                     readonly_text(ui, &hex_dump(b, 64 * 1024), false);
                 }
             }
@@ -303,19 +380,30 @@ impl<'a> ValuePanel<'a> {
                             (tex, d.original_size, d.kind.label())
                         }));
                     }
-                    ui.horizontal(|ui| {
-                        ui.weak(byte_size_text(b.len()));
-                        save_button(ui, &mut actions, row, col, detect_image(b).map_or("bin", |k| k.extension()));
-                    });
+                    size_row(ui, &mut actions, row, col, b);
                     match &state.image {
                         Some(Ok((tex, size, label))) => {
-                            ui.weak(format!("{label} {} × {}", size[0], size[1]));
-                            ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                                let avail = ui.available_size();
-                                let s = tex.size_vec2();
-                                let scale = (avail.x / s.x).min(avail.y / s.y).clamp(0.05, 1.0);
-                                ui.image((tex.id(), s * scale));
-                            });
+                            ui.label(RichText::new(format!("{label} {} × {}", size[0], size[1])).size(12.5).color(pal.text_muted));
+                            ui.add_space(4.0);
+                            // In a 220 high box, on a soft accent wash, scaled down to fit.
+                            let w = ui.available_width();
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 220.0), egui::Sense::hover());
+                            let mut mesh = egui::Mesh::default();
+                            let r = rect.shrink(1.0);
+                            let (a, z) = (pal.accent_soft, pal.subtle);
+                            mesh.colored_vertex(r.left_top(), a);
+                            mesh.colored_vertex(r.right_top(), crate::theme::mix(a, z, 0.5));
+                            mesh.colored_vertex(r.right_bottom(), z);
+                            mesh.colored_vertex(r.left_bottom(), crate::theme::mix(a, z, 0.5));
+                            mesh.add_triangle(0, 1, 2);
+                            mesh.add_triangle(0, 2, 3);
+                            ui.painter().add(mesh);
+                            ui.painter().rect_stroke(rect, 8, egui::Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                            let s = tex.size_vec2();
+                            let inner = rect.shrink(8.0);
+                            let scale = (inner.width() / s.x).min(inner.height() / s.y).clamp(0.05, 1.0);
+                            let img = egui::Rect::from_center_size(rect.center(), s * scale);
+                            ui.painter().image(tex.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
                         }
                         Some(Err(e)) => {
                             ui.colored_label(ui.visuals().error_fg_color, e);
@@ -356,10 +444,18 @@ impl<'a> ValuePanel<'a> {
     }
 }
 
-fn save_button(ui: &mut Ui, actions: &mut Vec<GridAction>, row: usize, col: usize, ext: &str) {
-    if ui.button(format!("{}  {}", egui_phosphor::regular::DOWNLOAD_SIMPLE, tr("Save to file…"))).clicked() {
-        actions.push(GridAction::SaveValueToFile { row, col, extension: ext.to_string() });
-    }
+/// The value's size (faint) and, at the right, Save to file….
+fn size_row(ui: &mut Ui, actions: &mut Vec<GridAction>, row: usize, col: usize, bytes: &[u8]) {
+    let ext = detect_image(bytes).map_or("bin", |k| k.extension());
+    let faint = ternarygrid_ui::pal(ui).text_faint;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(byte_size_text(bytes.len())).size(12.0).color(faint));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Ghost, Some(egui_phosphor::regular::DOWNLOAD_SIMPLE), tr("Save to file…"), true, false).clicked() {
+                actions.push(GridAction::SaveValueToFile { row, col, extension: ext.to_string() });
+            }
+        });
+    });
 }
 
 fn text_for(v: &Value, kind: DataKind) -> String {

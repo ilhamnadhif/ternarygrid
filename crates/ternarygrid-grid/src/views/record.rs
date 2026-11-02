@@ -28,7 +28,8 @@ fn value_text(v: &Value, is_default: bool, modified: bool, fmt: &PreparedFormat,
             other => RichText::new(clip(&fmt.format(other))).color(theme.text),
         }
     };
-    if modified { rt.background_color(theme.modified) } else { rt }
+    let _ = modified;
+    rt
 }
 
 /// The draggable right border of a header cell: drag to resize, double-click
@@ -59,11 +60,13 @@ fn is_bool_column(model: &ResultModel, c: usize, v: &Value) -> bool {
     matches!(v, Value::Bool(_)) || model.column_kind(c) == ternarygrid_core::DataKind::Bool
 }
 
-/// One line of text in `rect` (left, vertically centred, cut with "…").
-fn paint_text(ui: &Ui, rect: egui::Rect, text: RichText, fallback: egui::Color32) {
+/// One line of text in `rect` (left, vertically centred, cut with "…"). Returns its width.
+fn paint_text(ui: &Ui, rect: egui::Rect, text: RichText, fallback: egui::Color32) -> f32 {
     let galley = egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), rect.width(), egui::TextStyle::Body);
     let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+    let w = galley.size().x;
     ui.painter_at(rect).galley(pos, galley, fallback);
+    w
 }
 
 /// Most rows shown side by side.
@@ -141,7 +144,7 @@ fn keys_hint(ui: &mut Ui, text: &str, more: &str) {
     if ui.available_width() < 40.0 {
         return;
     }
-    let label = egui::Label::new(RichText::new(format!("{}  {}", icon::KEYBOARD, text)).small().weak()).truncate();
+    let label = egui::Label::new(RichText::new(text).size(11.5).color(ternarygrid_ui::pal(ui).text_faint)).truncate();
     ui.add(label).on_hover_text(format!("{text}\n\n{more}"));
 }
 
@@ -153,7 +156,7 @@ fn hide_empty_toggle(ui: &mut Ui, state: &mut RecordViewState, options: &GridOpt
         state.hide_empty = Some(hide);
     }
     if hide && state.hidden_empty > 0 {
-        ui.label(RichText::new(trf("{} hidden", &[&state.hidden_empty])).small().weak());
+        ui.label(RichText::new(trf("{} hidden", &[&state.hidden_empty])).size(12.0).color(ternarygrid_ui::pal(ui).text_faint));
     }
     changed
 }
@@ -239,28 +242,34 @@ impl<'a> RecordView<'a> {
         }
         focus.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, trf("Record view, row {} of {}", &[&(row + 1), &nrows])));
         let total_columns = grid.visible_columns().len();
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
+        let bar = egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 use ternarygrid_ui::kit;
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = 8.0;
                 let pal = ternarygrid_ui::pal(ui);
                 let nav = |ui: &mut Ui, on: bool, glyph: &str, tip: &str| ui.add_enabled_ui(on, |ui| kit::icon_button_ex(ui, glyph, tip, false, 26.0).clicked()).inner;
-                if nav(ui, row > 0, icon::CARET_DOUBLE_LEFT, tr("First row")) {
+                if nav(ui, row > 0, icon::ARROW_LEFT, tr("First row")) {
                     go_to = Some(0);
                 }
                 if nav(ui, row > 0, icon::CARET_LEFT, tr("Previous row (←)")) {
                     go_to = Some(row - 1);
                 }
-                ui.label(RichText::new(tr("Row")).color(pal.text_muted));
+                ui.label(RichText::new(tr("Row")).size(12.5).color(pal.text_muted));
                 let mut n = row + 1;
-                if ui.add(egui::DragValue::new(&mut n).range(1..=nrows).speed(0.25)).on_hover_text(tr("Type or drag to go to a row")).changed() {
+                let typed = ui
+                    .scope(|ui| {
+                        ui.spacing_mut().interact_size = egui::vec2(64.0, 26.0);
+                        ui.add_sized([64.0, 26.0], egui::DragValue::new(&mut n).range(1..=nrows).speed(0.25)).on_hover_text(tr("Type or drag to go to a row"))
+                    })
+                    .inner;
+                if typed.changed() {
                     go_to = Some(n.clamp(1, nrows) - 1);
                 }
-                ui.label(RichText::new(trf("of {}", &[&crate::format::group_thousands(&nrows.to_string())])).color(pal.text_muted));
+                ui.label(RichText::new(trf("of {}", &[&crate::format::group_thousands(&nrows.to_string())])).size(12.5).color(pal.text_muted));
                 if nav(ui, row + 1 < nrows, icon::CARET_RIGHT, tr("Next row (→)")) {
                     go_to = Some(row + 1);
                 }
-                if nav(ui, row + 1 < nrows, icon::CARET_DOUBLE_RIGHT, tr("Last row")) {
+                if nav(ui, row + 1 < nrows, icon::ARROW_RIGHT, tr("Last row")) {
                     go_to = Some(nrows - 1);
                 }
                 let state_label = match model.row_state(row) {
@@ -272,9 +281,8 @@ impl<'a> RecordView<'a> {
                 if let Some(s) = state_label {
                     kit::pill(ui, s, pal.warn);
                 }
-                kit::vdivider(ui, 16.0);
-                kit::search_field(ui, ui.id().with("record_column_filter"), &mut state.column_filter, tr("Filter columns"), 220.0);
-                ui.add_space(8.0);
+                kit::vdivider(ui, 18.0);
+                kit::search_field(ui, ui.id().with("record_column_filter"), &mut state.column_filter, tr("Filter columns"), 200.0);
                 if hide_empty_toggle(ui, state, options, tr("Hide the columns that are NULL or empty in this row")) {
                     actions.push(state.prefs(options));
                 }
@@ -292,6 +300,8 @@ impl<'a> RecordView<'a> {
                 });
             });
         });
+        let line = egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border);
+        ui.painter().hline(ui.max_rect().x_range(), bar.response.rect.bottom() + 0.5, line);
         // Keyboard: Page Up / Page Down move between rows when no field is edited.
         if state.editing.is_none() && go_to.is_none() && ui.ui_contains_pointer() {
             ui.input(|i| {
@@ -371,15 +381,18 @@ fn show_rows(model: &mut ResultModel, grid: &mut DataGridState, options: &GridOp
         }
     }
     let total_columns = grid.visible_columns().len();
-    egui::Frame::new().inner_margin(egui::Margin::symmetric(4, 4)).show(ui, |ui| {
+    let bar = egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{}  {}", icon::ROWS, trf("{} selected rows", &[&rows.len()]))).strong());
+            use ternarygrid_ui::kit;
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let pal = ternarygrid_ui::pal(ui);
+            ui.label(RichText::new(icon::LIST_DASHES).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.text_muted));
+            ui.label(RichText::new(trf("{} selected rows", &[&rows.len()])).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
             if more {
-                ui.label(RichText::new(trf("(the first {})", &[&MAX_ROWS])).weak());
+                ui.label(RichText::new(trf("(the first {})", &[&MAX_ROWS])).color(pal.text_faint));
             }
-            ui.add_space(12.0);
-            ui.add(TextEdit::singleline(&mut state.column_filter).hint_text(format!("{}  {}", icon::MAGNIFYING_GLASS, tr("Filter columns"))).desired_width(220.0));
-            ui.add_space(8.0);
+            kit::vdivider(ui, 18.0);
+            kit::search_field(ui, ui.id().with("record_column_filter"), &mut state.column_filter, tr("Filter columns"), 200.0);
             if hide_empty_toggle(ui, state, options, tr("Hide the columns that are NULL or empty in every row")) {
                 actions.push(state.prefs(options));
             }
@@ -397,6 +410,7 @@ fn show_rows(model: &mut ResultModel, grid: &mut DataGridState, options: &GridOp
             });
         });
     });
+    ui.painter().hline(ui.max_rect().x_range(), bar.response.rect.bottom() + 0.5, egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border));
     rows_table(model, grid, options, state, ui, &rows, &focus, &mut actions);
     actions
 }
@@ -465,11 +479,13 @@ fn rows_table(
     let measure = |ui: &Ui, text: String, font: egui::FontId| ui.fonts_mut(|f| f.layout_no_wrap(text, font, egui::Color32::WHITE).rect.width());
     let name_w = columns.iter().map(|&c| measure(ui, model.column_name(c).to_string(), body.clone())).fold(0.0_f32, f32::max).clamp(100.0, 260.0) + 8.0;
     let type_of = |c: usize| model.column_meta(c).map_or_else(|| tr("virtual").to_string(), |m| m.type_name.to_lowercase());
-    let fit_lead = 24.0 + name_w;
-    let lead = state.lead_width.unwrap_or(fit_lead);
-    // One row: its value column takes the width; side by side: each a share.
+    let fit_lead = 45.0 + name_w;
+    let lead = state.lead_width.unwrap_or(if single { 220.0 } else { 200.0 });
+    // In a card 16 from the sides: one row up to 860 wide, its value column takes the
+    // width; side by side, each row a share.
     let width_key = |r: usize| if single { SINGLE } else { r };
-    let default_w = if single { (ui.available_width() - lead - 16.0).max(200.0) } else { ((ui.available_width() - lead - 16.0) / rows.len() as f32).clamp(150.0, 360.0) };
+    let avail = ui.available_width() - 32.0;
+    let default_w = if single { (avail.min(860.0) - lead).max(200.0) } else { ((avail - lead) / rows.len() as f32).max(150.0) };
     let mut widths: Vec<f32> = rows.iter().map(|r| state.widths.get(&width_key(*r)).copied().unwrap_or(default_w)).collect();
     let mut lead_w = lead;
     // Width that shows the longest value of row `j` (double-click on the border).
@@ -485,8 +501,14 @@ fn rows_table(
         }
         w + 20.0
     };
-    // As high as the grid's rows (Settings › Results › Row height).
-    let row_h = options.row_height_for(ui.text_style_height(&egui::TextStyle::Body));
+    // A little higher than the grid's rows (Settings › Results › Row height): 34 at 13 points
+    // (32 side by side); the header 32.
+    let row_h = options.row_height_for(egui::TextStyle::Body.resolve(ui.style()).size) + if single { 5.0 } else { 3.0 };
+    let head_h = 32.0;
+    let pal = ternarygrid_ui::pal(ui);
+    let head_font = ternarygrid_ui::style::semibold(ui.ctx(), 12.0);
+    let name_font = ternarygrid_ui::style::medium(ui.ctx(), body.size);
+    let mut card = egui::Rect::NOTHING;
     let active_row = grid.active_cell().map(|(r, _)| r);
     let editable = model.is_editable() && options.allow_editing;
     let mut commit: Option<(usize, usize, String)> = None;
@@ -529,223 +551,249 @@ fn rows_table(
             ui.colored_label(theme.error, format!("{}  {e}", icon::WARNING_CIRCLE));
         });
     }
-    ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            // Header: one column per row.
-            // Borders are resized by dragging, fitted by a double-click.
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(lead_w, row_h), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 0.0, theme.header_bg);
-                ui.painter().text(rect.left_center() + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, tr("Column"), body.clone(), theme.weak);
-                if resize_handle(ui, rect, ui.id().with("record_lead"), tr("Column"), focus.id, &mut lead_w, |_| fit_lead) {
-                    state.lead_width = Some(lead_w);
-                }
-                for (j, &r) in rows.iter().enumerate() {
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(widths[j], row_h), egui::Sense::hover());
-                    // The shown row's header is "selected", as in DBeaver.
-                    let fill = if single || active_row == Some(r) { theme.header_selected_bg } else { theme.header_bg };
-                    ui.painter().rect_filled(rect, 0.0, fill);
-                    ui.painter().vline(rect.left(), rect.y_range(), egui::Stroke::new(1.0, theme.line));
-                    ui.painter().text(rect.left_center() + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, trf("Row #{}", &[&(r + 1)]), body.clone(), theme.header_text);
-                    if resize_handle(ui, rect, ui.id().with(("record_col", width_key(r))), &trf("Row #{}", &[&(r + 1)]), focus.id, &mut widths[j], |ui| fit_row(ui, j, r)) {
-                        state.widths.insert(width_key(r), widths[j]);
+    let card_frame = egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 14, bottom: 14 });
+    card_frame.show(ui, |ui| {
+        ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                // Header: one column per row.
+                // Borders are resized by dragging, fitted by a double-click.
+                let head = ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(lead_w, head_h), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, egui::CornerRadius { nw: 8, ..Default::default() }, theme.header_bg);
+                    ui.painter().text(rect.left_center() + egui::vec2(12.0, 0.0), egui::Align2::LEFT_CENTER, tr("Column"), head_font.clone(), pal.text_muted);
+                    if resize_handle(ui, rect, ui.id().with("record_lead"), tr("Column"), focus.id, &mut lead_w, |_| fit_lead) {
+                        state.lead_width = Some(lead_w);
                     }
-                }
-            });
-            let mut draw = |ui: &mut Ui, list: &[usize]| {
-                for &i in list {
-                    let c = columns[i];
-                    let row = ui.horizontal(|ui| {
-                        let (lead_rect, lead_resp) = ui.allocate_exact_size(egui::vec2(lead_w, row_h), egui::Sense::click());
-                        let name = model.column_name(c).to_string();
-                        let field_picked = rows.iter().all(|&r| picked.contains(&(r, c)));
-                        lead_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &name));
-                        // The column's type, and why it has a marker, on hover.
-                        let mut tip = type_of(c);
-                        if key_cols.contains(&c) {
-                            tip = format!("{tip}\n{}", tr("Key column"));
-                        } else if model.foreign_key_for_column(c).is_some() {
-                            tip = format!("{tip}\n{}", tr("References another table"));
+                    for (j, &r) in rows.iter().enumerate() {
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(widths[j], head_h), egui::Sense::hover());
+                        // The row picked among several is "selected".
+                        let fill = if !single && active_row == Some(r) { theme.header_selected_bg } else { theme.header_bg };
+                        let corner = if j + 1 == rows.len() { egui::CornerRadius { ne: 8, ..Default::default() } } else { egui::CornerRadius::ZERO };
+                        ui.painter().rect_filled(rect, corner, fill);
+                        ui.painter().text(rect.left_center() + egui::vec2(12.0, 0.0), egui::Align2::LEFT_CENTER, trf("Row #{}", &[&(r + 1)]), head_font.clone(), pal.text_muted);
+                        if resize_handle(ui, rect, ui.id().with(("record_col", width_key(r))), &trf("Row #{}", &[&(r + 1)]), focus.id, &mut widths[j], |ui| fit_row(ui, j, r)) {
+                            state.widths.insert(width_key(r), widths[j]);
                         }
-                        let lead_resp = lead_resp.on_hover_text(tip);
-                        if lead_resp.clicked() {
-                            clicked_field = Some((c, mods));
-                            focus.request_focus();
-                        }
-                        if lead_resp.secondary_clicked() && !field_picked {
-                            clicked_field = Some((c, egui::Modifiers::NONE));
-                        }
-                        if menu_open(&lead_resp) {
-                            menu_resp = Some(lead_resp.clone());
-                        }
-                        // As DBeaver: the names in the header's colour (the current field's
-                        // as a selected header), the values in one colour.
-                        let hovered = ui.input(|inp| inp.pointer.hover_pos()).is_some_and(|p| p.y >= lead_rect.top() && p.y < lead_rect.bottom() && ui.clip_rect().contains(p));
-                        let hover = |c: egui::Color32| if hovered { crate::theme::mix(c, theme.text, 0.06) } else { c };
-                        let row_fill = hover(theme.record_bg);
-                        let current = field_picked || anchor.is_some_and(|(_, ac)| ac == c);
-                        ui.painter().rect_filled(lead_rect, 0.0, hover(if current { theme.header_selected_bg } else { theme.header_bg }));
-                        let p = ui.painter();
-                        let mut x = lead_rect.left() + 6.0;
-                        if key_cols.contains(&c) {
-                            p.text(egui::pos2(x, lead_rect.center().y), egui::Align2::LEFT_CENTER, icon::KEY, body.clone(), theme.warn);
-                        } else if model.foreign_key_for_column(c).is_some() {
-                            p.text(egui::pos2(x, lead_rect.center().y), egui::Align2::LEFT_CENTER, icon::LINK_SIMPLE, body.clone(), theme.link);
-                        } else if let Some(k) = crate::grid::kind_icon(model.column_kind(c)) {
-                            // The column's kind, as in the grid's header.
-                            p.text(egui::pos2(x, lead_rect.center().y), egui::Align2::LEFT_CENTER, k, egui::FontId::new(body.size * 0.85, body.family.clone()), theme.weak);
-                        }
-                        x += 18.0;
-                        let name_rect = egui::Rect::from_min_max(egui::pos2(x, lead_rect.top()), egui::pos2(lead_rect.right() - 6.0, lead_rect.bottom()));
-                        let mut name_text = RichText::new(&name).color(theme.header_text);
-                        if model.is_virtual_column(c) {
-                            name_text = name_text.italics();
-                        }
-                        paint_text(ui, name_rect, name_text, theme.text);
-                        for (j, &r) in rows.iter().enumerate() {
-                            if state.editing.as_ref().is_some_and(|(er, ec, _, _)| *er == r && *ec == c) {
-                                if let Some((_, _, text, original)) = state.editing.as_mut() {
-                                    let id = ui.id().with(("record_edit", r, c));
-                                    let te = ui
-                                        .add_sized([widths[j], row_h], TextEdit::singleline(text).id(id).margin(egui::Margin::symmetric(7, 0)).vertical_align(egui::Align::Center));
-                                    if let Some(all) = state.select_text.take() {
-                                        let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
-                                        let n = text.chars().count();
-                                        let range = if all { CCursorRange::two(CCursor::new(0), CCursor::new(n)) } else { CCursorRange::one(CCursor::new(n)) };
-                                        st.cursor.set_char_range(Some(range));
-                                        st.store(ui.ctx(), id);
-                                    }
-                                    // A value it refused: the field is outlined in red, as the grid's editor.
-                                    if state.error.is_some() {
-                                        ui.painter().rect_stroke(te.rect, 2.0, egui::Stroke::new(1.5, theme.error), egui::StrokeKind::Inside);
-                                    }
-                                    if te.lost_focus() {
-                                        let (escape, enter) = ui.input(|inp| (inp.key_pressed(Key::Escape), inp.key_pressed(Key::Enter)));
-                                        // Ended with the keyboard: the keyboard goes on in the record (↑ ↓, typing).
-                                        if escape || enter {
-                                            state.focus_request = true;
-                                        }
-                                        // Unchanged text is no edit (a NULL would become '').
-                                        if escape || text == original {
-                                            state.editing = None;
-                                        } else {
-                                            commit = Some((r, c, text.clone()));
-                                        }
-                                    } else if !te.has_focus() {
-                                        te.request_focus();
-                                    }
-                                }
-                                continue;
+                    }
+                });
+                let hr = head.response.rect;
+                ui.painter().hline(hr.left()..=hr.left() + lead_w + widths.iter().sum::<f32>(), hr.bottom() - 0.5, egui::Stroke::new(1.0, theme.border));
+                card = egui::Rect::from_min_size(hr.min, egui::vec2(lead_w + widths.iter().sum::<f32>(), hr.height()));
+                let mut draw = |ui: &mut Ui, list: &[usize], bottom: &mut f32| {
+                    for &i in list {
+                        let c = columns[i];
+                        let row = ui.horizontal(|ui| {
+                            let (lead_rect, lead_resp) = ui.allocate_exact_size(egui::vec2(lead_w, row_h), egui::Sense::click());
+                            let name = model.column_name(c).to_string();
+                            let field_picked = rows.iter().all(|&r| picked.contains(&(r, c)));
+                            lead_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &name));
+                            // The column's type, and why it has a marker, on hover.
+                            let mut tip = type_of(c);
+                            if key_cols.contains(&c) {
+                                tip = format!("{tip}\n{}", tr("Key column"));
+                            } else if model.foreign_key_for_column(c).is_some() {
+                                tip = format!("{tip}\n{}", tr("References another table"));
                             }
-                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(widths[j], row_h), egui::Sense::click());
-                            let is_picked = picked.contains(&(r, c));
-                            let fill = if is_picked { theme.selection } else { row_fill };
-                            ui.painter().rect_filled(rect, 0.0, fill);
-                            ui.painter().vline(rect.left(), rect.y_range(), egui::Stroke::new(1.0, theme.line));
-                            if anchor == Some((r, c)) {
-                                ui.painter().rect_stroke(rect.shrink(1.0), 2.0, egui::Stroke::new(1.5, theme.active_border), egui::StrokeKind::Inside);
-                            }
-                            if moved_to == Some((r, c)) {
-                                resp.scroll_to_me(None);
-                            }
-                            let inner = rect.shrink2(egui::vec2(8.0, 0.0));
-                            let Some((v, is_default, modified)) = values.get(j).and_then(|vs| vs.get(i)) else { continue };
-                            let fmt = PreparedFormat::new(&options.format, grid.column_format(c));
-                            let rt = value_text(v, *is_default, *modified, &fmt, options, &theme);
-                            let mut text_rect = inner;
-                            // As in the grid: a foreign key value has a button that opens the row it references.
-                            if let Some(i) = model.foreign_key_for_column(c).filter(|_| !v.is_null() && !*is_default && inner.width() > 40.0) {
-                                let b = egui::Rect::from_center_size(egui::pos2(inner.right() - 8.0, rect.center().y), egui::vec2(16.0, (row_h - 4.0).min(18.0)));
-                                text_rect.max.x = b.left() - 2.0;
-                                let target = model.foreign_keys()[i].ref_table.display_path();
-                                let tip = trf("Open the referenced row in {}", &[&target]);
-                                let b_resp =
-                                    ui.interact(b, ui.id().with(("record_fk", r, c)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&tip);
-                                b_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &tip));
-                                let color = if b_resp.hovered() {
-                                    ui.painter().rect_filled(b, 3.0, crate::theme::mix(fill, theme.text, 0.12));
-                                    theme.link
-                                } else {
-                                    theme.weak
-                                };
-                                ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, icon::ARROW_SQUARE_OUT, egui::FontId::new(body.size * 0.85, body.family.clone()), color);
-                                if b_resp.clicked() {
-                                    follow = Some((r, c));
-                                }
-                            }
-                            paint_text(ui, text_rect, rt, theme.text);
-                            let boolean = is_bool_column(model, c, v) && !*is_default;
-                            let can_edit = editable && model.can_edit_cell(r, c).is_ok();
-                            // Booleans: the box is a check box of its own (a click elsewhere picks the cell).
-                            if boolean {
-                                let on = v.as_bool().unwrap_or(false);
-                                let label = if v.is_null() {
-                                    options.format.null_text.clone()
-                                } else if on {
-                                    "true".into()
-                                } else {
-                                    "false".into()
-                                };
-                                let box_rect = egui::Rect::from_min_size(egui::pos2(inner.left() - 2.0, rect.top()), egui::vec2(24.0, rect.height()));
-                                let box_resp = ui.interact(box_rect, ui.id().with(("record_bool", r, c)), egui::Sense::click());
-                                box_resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, can_edit, on, &label));
-                                let box_resp = if can_edit { box_resp.on_hover_text(tr("Click the box to change the value")) } else { box_resp };
-                                if box_resp.clicked() {
-                                    clicked_cell = Some((r, c, egui::Modifiers::NONE));
-                                    focus.request_focus();
-                                    if can_edit {
-                                        toggled = Some((r, c, !on));
-                                    }
-                                }
-                            }
-                            let full = if v.is_null() { None } else { Some(v.to_text().into_owned()) };
-                            let resp = match full.filter(|t| t.chars().count() > 40 || t.contains('\n')) {
-                                Some(t) => resp.on_hover_text(clip(&t)),
-                                None => resp,
-                            };
-                            let resp = if can_edit && !boolean { resp.on_hover_text(tr("Type, Enter or double-click to edit")) } else { resp };
-                            if resp.clicked() {
-                                clicked_cell = Some((r, c, mods));
+                            let lead_resp = lead_resp.on_hover_text(tip);
+                            if lead_resp.clicked() {
+                                clicked_field = Some((c, mods));
                                 focus.request_focus();
                             }
-                            if resp.secondary_clicked() && !is_picked {
-                                clicked_cell = Some((r, c, egui::Modifiers::NONE));
+                            if lead_resp.secondary_clicked() && !field_picked {
+                                clicked_field = Some((c, egui::Modifiers::NONE));
                             }
-                            if menu_open(&resp) {
-                                menu_resp = Some(resp.clone());
+                            if menu_open(&lead_resp) {
+                                menu_resp = Some(lead_resp.clone());
                             }
-                            if resp.double_clicked() && !boolean {
-                                let multi = matches!(v, Value::Text(s) if s.contains('\n')) || matches!(v, Value::Bytes(_));
-                                if can_edit && !multi {
-                                    let text = if v.is_null() { String::new() } else { v.to_text().into_owned() };
-                                    state.start_edit(model, r, c, text.clone(), text, false);
+                            // As DBeaver: the names in the header's colour (the current field's
+                            // as a selected header), the values in one colour.
+                            let hovered = ui.input(|inp| inp.pointer.hover_pos()).is_some_and(|p| p.y >= lead_rect.top() && p.y < lead_rect.bottom() && ui.clip_rect().contains(p));
+                            let hover = |c: egui::Color32| if hovered { crate::theme::mix(c, theme.text, 0.06) } else { c };
+                            let row_fill = hover(theme.bg);
+                            let current = field_picked || anchor.is_some_and(|(_, ac)| ac == c);
+                            ui.painter().rect_filled(lead_rect, 0.0, hover(if current { theme.header_selected_bg } else { theme.header_bg }));
+                            let p = ui.painter();
+                            let mut x = lead_rect.left() + 12.0;
+                            // A key, a link (a foreign key), else a text mark: 13 points, faint.
+                            let icon_font = ternarygrid_ui::style::icon_font(13.0);
+                            let (glyph, color) = if key_cols.contains(&c) {
+                                (icon::KEY, theme.warn)
+                            } else if model.foreign_key_for_column(c).is_some() {
+                                (icon::LINK_SIMPLE, theme.weak)
+                            } else {
+                                (icon::TEXT_AA, theme.weak)
+                            };
+                            p.text(egui::pos2(x + 6.5, lead_rect.center().y), egui::Align2::CENTER_CENTER, glyph, icon_font, color);
+                            x += 21.0;
+                            let name_rect = egui::Rect::from_min_max(egui::pos2(x, lead_rect.top()), egui::pos2(lead_rect.right() - 6.0, lead_rect.bottom()));
+                            let mut name_text = RichText::new(&name).font(name_font.clone()).color(theme.header_text);
+                            if model.is_virtual_column(c) {
+                                name_text = name_text.italics();
+                            }
+                            paint_text(ui, name_rect, name_text, theme.text);
+                            for (j, &r) in rows.iter().enumerate() {
+                                if state.editing.as_ref().is_some_and(|(er, ec, _, _)| *er == r && *ec == c) {
+                                    if let Some((_, _, text, original)) = state.editing.as_mut() {
+                                        let id = ui.id().with(("record_edit", r, c));
+                                        let te = ui.add_sized(
+                                            [widths[j], row_h],
+                                            TextEdit::singleline(text).id(id).margin(egui::Margin::symmetric(7, 0)).vertical_align(egui::Align::Center),
+                                        );
+                                        if let Some(all) = state.select_text.take() {
+                                            let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+                                            let n = text.chars().count();
+                                            let range = if all { CCursorRange::two(CCursor::new(0), CCursor::new(n)) } else { CCursorRange::one(CCursor::new(n)) };
+                                            st.cursor.set_char_range(Some(range));
+                                            st.store(ui.ctx(), id);
+                                        }
+                                        // A value it refused: the field is outlined in red, as the grid's editor.
+                                        if state.error.is_some() {
+                                            ui.painter().rect_stroke(te.rect, 2.0, egui::Stroke::new(1.5, theme.error), egui::StrokeKind::Inside);
+                                        }
+                                        if te.lost_focus() {
+                                            let (escape, enter) = ui.input(|inp| (inp.key_pressed(Key::Escape), inp.key_pressed(Key::Enter)));
+                                            // Ended with the keyboard: the keyboard goes on in the record (↑ ↓, typing).
+                                            if escape || enter {
+                                                state.focus_request = true;
+                                            }
+                                            // Unchanged text is no edit (a NULL would become '').
+                                            if escape || text == original {
+                                                state.editing = None;
+                                            } else {
+                                                commit = Some((r, c, text.clone()));
+                                            }
+                                        } else if !te.has_focus() {
+                                            te.request_focus();
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(widths[j], row_h), egui::Sense::click());
+                                let is_picked = picked.contains(&(r, c));
+                                let modified = values.get(j).and_then(|vs| vs.get(i)).is_some_and(|(_, _, m)| *m);
+                                let fill = if is_picked {
+                                    theme.selection
+                                } else if modified {
+                                    theme.modified
                                 } else {
-                                    open_value = Some((r, c));
+                                    row_fill
+                                };
+                                ui.painter().rect_filled(rect, 0.0, fill);
+                                if anchor == Some((r, c)) {
+                                    ui.painter().rect_stroke(rect.shrink(1.0), 2.0, egui::Stroke::new(1.5, theme.active_border), egui::StrokeKind::Inside);
+                                }
+                                if moved_to == Some((r, c)) {
+                                    resp.scroll_to_me(None);
+                                }
+                                let inner = rect.shrink2(egui::vec2(12.0, 0.0));
+                                let Some((v, is_default, modified)) = values.get(j).and_then(|vs| vs.get(i)) else { continue };
+                                let fmt = PreparedFormat::new(&options.format, grid.column_format(c));
+                                let rt = value_text(v, *is_default, *modified, &fmt, options, &theme);
+                                let mut text_rect = inner;
+                                let fk = model.foreign_key_for_column(c).filter(|_| !v.is_null() && !*is_default && inner.width() > 40.0);
+                                if fk.is_some() {
+                                    text_rect.max.x -= 22.0;
+                                }
+                                let text_w = paint_text(ui, text_rect, rt, theme.text);
+                                // As in the grid: a foreign key value has a button (↗, after it) that opens the row it references.
+                                if let Some(i) = fk {
+                                    let b =
+                                        egui::Rect::from_center_size(egui::pos2(text_rect.left() + text_w + 6.0 + 8.0, rect.center().y), egui::vec2(16.0, (row_h - 4.0).min(18.0)));
+                                    let target = model.foreign_keys()[i].ref_table.display_path();
+                                    let tip = trf("Open the referenced row in {}", &[&target]);
+                                    let b_resp =
+                                        ui.interact(b, ui.id().with(("record_fk", r, c)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&tip);
+                                    b_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &tip));
+                                    let color = if b_resp.hovered() {
+                                        ui.painter().rect_filled(b, 3.0, crate::theme::mix(fill, theme.text, 0.12));
+                                        theme.link
+                                    } else {
+                                        theme.text
+                                    };
+                                    ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, icon::ARROW_UP_RIGHT, ternarygrid_ui::style::icon_font(13.0), color);
+                                    if b_resp.clicked() {
+                                        follow = Some((r, c));
+                                    }
+                                }
+                                let boolean = is_bool_column(model, c, v) && !*is_default;
+                                let can_edit = editable && model.can_edit_cell(r, c).is_ok();
+                                // Booleans: the box is a check box of its own (a click elsewhere picks the cell).
+                                if boolean {
+                                    let on = v.as_bool().unwrap_or(false);
+                                    let label = if v.is_null() {
+                                        options.format.null_text.clone()
+                                    } else if on {
+                                        "true".into()
+                                    } else {
+                                        "false".into()
+                                    };
+                                    let box_rect = egui::Rect::from_min_size(egui::pos2(inner.left() - 2.0, rect.top()), egui::vec2(24.0, rect.height()));
+                                    let box_resp = ui.interact(box_rect, ui.id().with(("record_bool", r, c)), egui::Sense::click());
+                                    box_resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, can_edit, on, &label));
+                                    let box_resp = if can_edit { box_resp.on_hover_text(tr("Click the box to change the value")) } else { box_resp };
+                                    if box_resp.clicked() {
+                                        clicked_cell = Some((r, c, egui::Modifiers::NONE));
+                                        focus.request_focus();
+                                        if can_edit {
+                                            toggled = Some((r, c, !on));
+                                        }
+                                    }
+                                }
+                                let full = if v.is_null() { None } else { Some(v.to_text().into_owned()) };
+                                let resp = match full.filter(|t| t.chars().count() > 40 || t.contains('\n')) {
+                                    Some(t) => resp.on_hover_text(clip(&t)),
+                                    None => resp,
+                                };
+                                let resp = if can_edit && !boolean { resp.on_hover_text(tr("Type, Enter or double-click to edit")) } else { resp };
+                                if resp.clicked() {
+                                    clicked_cell = Some((r, c, mods));
+                                    focus.request_focus();
+                                }
+                                if resp.secondary_clicked() && !is_picked {
+                                    clicked_cell = Some((r, c, egui::Modifiers::NONE));
+                                }
+                                if menu_open(&resp) {
+                                    menu_resp = Some(resp.clone());
+                                }
+                                if resp.double_clicked() && !boolean {
+                                    let multi = matches!(v, Value::Text(s) if s.contains('\n')) || matches!(v, Value::Bytes(_));
+                                    if can_edit && !multi {
+                                        let text = if v.is_null() { String::new() } else { v.to_text().into_owned() };
+                                        state.start_edit(model, r, c, text.clone(), text, false);
+                                    } else {
+                                        open_value = Some((r, c));
+                                    }
+                                }
+                                if state.dropdown.as_ref().is_some_and(|d| d.row == r && d.col == c) {
+                                    list_at = Some(rect);
                                 }
                             }
-                            if state.dropdown.as_ref().is_some_and(|d| d.row == r && d.col == c) {
-                                list_at = Some(rect);
-                            }
-                        }
-                    });
-                    // A line under each field, over its name and its values (as the grid's rows).
-                    let r = row.response.rect;
-                    ui.painter().hline(r.left()..=r.left() + lead_w + widths.iter().sum::<f32>(), r.bottom() - 0.5, egui::Stroke::new(1.0, theme.line));
+                        });
+                        // A line under each field, over its name and its values (as the grid's rows).
+                        let r = row.response.rect;
+                        let right = r.left() + lead_w + widths.iter().sum::<f32>();
+                        ui.painter().hline(r.left()..=right, r.bottom() - 0.5, egui::Stroke::new(1.0, theme.line));
+                        *bottom = bottom.max(r.bottom().min(ui.clip_rect().bottom()));
+                    }
+                };
+                let mut bottom = card.bottom();
+                if !pinned.is_empty() && !rest.is_empty() {
+                    draw(ui, &pinned, &mut bottom);
+                    // A line under the pinned key columns, as wide as the table.
+                    let (y, left) = (ui.cursor().top(), ui.max_rect().left());
+                    let right = left + lead_w + widths.iter().sum::<f32>();
+                    ui.painter().hline(left..=right, y - 1.0, egui::Stroke::new(2.0, pal.border_strong));
+                    ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| draw(ui, &rest, &mut bottom));
+                } else {
+                    let all: Vec<usize> = (0..columns.len()).collect();
+                    ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| draw(ui, &all, &mut bottom));
                 }
-            };
-            if !pinned.is_empty() && !rest.is_empty() {
-                draw(ui, &pinned);
-                // A line under the pinned key columns, as wide as the table.
-                let (y, left) = (ui.cursor().top(), ui.max_rect().left());
-                let right = left + lead_w + widths.iter().sum::<f32>();
-                ui.painter().hline(left..=right, y, egui::Stroke::new(1.5, theme.weak.gamma_multiply(0.6)));
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| draw(ui, &rest));
-            } else {
-                let all: Vec<usize> = (0..columns.len()).collect();
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| draw(ui, &all));
-            }
-        });
+                card.max.y = bottom;
+                // The card's outline, over the corners of its cells.
+                ui.painter().rect_stroke(card, 8, egui::Stroke::new(1.0, theme.border), egui::StrokeKind::Inside);
+            });
+        })
     });
     // The list of values, under its field (closed when the field is not shown).
     if let Some(mut dd) = state.dropdown.take()

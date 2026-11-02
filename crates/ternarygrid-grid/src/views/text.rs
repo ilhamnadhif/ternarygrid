@@ -107,9 +107,7 @@ impl<'a> TextView<'a> {
             state.key = Some(key);
             state.built_at = ui.input(|i| i.time);
         }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
+        super::view_bar(ui, &mut |ui| {
             if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy text"), true, false).clicked() {
                 ui.ctx().copy_text(state.lines.join("\n"));
             }
@@ -120,7 +118,7 @@ impl<'a> TextView<'a> {
                 ));
             }
         });
-        super::show_lines(ui, "ternarygrid_text_view", &state.lines, state.max_chars);
+        super::show_lines(ui, "ternarygrid_text_view", &state.lines, state.max_chars, false);
     }
 }
 

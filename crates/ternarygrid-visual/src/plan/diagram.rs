@@ -309,7 +309,14 @@ pub fn show_plan_diagram(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewStat
         }
         let mut view = ViewTransform::new(state.zoom, state.pan);
         match bounds {
-            Some(b) => view.fit(rect.size(), b, 24.0, 0.1, 1.0),
+            // Readable boxes (at least 75 %): a plan taller than the area starts at its top
+            // (the rest is a scroll away), as the mockups show it.
+            Some(b) => {
+                view.fit(rect.size(), b, 24.0, 0.75, 1.0);
+                if b.height() * view.zoom > rect.height() - 48.0 {
+                    view.pan.y = 20.0 - b.top() * view.zoom;
+                }
+            }
             None => view = ViewTransform::default(),
         }
         state.zoom = view.zoom;

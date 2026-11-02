@@ -93,9 +93,7 @@ impl<'a> DocumentView<'a> {
             state.key = Some(key);
             state.built_at = ui.input(|i| i.time);
         }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
+        super::view_bar(ui, &mut |ui| {
             if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy"), true, false).clicked() {
                 ui.ctx().copy_text(state.text.as_str().to_string());
             }
@@ -108,7 +106,7 @@ impl<'a> DocumentView<'a> {
             DocumentKind::Json => "ternarygrid_json_view",
             DocumentKind::Xml => "ternarygrid_xml_view",
         };
-        super::show_lines(ui, salt, &state.lines, state.max_chars);
+        super::show_lines(ui, salt, &state.lines, state.max_chars, kind == DocumentKind::Json);
     }
 }
 

@@ -705,7 +705,7 @@ fn the_panel_tab_x_closes_it() {
         .nodes
         .iter()
         .filter_map(|(_, n)| {
-            let b = n.bounds().filter(|_| n.label().is_some_and(|l| l == egui_phosphor::regular::X))?;
+            let b = n.bounds().filter(|_| n.label().is_some_and(|l| l == "Close panel"))?;
             Some(egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
         })
         .filter(|p| p.x > tab.x && (p.y - tab.y).abs() < 10.0)
