@@ -930,7 +930,7 @@ impl ImportTab {
         }
     }
 
-    fn options_page(&mut self, ui: &mut Ui) {
+    fn options_page(&mut self, ui: &mut Ui, transactions: bool) {
         let id = self.uid;
         section(ui, tr("Writing"));
         let o = &mut self.options;
@@ -955,6 +955,9 @@ impl ImportTab {
                     ui.label(self.key_columns.join(", "));
                 }
                 ui.end_row();
+                if !transactions {
+                    super::replace_without_transactions_ui(ui);
+                }
             }
             ui.label(tr("Rows per batch"));
             ui.add(egui::DragValue::new(&mut o.batch_size).range(1..=1_000_000));
@@ -1399,7 +1402,7 @@ impl TabView for ImportTab {
             egui::ScrollArea::vertical().id_salt(("imp_body", uid)).auto_shrink([false, false]).show(ui, |ui| match self.page {
                 PAGE_FILE => self.file_page(ui),
                 PAGE_TARGET => self.target_page(ui, cx),
-                PAGE_OPTIONS => self.options_page(ui),
+                PAGE_OPTIONS => self.options_page(ui, super::has_transactions(cx, &self.conn)),
                 _ => self.run_page(ui, cx),
             });
         });

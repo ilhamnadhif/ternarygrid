@@ -154,6 +154,8 @@ pub enum AppCommand {
     OpenSettings,
     /// Preferences were edited: apply and save them.
     SettingsChanged,
+    /// Ask for the master password of the encrypted vault (it locked itself).
+    UnlockVault,
     OpenHistory,
     OpenTasks,
     OpenErDiagram {

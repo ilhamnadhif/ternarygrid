@@ -6,6 +6,18 @@ use egui::RichText;
 use egui_phosphor::regular as icon;
 use ternarygrid_core::{DbError, DbResult, Secret, tr};
 
+/// A secret could not be written because the vault locked itself (its master
+/// password was changed by another TernaryGrid): ask for the password again
+/// instead of only showing the error. Returns true when it does.
+pub fn unlock_after_failed_write(cx: &mut AppContext, e: &DbError) -> bool {
+    if e.kind != ternarygrid_core::ErrorKind::Auth || !cx.services.secrets.read().is_locked() {
+        return false;
+    }
+    cx.push(crate::command::AppCommand::UnlockVault);
+    cx.toasts.info(tr("The master password was changed elsewhere: unlock the saved passwords, then save again."));
+    true
+}
+
 #[derive(Default)]
 pub struct VaultDialog {
     password: String,

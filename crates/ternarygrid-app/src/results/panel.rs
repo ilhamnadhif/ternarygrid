@@ -98,7 +98,6 @@ pub struct ResultPanel {
     pub history_in_header: bool,
     /// Last status message (`true` = error).
     pub status: Option<(String, bool)>,
-    fetch_op: Option<u64>,
     executed: Instant,
     /// Dictionary lookups being loaded: (result column, job).
     dict_jobs: Vec<(usize, Job<DbResult<HashMap<String, String>>>)>,
@@ -214,7 +213,6 @@ impl ResultPanel {
             next_layout: None,
             history_in_header: false,
             status: None,
-            fetch_op: None,
             executed: Instant::now(),
             dict_jobs: Vec::new(),
             settings_applied: false,
@@ -255,22 +253,8 @@ impl ResultPanel {
 
     /// Keep the grid model in sync with the fetch job.
     pub(crate) fn poll(&mut self, cx: &mut AppContext) {
-        if let Some(op) = self.src.take_cancelled_op() {
-            cx.ops.finish(op, crate::ops::OpState::Cancelled);
-            if self.fetch_op == Some(op) {
-                self.fetch_op = None;
-            }
-        }
-        if let Some((op, res)) = self.src.poll() {
-            let state = match res {
-                Ok(n) => crate::ops::OpState::Succeeded(trf("{} rows", &[&n])),
-                Err(e) => crate::ops::OpState::Failed(e),
-            };
-            cx.ops.finish(op, state);
-            if self.fetch_op == Some(op) {
-                self.fetch_op = None;
-            }
-        }
+        // A "fetch all" ends its operation itself (see `ResultSource::fetch_more`).
+        self.src.poll();
         // A new store (refresh, requery), or other columns (foreign key navigation, ALTER):
         // the model follows; other columns need their editability resolved again.
         if self.columns_seen != self.src.columns_version {
@@ -737,7 +721,11 @@ impl ResultPanel {
                 let Some(d) = self.dialect(cx) else { return };
                 let confirm = cx.conns.type_of(&self.conn).confirm_data_change;
                 if confirm {
-                    self.save_preview = Some(self.model.change_preview_sql(d.as_ref()));
+                    // Why the changes cannot be saved, instead of an empty preview.
+                    match self.model.checked_change_set() {
+                        Ok(cs) => self.save_preview = Some(cs.preview_sql(d.as_ref())),
+                        Err(e) => self.status = Some((e, true)),
+                    }
                 } else {
                     self.start_save(cx);
                 }
@@ -787,7 +775,10 @@ impl ResultPanel {
                         self.status = Some((e, true));
                     }
                 }
-                None => self.status = Some((tr("Use ⌘V to paste into the grid.").to_string(), false)),
+                None => {
+                    let msg = if crate::keys::IS_MAC { tr("Use ⌘V to paste into the grid.") } else { tr("Use Ctrl+V to paste into the grid.") };
+                    self.status = Some((msg.to_string(), false));
+                }
             },
             GridAction::Export { rows, columns } => {
                 let rows = rows.map(|r| crate::tabs::transfer::grid_store_rows(&self.model, &r));
@@ -845,13 +836,18 @@ impl ResultPanel {
 
     fn fetch_all(&mut self, cx: &mut AppContext) {
         let op = cx.ops.start(trf("Fetching all rows: {}", &[&self.title]));
-        self.fetch_op = Some(op.id);
         self.src.fetch_more(cx.backend, usize::MAX, Some(op));
     }
 
     fn start_save(&mut self, cx: &mut AppContext) {
         let Some(d) = self.dialect(cx) else { return };
-        let Some(cs) = self.model.change_set() else { return };
+        let cs = match self.model.checked_change_set() {
+            Ok(cs) => cs,
+            Err(e) => {
+                self.status = Some((e, true));
+                return;
+            }
+        };
         let mut stmts = cs.save_statements(d.as_ref());
         if stmts.is_empty() {
             return;
@@ -1028,7 +1024,7 @@ impl ResultPanel {
             return;
         }
         let mut decided: Option<bool> = None;
-        let n = self.model.change_set().map(|c| c.len()).unwrap_or(0);
+        let n = self.model.pending_counts().total();
         let modal = egui::Modal::new(egui::Id::new(("confirm_discard", &self.conn, &self.title))).show(ui.ctx(), |ui| {
             ui.heading(tr("Unsaved changes"));
             ui.label(trf("Reloading the rows discards the {} pending change(s). Save them first to keep them.", &[&n]));

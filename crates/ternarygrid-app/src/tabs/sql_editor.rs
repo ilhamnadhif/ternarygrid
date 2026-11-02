@@ -952,9 +952,13 @@ impl SqlEditorTab {
 
     fn export_result(&mut self, cx: &mut AppContext, sql: &str, opts: BTreeMap<String, String>) {
         let Some(conn) = self.conn.clone() else { return };
-        cx.push(AppCommand::OpenExport { connection: conn, objects: Vec::new(), sql: Some(sql.to_string()) });
-        let _ = opts;
+        let mut tab = crate::tabs::transfer::ExportTab::new(conn, Vec::new(), Some(sql.to_string()));
+        let ignored = tab.apply_client_options(&opts);
+        cx.push(AppCommand::OpenTab(Box::new(tab)));
         self.log("INFO", tr("@export: the export dialog was opened with this query."));
+        if !ignored.is_empty() {
+            self.log("WARNING", trf("@export: options not used: {}", &[&ignored.join(", ")]));
+        }
     }
 
     /// The connection speaks SQL (the formatter and SQL tools apply).

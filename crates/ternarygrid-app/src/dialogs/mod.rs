@@ -309,7 +309,9 @@ impl Dialogs {
                                 Some(cfg) => cx.conns.store.network_secret_key(cfg, slot),
                                 None => secret_key(&p.conn_id, slot),
                             };
-                            if let Err(e) = cx.conns.secrets.set(&key, v) {
+                            if let Err(e) = cx.conns.secrets.set(&key, v)
+                                && !crate::dialogs::vault::unlock_after_failed_write(cx, &e)
+                            {
                                 cx.toasts.error(tr("Cannot store the password securely"), Some(e.to_string()));
                             }
                         }
@@ -458,7 +460,7 @@ impl Dialogs {
                 }
                 let delete = egui::Button::new(RichText::new(tr("Delete")).color(crate::theme::error_color(ui.visuals().dark_mode)));
                 if ui.add_enabled(!connected, delete).clicked() {
-                    cx.conns.remove(&d.conn_id);
+                    cx.conns.remove(cx.backend, &d.conn_id);
                     cx.push(AppCommand::SaveConnections);
                     close = true;
                 }

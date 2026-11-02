@@ -39,6 +39,19 @@ pub struct OpHandle {
     pub id: u64,
     pub progress: Arc<OpProgress>,
     pub cancel: CancellationToken,
+    outcome: Arc<Mutex<Option<OpState>>>,
+}
+
+impl OpHandle {
+    /// End the operation from the task that does it: the operations list takes
+    /// the outcome by itself, also when the view that started it is gone. The
+    /// first outcome counts.
+    pub fn finish(&self, state: OpState) {
+        let mut o = self.outcome.lock();
+        if o.is_none() {
+            *o = Some(state);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +70,14 @@ pub struct Operation {
     pub progress: Arc<OpProgress>,
     pub cancel: CancellationToken,
     pub state: OpState,
+    /// Set through [`OpHandle::finish`].
+    outcome: Arc<Mutex<Option<OpState>>>,
+}
+
+impl Operation {
+    fn is_running(&self) -> bool {
+        matches!(self.state, OpState::Running) && self.outcome.lock().is_none()
+    }
 }
 
 #[derive(Default)]
@@ -68,9 +89,11 @@ pub struct Operations {
 
 impl Operations {
     pub fn start(&mut self, title: impl Into<String>) -> OpHandle {
+        self.collect();
         self.next_id += 1;
         let progress = Arc::new(OpProgress::default());
         let cancel = CancellationToken::new();
+        let outcome = Arc::new(Mutex::new(None));
         self.list.push(Operation {
             id: self.next_id,
             title: title.into(),
@@ -79,6 +102,7 @@ impl Operations {
             progress: progress.clone(),
             cancel: cancel.clone(),
             state: OpState::Running,
+            outcome: outcome.clone(),
         });
         if self.list.len() > 100 {
             // drop the oldest finished entries
@@ -86,7 +110,19 @@ impl Operations {
                 self.list.remove(pos);
             }
         }
-        OpHandle { id: self.next_id, progress, cancel }
+        OpHandle { id: self.next_id, progress, cancel, outcome }
+    }
+
+    /// Take the outcomes the tasks set ([`OpHandle::finish`]).
+    pub fn collect(&mut self) {
+        for op in &mut self.list {
+            if matches!(op.state, OpState::Running)
+                && let Some(state) = op.outcome.lock().take()
+            {
+                op.state = state;
+                op.finished = Some(Instant::now());
+            }
+        }
     }
 
     pub fn finish(&mut self, id: u64, state: OpState) {
@@ -96,13 +132,18 @@ impl Operations {
         }
     }
 
+    /// State of the operation `id` (outcomes set by its task not yet [collected](Self::collect)).
+    pub fn state(&self, id: u64) -> Option<&OpState> {
+        self.list.iter().find(|o| o.id == id).map(|o| &o.state)
+    }
+
     pub fn running(&self) -> usize {
-        self.list.iter().filter(|o| matches!(o.state, OpState::Running)).count()
+        self.list.iter().filter(|o| o.is_running()).count()
     }
 
     pub fn cancel_all(&self) {
         for o in &self.list {
-            if matches!(o.state, OpState::Running) {
+            if o.is_running() {
                 o.cancel.cancel();
             }
         }
@@ -110,6 +151,7 @@ impl Operations {
 
     /// Operations panel content.
     pub fn ui(&mut self, ui: &mut Ui) {
+        self.collect();
         if self.list.is_empty() {
             ui.weak(tr("No background operations."));
             return;
@@ -170,5 +212,30 @@ impl Operations {
         if self.running() > 0 {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_task_ends_its_operation() {
+        let mut ops = Operations::default();
+        let a = ops.start("a");
+        let b = ops.start("b");
+        assert_eq!(ops.running(), 2);
+        // Ended by the task, nobody else polling it.
+        a.finish(OpState::Succeeded("1 rows".into()));
+        a.finish(OpState::Cancelled);
+        assert_eq!(ops.running(), 1);
+        ops.collect();
+        assert!(matches!(ops.list[0].state, OpState::Succeeded(_)) && ops.list[0].finished.is_some());
+        // Finished by the view first: the task's later outcome does not change it.
+        ops.finish(b.id, OpState::Cancelled);
+        b.finish(OpState::Succeeded("2 rows".into()));
+        ops.collect();
+        assert!(matches!(ops.list[1].state, OpState::Cancelled));
+        assert_eq!(ops.running(), 0);
     }
 }

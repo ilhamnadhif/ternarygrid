@@ -106,6 +106,12 @@ impl AppTaskExecutor {
         // Backup tools connect themselves; open (and close) a connection
         // anyway to establish tunnels and verify the credentials.
         let c = self.open(connection_id).await?;
+        // The restore tool connects by itself: the read-only session does not stop it.
+        if restore.is_some() && c.config.read_only {
+            let mut c = c;
+            let _ = c.session.close().await;
+            return Err(DbError::read_only(format!("The connection \"{}\" is read-only", c.config.name)));
+        }
         let spec = match (backup, restore) {
             (Some(b), _) => c.driver.backup_command(&c.params, b)?,
             (_, Some(r)) => c.driver.restore_command(&c.params, r)?,
@@ -153,6 +159,9 @@ impl AppTaskExecutor {
             out.output_files.push(p.clone());
         }
         if cfg.apply && !script.is_empty() {
+            if b.config.read_only {
+                return Err(DbError::read_only(format!("The connection \"{}\" is read-only", b.config.name)));
+            }
             if let Some(s) = &cfg.target_schema {
                 b.session.set_current_schema(s).await?;
             }
@@ -162,6 +171,10 @@ impl AppTaskExecutor {
                 }
                 execute_update(b.session.as_mut(), sql, &[]).await.map_err(|e| e.with_context(format!("statement {}", i + 1)))?;
                 ctx.progress(i as u64 + 1, Some(script.len() as u64), None);
+            }
+            // Manual commit (the connection type's default): closing would roll it all back.
+            if b.session.in_transaction() {
+                b.session.commit().await?;
             }
             ctx.info(format!("{} statement(s) applied", script.len()));
         }

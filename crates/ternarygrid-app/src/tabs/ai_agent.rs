@@ -6,8 +6,9 @@
 //!   `DESCRIBE`, `EXPLAIN` without `ANALYZE`), as the SQL editor classifies it;
 //! * none of the functions or clauses that act beyond reading (ending
 //!   sessions, reading server files, writing files, sleeping);
-//! * a session of its own, read-only where the database has the mode
-//!   (PostgreSQL / CockroachDB, MySQL / MariaDB, SQLite);
+//! * a session of its own, opened read-only (each driver that has the mode
+//!   applies it) and made read-only again by statement for PostgreSQL /
+//!   CockroachDB, MySQL / MariaDB and SQLite;
 //! * at most [`MAX_ROWS`] rows, within [`TIMEOUT`].
 
 use crate::conn::session::SessionHandle;
@@ -30,21 +31,28 @@ pub const MAX_ROUNDS: usize = 8;
 /// Characters of one value the model gets.
 const MAX_VALUE_CHARS: usize = 200;
 
-/// Calls and clauses that do more than read, refused even in a query.
+/// Functions that do more than read, refused even in a query. Matched as whole
+/// names (any case, quoted or schema-qualified too, also inside string literals,
+/// which some functions run as SQL): a trailing `*` matches every name starting
+/// so, a trailing `(` only a call.
 const DENIED: &[&str] = &[
     "pg_terminate_backend",
     "pg_cancel_backend",
     "pg_reload_conf",
-    "pg_rotate_logfile",
+    "pg_rotate_logfile*",
     "pg_switch_wal",
+    "pg_switch_xlog",
     "pg_read_file",
     "pg_read_binary_file",
-    "pg_ls_dir",
+    "pg_ls_*",
     "pg_sleep",
-    "pg_advisory",
+    "pg_sleep_*",
+    "pg_advisory_*",
+    "pg_try_advisory_*",
     "lo_import",
     "lo_export",
     "dblink",
+    "dblink_*",
     "set_config",
     "load_file",
     "sleep(",
@@ -53,10 +61,114 @@ const DENIED: &[&str] = &[
     "openrowset",
     "opendatasource",
     "openquery",
-    "xp_",
-    "into outfile",
-    "into dumpfile",
+    "xp_*",
 ];
+
+/// ClickHouse table functions that read files or other servers (or run programs).
+const DENIED_CLICKHOUSE: &[&str] = &[
+    "url(",
+    "urlcluster(",
+    "file(",
+    "filecluster(",
+    "s3(",
+    "s3cluster(",
+    "gcs(",
+    "oss(",
+    "cosn(",
+    "remote(",
+    "remotesecure(",
+    "cluster(",
+    "clusterallreplicas(",
+    "hdfs(",
+    "hdfscluster(",
+    "mysql(",
+    "postgresql(",
+    "jdbc(",
+    "odbc(",
+    "azureblobstorage(",
+    "azureblobstoragecluster(",
+    "mongodb(",
+    "redis(",
+    "sqlite(",
+    "executable(",
+    "iceberg*(",
+    "deltalake*(",
+    "hudi*(",
+    "paimon*(",
+    "ytsaurus(",
+    "arrowflight(",
+];
+
+/// `name` (lower case) is the denied entry `d`; `call`: it is followed by `(`.
+fn denied_name(d: &str, name: &str, call: bool) -> bool {
+    let (d, needs_call) = match d.strip_suffix('(') {
+        Some(d) => (d, true),
+        None => (d, false),
+    };
+    let hit = match d.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == d,
+    };
+    hit && (call || !needs_call)
+}
+
+/// What a statement uses that a query of the assistant may not.
+#[derive(Default)]
+struct Uses {
+    /// A denied function.
+    denied: Option<String>,
+    /// The `INTO` keyword (`SELECT … INTO`, `INTO OUTFILE`).
+    into: bool,
+}
+
+/// Look through `src` token by token: words in code (and in the comments MySQL runs,
+/// `/*! … */`) and the words of string literals.
+fn scan(src: &str, syntax: &SqlSyntax, denied: &[&[&str]], depth: usize, out: &mut Uses) {
+    use ternarygrid_sql::TokenKind as K;
+    let tokens = ternarygrid_sql::tokenize(src, syntax);
+    let code: Vec<&ternarygrid_sql::Token> = tokens.iter().filter(|t| !t.is_trivia()).collect();
+    let deny = |name: &str, call: bool, out: &mut Uses| {
+        if out.denied.is_none()
+            && let Some(d) = denied.iter().flat_map(|l| l.iter()).find(|d| denied_name(d, name, call))
+        {
+            out.denied = Some(d.trim_end_matches(['(', '*']).to_string());
+        }
+    };
+    let word_char = |c: char| c.is_alphanumeric() || c == '_';
+    for (i, t) in code.iter().enumerate() {
+        let text = t.text(src);
+        match t.kind {
+            K::Keyword | K::Identifier | K::QuotedIdentifier => {
+                let name = ternarygrid_sql::token::unquote_ident(text).to_lowercase();
+                let call = code.get(i + 1).is_some_and(|n| n.kind == K::LParen);
+                deny(&name, call, out);
+                out.into |= t.kind != K::QuotedIdentifier && name == "into";
+            }
+            K::String => {
+                // Some functions run a string as SQL (`query_to_xml('SELECT pg_sleep(9)', …)`).
+                let mut rest = text;
+                while let Some(s) = rest.find(word_char) {
+                    let after = &rest[s..];
+                    let len = after.find(|c: char| !word_char(c)).unwrap_or(after.len());
+                    let tail = after[len..].trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '`' | ']'));
+                    deny(&after[..len].to_lowercase(), tail.starts_with('('), out);
+                    rest = &after[len..];
+                }
+            }
+            _ => {}
+        }
+    }
+    // MySQL / MariaDB run the text of `/*! … */` and `/*M! … */`.
+    if depth < 4 {
+        for t in tokens.iter().filter(|t| t.kind == K::BlockComment) {
+            let text = t.text(src);
+            if let Some(body) = text.strip_prefix("/*!").or_else(|| text.strip_prefix("/*M!")) {
+                let body = body.trim_start_matches(|c: char| c.is_ascii_digit());
+                scan(body.strip_suffix("*/").unwrap_or(body), syntax, denied, depth + 1, out);
+            }
+        }
+    }
+}
 
 /// The `run_query` tool.
 pub fn tool() -> ToolDef {
@@ -83,9 +195,9 @@ pub fn system_note() -> String {
 
 /// [`check`] for a connection's language: Redis commands, MongoDB statements
 /// and Elasticsearch requests may run when they only read.
-pub fn check_for(sql: &str, syntax: &SqlSyntax, language: ternarygrid_core::QueryLanguage) -> Result<String, String> {
+pub fn check_for(sql: &str, syntax: &SqlSyntax, kind: DbKind) -> Result<String, String> {
     let text = sql.trim();
-    let Some(info) = ternarygrid_sql::classify_command(text, language) else { return check(sql, syntax) };
+    let Some(info) = ternarygrid_sql::classify_command(text, kind.language()) else { return check(sql, syntax, kind) };
     let stmts = ternarygrid_sql::split_statements(text, syntax, &Default::default());
     if stmts.len() != 1 {
         return Err(tr("Exactly one statement per query").to_string());
@@ -97,7 +209,7 @@ pub fn check_for(sql: &str, syntax: &SqlSyntax, language: ternarygrid_core::Quer
 }
 
 /// `Ok(statement)` when `sql` may run, else why not.
-pub fn check(sql: &str, syntax: &SqlSyntax) -> Result<String, String> {
+pub fn check(sql: &str, syntax: &SqlSyntax, kind: DbKind) -> Result<String, String> {
     let stmts = ternarygrid_sql::split_and_classify(sql, syntax, &Default::default());
     let [(span, info)] = stmts.as_slice() else {
         return Err(tr("Exactly one statement per query").to_string());
@@ -109,11 +221,14 @@ pub fn check(sql: &str, syntax: &SqlSyntax) -> Result<String, String> {
     if !reads || info.is_write || analyze {
         return Err(trf("Only queries can run here ({} is not one); show the statement to the user instead", &[&info.kind.label()]));
     }
-    if lower.split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == "into") {
+    let lists: &[&[&str]] = if kind == DbKind::ClickHouse { &[DENIED, DENIED_CLICKHOUSE] } else { &[DENIED] };
+    let mut uses = Uses::default();
+    scan(&stmt, syntax, lists, 0, &mut uses);
+    if uses.into {
         return Err(tr("SELECT … INTO writes; only queries can run here").to_string());
     }
-    if let Some(d) = DENIED.iter().find(|d| lower.contains(*d)) {
-        return Err(trf("{} does more than read; it cannot run here", &[d]));
+    if let Some(d) = uses.denied {
+        return Err(trf("{} does more than read; it cannot run here", &[&d]));
     }
     Ok(stmt)
 }
@@ -168,7 +283,7 @@ impl Agent {
         if call.name != TOOL {
             return ToolStep::refused(sql, trf("There is no tool {}", &[&call.name]));
         }
-        let stmt = match check_for(&sql, &self.syntax, self.kind.language()) {
+        let stmt = match check_for(&sql, &self.syntax, self.kind) {
             Ok(s) => s,
             Err(why) => return ToolStep::refused(sql, why),
         };
@@ -255,6 +370,7 @@ mod tests {
     #[test]
     fn only_queries_run() {
         let s = pg();
+        let check = |sql: &str, s: &SqlSyntax| check(sql, s, DbKind::Postgres);
         assert_eq!(check("SELECT count(*) FROM charges;", &s).unwrap(), "SELECT count(*) FROM charges");
         assert!(check("WITH x AS (SELECT 1) SELECT * FROM x", &s).is_ok());
         assert!(check("EXPLAIN SELECT 1", &s).is_ok());
@@ -275,6 +391,75 @@ mod tests {
         ] {
             assert!(check(refused, &s).is_err(), "{refused}");
         }
+    }
+
+    #[test]
+    fn denied_names_are_whole_words() {
+        let s = pg();
+        let check = |sql: &str| check(sql, &s, DbKind::Postgres);
+        // Names that merely contain a denied one, and words in string literals.
+        for ok in [
+            "SELECT exp_date, max_xp_level FROM cards",
+            "SELECT 'it turned into a pumpkin' AS story",
+            "SELECT * FROM notes WHERE body LIKE '%into%'",
+            "SELECT sleep_minutes, pg_sleeper FROM habits",
+            "SELECT sleep FROM habits",
+            "SELECT 'expected' -- into\n",
+        ] {
+            assert!(check(ok).is_ok(), "{ok}: {:?}", check(ok));
+        }
+        for refused in [
+            "SELECT pg_sleep(1)",
+            "SELECT PG_SLEEP_FOR('1 s')",
+            "SELECT pg_catalog.pg_read_file('/etc/passwd')",
+            "SELECT \"pg_read_file\"('/etc/passwd')",
+            "SELECT pg_ls_waldir()",
+            "SELECT pg_try_advisory_lock(1)",
+            "SELECT * FROM dblink_get_connections()",
+            "SELECT sleep (5)",
+            "SELECT sleep/**/(5)",
+            "SELECT 1 FROM t /*!INTO OUTFILE '/tmp/x' */ LIMIT 1",
+            "SELECT 1 /*!50000 , sleep(5) */ FROM t",
+            "SELECT 1 /*M!100000 , benchmark(9, 1) */ FROM t",
+            "SELECT query_to_xml('select pg_sleep(100)', true, false, '')",
+            "SELECT * INTO copy FROM charges",
+            "SELECT a FROM t INTO OUTFILE '/tmp/x'",
+        ] {
+            assert!(check(refused).is_err(), "{refused}");
+        }
+        let mysql = crate::driver_registry().dialect(DbKind::MySql).syntax().clone();
+        assert!(super::check("SELECT * FROM master..xp_dirtree", &mysql, DbKind::MySql).is_err());
+        assert!(super::check("SELECT exp_date FROM t WHERE note = 'turned into'", &mysql, DbKind::MySql).is_ok());
+    }
+
+    #[test]
+    fn clickhouse_table_functions_are_refused() {
+        let s = crate::driver_registry().dialect(DbKind::ClickHouse).syntax().clone();
+        let check = |sql: &str| check(sql, &s, DbKind::ClickHouse);
+        for refused in [
+            "SELECT * FROM url('http://169.254.169.254/latest/meta-data', CSV)",
+            "SELECT * FROM file('/etc/passwd', LineAsString)",
+            "SELECT * FROM s3('https://bucket.s3.amazonaws.com/x.csv')",
+            "SELECT * FROM remote('other:9000', system.users)",
+            "SELECT * FROM remoteSecure('other:9440', db.t)",
+            "SELECT * FROM mysql('h:3306', 'db', 't', 'u', 'p')",
+            "SELECT * FROM postgresql('h:5432', 'db', 't', 'u', 'p')",
+            "SELECT * FROM hdfs('hdfs://h:9000/x', 'TSV')",
+            "SELECT * FROM jdbc('jdbc:x', 't')",
+            "SELECT * FROM odbc('DSN=x', 't')",
+            "SELECT * FROM azureBlobStorage('x', 'c', 'b')",
+            "SELECT * FROM executable('script.sh', TSV, 'x String')",
+            "SELECT * FROM icebergS3('https://x')",
+            "SELECT * FROM `url`('http://x', CSV)",
+        ] {
+            assert!(check(refused).is_err(), "{refused}");
+        }
+        // Columns and tables of these names are not calls.
+        for ok in ["SELECT url, file, remote, URLHierarchy(url) FROM visits", "SELECT count() FROM system.tables WHERE engine = 'MySQL'"] {
+            assert!(check(ok).is_ok(), "{ok}: {:?}", check(ok));
+        }
+        // Other databases have no such table functions.
+        assert!(super::check("SELECT url(x) FROM t", &pg(), DbKind::Postgres).is_ok());
     }
 
     async fn sqlite(path: std::path::PathBuf) -> DbResult<SessionHandle> {

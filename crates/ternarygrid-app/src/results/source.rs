@@ -6,7 +6,7 @@
 
 use crate::backend::{Backend, Job, Loadable};
 use crate::conn::session::{FetchError, SessionHandle};
-use crate::ops::OpHandle;
+use crate::ops::{OpHandle, OpState};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -23,6 +23,8 @@ pub struct FetchBatch {
     /// The columns of the statement when it was (re-)executed: another table after
     /// foreign key navigation, a changed table after a refresh.
     pub columns: Option<Vec<ColumnMeta>>,
+    /// Stopped by its operation's Cancel before the end.
+    pub cancelled: bool,
 }
 
 pub struct ResultSource {
@@ -34,9 +36,8 @@ pub struct ResultSource {
     pub token: Option<u64>,
     pub exhausted: bool,
     fetch_job: Option<Job<DbResult<FetchBatch>>>,
-    fetch_op: Option<u64>,
-    /// Operation of a fetch that was cancelled, reported once.
-    cancelled_op: Option<u64>,
+    /// Operation of the running fetch ("fetch all"); the fetch ends it.
+    fetch_op: Option<OpHandle>,
     /// Rows of the cursor's result in the store (saved new rows are not), less the
     /// saved deletions: how far a re-executed query skips to continue.
     server_rows: usize,
@@ -71,7 +72,6 @@ impl ResultSource {
             exhausted: token.is_none(),
             fetch_job: None,
             fetch_op: None,
-            cancelled_op: None,
             server_rows: 0,
             fetch_store_len: 0,
             error: None,
@@ -126,7 +126,7 @@ impl ResultSource {
         self.error = None;
         self.fetch_started = Some(Instant::now());
         self.fetch_store_len = self.store.lock().len();
-        self.fetch_op = op.as_ref().map(|o| o.id);
+        self.fetch_op = op.clone();
         let session = self.session.clone();
         let store = self.store.clone();
         let sql = self.sql.clone();
@@ -134,12 +134,17 @@ impl ResultSource {
         let token = self.token;
         let rerun_safe = self.rerun_safe;
         let skip = self.server_rows;
-        self.fetch_job = Some(backend.spawn(fetch_rows(session, store, sql, params, token, rerun_safe, skip, n, op)));
+        self.fetch_job = Some(backend.spawn(async move {
+            // The operation ends with the fetch, also when the result is no longer shown.
+            let end = OpEnd(op.clone());
+            let r = fetch_rows(session, store, sql, params, token, rerun_safe, skip, n, op).await;
+            end.done(&r);
+            r
+        }));
     }
 
-    /// Apply finished fetches. Returns the id of the finished operation, if any.
-    pub fn poll(&mut self) -> Option<(u64, Result<usize, String>)> {
-        let mut finished_op = None;
+    /// Apply finished fetches.
+    pub fn poll(&mut self) {
         if let Some(job) = self.fetch_job.as_mut() {
             if let Some(res) = job.poll() {
                 self.fetch_job = None;
@@ -176,14 +181,10 @@ impl ResultSource {
                         self.token = b.token;
                         self.messages.extend(b.messages);
                         self.generation += 1;
-                        if let Some(op) = self.fetch_op.take() {
-                            finished_op = Some((op, Ok(b.added)));
-                        }
+                        self.fetch_op = None;
                     }
                     Err(e) => {
-                        if let Some(op) = self.fetch_op.take() {
-                            finished_op = Some((op, Err(e.to_string())));
-                        }
+                        self.fetch_op = None;
                         self.error = Some(e);
                     }
                 }
@@ -193,15 +194,14 @@ impl ResultSource {
             }
         }
         self.total_count.poll();
-        finished_op
     }
 
-    /// Stop a running "fetch all" (the cursor stays open).
+    /// Stop a running "fetch all" (the cursor stays open); its operation ends as cancelled.
     pub fn cancel_fetch(&mut self) {
         if let Some(mut j) = self.fetch_job.take() {
             j.abort();
             self.count_fetched();
-            self.cancelled_op = self.fetch_op.take().or(self.cancelled_op);
+            self.fetch_op = None;
         }
     }
 
@@ -221,11 +221,6 @@ impl ResultSource {
         } else {
             self.cancel_fetch();
         }
-    }
-
-    /// The operation of a cancelled fetch, to be marked as cancelled.
-    pub fn take_cancelled_op(&mut self) -> Option<u64> {
-        self.cancelled_op.take()
     }
 
     /// The result is no longer shown: close its cursor on the server now (it holds a
@@ -288,6 +283,40 @@ impl ResultSource {
     }
 }
 
+impl Drop for ResultSource {
+    /// A "fetch all" of a result no longer shown stops at its next page (and its
+    /// operation ends as cancelled).
+    fn drop(&mut self) {
+        if let Some(op) = &self.fetch_op {
+            op.cancel.cancel();
+        }
+    }
+}
+
+/// Ends the operation of a fetch with its outcome, or as cancelled when the
+/// fetch is aborted before.
+struct OpEnd(Option<OpHandle>);
+
+impl OpEnd {
+    fn done(&self, r: &DbResult<FetchBatch>) {
+        if let Some(op) = &self.0 {
+            op.finish(match r {
+                Ok(b) if b.cancelled => OpState::Cancelled,
+                Ok(b) => OpState::Succeeded(ternarygrid_core::trf("{} rows", &[&b.added])),
+                Err(e) => OpState::Failed(e.to_string()),
+            });
+        }
+    }
+}
+
+impl Drop for OpEnd {
+    fn drop(&mut self) {
+        if let Some(op) = &self.0 {
+            op.finish(OpState::Cancelled);
+        }
+    }
+}
+
 /// Fetch `n` rows, re-executing the query when the cursor was closed.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_rows(
@@ -315,7 +344,7 @@ async fn fetch_rows(
     // (an explicit refresh starts without a token and does run it again).
     if reopen && token.is_some() && !rerun_safe {
         let m = ServerMessage::new("WARNING", ternarygrid_core::tr("The cursor of this result was closed; run the statement again to see the remaining rows."));
-        return Ok(FetchBatch { added: 0, exhausted: true, token: None, messages: vec![m], columns: None });
+        return Ok(FetchBatch { added: 0, exhausted: true, token: None, messages: vec![m], columns: None, cancelled: false });
     }
     if reopen {
         // With the columns' tables: without them the result would turn read-only after a
@@ -324,7 +353,7 @@ async fn fetch_rows(
         messages.extend(ex.messages);
         match ex.header {
             Some(ResultHeader::Rows(cols)) => columns = Some(cols),
-            _ => return Ok(FetchBatch { added: 0, exhausted: true, token: None, messages, columns: None }),
+            _ => return Ok(FetchBatch { added: 0, exhausted: true, token: None, messages, columns: None, cancelled: false }),
         }
         token = Some(ex.token);
         let mut skip = server_rows;
@@ -335,19 +364,21 @@ async fn fetch_rows(
                     let got = out.rows.len();
                     skip -= got.min(skip);
                     if out.exhausted || got == 0 {
-                        return Ok(FetchBatch { added: 0, exhausted: true, token: None, messages, columns });
+                        return Ok(FetchBatch { added: 0, exhausted: true, token: None, messages, columns, cancelled: false });
                     }
                 }
                 Err(e) => return Err(e.into()),
             }
         }
     }
-    let Some(tok) = token else { return Ok(FetchBatch { added: 0, exhausted: true, token: None, messages, columns }) };
+    let Some(tok) = token else { return Ok(FetchBatch { added: 0, exhausted: true, token: None, messages, columns, cancelled: false }) };
     let mut exhausted = false;
+    let mut cancelled = false;
     while added < n {
         if let Some(op) = &op
             && op.cancel.is_cancelled()
         {
+            cancelled = true;
             break;
         }
         let want = page.min(n - added);
@@ -377,5 +408,58 @@ async fn fetch_rows(
     if exhausted {
         session.close_cursor_token(tok).await;
     }
-    Ok(FetchBatch { added, exhausted, token: if exhausted { None } else { Some(tok) }, messages, columns })
+    Ok(FetchBatch { added, exhausted, token: if exhausted { None } else { Some(tok) }, messages, columns, cancelled })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::Operations;
+
+    fn sqlite(backend: &Backend) -> SessionHandle {
+        use ternarygrid_core::Driver;
+        let mut cfg = ternarygrid_core::ConnectionConfig::new(ternarygrid_core::DbKind::Sqlite, "fetch");
+        cfg.file_path = Some(":memory:".into());
+        let s = backend.block_on(ternarygrid_driver_sqlite::SqliteDriver::new().connect(&ternarygrid_core::ConnectParams::from_config(&cfg, None))).unwrap();
+        SessionHandle::new(s, "fetch", None)
+    }
+
+    const MANY: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000000) SELECT i FROM n";
+
+    fn wait(ops: &mut Operations, what: &str) {
+        let t0 = Instant::now();
+        while ops.running() > 0 {
+            assert!(t0.elapsed() < Duration::from_secs(20), "{what}: the operation never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ops.collect();
+    }
+
+    #[test]
+    fn a_fetch_all_ends_its_operation() {
+        let backend = Backend::new().unwrap();
+        let session = sqlite(&backend);
+        let mut ops = Operations::default();
+        // Cancelled from the operations panel: cancelled, not succeeded.
+        let mut src = ResultSource::new(session.clone(), MANY.into(), Vec::new(), Vec::new(), None, 1 << 20);
+        src.exhausted = false;
+        let op = ops.start("all");
+        let id = op.id;
+        src.fetch_more(&backend, usize::MAX, Some(op.clone()));
+        std::thread::sleep(Duration::from_millis(50));
+        op.cancel.cancel();
+        wait(&mut ops, "cancel");
+        assert!(matches!(ops.state(id), Some(OpState::Cancelled)), "{:?}", ops.state(id));
+        // The result is no longer shown (its panel dropped) while fetching: the fetch stops
+        // and the operation ends.
+        let mut src = ResultSource::new(session, MANY.into(), Vec::new(), Vec::new(), None, 1 << 20);
+        src.exhausted = false;
+        let op = ops.start("all");
+        let id = op.id;
+        src.fetch_more(&backend, usize::MAX, Some(op));
+        std::thread::sleep(Duration::from_millis(50));
+        drop(src);
+        wait(&mut ops, "drop");
+        assert!(matches!(ops.state(id), Some(OpState::Cancelled)), "{:?}", ops.state(id));
+    }
 }

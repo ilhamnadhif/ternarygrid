@@ -1376,7 +1376,9 @@ impl Navigator {
     }
 
     fn keyboard(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        if !ui.ui_contains_pointer() && !ui.memory(|m| m.focused().is_none()) {
+        // Only while the user works in the navigator (clicked it last): keys typed in a
+        // grid or another view, which may not take egui's focus, are theirs.
+        if !self.has_focus {
             return;
         }
         let nodes: Vec<usize> = self.rows.iter().enumerate().filter(|(_, r)| r.kind == RowKind::Node).map(|(i, _)| i).collect();

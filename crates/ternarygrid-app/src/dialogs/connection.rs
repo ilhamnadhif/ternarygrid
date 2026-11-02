@@ -206,6 +206,7 @@ impl ConnectionDialog {
             store(SecretSlot::ProxyPassword, &self.proxy_password, proxy_save),
         ];
         if let Some(Err(e)) = results.into_iter().find(|r| r.is_err()) {
+            crate::dialogs::vault::unlock_after_failed_write(cx, &e);
             self.error = Some(trf("Cannot store the password securely: {}", &[&e]));
             return false;
         }

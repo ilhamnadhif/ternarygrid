@@ -125,10 +125,11 @@ impl TabView for QueryBuilderTab {
                 QbEvent::OpenInEditor(sql) => {
                     cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: self.schema.clone(), text: Some(sql) });
                 }
-                // Run: an editor that executes it as soon as its session is open.
+                // Run: an editor that executes it as soon as its session is open,
+                // with the confirmations of the connection type.
                 QbEvent::RunQuery(sql) => {
                     let mut tab = crate::tabs::sql_editor::SqlEditorTab::new(Some(self.conn.clone()), self.schema.clone(), sql, None, false, tr("Query builder").to_string());
-                    tab.auto_run = true;
+                    tab.run_on_open = true;
                     cx.push(AppCommand::OpenTab(Box::new(tab)));
                 }
                 QbEvent::Changed => {}

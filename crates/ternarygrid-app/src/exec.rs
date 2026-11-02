@@ -180,6 +180,7 @@ async fn run(
         let mut rows_total: Option<u64> = None;
         let mut ok = true;
         let mut error_text: Option<String> = None;
+        let single_result = returns_one_result(&session, &plan.sql);
         let result = tokio::select! {
             r = session.execute(&plan.sql, &[], &exec_opts) => Some(r),
             _ = cancel.cancelled() => None,
@@ -235,7 +236,32 @@ async fn run(
                                         send(ExecEvent::Message { index: Some(index), severity: m.severity, text: m.message });
                                     }
                                     store.lock().extend(out.rows);
-                                    let exhausted = out.exhausted;
+                                    let mut exhausted = out.exhausted;
+                                    // A statement that may return more results (a procedure, a batch):
+                                    // moving on to the next one would discard the unread rows of this
+                                    // one, so it is read to its end first (the store spills to disk).
+                                    let mut stopped = false;
+                                    let mut failure = None;
+                                    while !exhausted && !single_result {
+                                        let more = tokio::select! {
+                                            r = session.fetch(token, opts.fetch_size.max(1000)) => Some(r),
+                                            _ = cancel.cancelled() => None,
+                                        };
+                                        match more {
+                                            None => stopped = true,
+                                            Some(Err(e)) => failure = Some(DbError::from(e)),
+                                            Some(Ok(out)) => {
+                                                rows_total = Some(rows_total.unwrap_or(0) + out.rows.len() as u64);
+                                                for m in out.messages {
+                                                    send(ExecEvent::Message { index: Some(index), severity: m.severity, text: m.message });
+                                                }
+                                                store.lock().extend(out.rows);
+                                                exhausted = out.exhausted;
+                                                continue;
+                                            }
+                                        }
+                                        break;
+                                    }
                                     send(ExecEvent::Rows {
                                         index,
                                         sql: plan.sql.clone(),
@@ -245,6 +271,16 @@ async fn run(
                                         exhausted,
                                         elapsed: t0.elapsed(),
                                     });
+                                    if let Some(e) = failure {
+                                        ok = false;
+                                        error_text = Some(e.to_string());
+                                        send(ExecEvent::Error { index, error: e });
+                                        break;
+                                    }
+                                    if stopped {
+                                        ok = false;
+                                        break;
+                                    }
                                     if !exhausted {
                                         // Remaining rows are fetched on demand; the
                                         // cursor stays open only for the last statement.
@@ -285,4 +321,17 @@ async fn run(
         }
     }
     send(ExecEvent::Done { elapsed: started_all.elapsed(), cancelled: cancel.is_cancelled(), executed, failed });
+}
+
+/// The statement returns one result at most (a query): a row set not read to its
+/// end stays open for paging. Others (`CALL`, `EXEC`, blocks) may return more
+/// results after it.
+fn returns_one_result(session: &SessionHandle, sql: &str) -> bool {
+    use ternarygrid_sql::StatementKind as K;
+    let language = session.kind().language();
+    if !language.is_sql() {
+        return true;
+    }
+    let info = ternarygrid_sql::classify_command(sql, language).unwrap_or_else(|| ternarygrid_sql::classify(sql, session.dialect().syntax()));
+    matches!(info.kind, K::Select | K::Show | K::Explain | K::Describe | K::Pragma)
 }

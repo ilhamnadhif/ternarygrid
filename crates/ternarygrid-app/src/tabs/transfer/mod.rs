@@ -586,6 +586,27 @@ pub(crate) fn not_connected(cx: &mut AppContext, conn: &str) -> String {
     tr("The connection is closed; connecting… try again when it is connected.").to_string()
 }
 
+/// The connection's database has transactions (ClickHouse, Cassandra and the NoSQL
+/// stores have none: "Replace" without an upsert of their own is refused there).
+pub(crate) fn has_transactions(cx: &AppContext, conn: &str) -> bool {
+    match cx.conns.live(conn) {
+        Some(l) => l.driver.info().capabilities.transactions,
+        None => cx.conns.config(conn).and_then(|c| cx.conns.registry.get(c.kind)).is_none_or(|d| d.info().capabilities.transactions),
+    }
+}
+
+/// Shown under a "Replace" choice for a database without transactions.
+pub(crate) fn replace_without_transactions_ui(ui: &mut Ui) {
+    ui.label("");
+    ui.label(
+        RichText::new(tr(
+            "This database has no transactions: replacing rows works only where it has an upsert of its own, otherwise the run is refused before anything is deleted.",
+        ))
+        .color(crate::theme::warning_color(ui.visuals().dark_mode)),
+    );
+    ui.end_row();
+}
+
 /// Display name of a connection.
 pub(crate) fn connection_name(cx: &AppContext, conn: &str) -> String {
     cx.conns.config(conn).map(|c| c.name.clone()).unwrap_or_else(|| conn.to_string())

@@ -165,18 +165,31 @@ impl MigrationTab {
         let enabled: Vec<&TableEntry> = self.tables.iter().filter(|t| t.enabled).collect();
         job.tables = enabled.iter().map(|t| t.source.clone()).collect();
         job.target_schema = self.target_schema.as_ref().and_then(|s| s.schema.clone());
-        job.table_names = enabled.iter().filter(|t| !t.target_name.trim().is_empty()).map(|t| (t.source.name.clone(), t.target_name.trim().to_string())).collect();
+        // Keyed by the schema-qualified source name: tables of the same name in two
+        // schemas keep their own names. A name only one table has is also given
+        // alone (the key of saved tasks and of readers that know no schema).
+        let keys = |t: &TableEntry| {
+            let mut keys = vec![table_key(&t.source)];
+            if keys[0] != t.source.name && enabled.iter().filter(|o| o.source.name == t.source.name).count() == 1 {
+                keys.push(t.source.name.clone());
+            }
+            keys
+        };
+        job.table_names = enabled.iter().filter(|t| !t.target_name.trim().is_empty()).flat_map(|t| keys(t).into_iter().map(|k| (k, t.target_name.trim().to_string()))).collect();
         job.column_names = enabled
             .iter()
-            .map(|t| {
+            .flat_map(|t| {
                 let names: BTreeMap<String, String> = t.column_names.iter().filter(|(_, v)| !v.trim().is_empty()).map(|(k, v)| (k.clone(), v.trim().to_string())).collect();
-                (t.source.name.clone(), names)
+                keys(t).into_iter().map(move |k| (k, names.clone()))
             })
             .filter(|(_, m)| !m.is_empty())
             .collect();
         job.column_types = enabled
             .iter()
-            .flat_map(|t| t.column_types.iter().filter(|(_, v)| !v.trim().is_empty()).map(|(c, v)| (format!("{}.{c}", t.source.name), v.trim().to_string())))
+            .flat_map(|t| {
+                let types: Vec<(&String, &String)> = t.column_types.iter().filter(|(_, v)| !v.trim().is_empty()).collect();
+                keys(t).into_iter().flat_map(move |k| types.clone().into_iter().map(move |(c, v)| (format!("{k}.{c}"), v.trim().to_string())))
+            })
             .collect();
         job
     }
@@ -560,7 +573,7 @@ impl MigrationTab {
         }
     }
 
-    fn options_page(&mut self, ui: &mut Ui) {
+    fn options_page(&mut self, ui: &mut Ui, transactions: bool) {
         section(ui, tr("Options"));
         let id = self.uid;
         let o = &mut self.options;
@@ -581,6 +594,9 @@ impl MigrationTab {
                 ],
             );
             ui.end_row();
+            if o.mode == MigrationMode::Replace && !transactions {
+                super::replace_without_transactions_ui(ui);
+            }
             ui.label(tr("Rows per batch"));
             ui.add(egui::DragValue::new(&mut o.batch_size).range(1..=100_000));
             ui.end_row();
@@ -861,7 +877,7 @@ impl TabView for MigrationTab {
                 PAGE_SOURCE => self.source_page(ui, cx),
                 PAGE_TARGET => self.target_page(ui, cx),
                 PAGE_MAPPING => self.mapping_page(ui, cx),
-                PAGE_OPTIONS => self.options_page(ui),
+                PAGE_OPTIONS => self.options_page(ui, self.target_conn.as_deref().is_none_or(|c| super::has_transactions(cx, c))),
                 _ => self.run_page(ui, cx),
             });
         });
@@ -882,6 +898,14 @@ impl TabView for MigrationTab {
     crate::impl_tab_any!();
 }
 
+/// Key of a source table in the job's name maps: `schema.table` (`table` without a schema).
+pub fn table_key(o: &ObjectRef) -> String {
+    match o.schema.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => format!("{s}.{}", o.name),
+        None => o.name.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,8 +922,27 @@ mod tests {
         assert_eq!(job.target_schema.as_deref(), Some("archive"));
         assert_eq!(job.table_names.get("users").map(String::as_str), Some("app_users"));
         assert!(!job.table_names.contains_key("orders"));
+        assert_eq!(job.table_names.get("public.users").map(String::as_str), Some("app_users"));
+        assert!(!job.table_names.contains_key("orders"));
         assert_eq!(job.column_types.get("users.id").map(String::as_str), Some("BIGINT"));
-        assert_eq!(job.column_types.len(), 1);
+        assert_eq!(job.column_types.get("public.users.id").map(String::as_str), Some("BIGINT"));
+        assert_eq!(job.column_types.len(), 2);
         assert_eq!(apply_case(NameCase::Upper, "ab"), "AB");
+    }
+
+    #[test]
+    fn same_table_names_in_two_schemas_keep_their_own_mapping() {
+        let mut tab = MigrationTab::new("src".into(), vec![ObjectRef::table(Some("sales".into()), "orders"), ObjectRef::table(Some("archive".into()), "orders")]);
+        tab.tables[1].target_name = "old_orders".into();
+        tab.tables[1].column_names.insert("id".into(), "order_id".into());
+        tab.tables[1].column_types.insert("id".into(), "BIGINT".into());
+        tab.tables[0].column_types.insert("id".into(), "INT".into());
+        let job = tab.job();
+        // Only the archive table is renamed; no unqualified key could tell them apart.
+        assert_eq!(job.table_names, BTreeMap::from([("archive.orders".to_string(), "old_orders".to_string())]));
+        assert_eq!(job.column_names.keys().collect::<Vec<_>>(), vec!["archive.orders"]);
+        assert_eq!(job.column_types.get("archive.orders.id").map(String::as_str), Some("BIGINT"));
+        assert_eq!(job.column_types.get("sales.orders.id").map(String::as_str), Some("INT"));
+        assert!(!job.column_types.contains_key("orders.id"));
     }
 }

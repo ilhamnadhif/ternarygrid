@@ -83,6 +83,7 @@ impl DropDialog {
                         return false;
                     }
                     let mut schemas: Vec<_> = self.objects.iter().map(|o| o.schema_ref()).collect();
+                    schemas.sort();
                     schemas.dedup();
                     for s in schemas {
                         cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: None, schema: Some(s) });

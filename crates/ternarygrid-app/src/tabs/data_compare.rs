@@ -712,6 +712,12 @@ impl DataCompareTab {
     /// Run the sync script on the target in one transaction.
     fn apply(&mut self, cx: &mut AppContext) {
         let Some(o) = &self.result else { return };
+        if let Some(cfg) = cx.conns.config(&o.target_conn)
+            && cfg.read_only
+        {
+            self.error = Some(trf("The connection \"{}\" is read-only.", &[&cfg.name]));
+            return;
+        }
         let Some(session) = self.dst_session.current() else {
             self.error = Some(tr("The target session is closed; compare again first.").to_string());
             return;

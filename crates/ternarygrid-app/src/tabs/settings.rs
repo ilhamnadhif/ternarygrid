@@ -101,6 +101,9 @@ pub struct SettingsTab {
     new_master2: String,
     old_master: String,
     message: Option<Result<String, String>>,
+    /// Moving the secrets or changing the master password (Argon2 takes a moment, off
+    /// the UI thread): the message and the storage now used.
+    secrets_job: Option<crate::backend::Job<Result<(String, Option<SecretBackend>), String>>>,
     /// Asking whether to reset every setting.
     confirm_reset: bool,
 }
@@ -132,9 +135,15 @@ impl Default for SettingsTab {
             new_master2: String::new(),
             old_master: String::new(),
             message: None,
+            secrets_job: None,
             confirm_reset: false,
         }
     }
+}
+
+/// Run `work` on a blocking thread (Argon2 key derivation) as a job.
+fn blocking<T: Send + 'static>(cx: &AppContext, work: impl FnOnce() -> Result<T, String> + Send + 'static) -> crate::backend::Job<Result<T, String>> {
+    cx.backend.spawn(async move { tokio::task::spawn_blocking(work).await.unwrap_or_else(|e| Err(e.to_string())) })
 }
 
 fn row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
@@ -711,7 +720,9 @@ impl SettingsTab {
                             } else {
                                 Ok(())
                             };
-                            if let Err(e) = r {
+                            if let Err(e) = r
+                                && !crate::dialogs::vault::unlock_after_failed_write(cx, &e)
+                            {
                                 cx.toasts.error(tr("Cannot store the password securely"), Some(e.to_string()));
                             }
                         }
@@ -782,6 +793,7 @@ impl SettingsTab {
             c |= check(ui, &mut a.include_schema_context, tr("Send table and column names as context"));
             ui.label("");
             c |= check(ui, &mut a.send_sample_data, tr("Allow sending sample rows"));
+            ui.label("");
             c |= check(ui, &mut a.agent_queries, tr("Let the assistant run read-only queries (their results are sent to the AI service)"));
             c
         });
@@ -791,17 +803,25 @@ impl SettingsTab {
             ui.add(egui::TextEdit::singleline(&mut self.ai_key).password(true).hint_text(hint).desired_width(300.0));
             if ui.add_enabled(!self.ai_key.trim().is_empty(), egui::Button::new(tr("Save key"))).clicked() {
                 let key = Secret::new(self.ai_key.trim().to_string());
-                match cx.services.secrets.read().set_ai_api_key(provider.id(), Some(&key)) {
+                let r = cx.services.secrets.read().set_ai_api_key(provider.id(), Some(&key));
+                match r {
                     Ok(()) => {
                         self.ai_key.clear();
                         self.ai_key_saved = true;
                         cx.toasts.success(tr("API key saved securely"));
                     }
+                    Err(e) if crate::dialogs::vault::unlock_after_failed_write(cx, &e) => {}
                     Err(e) => cx.toasts.error(tr("Cannot store the API key"), Some(e.to_string())),
                 }
             }
-            if self.ai_key_saved && ui.button(tr("Remove key")).clicked() && cx.services.secrets.read().set_ai_api_key(provider.id(), None).is_ok() {
-                self.ai_key_saved = false;
+            if self.ai_key_saved && ui.button(tr("Remove key")).clicked() {
+                let r = cx.services.secrets.read().set_ai_api_key(provider.id(), None);
+                match r {
+                    Ok(()) => self.ai_key_saved = false,
+                    Err(e) => {
+                        crate::dialogs::vault::unlock_after_failed_write(cx, &e);
+                    }
+                }
             }
         });
         c |= false;
@@ -809,10 +829,25 @@ impl SettingsTab {
     }
 
     fn security(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
+        let mut moved = false;
+        if let Some(r) = self.secrets_job.as_mut().and_then(|j| j.poll()) {
+            self.secrets_job = None;
+            if let Ok((_, backend)) = &r {
+                if let Some(b) = backend {
+                    cx.settings.security.secret_backend = *b;
+                    moved = true;
+                }
+                self.old_master.clear();
+                self.new_master.clear();
+                self.new_master2.clear();
+            }
+            self.message = Some(r.map(|(m, _)| m));
+        }
+        let busy = self.secrets_job.is_some();
         let current = cx.services.secrets.read().backend();
         ui.label(tr("Passwords and API keys are never written to configuration files."));
         ui.add_space(4.0);
-        let mut changed = grid(ui, "set_sec", |ui| {
+        let changed = grid(ui, "set_sec", |ui| {
             let mut c = false;
             ui.label(tr("Secret storage"));
             ui.label(match current {
@@ -843,7 +878,7 @@ impl SettingsTab {
                 false
             });
         }
-        if ui.button(tr("Move secrets")).clicked() {
+        if ui.add_enabled(!busy, egui::Button::new(tr("Move secrets"))).clicked() {
             let keys = {
                 let mut k = cx.conns.store.all_secret_keys();
                 for p in [AiProvider::Anthropic, AiProvider::OpenAiCompatible] {
@@ -851,34 +886,27 @@ impl SettingsTab {
                 }
                 k
             };
-            let result: Result<String, String> = (|| {
-                let mut mgr = cx.services.secrets.write();
-                if need_master {
-                    if self.new_master.is_empty() || self.new_master != self.new_master2 {
-                        return Err(tr("The passwords do not match.").to_string());
-                    }
-                    let vault = std::sync::Arc::new(ternarygrid_config::VaultStore::new(cx.services.paths.vault_file()));
-                    if !vault.exists() {
-                        vault.create(&Secret::new(self.new_master.clone())).map_err(|e| e.to_string())?;
+            if need_master && (self.new_master.is_empty() || self.new_master != self.new_master2) {
+                self.message = Some(Err(tr("The passwords do not match.").to_string()));
+            } else {
+                let secrets = cx.services.secrets.clone();
+                let vault_file = cx.services.paths.vault_file();
+                let master = Secret::new(self.new_master.clone());
+                self.message = None;
+                self.secrets_job = Some(blocking(cx, move || {
+                    let r = if need_master {
+                        let vault = std::sync::Arc::new(ternarygrid_config::VaultStore::new(vault_file));
+                        let opened = if vault.exists() { vault.unlock(&master) } else { vault.create(&master) };
+                        opened.map_err(|e| e.to_string())?;
+                        secrets.write().switch_to_vault(vault, &keys, true)
                     } else {
-                        vault.unlock(&Secret::new(self.new_master.clone())).map_err(|e| e.to_string())?;
-                    }
-                    let r = mgr.switch_to_vault(vault, &keys, true).map_err(|e| e.to_string())?;
-                    Ok(trf("{} secret(s) moved", &[&r.migrated.len()]))
-                } else {
-                    let r = mgr
-                        .switch_backend(SecretBackend::Keychain, std::sync::Arc::new(ternarygrid_config::BundledStore::new(ternarygrid_config::KeychainStore::new())), &keys, true)
-                        .map_err(|e| e.to_string())?;
-                    Ok(trf("{} secret(s) moved", &[&r.migrated.len()]))
-                }
-            })();
-            if result.is_ok() {
-                cx.settings.security.secret_backend = target;
-                changed = true;
-                self.new_master.clear();
-                self.new_master2.clear();
+                        let keychain = std::sync::Arc::new(ternarygrid_config::BundledStore::new(ternarygrid_config::KeychainStore::new()));
+                        secrets.write().switch_backend(SecretBackend::Keychain, keychain, &keys, true)
+                    };
+                    let r = r.map_err(|e| e.to_string())?;
+                    Ok((trf("{} secret(s) moved", &[&r.migrated.len()]), Some(target)))
+                }));
             }
-            self.message = Some(result);
         }
         if current == SecretBackend::EncryptedFile {
             heading(ui, tr("Change master password"));
@@ -888,29 +916,31 @@ impl SettingsTab {
                 row(ui, tr("Repeat password"), |ui| ui.add(egui::TextEdit::singleline(&mut self.new_master2).password(true)).changed());
                 false
             });
-            if ui.button(tr("Change password")).clicked() {
+            if ui.add_enabled(!busy, egui::Button::new(tr("Change password"))).clicked() {
                 let mgr: parking_lot::RwLockReadGuard<'_, SecretsManager> = cx.services.secrets.read();
-                let r = if self.new_master.is_empty() || self.new_master != self.new_master2 {
-                    Err(tr("The passwords do not match.").to_string())
-                } else if let Some(v) = mgr.vault() {
-                    v.change_master_password(&Secret::new(self.old_master.clone()), &Secret::new(self.new_master.clone()))
-                        .map(|_| tr("Master password changed").to_string())
-                        .map_err(|e| e.to_string())
+                if self.new_master.is_empty() || self.new_master != self.new_master2 {
+                    self.message = Some(Err(tr("The passwords do not match.").to_string()));
+                } else if let Some(v) = mgr.vault().cloned() {
+                    let (old, new) = (Secret::new(self.old_master.clone()), Secret::new(self.new_master.clone()));
+                    drop(mgr);
+                    self.message = None;
+                    self.secrets_job =
+                        Some(blocking(cx, move || v.change_master_password(&old, &new).map(|_| (tr("Master password changed").to_string(), None)).map_err(|e| e.to_string())));
                 } else {
-                    Err(tr("The vault is not active.").to_string())
-                };
-                if r.is_ok() {
-                    self.old_master.clear();
-                    self.new_master.clear();
-                    self.new_master2.clear();
+                    self.message = Some(Err(tr("The vault is not active.").to_string()));
                 }
-                self.message = Some(r);
             }
             if ui.button((ternarygrid_icons::ic(icon::LOCK), tr("Lock now"))).clicked()
                 && let Some(v) = cx.services.secrets.read().vault()
             {
                 v.lock();
             }
+        }
+        if busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak(tr("Working…"));
+            });
         }
         match &self.message {
             Some(Ok(m)) => {
@@ -919,7 +949,7 @@ impl SettingsTab {
             Some(Err(e)) => crate::widgets::error_box(ui, e),
             None => {}
         }
-        changed
+        changed | moved
     }
 
     fn accessibility(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {

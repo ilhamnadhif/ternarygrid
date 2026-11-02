@@ -5,6 +5,7 @@
 
 use crate::backend::Job;
 use crate::command::AppCommand;
+use crate::conn::session::SessionHandle;
 use crate::cx::AppContext;
 use crate::tabs::TabView;
 use egui::{RichText, Ui};
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use ternarygrid_compare::{CompareOptions, DiffItem, DiffStatus, LiquibaseOptions, SchemaDiff, ScriptOptions};
 use ternarygrid_core::ddl::{SchemaSnapshot, SnapshotOptions};
 use ternarygrid_core::meta::SchemaRef;
-use ternarygrid_core::{DbResult, tr, trf};
+use ternarygrid_core::{DbError, DbResult, tr, trf};
 
 #[derive(Clone, Default, PartialEq)]
 struct Side {
@@ -42,6 +43,56 @@ pub struct SchemaCompareTab {
     confirm_apply: bool,
     error: Option<String>,
     selected: Option<String>,
+}
+
+/// Run the migration script on the target connection's own session (the
+/// navigator's); returns the number of statements run.
+pub(crate) async fn apply_script(s: SessionHandle, target_schema: Option<String>, stmts: Vec<String>) -> DbResult<usize> {
+    // The session is shared: other uncommitted work would be committed with the migration.
+    if s.has_uncommitted_writes() {
+        return Err(DbError::config(tr("The session has uncommitted changes (another tab, the data editor): commit or roll them back before applying the migration.")));
+    }
+    // Unqualified names in view bodies and foreign keys resolve in the active schema:
+    // it is the target for the run, then the session's own again.
+    let previous = match &target_schema {
+        Some(t) => {
+            let mut g = s.lock().await;
+            let previous = match g.current_schema().await {
+                Ok(Some(p)) => Some(p),
+                _ => g.current_database().await.ok().flatten(),
+            };
+            if previous.as_deref() == Some(t.as_str()) {
+                None
+            } else {
+                g.set_current_schema(t).await?;
+                previous
+            }
+        }
+        None => None,
+    };
+    let mut n = 0;
+    let mut result = Ok(());
+    for sql in &stmts {
+        if let Err(e) = s.execute_update(sql, &[]).await {
+            result = Err(e.with_context(sql.chars().take(200).collect::<String>()));
+            break;
+        }
+        n += 1;
+    }
+    // In manual commit mode the migration would stay in an open transaction holding
+    // its locks: committed, or undone when a statement failed.
+    if s.tx_state().in_transaction {
+        match &result {
+            Ok(()) => result = s.commit().await,
+            Err(_) => {
+                let _ = s.rollback().await;
+            }
+        }
+    }
+    if let Some(p) = &previous {
+        let _ = s.lock().await.set_current_schema(p).await;
+    }
+    result.map(|_| n)
 }
 
 fn key(i: &DiffItem) -> String {
@@ -354,31 +405,15 @@ impl TabView for SchemaCompareTab {
                 ui.label(trf("Run {} statement(s) on \"{}\"?", &[&script.len(), &target_name]));
                 ui.horizontal(|ui| {
                     if ui.button(RichText::new(tr("Run")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        if let Some(live) = self.target.conn.as_ref().and_then(|c| cx.conns.live(c)) {
+                        let read_only = self.target.conn.as_ref().and_then(|c| cx.conns.config(c)).filter(|c| c.read_only).map(|c| c.name.clone());
+                        if let Some(name) = read_only {
+                            self.error = Some(trf("The connection \"{}\" is read-only.", &[&name]));
+                        } else if let Some(live) = self.target.conn.as_ref().and_then(|c| cx.conns.live(c)) {
                             let s = live.main.clone();
-                            let previous = live.current_schema.clone().or(live.current_database.clone());
                             let target_schema = self.target.schema.as_ref().and_then(|t| t.schema.clone());
                             let stmts = script.clone();
-                            self.apply_job = Some(cx.backend.spawn(async move {
-                                // Unqualified names in view bodies and foreign keys
-                                // resolve in the active schema: make it the target.
-                                if let Some(t) = &target_schema {
-                                    s.lock().await.set_current_schema(t).await?;
-                                }
-                                let mut n = 0;
-                                let mut result = Ok(());
-                                for sql in &stmts {
-                                    if let Err(e) = s.execute_update(sql, &[]).await {
-                                        result = Err(e.with_context(sql.chars().take(200).collect::<String>()));
-                                        break;
-                                    }
-                                    n += 1;
-                                }
-                                if let (Some(p), Some(_)) = (&previous, &target_schema) {
-                                    let _ = s.lock().await.set_current_schema(p).await;
-                                }
-                                result.map(|_| n)
-                            }));
+                            self.error = None;
+                            self.apply_job = Some(cx.backend.spawn(async move { apply_script(s, target_schema, stmts).await }));
                         }
                         close = true;
                     }
@@ -397,4 +432,53 @@ impl TabView for SchemaCompareTab {
     }
 
     crate::impl_tab_any!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ternarygrid_core::driver::{ConnectParams, Driver, TransactionMode};
+    use ternarygrid_core::{ConnectionConfig, DbKind};
+
+    async fn manual_session() -> SessionHandle {
+        let mut cfg = ConnectionConfig::new(DbKind::Sqlite, "cmp");
+        cfg.file_path = Some(format!(":memory:cmp-{}", uuid::Uuid::new_v4().simple()));
+        let s = ternarygrid_driver_sqlite::SqliteDriver::new().connect(&ConnectParams::from_config(&cfg, None)).await.unwrap();
+        let h = SessionHandle::new(s, "cmp", None);
+        h.set_transaction_mode(TransactionMode::Manual).await.unwrap();
+        h
+    }
+
+    async fn tables(s: &SessionHandle) -> Vec<String> {
+        let (_, rows) = s.query_all("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name", &[]).await.unwrap();
+        rows.iter().map(|r| r[0].to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn applying_a_migration_in_manual_commit_mode() {
+        // Committed: nothing is left open on the shared session.
+        let s = manual_session().await;
+        let n = apply_script(s.clone(), Some("main".into()), vec!["CREATE TABLE a (id INT)".into(), "CREATE TABLE b (id INT)".into()]).await.unwrap();
+        assert_eq!(n, 2);
+        assert!(!s.tx_state().in_transaction);
+        assert_eq!(tables(&s).await, vec!["a", "b"]);
+        s.rollback().await.unwrap();
+        assert_eq!(tables(&s).await, vec!["a", "b"]);
+
+        // A failing statement undoes the ones before it.
+        let s = manual_session().await;
+        let e = apply_script(s.clone(), None, vec!["CREATE TABLE c (id INT)".into(), "CREATE TABLE c (id INT)".into()]).await.unwrap_err();
+        assert!(e.full_text().contains("CREATE TABLE c"), "{}", e.full_text());
+        assert!(!s.tx_state().in_transaction);
+        assert!(tables(&s).await.is_empty());
+
+        // Someone else's uncommitted change is not committed with the migration.
+        let s = manual_session().await;
+        s.execute_update("CREATE TABLE mine (id INT)", &[]).await.unwrap();
+        s.execute_update("INSERT INTO mine VALUES (1)", &[]).await.unwrap();
+        assert!(s.has_uncommitted_writes());
+        assert!(apply_script(s.clone(), None, vec!["CREATE TABLE d (id INT)".into()]).await.is_err());
+        assert!(s.tx_state().in_transaction);
+        assert_eq!(tables(&s).await, vec!["mine"]);
+    }
 }

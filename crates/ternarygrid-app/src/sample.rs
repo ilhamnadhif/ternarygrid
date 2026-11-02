@@ -23,8 +23,9 @@ const FIRST: &[&str] = &["Ani", "Budi", "Citra", "Dewi", "Eko", "Fajar", "Gita",
 const LAST: &[&str] = &["Santoso", "Wijaya", "Pratama", "Saputra", "Lestari", "Hidayat", "Kurniawan", "Nugroho"];
 const CATEGORIES: &[&str] = &["Books", "Coffee", "Electronics", "Garden", "Kitchen", "Toys"];
 
-/// Create the sample database at `path` (fails when the file exists).
-pub fn create(path: &Path) -> DbResult<()> {
+/// Create the sample database at `path` (fails when the file exists). Run in
+/// the background: it inserts a few thousand rows.
+pub async fn create(path: &Path) -> DbResult<()> {
     if path.exists() {
         return Err(ternarygrid_core::DbError::config(format!("{} already exists", path.display())));
     }
@@ -81,53 +82,38 @@ pub fn create(path: &Path) -> DbResult<()> {
         }
     }
     sql.push_str("COMMIT;\n");
-    let conn = rusqlite_like::open(path)?;
-    conn.exec(&sql)
+    exec(path, &sql).await
 }
 
-/// Minimal blocking SQLite access through the SQLite driver's session API.
-mod rusqlite_like {
-    use std::path::Path;
-    use ternarygrid_core::{ConnectParams, DbResult, Driver};
-
-    pub struct Conn {
-        params: ConnectParams,
-    }
-
-    pub fn open(path: &Path) -> DbResult<Conn> {
-        let mut cfg = ternarygrid_core::config::ConnectionConfig::new(ternarygrid_core::DbKind::Sqlite, "sample");
-        cfg.file_path = Some(path.display().to_string());
-        Ok(Conn { params: ConnectParams::from_config(&cfg, None) })
-    }
-
-    impl Conn {
-        pub fn exec(&self, script: &str) -> DbResult<()> {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(ternarygrid_core::DbError::from)?;
-            rt.block_on(async {
-                let driver = ternarygrid_driver_sqlite::SqliteDriver::new();
-                let syntax = driver.dialect().syntax().clone();
-                let mut s = driver.connect(&self.params).await?;
-                for span in ternarygrid_sql::split_statements(script, &syntax, &ternarygrid_sql::SplitOptions::default()) {
-                    let stmt = span.text(script);
-                    ternarygrid_core::driver::execute_update(s.as_mut(), stmt, &[]).await.map_err(|e| e.with_context(stmt.chars().take(120).collect::<String>()))?;
-                }
-                s.close().await
-            })
+/// Run `script` on the SQLite database at `path` through the SQLite driver.
+async fn exec(path: &Path, script: &str) -> DbResult<()> {
+    use ternarygrid_core::Driver;
+    let mut cfg = ternarygrid_core::config::ConnectionConfig::new(ternarygrid_core::DbKind::Sqlite, "sample");
+    cfg.file_path = Some(path.display().to_string());
+    let driver = ternarygrid_driver_sqlite::SqliteDriver::new();
+    let syntax = driver.dialect().syntax().clone();
+    let mut s = driver.connect(&ternarygrid_core::ConnectParams::from_config(&cfg, None)).await?;
+    for span in ternarygrid_sql::split_statements(script, &syntax, &ternarygrid_sql::SplitOptions::default()) {
+        let stmt = span.text(script);
+        if let Err(e) = ternarygrid_core::driver::execute_update(s.as_mut(), stmt, &[]).await {
+            let _ = s.close().await;
+            return Err(e.with_context(stmt.chars().take(120).collect::<String>()));
         }
     }
+    s.close().await
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn sample_database_is_created() {
+    #[tokio::test]
+    async fn sample_database_is_created() {
         let dir = std::env::temp_dir().join(format!("ternarygrid-sample-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("sample.db");
         let _ = std::fs::remove_file(&path);
-        super::create(&path).unwrap();
+        super::create(&path).await.unwrap();
         assert!(path.metadata().unwrap().len() > 10_000);
-        assert!(super::create(&path).is_err(), "never overwrites");
+        assert!(super::create(&path).await.is_err(), "never overwrites");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

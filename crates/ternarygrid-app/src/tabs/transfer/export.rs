@@ -208,6 +208,54 @@ impl ExportTab {
         &mut self.settings
     }
 
+    /// Apply the options of an `@export {…}` command (DBeaver's names, nested keys
+    /// joined with `.`, the section prefix optional) to the settings they map to.
+    /// Returns the keys that map to nothing here.
+    pub fn apply_client_options(&mut self, opts: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+        let flag = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on");
+        let mut ignored = Vec::new();
+        for (key, value) in opts {
+            let name = key.rsplit('.').next().unwrap_or(key).to_ascii_lowercase();
+            // `type`, `format` and `extension` name the format at any level (`markdown.table`).
+            let format = || {
+                let v = value.trim().to_ascii_lowercase();
+                let v = v.split('.').next().unwrap_or("").to_string();
+                match v.as_str() {
+                    "dbunit" => Some(ExportFormat::DbUnit),
+                    "excel" => Some(ExportFormat::Xlsx),
+                    "jsonlines" => Some(ExportFormat::JsonLines),
+                    _ => ExportFormat::from_extension(&v),
+                }
+            };
+            let s = &mut self.settings;
+            match name.as_str() {
+                "type" | "format" => match format() {
+                    Some(f) => s.format = f,
+                    None => ignored.push(key.clone()),
+                },
+                "outputfolder" | "folder" | "directory" => s.output_folder = PathBuf::from(value.trim()),
+                "outputfilepattern" | "filepattern" | "filename" => s.file_name_pattern = value.trim().to_string(),
+                "outputencoding" | "encoding" => s.options.encoding = value.trim().to_string(),
+                "outputencodingbom" | "insertbom" | "bom" => s.options.insert_bom = flag(value),
+                "delimiter" => s.options.csv.delimiter = value.replace("\\t", "\t"),
+                "quotechar" => match value.chars().next() {
+                    Some(c) => s.options.csv.quote_char = c,
+                    None => ignored.push(key.clone()),
+                },
+                "header" => s.options.csv.header = !matches!(value.trim().to_ascii_lowercase().as_str(), "none" | "false" | "0" | "no" | "off"),
+                "nullstring" => s.options.csv.null_string = value.clone(),
+                "fetchsize" => match value.trim().parse::<usize>() {
+                    Ok(n) if n > 0 => s.options.fetch_size = n,
+                    _ => ignored.push(key.clone()),
+                },
+                // The format's own extension is used.
+                "extension" => {}
+                _ => ignored.push(key.clone()),
+            }
+        }
+        ignored
+    }
+
     /// Database product of SQL output (`None`: the source's).
     pub fn set_sql_dialect(&mut self, kind: Option<DbKind>) {
         self.sql_dialect = kind;
@@ -1406,6 +1454,32 @@ impl TabView for ExportTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_command_options_reach_the_settings() {
+        let ternarygrid_sql::ClientCommand::Export { options } = ternarygrid_sql::parse_client_command(
+            r#"@export {"type": "json", "consumer": {"outputFolder": "/tmp/out", "outputFilePattern": "${table}_x", "outputEncoding": "UTF-16LE", "outputEncodingBOM": true}, "processor": {"delimiter": ";", "header": "none", "extension": "json"}, "producer": {"selectedRowsOnly": false}}"#,
+        )
+        .unwrap()
+        .unwrap() else {
+            panic!("not @export")
+        };
+        let mut tab = ExportTab::new("c".into(), Vec::new(), Some("select 1".into()));
+        let ignored = tab.apply_client_options(&options);
+        let job = tab.job();
+        assert_eq!(job.format, ExportFormat::Json);
+        assert_eq!(job.output_folder, PathBuf::from("/tmp/out"));
+        assert_eq!(job.file_name_pattern, "${table}_x");
+        assert_eq!(job.options.encoding, "UTF-16LE");
+        assert!(job.options.insert_bom);
+        assert_eq!(job.options.csv.delimiter, ";");
+        assert!(!job.options.csv.header);
+        assert_eq!(ignored, vec!["producer.selectedRowsOnly".to_string()]);
+        let mut tab = ExportTab::new("c".into(), Vec::new(), Some("select 1".into()));
+        let opts = std::collections::BTreeMap::from([("type".to_string(), "markdown.table".to_string()), ("delimiter".to_string(), "\\t".to_string())]);
+        assert!(tab.apply_client_options(&opts).is_empty());
+        assert_eq!((tab.job().format, tab.job().options.csv.delimiter.as_str()), (ExportFormat::Markdown, "\t"));
+    }
 
     #[test]
     fn constructor_builds_items() {

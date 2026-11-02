@@ -127,7 +127,6 @@ fn add_spans(text: &str, spans: &[StatementSpan], cfg: &PrepConfig, out: &mut Pr
             }
             continue;
         }
-        let info = ternarygrid_sql::classify_command(stmt, cfg.language).unwrap_or_else(|| ternarygrid_sql::classify(stmt, cfg.syntax));
         let mut missing = Vec::new();
         let sql = substitute(stmt, cfg, &out.variables, &mut missing);
         for m in missing {
@@ -135,12 +134,42 @@ fn add_spans(text: &str, spans: &[StatementSpan], cfg: &PrepConfig, out: &mut Pr
                 out.missing.push(m);
             }
         }
-        if let Some(d) = info.danger {
+        let (is_write, danger) = classify_substituted(stmt, &sql, cfg);
+        if let Some(d) = danger {
             out.dangers.push((*index, d));
         }
-        out.has_writes |= info.is_write;
-        push(out, index, stmt, sql, range, info.is_write, None);
+        out.has_writes |= is_write;
+        push(out, index, stmt, sql, range, is_write, None);
     }
+}
+
+/// Whether the statement writes and why it needs a confirmation. Parameter values
+/// are SQL text: what is sent (`sql`) is classified too, so a value cannot turn a
+/// read into a write (`${x}` = `1; DROP TABLE t`) past the read-only check and the
+/// confirmations.
+fn classify_substituted(original: &str, sql: &str, cfg: &PrepConfig) -> (bool, Option<Danger>) {
+    let classify = |s: &str| ternarygrid_sql::classify_command(s, cfg.language).unwrap_or_else(|| ternarygrid_sql::classify(s, cfg.syntax));
+    let info = classify(original);
+    let (mut is_write, mut danger) = (info.is_write, info.danger);
+    if sql != original {
+        let parts: Vec<(bool, Option<Danger>)> = if cfg.language.is_sql() {
+            // A value may add statements: each one sent counts.
+            ternarygrid_sql::split_and_classify(sql, cfg.syntax, &cfg.split).into_iter().map(|(_, i)| (i.is_write, i.danger)).collect()
+        } else {
+            Vec::new()
+        };
+        let parts = if parts.is_empty() {
+            let i = classify(sql);
+            vec![(i.is_write, i.danger)]
+        } else {
+            parts
+        };
+        for (w, d) in parts {
+            is_write |= w;
+            danger = danger.or(d);
+        }
+    }
+    (is_write, danger)
 }
 
 fn push(out: &mut Prepared, index: &mut usize, original: &str, sql: String, range: Range<usize>, is_write: bool, client: Option<ClientAction>) {
@@ -203,6 +232,31 @@ mod tests {
         assert!(p.missing.is_empty());
         assert!(matches!(p.plans[0].client, Some(ClientAction::Set { .. })));
         assert_eq!(p.plans[1].sql, "select * from t where id = 42 limit 10");
+    }
+
+    #[test]
+    fn parameters_are_classified_after_substitution() {
+        let syntax = SqlSyntax::ansi();
+        let text = "select * from t where id = ${x}";
+        // A value is SQL text: it can add a write to a read.
+        let mut v = BTreeMap::new();
+        v.insert("x".to_string(), "1; DELETE FROM t".to_string());
+        let p = prepare(text, Scope::Script, &cfg(&syntax), &v);
+        assert!(p.missing.is_empty());
+        assert!(p.has_writes && p.plans[0].is_write);
+        assert_eq!(p.dangers, vec![(0, Danger::DeleteWithoutWhere)]);
+        let p = prepare("select :p", Scope::Script, &cfg(&syntax), &BTreeMap::from([("p".to_string(), "1; update t set a = 2".to_string())]));
+        assert!(p.has_writes);
+        assert_eq!(p.dangers, vec![(0, Danger::UpdateWithoutWhere)]);
+        // A plain value keeps the read a read.
+        v.insert("x".to_string(), "42".to_string());
+        let p = prepare(text, Scope::Script, &cfg(&syntax), &v);
+        assert!(!p.has_writes && p.dangers.is_empty());
+        assert_eq!(p.plans[0].sql, "select * from t where id = 42");
+        // Without a value it is asked for (and nothing is classified as a write).
+        let p = prepare(text, Scope::Script, &cfg(&syntax), &BTreeMap::new());
+        assert_eq!(p.missing, vec![(ParamKind::Template, "x".to_string())]);
+        assert!(!p.has_writes);
     }
 
     #[test]

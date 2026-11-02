@@ -17,6 +17,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use ternarygrid_core::tr;
 
+/// Settings changed are written after this long without another change.
+const SETTINGS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
 /// SQLite database file (by extension).
 pub fn database_file_kind(path: &std::path::Path) -> Option<ternarygrid_core::DbKind> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -67,6 +70,13 @@ pub struct TernaryGridApp {
     /// Dirty tabs waiting for "discard and close?" (the first is asked).
     close_confirm: Vec<u64>,
     quit_confirmed: bool,
+    /// The settings changed: written once they stayed unchanged for a moment (a
+    /// dragged value changes them every frame), or at exit.
+    settings_save_at: Option<Instant>,
+    /// The sample database being created.
+    sample_job: Option<(std::path::PathBuf, crate::backend::Job<ternarygrid_core::DbResult<()>>)>,
+    /// The history retention applied last (applying it deletes rows: not at every change of the settings).
+    history_retention: Option<ternarygrid_config::history::RetentionPolicy>,
     /// "Generate SQL" requests waiting for the table definition.
     pending_generate: Vec<(String, ternarygrid_core::ObjectRef, String)>,
     /// Tab last revealed in the navigator (Link with editor).
@@ -137,6 +147,9 @@ impl TernaryGridApp {
             confirm_disconnect: None,
             close_confirm: Vec::new(),
             quit_confirmed: false,
+            settings_save_at: None,
+            sample_job: None,
+            history_retention: None,
             bench_workload: None,
             updates: Default::default(),
             popups: Vec::new(),
@@ -465,12 +478,10 @@ impl TernaryGridApp {
                     path = dir.join(format!("ternarygrid-sample-{n}.db"));
                     n += 1;
                 }
-                match crate::sample::create(&path) {
-                    Ok(()) => {
-                        self.open_path(&path, false);
-                        self.toasts.success(tr("Sample database created"));
-                    }
-                    Err(e) => self.toasts.error(tr("Cannot create the sample database"), Some(e.full_text())),
+                // A few thousand inserts: in the background ([`Self::poll_sample`]).
+                if self.sample_job.is_none() {
+                    let p = path.clone();
+                    self.sample_job = Some((path, self.backend.spawn(async move { crate::sample::create(&p).await })));
                 }
             }
             AppCommand::ImportConnections => {
@@ -528,6 +539,10 @@ impl TernaryGridApp {
                 self.open_tab(Box::new(crate::tabs::settings::SettingsTab::default()));
             }
             AppCommand::SettingsChanged => self.apply_settings(ctx),
+            AppCommand::UnlockVault => {
+                self.dialogs.vault.skipped = false;
+                self.dialogs.vault_open = true;
+            }
             AppCommand::OpenErDiagram { connection, schema, tables } => {
                 self.open_tab(Box::new(crate::tabs::er::ErTab::new(connection, schema, tables)));
             }
@@ -1188,6 +1203,7 @@ impl TernaryGridApp {
         match (self.settings.history.enabled, self.services.history.is_some()) {
             (true, false) => {
                 let mut warnings = Vec::new();
+                self.history_retention = None;
                 self.services.history = crate::services::Services::open_history(&self.services.paths, &self.settings, &mut warnings);
                 for w in warnings {
                     self.toasts.warning(w, None);
@@ -1199,7 +1215,11 @@ impl TernaryGridApp {
         if let Some(h) = &self.services.history {
             let mut h = h.lock();
             h.set_redaction(self.settings.history.redact_secrets);
-            let _ = h.set_retention(Some(self.settings.history.retention()));
+            let retention = self.settings.history.retention();
+            if self.history_retention != Some(retention) {
+                self.history_retention = Some(retention);
+                let _ = h.set_retention(Some(retention));
+            }
         }
         if let Some(s) = &self.services.scheduler {
             match (self.settings.tasks.scheduler_enabled, s.is_started()) {
@@ -1212,7 +1232,34 @@ impl TernaryGridApp {
                 _ => {}
             }
         }
-        self.save_settings();
+        self.settings_save_at = Some(Instant::now() + SETTINGS_SAVE_DELAY);
+    }
+
+    /// Open the sample database once it is created.
+    fn poll_sample(&mut self) {
+        let Some((path, job)) = self.sample_job.as_mut() else { return };
+        let Some(r) = job.poll() else { return };
+        let path = path.clone();
+        self.sample_job = None;
+        match r {
+            Ok(()) => {
+                self.open_path(&path, false);
+                self.toasts.success(tr("Sample database created"));
+            }
+            Err(e) => self.toasts.error(tr("Cannot create the sample database"), Some(e.full_text())),
+        }
+    }
+
+    /// Write the settings once they stayed unchanged for [`SETTINGS_SAVE_DELAY`].
+    fn save_settings_when_due(&mut self, ctx: &egui::Context) {
+        let Some(at) = self.settings_save_at else { return };
+        let now = Instant::now();
+        if now >= at {
+            self.settings_save_at = None;
+            self.save_settings();
+        } else {
+            ctx.request_repaint_after(at - now);
+        }
     }
 
     /// Use `theme` from now on (and save it).
@@ -2004,6 +2051,8 @@ impl eframe::App for TernaryGridApp {
         }
         self.ensure_focus();
         self.process_commands(&ctx);
+        self.poll_sample();
+        self.save_settings_when_due(&ctx);
         if self.conns.dirty {
             self.conns.dirty = false;
             if let Err(e) = self.conns.store.save(&self.services.paths) {
@@ -2016,6 +2065,9 @@ impl eframe::App for TernaryGridApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.settings_save_at.take().is_some() {
+            self.save_settings();
+        }
         self.save_session();
         self.updates.install_on_exit();
         if let Some(s) = self.services.scheduler.clone() {

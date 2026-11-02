@@ -831,7 +831,8 @@ impl AiAssistantTab {
         let mut agent = match live {
             Some(l) if ai.agent_queries => {
                 let schema = self.schema.clone().unwrap_or_default();
-                let opener = l.open_session_future(format!("{} ({})", l.config.name, tr("AI assistant")), schema.database);
+                // Read-only for the driver too (ClickHouse `readonly`, the NoSQL drivers), besides the agent's own checks.
+                let opener = l.open_read_only_session_future(format!("{} ({})", l.config.name, tr("AI assistant")), schema.database);
                 Some(Agent::new(l.kind(), l.main.dialect().syntax().clone(), schema.schema, Box::pin(opener)))
             }
             _ => None,

@@ -2,7 +2,7 @@
 
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use ternarygrid_core::driver::{CancelHandle, ExecOptions, QueryCursor, ResultHeader, ServerMessage, Session, TransactionMode};
 use ternarygrid_core::{DbError, DbKind, DbResult, Dialect, Row, Value};
@@ -37,7 +37,8 @@ struct Shared {
     dialect: Arc<dyn Dialect>,
     label: String,
     database: Option<String>,
-    busy: AtomicBool,
+    /// Operations running (an execute and a fetch may overlap): busy while any is.
+    busy: AtomicUsize,
     closed: AtomicBool,
     /// Closed by [`SessionHandle::close`] (not lost: the server or the network ended it).
     closed_here: AtomicBool,
@@ -106,7 +107,7 @@ impl SessionHandle {
                 dialect,
                 label: label.into(),
                 database,
-                busy: AtomicBool::new(false),
+                busy: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),
                 closed_here: AtomicBool::new(false),
                 next_token: AtomicU64::new(1),
@@ -153,7 +154,7 @@ impl SessionHandle {
 
     /// A statement is currently running on this session.
     pub fn is_busy(&self) -> bool {
-        self.inner.busy.load(Ordering::Relaxed)
+        self.inner.busy.load(Ordering::Relaxed) > 0
     }
 
     pub fn busy_for(&self) -> Option<Duration> {
@@ -226,14 +227,13 @@ impl SessionHandle {
         guard
     }
 
-    fn mark_busy(&self, on: bool) {
-        self.inner.busy.store(on, Ordering::Relaxed);
-        *self.inner.busy_since.lock() = if on { Some(Instant::now()) } else { None };
-    }
-
     /// Busy until the guard is dropped (also when the operation is cancelled mid-await).
+    /// Counted: a fetch that ends does not make a running execute look idle.
     fn busy(&self) -> BusyGuard<'_> {
-        self.mark_busy(true);
+        let mut since = self.inner.busy_since.lock();
+        if self.inner.busy.fetch_add(1, Ordering::Relaxed) == 0 {
+            *since = Some(Instant::now());
+        }
         BusyGuard(self)
     }
 
@@ -458,8 +458,13 @@ impl SessionHandle {
         // the statements join it and nothing is committed or rolled back for the user.
         let in_tx = guard.in_transaction();
         let manual = guard.transaction_mode() == TransactionMode::Manual || in_tx;
-        if !manual {
-            guard.set_transaction_mode(TransactionMode::Manual).await?;
+        // A database without transactions (ClickHouse) applies each statement as it runs.
+        let mut no_tx = false;
+        if !manual && let Err(e) = guard.set_transaction_mode(TransactionMode::Manual).await {
+            if e.kind != ternarygrid_core::ErrorKind::Unsupported {
+                return Err(e);
+            }
+            no_tx = true;
         }
         // In the user's open transaction a failure must not leave the batch half applied:
         // the grid keeps every change pending, saving again would repeat the first ones.
@@ -476,6 +481,15 @@ impl SessionHandle {
             Some(sp) if ternarygrid_core::driver::execute_update(guard.as_mut(), sp.0, &[]).await.is_ok() => Some(sp),
             _ => None,
         };
+        // No savepoint in the user's transaction (it failed already, or the database has
+        // none): a failure after the first statement could not be undone without ending
+        // the transaction, so several statements are not started.
+        if in_tx && savepoint.is_none() && stmts.len() > 1 {
+            self.refresh_tx(guard.as_ref());
+            return Err(DbError::query(
+                "The open transaction cannot take a savepoint (it failed, or the database has none), so the changes could not be saved all or nothing: commit or roll it back, then save again.",
+            ));
+        }
         let mut total = 0u64;
         let mut failure = None;
         let mut results = Vec::with_capacity(stmts.len());
@@ -522,16 +536,17 @@ impl SessionHandle {
         let result = match failure {
             Some(e) => {
                 // Nothing of the user's was in the transaction: all of the batch goes.
-                if !in_tx && savepoint.is_none() {
+                if !in_tx && savepoint.is_none() && !no_tx {
                     let _ = guard.rollback().await;
                 }
                 Err(e)
             }
+            None if no_tx => Ok(Applied { rows: total, committed: true, results }),
             None if !manual => guard.commit().await.map(|_| Applied { rows: total, committed: true, results }),
             // Manual mode without a transaction before: it holds just this save, left open to commit.
             None => Ok(Applied { rows: total, committed: false, results }),
         };
-        if !manual {
+        if !manual && !no_tx {
             let _ = guard.set_transaction_mode(TransactionMode::Auto).await;
         }
         self.refresh_tx(guard.as_ref());
@@ -693,13 +708,148 @@ struct BusyGuard<'a>(&'a SessionHandle);
 
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
-        self.0.mark_busy(false);
+        let mut since = self.0.inner.busy_since.lock();
+        if self.0.inner.busy.fetch_sub(1, Ordering::Relaxed) == 1 {
+            *since = None;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ends_with_rollback;
+    use super::*;
+
+    /// A SQLite session that cannot take savepoints (as a failed transaction, or a
+    /// database without them).
+    struct NoSavepoints(Box<dyn ternarygrid_core::Session>);
+
+    #[async_trait::async_trait]
+    impl ternarygrid_core::Session for NoSavepoints {
+        fn kind(&self) -> ternarygrid_core::DbKind {
+            self.0.kind()
+        }
+        fn dialect(&self) -> std::sync::Arc<dyn ternarygrid_core::Dialect> {
+            self.0.dialect()
+        }
+        fn server_info(&self) -> &ternarygrid_core::driver::ServerInfo {
+            self.0.server_info()
+        }
+        fn cancel_handle(&self) -> Option<std::sync::Arc<dyn ternarygrid_core::CancelHandle>> {
+            self.0.cancel_handle()
+        }
+        async fn ping(&mut self) -> DbResult<()> {
+            self.0.ping().await
+        }
+        async fn close(&mut self) -> DbResult<()> {
+            self.0.close().await
+        }
+        fn is_closed(&self) -> bool {
+            self.0.is_closed()
+        }
+        async fn execute(&mut self, sql: &str, params: &[Value], opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
+            if sql.starts_with("SAVEPOINT") {
+                return Err(DbError::query("no savepoints here"));
+            }
+            self.0.execute(sql, params, opts).await
+        }
+        fn transaction_mode(&self) -> TransactionMode {
+            self.0.transaction_mode()
+        }
+        async fn set_transaction_mode(&mut self, mode: TransactionMode) -> DbResult<()> {
+            self.0.set_transaction_mode(mode).await
+        }
+        fn in_transaction(&self) -> bool {
+            self.0.in_transaction()
+        }
+        async fn commit(&mut self) -> DbResult<()> {
+            self.0.commit().await
+        }
+        async fn rollback(&mut self) -> DbResult<()> {
+            self.0.rollback().await
+        }
+        async fn current_database(&mut self) -> DbResult<Option<String>> {
+            self.0.current_database().await
+        }
+        async fn current_schema(&mut self) -> DbResult<Option<String>> {
+            self.0.current_schema().await
+        }
+        async fn set_current_schema(&mut self, schema: &str) -> DbResult<()> {
+            self.0.set_current_schema(schema).await
+        }
+        async fn list_databases(&mut self) -> DbResult<Vec<ternarygrid_core::meta::DatabaseInfo>> {
+            self.0.list_databases().await
+        }
+        async fn list_schemas(&mut self) -> DbResult<Vec<ternarygrid_core::meta::SchemaInfo>> {
+            self.0.list_schemas().await
+        }
+        async fn list_objects(&mut self, schema: &ternarygrid_core::SchemaRef, kind: ternarygrid_core::ObjectKind) -> DbResult<Vec<ternarygrid_core::meta::ObjectInfo>> {
+            self.0.list_objects(schema, kind).await
+        }
+        async fn list_children(&mut self, parent: &ternarygrid_core::ObjectRef, kind: ternarygrid_core::ObjectKind) -> DbResult<Vec<ternarygrid_core::meta::ObjectInfo>> {
+            self.0.list_children(parent, kind).await
+        }
+        async fn table_definition(&mut self, table: &ternarygrid_core::ObjectRef) -> DbResult<ternarygrid_core::ddl::TableDef> {
+            self.0.table_definition(table).await
+        }
+        async fn object_ddl(&mut self, obj: &ternarygrid_core::ObjectRef) -> DbResult<String> {
+            self.0.object_ddl(obj).await
+        }
+        async fn search_metadata(&mut self, search: &ternarygrid_core::meta::MetadataSearch) -> DbResult<Vec<ternarygrid_core::meta::ObjectInfo>> {
+            self.0.search_metadata(search).await
+        }
+        async fn schema_snapshot(
+            &mut self,
+            schema: &ternarygrid_core::SchemaRef,
+            opts: &ternarygrid_core::ddl::SnapshotOptions,
+        ) -> DbResult<ternarygrid_core::ddl::SchemaSnapshot> {
+            self.0.schema_snapshot(schema, opts).await
+        }
+        async fn explain(&mut self, sql: &str, analyze: bool) -> DbResult<ternarygrid_core::plan::QueryPlan> {
+            self.0.explain(sql, analyze).await
+        }
+    }
+
+    async fn sqlite(label: &str) -> Box<dyn ternarygrid_core::Session> {
+        use ternarygrid_core::Driver;
+        let mut cfg = ternarygrid_core::ConnectionConfig::new(DbKind::Sqlite, label);
+        cfg.file_path = Some(":memory:".into());
+        ternarygrid_driver_sqlite::SqliteDriver::new().connect(&ternarygrid_core::ConnectParams::from_config(&cfg, None)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_save_without_a_savepoint_is_not_started_in_an_open_transaction() {
+        let h = SessionHandle::new(Box::new(NoSavepoints(sqlite("sp").await)), "sp", None);
+        h.execute_update("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+        h.set_transaction_mode(TransactionMode::Manual).await.unwrap();
+        h.execute_update("INSERT INTO t VALUES (1)", &[]).await.unwrap();
+        assert!(h.tx_state().in_transaction);
+        // The second statement fails: without the guard the first stayed applied in the transaction.
+        let stmts = vec![("INSERT INTO t VALUES (2)".to_string(), Vec::new()), ("INSERT INTO t VALUES (1)".to_string(), Vec::new())];
+        let e = h.apply_changes(&stmts).await.expect_err("refused");
+        assert!(e.message.contains("savepoint"), "{}", e.full_text());
+        let (_, rows) = h.query_all("SELECT id FROM t ORDER BY id", &[]).await.unwrap();
+        assert_eq!(rows.len(), 1, "nothing of the batch ran");
+        // One statement is all or nothing by itself.
+        let (n, committed) = h.apply_changes(&stmts[..1]).await.unwrap();
+        assert_eq!((n, committed), (1, false));
+    }
+
+    #[tokio::test]
+    async fn busy_while_any_operation_runs() {
+        use ternarygrid_core::Driver;
+        let mut cfg = ternarygrid_core::ConnectionConfig::new(ternarygrid_core::DbKind::Sqlite, "busy");
+        cfg.file_path = Some(":memory:".into());
+        let s = ternarygrid_driver_sqlite::SqliteDriver::new().connect(&ternarygrid_core::ConnectParams::from_config(&cfg, None)).await.unwrap();
+        let h = SessionHandle::new(s, "busy", None);
+        assert!(!h.is_busy());
+        // An execute runs while a fetch of the previous result ends.
+        let execute = h.busy();
+        let fetch = h.busy();
+        drop(fetch);
+        assert!(h.is_busy() && h.busy_for().is_some(), "still busy with the execute");
+        drop(execute);
+        assert!(!h.is_busy() && h.busy_for().is_none());
+    }
 
     #[test]
     fn typed_rollbacks() {

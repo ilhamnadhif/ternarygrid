@@ -279,8 +279,16 @@ impl MaintenanceTab {
             return;
         }
         self.error = None;
-        if self.preview_sql(cx).is_empty() {
+        let statements = self.preview_sql(cx);
+        if statements.is_empty() {
             self.error = Some(tr("Nothing to run for the selected objects.").to_string());
+            return;
+        }
+        if let (Some(cfg), Some(d)) = (cx.conns.config(&self.conn), self.dialect(cx))
+            && cfg.read_only
+            && statements.iter().any(|s| ternarygrid_sql::classify(s, d.syntax()).is_write)
+        {
+            self.error = Some(trf("The connection \"{}\" is read-only.", &[&cfg.name]));
             return;
         }
         self.pending = true;

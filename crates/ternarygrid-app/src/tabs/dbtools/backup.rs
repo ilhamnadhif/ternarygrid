@@ -675,6 +675,14 @@ impl BackupTab {
             self.form_error = Some(e);
             return;
         }
+        // The restore tool connects by itself: the driver's read-only session does not stop it.
+        if self.restore
+            && let Some(cfg) = cx.conns.config(&self.conn)
+            && cfg.read_only
+        {
+            self.form_error = Some(trf("The connection \"{}\" is read-only.", &[&cfg.name]));
+            return;
+        }
         self.form_error = None;
         let spec = match self.spec(cx) {
             Ok(s) => s,

@@ -86,6 +86,10 @@ impl ChangePasswordTab {
         if self.new_password != self.confirm {
             return Some(tr("The passwords do not match.").to_string());
         }
+        // A dialect refuses a password it cannot write (Oracle: `"`).
+        if live.dialect.change_password_sql(None, &self.new_password).is_none() {
+            return Some(tr("This database does not accept this password (it contains a character the database cannot store in a password).").to_string());
+        }
         None
     }
 
@@ -95,7 +99,10 @@ impl ChangePasswordTab {
             return;
         }
         let Some(live) = cx.conns.live(&self.conn) else { return };
-        let Some(sql) = live.dialect.change_password_sql(None, &self.new_password) else { return };
+        let Some(sql) = live.dialect.change_password_sql(None, &self.new_password) else {
+            self.outcome = Some(Err(tr("Changing the password is not supported for this database.").to_string()));
+            return;
+        };
         let driver = live.driver.clone();
         let params = live.params().clone();
         let cfg = live.config.clone();
@@ -181,6 +188,15 @@ impl TabView for ChangePasswordTab {
         {
             cx.toasts.push(crate::toasts::ToastKind::Success, tr("The password was changed."), Some(tr("Reconnect so that new sessions use the new password.").to_string()));
             self.done = true;
+        }
+        // The saved password could not be updated because the vault locked itself (its
+        // master password was changed elsewhere): ask for it again.
+        if was_running
+            && let Some(Ok(c)) = &self.outcome
+            && c.saved_error.is_some()
+            && cx.conns.secrets.is_locked()
+        {
+            cx.push(crate::command::AppCommand::UnlockVault);
         }
         let Some(cfg) = cx.conns.config(&self.conn).cloned() else {
             crate::widgets::error_box(ui, tr("The connection does not exist."));

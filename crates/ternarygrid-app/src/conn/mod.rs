@@ -140,27 +140,31 @@ impl Drop for KeepAlive {
 }
 
 impl KeepAlive {
-    fn start(backend: &Backend, session: SessionHandle, secs: u32) -> KeepAlive {
+    fn start(backend: &Backend, session: &SessionHandle, secs: u32) -> KeepAlive {
         let token = tokio_util::sync::CancellationToken::new();
         if secs > 0 {
-            let t = token.clone();
-            backend.spawn_detached(async move {
-                let period = Duration::from_secs(secs.max(5) as u64);
-                loop {
-                    tokio::select! {
-                        _ = t.cancelled() => break,
-                        _ = tokio::time::sleep(period) => {}
-                    }
-                    if session.is_closed() {
-                        break;
-                    }
-                    if let Err(e) = session.ping().await {
-                        tracing::warn!("keep-alive failed: {e}");
-                    }
-                }
-            });
+            backend.spawn_detached(keep_alive_loop(session.downgrade(), secs, token.clone()));
         }
         KeepAlive(token)
+    }
+}
+
+/// Ping `session` every `secs` seconds until it is closed or dropped, or `stop`
+/// is cancelled.
+async fn keep_alive_loop(session: session::WeakSession, secs: u32, stop: tokio_util::sync::CancellationToken) {
+    let period = Duration::from_secs(secs.max(5) as u64);
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            _ = tokio::time::sleep(period) => {}
+        }
+        let Some(session) = session.upgrade() else { break };
+        if session.is_closed() {
+            break;
+        }
+        if let Err(e) = session.ping().await {
+            tracing::warn!("keep-alive failed: {e}");
+        }
     }
 }
 
@@ -218,7 +222,12 @@ impl LiveConnection {
             *entry = Loadable::Loading(backend.spawn(async move {
                 let mut s = driver.connect(&params).await?;
                 init_session(s.as_mut(), &cfg, &params).await?;
-                Ok(SessionHandle::new(s, label, Some(db)))
+                let handle = SessionHandle::new(s, label, Some(db));
+                // Kept alive like the main session; it ends with the session.
+                if cfg.init.keep_alive_secs > 0 {
+                    tokio::spawn(keep_alive_loop(handle.downgrade(), cfg.init.keep_alive_secs, tokio_util::sync::CancellationToken::new()));
+                }
+                Ok(handle)
             }));
         }
         None
@@ -281,7 +290,7 @@ impl LiveConnection {
                         self.params = params;
                         self.server = server;
                     }
-                    self._keepalive = KeepAlive::start(backend, s.clone(), self.config.init.keep_alive_secs);
+                    self._keepalive = KeepAlive::start(backend, &s, self.config.init.keep_alive_secs);
                     self.main = s;
                     self.revive.next = None;
                     self.revive.failures = 0;
@@ -346,8 +355,20 @@ impl LiveConnection {
     /// The opening of an additional session, to await in a background job
     /// (the AI assistant's queries).
     pub fn open_session_future(&self, label: String, database: Option<String>) -> impl std::future::Future<Output = DbResult<SessionHandle>> + Send + 'static {
+        self.open_session_future_with(label, database, false)
+    }
+
+    /// [`open_session_future`](Self::open_session_future) for a session that only
+    /// reads (the AI assistant's queries): the driver makes it read-only where the
+    /// database has the mode, whatever the connection's own setting.
+    pub fn open_read_only_session_future(&self, label: String, database: Option<String>) -> impl std::future::Future<Output = DbResult<SessionHandle>> + Send + 'static {
+        self.open_session_future_with(label, database, true)
+    }
+
+    fn open_session_future_with(&self, label: String, database: Option<String>, read_only: bool) -> impl std::future::Future<Output = DbResult<SessionHandle>> + Send + 'static {
         let driver = self.driver.clone();
         let mut params = self.params.clone();
+        params.read_only |= read_only;
         if database.is_some() {
             params.database = database.clone();
         }
@@ -370,8 +391,15 @@ impl LiveConnection {
 
 /// Apply transaction mode, default schema and init SQL after connecting.
 pub async fn init_session(s: &mut dyn ternarygrid_core::Session, cfg: &ConnectionConfig, params: &ConnectParams) -> DbResult<()> {
-    if !params.auto_commit {
-        s.set_transaction_mode(TransactionMode::Manual).await?;
+    // A database without transactions (ClickHouse) stays in auto-commit: its session
+    // reports that mode, so the editors show what really happens.
+    if !params.auto_commit
+        && let Err(e) = s.set_transaction_mode(TransactionMode::Manual).await
+    {
+        if e.kind != ternarygrid_core::ErrorKind::Unsupported {
+            return Err(e);
+        }
+        tracing::warn!("{}: manual commit is not available, auto-commit stays on: {e}", cfg.name);
     }
     if let Some(schema) = cfg.init.default_schema.as_deref().filter(|s| !s.is_empty())
         && let Err(e) = s.set_current_schema(schema).await
@@ -635,6 +663,9 @@ pub struct ConnectionManager {
     pub store: ConnectionStore,
     live: HashMap<String, LiveConnection>,
     connecting: HashMap<String, Job<DbResult<Connected>>>,
+    /// Connects given up while running (disconnected, removed): what they open is
+    /// closed when they finish, with the after-disconnect command.
+    abandoned: Vec<(Job<DbResult<Connected>>, Option<String>)>,
     failed: HashMap<String, String>,
     /// Connect errors already reported (their connection stays red until it connects).
     failed_shown: HashSet<String>,
@@ -656,6 +687,7 @@ impl ConnectionManager {
             store: ConnectionStore::new(),
             live: HashMap::new(),
             connecting: HashMap::new(),
+            abandoned: Vec::new(),
             failed: HashMap::new(),
             failed_shown: HashSet::new(),
             secrets,
@@ -717,8 +749,8 @@ impl ConnectionManager {
         self.dirty = true;
     }
 
-    pub fn remove(&mut self, id: &str) {
-        self.disconnect_now(id);
+    pub fn remove(&mut self, backend: &Backend, id: &str) {
+        self.disconnect(backend, id);
         self.store.remove(id);
         for key in ConnectionStore::secret_keys_for(id) {
             let _ = self.secrets.delete(&key);
@@ -865,6 +897,14 @@ impl ConnectionManager {
     /// Poll connect jobs and keep-alive. Call once per frame.
     pub fn poll(&mut self, backend: &Backend) {
         self.just_connected.clear();
+        self.abandoned.retain_mut(|(job, after)| match job.poll() {
+            Some(Ok(c)) => {
+                backend.spawn_detached(close_connected(c, after.take()));
+                false
+            }
+            Some(Err(_)) => false,
+            None => true,
+        });
         let ids: Vec<String> = self.connecting.keys().cloned().collect();
         for id in ids {
             let done = self.connecting.get_mut(&id).and_then(|j| j.poll());
@@ -880,7 +920,7 @@ impl ConnectionManager {
                         let catalog_folders = Arc::new(dialect.catalog_folders());
                         let conn_type = self.connection_type(&cfg.connection_type);
                         let main = SessionHandle::new(c.session, format!("{} (main)", cfg.name), c.database.clone());
-                        let keepalive = KeepAlive::start(backend, main.clone(), cfg.init.keep_alive_secs);
+                        let keepalive = KeepAlive::start(backend, &main, cfg.init.keep_alive_secs);
                         if let Some(cfg) = self.config_mut(&id) {
                             cfg.last_connected = Some(chrono::Utc::now().timestamp());
                         }
@@ -961,12 +1001,16 @@ impl ConnectionManager {
         if let Some(live) = self.live.remove(id) {
             backend.spawn_detached(close_live(live));
         }
-        self.connecting.remove(id);
+        // A connect still running: its session and tunnel are closed once it finishes.
+        if let Some(job) = self.connecting.remove(id) {
+            let after = self.config(id).and_then(|c| c.init.shell_after_disconnect.clone());
+            self.abandoned.push((job, after));
+        }
     }
 
-    fn disconnect_now(&mut self, id: &str) {
-        self.live.remove(id);
-        self.connecting.remove(id);
+    /// Connects given up that have not finished yet.
+    pub fn has_abandoned_connects(&self) -> bool {
+        !self.abandoned.is_empty()
     }
 
     pub fn disconnect_all(&mut self, backend: &Backend) {
@@ -1008,6 +1052,17 @@ async fn close_live(live: LiveConnection) {
         s.cancel_and_close().await;
     }
     drop(live.tunnel);
+    run_after_disconnect(after).await;
+}
+
+/// Close what a connect given up opened.
+async fn close_connected(mut c: Connected, after: Option<String>) {
+    let _ = c.session.close().await;
+    drop(c.tunnel.take());
+    run_after_disconnect(after).await;
+}
+
+async fn run_after_disconnect(after: Option<String>) {
     if let Some(cmd) = after.filter(|c| !c.trim().is_empty())
         && let Err(e) = run_shell(&cmd, Duration::from_secs(60)).await
     {
@@ -1144,6 +1199,67 @@ mod tests {
         let h = sqlite_session("b").await;
         h.close().await;
         assert!(h.is_closed() && !h.is_lost());
+    }
+
+    /// A SQLite connection whose after-disconnect command creates `marker`.
+    #[cfg(unix)]
+    fn manager_with(dir: &std::path::Path, marker: &std::path::Path, before: Option<&str>) -> (ConnectionManager, String) {
+        let mut cfg = ConnectionConfig::new(DbKind::Sqlite, "rm");
+        cfg.file_path = Some(dir.join("rm.db").display().to_string());
+        cfg.init.shell_before_connect = before.map(str::to_string);
+        cfg.init.shell_after_disconnect = Some(format!("touch '{}'", marker.display()));
+        let mut cm = ConnectionManager::new(crate::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
+        let id = cfg.id.clone();
+        cm.upsert(cfg);
+        (cm, id)
+    }
+
+    #[cfg(unix)]
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let t0 = Instant::now();
+        while !done() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_connected_connection_closes_it() {
+        let backend = Backend::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("after");
+        let (mut cm, id) = manager_with(dir.path(), &marker, None);
+        cm.connect(&backend, &id, Credentials::default()).unwrap();
+        wait_for("connect", || {
+            cm.poll(&backend);
+            cm.is_connected(&id)
+        });
+        let tab = backend.block_on(cm.live(&id).unwrap().open_session_future("tab".into(), None)).unwrap();
+        cm.remove(&backend, &id);
+        assert!(cm.config(&id).is_none() && !cm.is_connected(&id));
+        // The tab's session closes and the after-disconnect command runs.
+        wait_for("the tab session to close", || tab.is_closed() && !tab.is_lost());
+        wait_for("the after-disconnect command", || marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_connect_given_up_is_closed_when_it_finishes() {
+        let backend = Backend::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("after");
+        let (mut cm, id) = manager_with(dir.path(), &marker, Some("sleep 0.3"));
+        cm.connect(&backend, &id, Credentials::default()).unwrap();
+        assert_eq!(cm.status(&id), ConnStatus::Connecting);
+        cm.disconnect(&backend, &id);
+        assert_eq!(cm.status(&id), ConnStatus::Disconnected);
+        wait_for("the connect to end", || {
+            cm.poll(&backend);
+            !cm.has_abandoned_connects()
+        });
+        wait_for("the after-disconnect command", || marker.exists());
+        assert!(!cm.is_connected(&id));
     }
 
     #[test]

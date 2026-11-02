@@ -32,7 +32,11 @@ impl ErrorLogTab {
     /// The entries shown with the current filter, newest first.
     pub fn visible(&self) -> Vec<&LogEntry> {
         let needle = self.search.to_lowercase();
-        self.entries.iter().rev().filter(|e| e.level <= self.level && (needle.is_empty() || e.message.to_lowercase().contains(&needle) || e.target.contains(&needle))).collect()
+        self.entries
+            .iter()
+            .rev()
+            .filter(|e| e.level <= self.level && (needle.is_empty() || e.message.to_lowercase().contains(&needle) || e.target.to_lowercase().contains(&needle)))
+            .collect()
     }
 
     pub fn set_level(&mut self, level: Level) {

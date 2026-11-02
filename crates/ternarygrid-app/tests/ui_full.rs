@@ -370,6 +370,12 @@ fn navigator_data_editing_and_context_menus() {
     wait(&mut h, "saved", |h| !h.state().dock.iter_all_tabs().any(|(_, t)| t.view.is_dirty()));
     no_errors(&mut h, "save data");
     assert_eq!(query_one(&db, "SELECT COUNT(*) FROM customer WHERE name = 'Zedka'"), "1");
+    // Keys typed in the grid (clicked last) are the grid's, not the navigator's.
+    let selected = h.state().nav.selected.clone();
+    assert!(selected.is_some());
+    h.key_press(Key::ArrowDown);
+    frames(&mut h, 2);
+    assert_eq!(h.state().nav.selected, selected, "the navigator's selection stays");
 
     // Every navigator context menu, on every kind of node.
     let skip = ["Delete", "Drop", "Disconnect", "Duplicate", "Copy name", "Connect", "Hide in navigator"];

@@ -631,6 +631,7 @@ impl TasksTab {
     }
 
     fn store_done(&mut self, cx: &mut AppContext, done: StoreDone) {
+        let imported = matches!(done, StoreDone::Imported(_));
         match done {
             StoreDone::Saved { task, previous } => {
                 self.editor = None;
@@ -658,6 +659,12 @@ impl TasksTab {
                 self.selected = tasks.iter().map(|t| t.id.clone()).collect();
                 self.focus = tasks.first().map(|t| t.id.clone());
                 cx.toasts.success(trf("{} task(s) added", &[&tasks.len()]));
+                // Imported scheduled tasks come in disabled: they run on their own only once enabled.
+                let disabled = if imported { tasks.iter().filter(|t| t.schedule.is_some() && !t.enabled).count() } else { 0 };
+                if disabled > 0 {
+                    cx.toasts
+                        .warning(trf("{} imported scheduled task(s) are disabled", &[&disabled]), Some(tr("Review them, then enable them to run on their schedule.").to_string()));
+                }
             }
             StoreDone::Toggled(tasks) => {
                 for t in tasks.into_iter().filter(|t| t.os_scheduler) {

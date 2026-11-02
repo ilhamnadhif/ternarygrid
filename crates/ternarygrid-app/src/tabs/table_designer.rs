@@ -917,6 +917,12 @@ impl TableDesignerTab {
         if stmts.is_empty() || !self.issues().is_empty() || self.exec.is_some() {
             return;
         }
+        if let Some(cfg) = cx.conns.config(&self.conn)
+            && cfg.read_only
+        {
+            self.exec_error = Some(trf("The connection \"{}\" is read-only.", &[&cfg.name]));
+            return;
+        }
         let Some(session) = self.session(cx) else {
             self.exec_error = Some(tr("The connection is closed.").to_string());
             return;
@@ -932,7 +938,14 @@ impl TableDesignerTab {
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         self.applied = applied.clone();
         self.create_at = stmts.iter().position(|s| s.trim_start().get(..12).is_some_and(|p| p.eq_ignore_ascii_case("CREATE TABLE")));
+        let sqlite = self.kind == DbKind::Sqlite;
         self.exec = Some(cx.backend.spawn(async move {
+            // SQLite rebuilds a table outside a transaction (`PRAGMA foreign_keys` does nothing
+            // inside one); manual commit mode opens one for a mere SELECT. It holds only reads
+            // (checked above): it ends first.
+            if sqlite && session.tx_state().in_transaction {
+                session.commit().await?;
+            }
             if transactional {
                 let list: Vec<(String, Vec<Value>)> = stmts.iter().map(|s| (s.clone(), Vec::new())).collect();
                 let (_, committed) = session.apply_changes(&list).await?;
