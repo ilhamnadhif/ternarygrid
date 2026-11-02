@@ -137,6 +137,9 @@ pub struct GeneralSettings {
     pub show_tips: bool,
     /// Index of the next tip.
     pub next_tip: usize,
+    /// The first-start setup (import from DBeaver, keyboard, look) was
+    /// finished or skipped. Installs from before it existed count as done.
+    pub onboarding_done: bool,
 }
 
 impl Default for GeneralSettings {
@@ -150,6 +153,7 @@ impl Default for GeneralSettings {
             confirm_exit_with_unsaved: true,
             show_tips: true,
             next_tip: 0,
+            onboarding_done: false,
         }
     }
 }

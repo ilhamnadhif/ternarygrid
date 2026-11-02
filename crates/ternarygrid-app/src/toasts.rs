@@ -49,6 +49,11 @@ impl Toasts {
         }
     }
 
+    /// Dismiss every visible toast (the log keeps them).
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
     /// Takes the toasts pushed since the previous call.
     pub fn take_log(&mut self) -> Vec<Toast> {
         std::mem::take(&mut self.log)

@@ -38,6 +38,8 @@ fn harness_conns(dir: &std::path::Path, mut settings: Settings, conns: Connectio
     let backend = Arc::new(Backend::new().unwrap());
     let services = Services::ephemeral(&dir.join("home"));
     settings.general.restore_session = false;
+    // The walkthroughs start at the welcome page, not in the first-start setup.
+    settings.general.onboarding_done = true;
     let h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_max_steps(400).with_step_dt(1.0 / 60.0).build_eframe(move |cc| {
         ternarygrid_app::theme::setup_fonts(&cc.egui_ctx);
         backend.set_context(cc.egui_ctx.clone());
@@ -81,10 +83,21 @@ fn has(h: &H, label: &str) -> bool {
     h.query_all_by_label_contains(label).next().is_some()
 }
 
+/// Whether `n` lies in the chrome at the top of the window (menu bar, toolbar),
+/// as drawn in the last frame.
+fn in_top_chrome(h: &H, n: &egui_kittest::Node<'_>) -> bool {
+    n.rect().center().y < h.state().chrome.top_bottom()
+}
+
 /// Whether `n` is a button of the main toolbar (its icon and short label).
-fn on_toolbar(n: &egui_kittest::Node<'_>) -> bool {
+fn on_toolbar(h: &H, n: &egui_kittest::Node<'_>) -> bool {
     let label = n.accesskit_node().label().unwrap_or_default();
-    n.rect().top() < 60.0 && Action::ALL.iter().any(|&a| label == format!("{} {}", ternarygrid_app::keys::action_icon(a), ternarygrid_app::keys::toolbar_label(a)))
+    in_top_chrome(h, n) && Action::ALL.iter().any(|&a| label == format!("{} {}", ternarygrid_app::keys::action_icon(a), ternarygrid_app::keys::toolbar_label(a)))
+}
+
+/// Whether `n` lies in the navigator panel.
+fn in_nav(h: &H, n: &egui_kittest::Node<'_>) -> bool {
+    h.state().chrome.nav.is_some_and(|r| r.contains(n.rect().center()))
 }
 
 /// Click the first widget whose label contains `label`, one outside the
@@ -92,7 +105,7 @@ fn on_toolbar(n: &egui_kittest::Node<'_>) -> bool {
 fn click(h: &mut H, label: &str) {
     pause(h);
     {
-        let Some(n) = h.query_all_by_label_contains(label).find(|n| !on_toolbar(n)).or_else(|| h.query_all_by_label_contains(label).next()) else {
+        let Some(n) = h.query_all_by_label_contains(label).find(|n| !on_toolbar(h, n)).or_else(|| h.query_all_by_label_contains(label).next()) else {
             panic!("no widget labelled {label:?}; labels: {:?}", labels(h));
         };
         n.click();
@@ -220,9 +233,7 @@ fn editor_execute_sort_and_edit() {
 
 /// A navigator row (the navigator is the left panel).
 fn nav_row<'a>(h: &'a H, label: &'a str) -> Option<egui_kittest::Node<'a>> {
-    // Not the status bar's breadcrumb at the bottom.
-    let status_top = h.ctx.content_rect().bottom() - 30.0;
-    h.query_all_by_label(label).find(|n| n.rect().left() < 120.0 && n.rect().top() > 60.0 && n.rect().top() < status_top)
+    h.query_all_by_label(label).find(|n| in_nav(h, n))
 }
 
 fn nav_double_click(h: &mut H, label: &str) {
@@ -728,7 +739,7 @@ fn settings_grid_menu_and_editor_helpers() {
     ] {
         pause(&mut h);
         let key = format!(" {section}");
-        let Some(n) = h.query_all_by_label_contains(&key).find(|n| !on_toolbar(n)) else {
+        let Some(n) = h.query_all_by_label_contains(&key).find(|n| !on_toolbar(&h, n)) else {
             panic!("settings section {section:?}; labels: {:?}", labels(&h));
         };
         n.click();
@@ -904,7 +915,7 @@ fn settings_grid_menu_and_editor_helpers() {
     h.event(egui::Event::Text("select * from cust".into()));
     frames(&mut h, 2);
     h.key_press_modifiers(Modifiers::CTRL, Key::Space);
-    wait(&mut h, "completion popup", |h| h.query_all_by_label("customer").any(|n| n.rect().left() > 300.0));
+    wait(&mut h, "completion popup", |h| h.query_all_by_label("customer").any(|n| !in_nav(h, &n)));
     h.key_press(Key::Enter);
     frames(&mut h, 3);
     assert!(focused_editor(&mut h).text().contains("customer"), "{}", focused_editor(&mut h).text());
@@ -1232,10 +1243,10 @@ fn catalog_folders_in_the_navigator() {
     wait(&mut h, "Roles folder", |h| nav_row(h, "Roles").is_some());
     nav_double_click(&mut h, "Roles");
     // The role (the database has the same name: the role row is the last one).
-    wait(&mut h, "role row", |h| h.query_all_by_label(&user).filter(|n| n.rect().left() < 120.0).count() >= 2);
+    wait(&mut h, "role row", |h| h.query_all_by_label(&user).filter(|n| in_nav(h, n)).count() >= 2);
     pause(&mut h);
     {
-        let n = h.query_all_by_label(&user).rfind(|n| n.rect().left() < 120.0).unwrap();
+        let n = h.query_all_by_label(&user).rfind(|n| in_nav(&h, n)).unwrap();
         n.click();
         n.click();
     }
@@ -1541,14 +1552,14 @@ fn workspace_from_dbeaver() {
     // Main toolbar: SQL editor actions are disabled without an editor.
     let toolbar_enabled = |h: &H, icon: &str| -> bool {
         // Icon and short label, or the icon alone.
-        let n = h.query_all_by_label_contains(icon).find(|n| n.rect().top() < 70.0).unwrap_or_else(|| panic!("toolbar {icon:?}: {:?}", labels(h)));
+        let n = h.query_all_by_label_contains(icon).find(|n| in_top_chrome(h, n)).unwrap_or_else(|| panic!("toolbar {icon:?}: {:?}", labels(h)));
         !n.accesskit_node().is_disabled()
     };
     // No tab is open: the start page fills the editor area.
     assert_eq!(h.state().dock.iter_all_tabs().count(), 0);
     assert!(has(&h, "Create sample database"));
     // The default toolbar has global actions only (run, commit … are in the editor).
-    assert!(h.query_all_by_label_contains(egui_phosphor::regular::PLAY).all(|n| n.rect().top() >= 70.0), "no Run in the main toolbar by default");
+    assert!(h.query_all_by_label_contains(egui_phosphor::regular::PLAY).all(|n| !in_top_chrome(&h, &n)), "no Run in the main toolbar by default");
     // A customised toolbar with editor actions: disabled without an editor.
     h.state_mut().settings.toolbar.items = ["sql.new_editor", "sql.execute_statement", "tx.commit"].map(String::from).to_vec();
     frames(&mut h, 2);

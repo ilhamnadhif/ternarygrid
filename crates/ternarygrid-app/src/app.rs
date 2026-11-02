@@ -20,6 +20,30 @@ use ternarygrid_core::tr;
 /// Settings changed are written after this long without another change.
 const SETTINGS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
 
+/// Where the window chrome was drawn in the last frame. Tests find the toolbar,
+/// the navigator … by these areas rather than by fixed coordinates, so the
+/// layout can change without them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ChromeRects {
+    /// In-window menu bar (absent with the native macOS menu).
+    pub menu: Option<egui::Rect>,
+    /// The main toolbar row.
+    pub toolbar: Option<egui::Rect>,
+    /// Left icon rail.
+    pub rail: Option<egui::Rect>,
+    /// Navigator / project panel.
+    pub nav: Option<egui::Rect>,
+    /// Status bar.
+    pub status: Option<egui::Rect>,
+}
+
+impl ChromeRects {
+    /// Bottom edge of the chrome at the top of the window (menu and toolbar).
+    pub fn top_bottom(&self) -> f32 {
+        [self.menu, self.toolbar].into_iter().flatten().map(|r| r.bottom()).fold(0.0, f32::max)
+    }
+}
+
 /// SQLite database file (by extension).
 pub fn database_file_kind(path: &std::path::Path) -> Option<ternarygrid_core::DbKind> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -106,6 +130,8 @@ pub struct TernaryGridApp {
     pub pending_tx: crate::pending_tx::PendingTxDialog,
     /// Collect diagnostic info running.
     diagnostics: Option<crate::backend::Job<ternarygrid_core::DbResult<std::path::PathBuf>>>,
+    /// Where the chrome was drawn in the last frame.
+    pub chrome: ChromeRects,
 }
 
 impl TernaryGridApp {
@@ -161,6 +187,7 @@ impl TernaryGridApp {
             tip: None,
             pending_tx: Default::default(),
             diagnostics: None,
+            chrome: ChromeRects::default(),
         };
         app.existing_install = crate::updates::is_existing_install(&app.services.paths);
         app.updates.data_dir = Some(app.services.paths.data_dir().to_path_buf());
@@ -1836,16 +1863,18 @@ impl eframe::App for TernaryGridApp {
             self.open_path(&path, false);
         }
 
+        let mut chrome = ChromeRects::default();
         // On macOS the menus are in the system's menu bar (as in DBeaver).
         #[cfg(target_os = "macos")]
         let native_menu = self.app_menu.is_some();
         #[cfg(not(target_os = "macos"))]
         let native_menu = false;
         if !native_menu {
-            egui::Panel::top("ternarygrid_menu").frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.menu_bar(ui));
+            chrome.menu = Some(egui::Panel::top("ternarygrid_menu").frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.menu_bar(ui)).response.rect);
         }
-        egui::Panel::top("ternarygrid_toolbar").frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.toolbar(ui));
-        egui::Panel::bottom("ternarygrid_status").exact_size(24.0).frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.status_bar(ui));
+        chrome.toolbar = Some(egui::Panel::top("ternarygrid_toolbar").frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.toolbar(ui)).response.rect);
+        chrome.status =
+            Some(egui::Panel::bottom("ternarygrid_status").exact_size(24.0).frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.status_bar(ui)).response.rect);
 
         let mut cx = AppContext {
             backend: &self.backend,
@@ -1861,7 +1890,7 @@ impl eframe::App for TernaryGridApp {
             popup: false,
         };
         if self.show_nav {
-            egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(280.0).size_range(160.0..=600.0).show(ui, |ui| {
+            let nav_panel = egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(280.0).size_range(160.0..=600.0).show(ui, |ui| {
                 // The tree's toolbar on the switch's row (as in DBeaver); below it
                 // when the panel is too narrow for both.
                 let mut toolbar_below = false;
@@ -1892,7 +1921,9 @@ impl eframe::App for TernaryGridApp {
                     self.nav.track_focus(ui);
                 }
             });
+            chrome.nav = Some(nav_panel.response.rect);
         }
+        self.chrome = chrome;
         // The AI assistant at the right of the tabs (as an agent panel), resizable up
         // to 720 points while the tabs keep 640 (narrower, their toolbars no longer fit).
         if self.ai_open
