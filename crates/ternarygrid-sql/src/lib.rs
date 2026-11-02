@@ -26,7 +26,7 @@
 //! | [`highlight`](mod@highlight) | [`highlight`](fn@highlight) | syntax colouring |
 //! | [`spell`](mod@spell) | [`check_spelling`](fn@check_spelling), [`SpellChecker`] | spell checker |
 //! | [`generate`](mod@generate) | [`select_sql`](fn@select_sql), [`rows_insert_sql`](fn@rows_insert_sql) ... | SQL generation |
-//! | [`fuzzy`](mod@fuzzy) | [`fuzzy_score`](fn@fuzzy_score), [`fuzzy_indices`](fn@fuzzy_indices) | command palette |
+//! | [`fuzzy`](mod@fuzzy) | [`fuzzy_score`](fn@fuzzy_score), [`fuzzy_indices`](fn@fuzzy_indices) | autocomplete ranking |
 //! | [`position`](mod@position) | [`line_col`](fn@line_col), [`char_pos_to_byte`](fn@char_pos_to_byte) | error positions |
 //! | [`syntax_check`](mod@syntax_check) | [`syntax_check`](fn@syntax_check) | pre-execution warnings |
 
