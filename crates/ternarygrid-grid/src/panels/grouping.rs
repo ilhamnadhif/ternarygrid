@@ -129,8 +129,9 @@ impl<'a> GroupingPanel<'a> {
                 changed = true;
             }
             ComboBox::from_id_salt("ternarygrid_group_add").width(140.0).icon(ternarygrid_ui::kit::combo_caret).selected_text(tr("Add column…")).show_ui(ui, |ui| {
+                ternarygrid_ui::kit::menu_look(ui, 140.0);
                 for (c, n) in names.iter().enumerate() {
-                    if !state.spec.columns.contains(&c) && ui.selectable_label(false, n).clicked() {
+                    if !state.spec.columns.contains(&c) && ternarygrid_ui::kit::menu_item(ui, None, n, "").clicked() {
                         state.spec.columns.push(c);
                         changed = true;
                     }
@@ -142,13 +143,14 @@ impl<'a> GroupingPanel<'a> {
             ui.label(RichText::new(tr("Measure")).size(12.5).color(pal.text_muted));
             let current = state.spec.measure.and_then(|m| names.get(m)).cloned().unwrap_or_else(|| tr("(none)").to_string());
             ComboBox::from_id_salt("ternarygrid_group_measure").width(120.0).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
-                if ui.selectable_label(state.spec.measure.is_none(), tr("(none)")).clicked() {
+                ternarygrid_ui::kit::menu_look(ui, 120.0);
+                if ternarygrid_ui::kit::menu_check(ui, &mut state.spec.measure.is_none(), tr("(none)")).clicked() {
                     state.spec.measure = None;
                     changed = true;
                 }
                 for (c, n) in names.iter().enumerate() {
                     let numeric = model.column_kind(c).is_numeric() || model.is_virtual_column(c);
-                    if numeric && ui.selectable_label(state.spec.measure == Some(c), n).clicked() {
+                    if numeric && ternarygrid_ui::kit::menu_check(ui, &mut (state.spec.measure == Some(c)), n).clicked() {
                         state.spec.measure = Some(c);
                         changed = true;
                     }

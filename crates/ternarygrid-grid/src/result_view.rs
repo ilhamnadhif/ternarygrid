@@ -254,18 +254,22 @@ impl<'a> ResultViewer<'a> {
         let mut actions: Vec<GridAction> = Vec::new();
         let mut grid_response = None;
         let pal = ternarygrid_ui::pal(ui);
-        // The filter bar: 46 high, 16 / 12 at the sides, a line under it; the footer 42 high, a line over it.
-        let filter_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 12, top: 8, bottom: 8 }).fill(pal.canvas);
-        let footer_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 10, top: 6, bottom: 6 }).fill(pal.canvas);
+        // The filter bar: 46 high (44 in the full style), 16 / 12 at the sides, a line under it;
+        // the footer a line and 42 (40) under it, 16 / 10 (10 / 8) at the sides.
+        let full = options.full_bars;
+        let (bar_y, foot_y) = if full { (7, 5) } else { (8, 6) };
+        let filter_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 12, top: bar_y, bottom: bar_y + 1 }).fill(pal.canvas);
+        let foot_x = if full { (10, 8) } else { (16, 10) };
+        let footer_frame = Frame::new().inner_margin(egui::Margin { left: foot_x.0, right: foot_x.1, top: foot_y + 1, bottom: foot_y }).fill(pal.canvas);
         let line = egui::Stroke::new(1.0, pal.border);
         let bar = Panel::top(id.with("filter_bar")).frame(filter_frame).show_separator_line(false).show(ui, |ui| {
-            actions.extend(FilterBar::new(model, &mut state.grid, &mut state.toolbar).dialect(options.dialect.clone()).show(ui));
+            actions.extend(FilterBar::new(model, &mut state.grid, &mut state.toolbar).dialect(options.dialect.clone()).full(full).show(ui));
         });
         ui.painter().hline(bar.response.rect.x_range(), bar.response.rect.bottom() - 0.5, line);
         // "Filter by value" in server mode adds to the WHERE the filter box shows.
         state.grid.set_server_filter(&state.toolbar.filter_text);
         let footer = Panel::bottom(id.with("toolbar")).frame(footer_frame).show_separator_line(false).show(ui, |ui| {
-            actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).fetch_size(options.fetch_more_threshold).show(ui));
+            actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).fetch_size(options.fetch_more_threshold).full(full).show(ui));
         });
         ui.painter().hline(footer.response.rect.x_range(), footer.response.rect.top() + 0.5, line);
         // Errors in a pop-up: a refused edit or a failed save each time, a failed fetch once.

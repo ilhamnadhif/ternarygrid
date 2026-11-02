@@ -240,15 +240,16 @@ fn stats_table(ui: &mut Ui, rows: &[StatRow], state: &mut CalcPanelState) {
             copy = Some((row.copy.clone(), Some(row.name.to_string())));
         }
         resp.on_hover_text(row.copy.as_str()).context_menu(|ui| {
-            if ui.button(format!("{} {}", icon::COPY, tr("Copy value"))).clicked() {
+            ternarygrid_ui::kit::menu_look(ui, 200.0);
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::COPY), tr("Copy value"), "").clicked() {
                 copy = Some((row.copy.clone(), Some(row.name.to_string())));
                 ui.close();
             }
-            if ui.button(tr("Copy name and value")).clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, None, tr("Copy name and value"), "").clicked() {
                 copy = Some((format!("{}\t{}", row.name, row.copy), Some(row.name.to_string())));
                 ui.close();
             }
-            if ui.button(tr("Copy all")).clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, None, tr("Copy all"), "").clicked() {
                 copy = Some((all_text(), None));
                 ui.close();
             }

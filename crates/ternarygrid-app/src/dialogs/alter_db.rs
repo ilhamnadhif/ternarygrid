@@ -187,7 +187,7 @@ impl AlterDatabaseDialog {
     /// The fields: editable where the product can change them, else shown as read.
     fn form(&mut self, ui: &mut egui::Ui, original: &DatabaseProps, kind: DbKind, edits: ternarygrid_core::DatabaseEdits, save: &mut bool) {
         let p = ternarygrid_ui::pal(ui);
-        let value = |ui: &mut egui::Ui, v: &str| ui.label(RichText::new(v).color(p.text_muted));
+        let value = |ui: &mut egui::Ui, v: &str| super::value_text(ui, v, p.text_muted, false);
         super::form_row(ui, tr("Name"), |ui| {
             if edits.name {
                 let r = add_field(ui, text_field(&mut self.edited.name, f32::INFINITY));

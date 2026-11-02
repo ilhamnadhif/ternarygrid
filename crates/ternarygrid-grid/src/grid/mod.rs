@@ -105,6 +105,9 @@ pub struct GridOptions {
     /// Binary values read as their size ("‹binary · 64 B›", images as "‹PNG image · 2 KB›")
     /// instead of their bytes in the format's encoding (the value panel shows them).
     pub binary_summary: bool,
+    /// The SQL editor's filter bar and footer: an ORDER BY field instead of the sort chip, and
+    /// a button for each action instead of the footer's ⋯ (see [`crate::toolbar::ResultToolbar::full`]).
+    pub full_bars: bool,
 }
 
 impl std::fmt::Debug for GridOptions {
@@ -145,6 +148,7 @@ impl Default for GridOptions {
             max_tooltip_chars: 2_000,
             record_hide_empty: false,
             binary_summary: true,
+            full_bars: false,
         }
     }
 }

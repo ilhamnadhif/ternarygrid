@@ -150,7 +150,7 @@ impl DropDialog {
                     editor.set(true);
                 }
                 super::right(ui, |ui| {
-                    if ui.add_enabled_ui(!busy && !read_only && !opening, |ui| super::danger_button(ui, Some(icon::TRASH), tr("Drop"))).inner.clicked() {
+                    if ui.add_enabled_ui(!busy && !read_only && !opening, |ui| kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Drop"), false)).inner.clicked() {
                         drop.set(true);
                     }
                     if ui.add_enabled_ui(!busy, super::cancel_button).inner.clicked() {

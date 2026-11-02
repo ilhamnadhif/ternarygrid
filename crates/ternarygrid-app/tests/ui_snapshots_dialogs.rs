@@ -166,11 +166,16 @@ impl Shots {
             .build_eframe(move |cc| {
                 ternarygrid_app::theme::setup_fonts(&cc.egui_ctx);
                 backend.set_context(cc.egui_ctx.clone());
-                TernaryGridApp::new(backend, conns, services, settings)
+                let mut app = TernaryGridApp::new(backend, conns, services, settings);
+                // As on macOS: the menus in the system's menu bar, the window buttons at the
+                // left of the top bar (painted by `shot`, as the system draws them).
+                app.native_menu_bar = true;
+                app.titlebar_inset = ternarygrid_app::app::MAC_TITLEBAR_INSET;
+                app
             });
         ternarygrid_app::theme::apply_settings(&h.ctx, &h.state().settings);
         let theme = if theme == Theme::Dark { "dark" } else { "light" };
-        let only = std::env::var("TERNARYGRID_SNAPSHOT_ONLY").ok();
+        let only = std::env::var("TERNARYGRID_SNAPSHOT_ONLY").ok().filter(|s| !s.is_empty());
         let mut s = Shots { h, raster, dir, theme, only };
         s.frames(4);
         s
@@ -199,15 +204,18 @@ impl Shots {
     }
 
     fn shot_with_toasts(&mut self, name: &str) {
+        // The pointer away from the content: no hover effects (as in the design's pictures).
+        self.h.event(egui::Event::PointerMoved(egui::pos2(1439.0, 899.0)));
         self.frames(30);
-        if self.only.as_deref().is_some_and(|o| !name.contains(o)) {
+        if self.only.as_deref().is_some_and(|o| !o.split(',').any(|o| name.contains(o))) {
             return;
         }
         let out = self.h.output();
         let prims = self.h.ctx.tessellate(out.shapes.clone(), PPP);
         let size = self.h.ctx.content_rect().size() * PPP;
         let bg = self.h.ctx.global_style().visuals.panel_fill;
-        let img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        let mut img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
+        traffic_lights(&mut img, PPP);
         let path = self.dir.join(format!("{name}-{}.png", self.theme));
         img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
@@ -311,10 +319,43 @@ impl Shots {
     }
 }
 
+/// The query of the SQL editor behind the design's dialogs.
+const BACKDROP_SQL: &str = "-- Revenue per customer, last 90 days
+select c.name, c.city,
+       count(distinct o.id) as orders,
+       round(sum(l.quantity * l.unit_price), 2) as revenue
+from customer c
+join \"order\" o on o.customer_id = c.id
+join order_line l on l.order_id = o.id
+where o.status <> 'cancelled'
+  and o.created_at > now() - interval '90 days'
+group by c.id
+order by revenue desc;
+";
+
+/// The macOS window buttons, as the system paints them over the top bar's left end.
+fn traffic_lights(img: &mut image::RgbaImage, ppp: f32) {
+    for (i, c) in [[0xff, 0x5f, 0x57], [0xfe, 0xbc, 0x2e], [0x28, 0xc8, 0x40]].iter().enumerate() {
+        let (cx, cy, r) = ((16.0 + 6.0 + 20.0 * i as f32) * ppp, 22.0 * ppp, 6.0 * ppp);
+        for y in (cy - r - 2.0) as u32..=(cy + r + 2.0) as u32 {
+            for x in (cx - r - 2.0) as u32..=(cx + r + 2.0) as u32 {
+                let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                let a = (r + 0.5 - d).clamp(0.0, 1.0);
+                if a > 0.0 {
+                    let px = img.get_pixel_mut(x, y);
+                    for k in 0..3 {
+                        px[k] = (c[k] as f32 * a + px[k] as f32 * (1.0 - a)).round() as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A DBeaver workspace with the connections of the design's import dialog (and two
 /// databases TernaryGrid does not support, for the notes).
 fn dbeaver_workspace(home: &Path) -> PathBuf {
-    let ws = home.join("DBeaverData/workspace6");
+    let ws = home.join("Library/DBeaverData/workspace6");
     let dir = ws.join("General/.dbeaver");
     std::fs::create_dir_all(&dir).unwrap();
     let json = r#"{
@@ -379,8 +420,18 @@ fn slypee_prod() -> ternarygrid_core::config::ConnectionConfig {
 fn ui_snapshots_dialogs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots/dialogs");
     std::fs::create_dir_all(&root).unwrap();
-    for theme in [Theme::Dark, Theme::Light] {
-        let home = std::env::temp_dir().join(format!("ternarygrid-dlg-shots-{}", uuid::Uuid::new_v4().simple()));
+    let themes: Vec<Theme> = match std::env::var("TERNARYGRID_SNAPSHOT_THEME").as_deref() {
+        Ok("dark") => vec![Theme::Dark],
+        Ok("light") => vec![Theme::Light],
+        _ => vec![Theme::Dark, Theme::Light],
+    };
+    // A home of its own, so paths read as the design's (`~/Library/DBeaverData/workspace6`).
+    let base = std::env::temp_dir().join(format!("ternarygrid-dlg-shots-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&base).unwrap();
+    // SAFETY: set before the app and its threads start; nothing else runs in this process.
+    unsafe { std::env::set_var("HOME", &base) };
+    for theme in themes {
+        let home = base.join(if theme == Theme::Dark { "dark" } else { "light" });
         std::fs::create_dir_all(&home).unwrap();
         let mut s = Shots::new(&home, root.clone(), theme);
 
@@ -407,6 +458,9 @@ fn ui_snapshots_dialogs() {
             }
         }
         s.frames(3);
+        // Behind the dialogs, as in the design: a SQL editor with the report's query.
+        s.h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: Some(BACKDROP_SQL.into()) });
+        s.frames(4);
 
         // New connection: Main (as filled in), a missing name after a failed test, a SQLite file.
         let ctx = s.h.ctx.clone();
@@ -471,8 +525,16 @@ fn ui_snapshots_dialogs() {
         s.shot("credential");
         s.reset();
         {
+            // The design's name for the connected connection (the sample one), while it opens.
             let app = s.h.state_mut();
+            let name = app.conns.config(&conn).map(|c| c.name.clone()).unwrap_or_default();
+            if let Some(c) = app.conns.config_mut(&conn) {
+                c.name = "slypee-prod".into();
+            }
             app.dialogs.confirm_delete_connection(&conn, &app.conns);
+            if let Some(c) = app.conns.config_mut(&conn) {
+                c.name = name;
+            }
         }
         s.shot("delete_conn");
         s.reset();
@@ -484,11 +546,18 @@ fn ui_snapshots_dialogs() {
         s.h.state_mut().push_command(AppCommand::DeleteFolder("Clients/Slypee".into()));
         s.shot("folder_delete");
         s.reset();
-        let ws = dbeaver_workspace(&home);
+        let ws = dbeaver_workspace(&base);
         s.h.state_mut().dialogs.import = Some(ternarygrid_app::dialogs::import::ImportDialog::with_workspace(ws));
         s.frames(3);
         s.shot("import_start");
         s.click("Find connections");
+        {
+            // As in the design: every connection but the SQLite one (the last row's box).
+            let mut boxes: Vec<_> = s.h.query_all_by_role(egui::accesskit::Role::CheckBox).filter(|n| n.rect().left() < 400.0).collect();
+            boxes.sort_by(|a, b| a.rect().top().total_cmp(&b.rect().top()));
+            boxes.last().expect("the import table's check boxes").click();
+        }
+        s.frames(3);
         s.shot("import_found");
         s.reset();
         {
@@ -665,6 +734,10 @@ fn ui_snapshots_dialogs() {
         s.reset();
         s.h.state_mut().settings.general.show_tips = true;
         s.h.state_mut().show_tip();
+        // The design's tip (about the filter bar's WHERE and FILTER).
+        if let Some(t) = s.h.state_mut().tip.as_mut() {
+            t.index = 4;
+        }
         s.shot("tip");
         s.reset();
         s.h.state_mut().dialogs.about_open = true;
@@ -695,4 +768,5 @@ fn ui_snapshots_dialogs() {
         drop(s);
         let _ = std::fs::remove_dir_all(&home);
     }
+    let _ = std::fs::remove_dir_all(&base);
 }

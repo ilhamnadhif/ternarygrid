@@ -31,7 +31,7 @@ pub fn metadata_rows(model: &ResultModel) -> Vec<[String; 7]> {
                     };
                     [
                         name,
-                        m.type_name.clone(),
+                        m.type_name.to_lowercase(),
                         format!("{:?}", m.kind),
                         match m.nullable {
                             Some(true) => tr("yes").to_string(),
@@ -85,7 +85,7 @@ impl<'a> MetadataPanel<'a> {
             match self.model.editability() {
                 Ok(t) => {
                     ui.label(RichText::new(egui_phosphor::regular::TABLE).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.text_muted));
-                    ui.label(RichText::new(t.table.display_path()).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
+                    ternarygrid_ui::kit::semibold_label(ui, &t.table.display_path(), 13.0, pal.text);
                 }
                 Err(r) => {
                     ui.label(RichText::new(format!("{} {}", egui_phosphor::regular::LOCK_SIMPLE, r.short_label())).color(pal.warn)).on_hover_text(r.message());

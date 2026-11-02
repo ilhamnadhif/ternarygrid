@@ -179,7 +179,6 @@ impl Operations {
     pub fn ui(&mut self, ui: &mut Ui) {
         self.collect();
         let p = style::pal(ui);
-        let line = if ui.visuals().dark_mode { egui::Color32::from_rgb(0x33, 0x35, 0x3e) } else { egui::Color32::from_rgb(0xed, 0xed, 0xf2) };
         ui.spacing_mut().item_spacing.y = 0.0;
         if self.list.is_empty() {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 18)).show(ui, |ui| {
@@ -191,7 +190,7 @@ impl Operations {
         egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(26.0);
-                ui.label(RichText::new(trf("{} running", &[&self.running()])).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+                kit::semibold_label(ui, &trf("{} running", &[&self.running()]), 13.0, p.text);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if kit::ghost(ui, None, tr("Clear finished")).clicked() {
                         clear = true;
@@ -227,12 +226,13 @@ impl Operations {
                             ui.spacing_mut().interact_size.y = 0.0;
                             let elapsed = op.finished.unwrap_or_else(Instant::now).duration_since(op.started);
                             ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
                                 let time = format!("{:.1}s", elapsed.as_secs_f32());
                                 let time_w = ui.painter().layout_no_wrap(time.clone(), egui::FontId::proportional(11.5), p.text_faint).size().x;
                                 let title_w = (ui.available_width() - time_w - 8.0).max(40.0);
                                 ui.allocate_ui_with_layout(egui::vec2(title_w, 0.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                     ui.set_min_width(title_w);
-                                    ui.add(egui::Label::new(RichText::new(&op.title).font(style::semibold(ui.ctx(), 13.0)).color(p.text)).truncate());
+                                    crate::dialogs::semibold_text(ui, &op.title, 13.0, p.text, None, true);
                                 });
                                 ui.label(RichText::new(time).size(11.5).color(p.text_faint));
                             });
@@ -269,13 +269,13 @@ impl Operations {
                                 faint(ui, &txt);
                             }
                         });
-                        if running && kit::icon_button_ex(ui, icon::STOP, tr("Cancel"), false, 24.0).clicked() {
+                        if running && kit::icon_button_sized(ui, icon::STOP, tr("Cancel"), false, 24.0, 12.0).clicked() {
                             op.cancel.cancel();
                         }
                     });
                 });
                 let r = row.response.rect;
-                ui.painter().hline(r.x_range(), r.bottom() + 0.5, egui::Stroke::new(1.0, line));
+                ui.painter().hline(r.x_range(), r.bottom() + 0.5, egui::Stroke::new(1.0, p.line));
                 ui.add_space(1.0);
             }
         });
