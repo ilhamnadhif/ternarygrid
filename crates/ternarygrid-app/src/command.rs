@@ -188,6 +188,13 @@ pub enum AppCommand {
     OpenAiAssistant {
         connection: Option<String>,
     },
+    /// Open the AI assistant on a new conversation about `sql`: "Fix error" with `error`,
+    /// "Explain query" without (sent at once).
+    AskAi {
+        connection: Option<String>,
+        sql: String,
+        error: Option<String>,
+    },
     OpenExport {
         connection: String,
         objects: Vec<ObjectRef>,

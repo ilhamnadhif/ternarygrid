@@ -991,21 +991,19 @@ impl ResultPanel {
             return;
         }
         let mut decided: Option<bool> = None;
-        let modal = egui::Modal::new(egui::Id::new(("confirm_rerun", &self.conn, &self.title))).show(ui.ctx(), |ui| {
-            ui.set_max_width(460.0);
-            ui.heading(tr("Run the statement again?"));
-            ui.label(tr("These rows come from a statement that changes data (INSERT / UPDATE … RETURNING, CALL, EXEC). Reloading them runs it again."));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new(tr("Run again")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                    decided = Some(true);
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    decided = Some(false);
-                }
-            });
-        });
-        if decided.is_none() && modal.should_close() {
+        let (modal, ()) = confirm_dialog(
+            ui,
+            egui::Id::new(("confirm_rerun", &self.conn, &self.title)),
+            tr("Run the statement again?"),
+            icon::WARNING,
+            |ui| {
+                ui.add(egui::Label::new(tr("These rows come from a statement that changes data (INSERT / UPDATE … RETURNING, CALL, EXEC). Reloading them runs it again.")).wrap());
+            },
+            tr("Run again"),
+            true,
+            &mut decided,
+        );
+        if decided.is_none() && modal.close {
             decided = Some(false);
         }
         match decided {
@@ -1025,19 +1023,19 @@ impl ResultPanel {
         }
         let mut decided: Option<bool> = None;
         let n = self.model.pending_counts().total();
-        let modal = egui::Modal::new(egui::Id::new(("confirm_discard", &self.conn, &self.title))).show(ui.ctx(), |ui| {
-            ui.heading(tr("Unsaved changes"));
-            ui.label(trf("Reloading the rows discards the {} pending change(s). Save them first to keep them.", &[&n]));
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new(tr("Discard and reload")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                    decided = Some(true);
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    decided = Some(false);
-                }
-            });
-        });
-        if decided.is_none() && modal.should_close() {
+        let (modal, ()) = confirm_dialog(
+            ui,
+            egui::Id::new(("confirm_discard", &self.conn, &self.title)),
+            tr("Unsaved changes"),
+            icon::WARNING,
+            |ui| {
+                ui.add(egui::Label::new(trf("Reloading the rows discards the {} pending change(s). Save them first to keep them.", &[&n])).wrap());
+            },
+            tr("Discard and reload"),
+            true,
+            &mut decided,
+        );
+        if decided.is_none() && modal.close {
             decided = Some(false);
         }
         match decided {
@@ -1069,11 +1067,12 @@ impl ResultPanel {
             let config = ternarygrid_visual::chart::ChartConfig::suggest(self.model.columns());
             ChartView { data: ternarygrid_visual::chart::ChartData::default(), config, state: Default::default(), generation: u64::MAX }
         });
-        ui.horizontal(|ui| {
-            if ui.button((ternarygrid_icons::ic(icon::TABLE), tr("Back to grid"))).clicked() {
+        ternarygrid_ui::parts::toolbar(ui, |ui| {
+            use ternarygrid_ui::kit;
+            if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TABLE), tr("Back to grid"), true, false).clicked() {
                 self.mode = Mode::Grid;
             }
-            if ui.button((ternarygrid_icons::ic(icon::EXPORT), tr("Export chart…"))).clicked()
+            if kit::button_full(ui, kit::Kind::Ghost, Some(icon::EXPORT), tr("Export chart…"), true, false).clicked()
                 && let Some(path) = rfd::FileDialog::new().set_file_name("chart.png").add_filter("PNG", &["png"]).add_filter("SVG", &["svg"]).save_file()
             {
                 let size = egui::vec2(1200.0, 700.0);
@@ -1090,7 +1089,8 @@ impl ResultPanel {
             }
         });
         let mut rebuild = cv.generation != generation;
-        egui::Panel::left("chart_cfg").resizable(true).default_size(220.0).show(ui, |ui| {
+        let pal = ternarygrid_ui::pal(ui);
+        egui::Panel::left("chart_cfg").resizable(true).default_size(250.0).frame(egui::Frame::new().fill(pal.surface).inner_margin(egui::Margin::same(14))).show(ui, |ui| {
             rebuild |= ternarygrid_visual::chart::chart_config_ui(ui, self.model.columns(), &mut cv.config);
         });
         if rebuild {
@@ -1099,7 +1099,7 @@ impl ResultPanel {
             cv.generation = generation;
             cv.state.reset_view = true;
         }
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.surface).inner_margin(egui::Margin::symmetric(24, 18))).show(ui, |ui| {
             ternarygrid_visual::chart::show_chart(ui, &cv.data, &cv.config, &mut cv.state);
         });
     }
@@ -1118,8 +1118,9 @@ impl ResultPanel {
         let names: Vec<String> = self.model.columns().iter().map(|c| c.name.clone()).collect();
         let sv = self.spatial.as_mut().expect("set above");
         let mut rebuild = need || sv.layers.is_empty();
-        ui.horizontal(|ui| {
-            if ui.button((ternarygrid_icons::ic(icon::TABLE), tr("Back to grid"))).clicked() {
+        ternarygrid_ui::parts::toolbar(ui, |ui| {
+            use ternarygrid_ui::kit;
+            if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TABLE), tr("Back to grid"), true, false).clicked() {
                 self.mode = Mode::Grid;
             }
             egui::ComboBox::from_id_salt("spatial_col").icon(ternarygrid_ui::kit::combo_caret).selected_text(names.get(sv.column).cloned().unwrap_or_default()).show_ui(ui, |ui| {
@@ -1129,7 +1130,7 @@ impl ResultPanel {
                     }
                 }
             });
-            if ui.button(ternarygrid_icons::ic(icon::ARROW_CLOCKWISE)).clicked() {
+            if kit::icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0).clicked() {
                 rebuild = true;
             }
         });
@@ -1148,59 +1149,77 @@ impl ResultPanel {
         if self.confirm_fetch_all {
             let mut decided: Option<bool> = None;
             let limit = cx.settings.results.confirm_fetch_all_above;
-            let modal = egui::Modal::new(egui::Id::new(("fetch_all", &self.conn, &self.title))).show(ui.ctx(), |ui| {
-                ui.heading(tr("Fetch all rows?"));
-                match self.model.fetch.total_count {
-                    Some(t) => ui.label(trf("The result has {} rows; fetching them may take a while.", &[&t])),
-                    None => ui.label(trf("The result may have more than {} rows; fetching them may take a while.", &[&limit])),
-                };
-                ui.weak(tr("Rows beyond the memory limit are kept in a temporary file."));
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Fetch all")).strong()).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        decided = Some(false);
-                    }
-                });
-            });
+            let total = self.model.fetch.total_count;
+            let (modal, ()) = confirm_dialog(
+                ui,
+                egui::Id::new(("fetch_all", &self.conn, &self.title)),
+                tr("Fetch all rows?"),
+                icon::ARROW_LINE_DOWN,
+                |ui| {
+                    let text = match total {
+                        Some(t) => trf("The result has {} rows; fetching them may take a while.", &[&ternarygrid_grid::format::group_thousands(&t.to_string())]),
+                        None => trf("The result may have more than {} rows; fetching them may take a while.", &[&limit]),
+                    };
+                    ui.add(egui::Label::new(text).wrap());
+                    ui.label(RichText::new(tr("Rows beyond the memory limit are kept in a temporary file.")).color(ternarygrid_ui::pal(ui).text_muted));
+                },
+                tr("Fetch all"),
+                false,
+                &mut decided,
+            );
             if let Some(go) = decided {
                 self.confirm_fetch_all = false;
                 if go {
                     self.fetch_all(cx);
                 }
-            } else if modal.should_close() {
+            } else if modal.close {
                 self.confirm_fetch_all = false;
             }
         }
         if let Some(sql) = self.save_preview.clone() {
             let mut close = false;
             let mut save = false;
-            let modal = egui::Modal::new(egui::Id::new(("save_preview", &self.conn, &self.title))).show(ui.ctx(), |ui| {
-                ui.set_width(640.0);
-                ui.heading(tr("Save changes"));
-                ui.label(tr("These statements will run in one transaction:"));
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    let mut t = sql.as_str();
-                    ui.add(egui::TextEdit::multiline(&mut t).code_editor().desired_width(f32::INFINITY));
-                });
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("Save")).strong()).clicked() {
-                        save = true;
+            use ternarygrid_ui::{kit, parts};
+            let pending = self.model.pending_counts().total();
+            let table = self.table.as_ref().map(|t| t.display_path()).unwrap_or_default();
+            let subtitle = if table.is_empty() { trf("{} changes", &[&pending]) } else { trf("{} changes in {}", &[&pending, &table]) };
+            let ty = cx.conns.type_of(&self.conn);
+            let conn_name = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default();
+            let (modal, ()) = parts::Dialog::new(tr("Save changes")).icon(icon::FLOPPY_DISK).subtitle(&subtitle).width(660.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("save_preview", &self.conn, &self.title)),
+                |ui| {
+                    ui.label(RichText::new(tr("These statements will run in one transaction:")).color(ternarygrid_ui::pal(ui).text_muted));
+                    parts::code_frame()(ui).show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            let mut t = sql.as_str();
+                            ui.add(egui::TextEdit::multiline(&mut t).code_editor().frame(egui::Frame::NONE).desired_width(f32::INFINITY));
+                        });
+                    });
+                    if crate::theme::connection_marker(ty.color).is_some() {
+                        let note = trf("{} is a {} connection: these changes reach the live database.", &[&conn_name, &ty.name]);
+                        parts::callout(ui, parts::Tone::Warning, None, &note, |_| {});
                     }
-                    if ui.button(tr("Copy SQL")).clicked() {
+                },
+                |ui| {
+                    if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy SQL"), false).clicked() {
                         ui.ctx().copy_text(sql.clone());
                     }
-                    if ui.button(tr("Cancel")).clicked() {
-                        close = true;
-                    }
-                });
-            });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if kit::primary_icon(ui, icon::FLOPPY_DISK, tr("Save")).clicked() {
+                            save = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            close = true;
+                        }
+                    });
+                },
+            );
             if save {
                 self.start_save(cx);
                 close = true;
             }
-            if close || modal.should_close() {
+            if close || modal.close {
                 self.save_preview = None;
             }
         }
@@ -1208,25 +1227,34 @@ impl ResultPanel {
             let mut close = false;
             let mut apply = false;
             let names: Vec<String> = self.model.columns().iter().map(|c| c.name.clone()).collect();
-            let modal = egui::Modal::new(egui::Id::new(("vkey", &self.conn))).show(ui.ctx(), |ui| {
-                ui.heading(tr("Define a virtual key"));
-                ui.label(trf("Columns that identify a row of {}:", &[&table.name]));
-                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    for (i, n) in names.iter().enumerate() {
-                        if let Some(s) = selected.get_mut(i) {
-                            ui.checkbox(s, n);
+            let table_name = table.name.clone();
+            // Enabled from the ticks of the last frame (the list below borrows them).
+            let any = selected.iter().any(|s| *s);
+            let (modal, ()) = ternarygrid_ui::parts::Dialog::new(tr("Define a virtual key")).icon(icon::KEY).width(480.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("vkey", &self.conn)),
+                |ui| {
+                    ui.label(trf("Columns that identify a row of {}:", &[&table_name]));
+                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            if let Some(s) = selected.get_mut(i) {
+                                ui.checkbox(s, n);
+                            }
                         }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(selected.iter().any(|s| *s), egui::Button::new(tr("Save"))).clicked() {
-                        apply = true;
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        close = true;
-                    }
-                });
-            });
+                    });
+                },
+                |ui| {
+                    use ternarygrid_ui::kit;
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled_ui(any, |ui| kit::button_ex(ui, kit::Kind::Primary, Some(icon::CHECK), tr("Save"), false).clicked()).inner {
+                            apply = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            close = true;
+                        }
+                    });
+                },
+            );
             if apply {
                 let cols: Vec<String> = names.iter().zip(selected.iter()).filter(|(_, s)| **s).map(|(n, _)| n.clone()).collect();
                 if let Some(p) = cx.services.projects.as_ref() {
@@ -1245,7 +1273,7 @@ impl ResultPanel {
                 }
                 close = true;
             }
-            if close || modal.should_close() {
+            if close || modal.close {
                 self.virtual_key_dialog = None;
             }
         }
@@ -1360,4 +1388,42 @@ fn column_stats_text(v: &[Value]) -> String {
         text.push_str(&format!("\n{}: {} · {}: {}", tr("Min"), short(3), tr("Max"), short(4)));
     }
     text
+}
+
+/// A small confirmation dialog: the question as the title, `body`, Cancel and the action
+/// (red when `danger`). Sets `decided` to the choice.
+#[allow(clippy::too_many_arguments)]
+fn confirm_dialog(
+    ui: &Ui,
+    id: egui::Id,
+    title: &str,
+    glyph: &str,
+    body: impl FnOnce(&mut Ui),
+    action: &str,
+    danger: bool,
+    decided: &mut Option<bool>,
+) -> (ternarygrid_ui::parts::DialogResponse, ()) {
+    use ternarygrid_ui::kit;
+    ternarygrid_ui::parts::Dialog::new(title).icon(glyph).width(500.0).show_modal(ui.ctx(), id, body, |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let clicked = if danger {
+                let pal = ternarygrid_ui::pal(ui);
+                let b =
+                    egui::Button::new(RichText::new(action).color(egui::Color32::WHITE).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))))
+                        .fill(if ui.visuals().dark_mode { egui::Color32::from_rgb(0xc4, 0x35, 0x2b) } else { pal.err })
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(ternarygrid_ui::style::RADIUS)
+                        .min_size(egui::vec2(0.0, ternarygrid_ui::style::CONTROL_H));
+                ui.add(b).clicked()
+            } else {
+                kit::primary(ui, action).clicked()
+            };
+            if clicked {
+                *decided = Some(true);
+            }
+            if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                *decided = Some(false);
+            }
+        });
+    })
 }

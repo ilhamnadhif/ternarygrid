@@ -130,12 +130,15 @@ impl<'a> ValuePanel<'a> {
             }
         };
         let cell_editable = options.allow_editing && model.can_edit_cell(row, col).is_ok();
+        let pal = ternarygrid_ui::pal(ui);
         ui.horizontal(|ui| {
-            ui.strong(model.column_name(col));
+            ui.label(RichText::new(model.column_name(col)).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
             if let Some(m) = model.column_meta(col) {
-                ui.weak(&m.type_name);
+                ui.label(RichText::new(&m.type_name).color(pal.text_faint));
             }
-            ui.weak(trf("row {}", &[&(row + 1)]));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(trf("row {}", &[&(row + 1)])).color(pal.text_faint));
+            });
         });
         // Mode selector with the modes that make sense for the value.
         let mut modes = vec![(ValueMode::Auto, tr("Auto")), (ValueMode::Text, tr("Text"))];
@@ -157,12 +160,12 @@ impl<'a> ValuePanel<'a> {
             state.mode = ValueMode::Auto;
         }
         ui.horizontal(|ui| {
-            for (m, label) in &modes {
-                ui.selectable_value(&mut state.mode, *m, *label);
-            }
-            ui.checkbox(&mut state.wrap, tr("Wrap"));
+            ternarygrid_ui::parts::segmented_small(ui, &mut state.mode, &modes);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut state.wrap, tr("Wrap"));
+            });
         });
-        ui.separator();
+        ui.add_space(4.0);
         let mode = match state.mode {
             // NULL has nothing to parse or decode: show the (empty) text editor.
             _ if value.is_null() => ValueMode::Text,
@@ -209,8 +212,11 @@ impl<'a> ValuePanel<'a> {
                     }
                 });
                 ui.horizontal(|ui| {
+                    use ternarygrid_ui::kit;
                     if cell_editable {
-                        if ui.add_enabled(state.edit_dirty, egui::Button::new(tr("Apply"))).clicked() {
+                        let dirty = state.edit_dirty;
+                        let apply = ui.add_enabled_ui(dirty, |ui| kit::button_full(ui, kit::Kind::Primary, None, tr("Apply"), true, false).clicked()).inner;
+                        if apply {
                             match model.set_cell(row, col, &state.edit_text) {
                                 Ok(()) => {
                                     state.edit_dirty = false;
@@ -219,11 +225,12 @@ impl<'a> ValuePanel<'a> {
                                 Err(e) => state.error = Some(e),
                             }
                         }
-                        if ui.add_enabled(state.edit_dirty, egui::Button::new(tr("Revert"))).clicked() {
+                        let revert = ui.add_enabled_ui(dirty, |ui| kit::button_full(ui, kit::Kind::Ghost, None, tr("Revert"), true, false).clicked()).inner;
+                        if revert {
                             state.edit_text = text_for(&value, kind);
                             state.edit_dirty = false;
                         }
-                        if ui.button(tr("Set NULL")).clicked() {
+                        if kit::button_full(ui, kit::Kind::Ghost, None, tr("Set NULL"), true, false).clicked() {
                             match model.set_null(row, col) {
                                 // The text shows the cell again (typed text is gone).
                                 Ok(()) => {
@@ -234,12 +241,14 @@ impl<'a> ValuePanel<'a> {
                             }
                         }
                     } else if let Some(r) = model.read_only_reason() {
-                        ui.weak(r.short_label());
+                        ui.label(RichText::new(format!("{} {}", egui_phosphor::regular::LOCK_SIMPLE, r.short_label())).color(pal.warn));
                     }
-                    ui.weak(trf("{} chars", &[&state.edit_text.chars().count()]));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(trf("{} chars", &[&state.edit_text.chars().count()])).color(pal.text_faint));
+                    });
                 });
                 if let Some(e) = &state.error {
-                    ui.colored_label(ui.visuals().error_fg_color, e);
+                    ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Error, e);
                 }
             }
             ValueMode::Json => {

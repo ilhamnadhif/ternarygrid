@@ -606,24 +606,32 @@ fn hit_test(
 }
 
 fn toolbar(ui: &mut Ui, layers: &[SpatialLayer], state: &mut SpatialState, srid: Option<i32>) {
+    use ternarygrid_ui::kit;
+    let pal = ternarygrid_ui::pal(ui);
     ui.horizontal(|ui| {
-        if ui
-            .button(ternarygrid_icons::ic(icon::CORNERS_OUT))
-            .on_hover_text(tr("Zoom to fit"))
-            .clicked()
-        {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if kit::icon_button_ex(ui, icon::CORNERS_OUT, tr("Zoom to fit"), false, 26.0).clicked() {
             state.fit_pending = true;
         }
-        ui.toggle_value(&mut state.show_grid, ternarygrid_icons::ic(icon::GRID_FOUR))
-            .on_hover_text(tr("Show grid"));
-        ui.toggle_value(
-            &mut state.color_by_row,
-            ternarygrid_icons::ic(icon::PALETTE),
+        if kit::icon_button_ex(ui, icon::GRID_FOUR, tr("Show grid"), state.show_grid, 26.0)
+            .clicked()
+        {
+            state.show_grid = !state.show_grid;
+        }
+        if kit::icon_button_ex(
+            ui,
+            icon::PALETTE,
+            tr("One color per row"),
+            state.color_by_row,
+            26.0,
         )
-        .on_hover_text(tr("One color per row"));
-        ui.separator();
+        .clicked()
+        {
+            state.color_by_row = !state.color_by_row;
+        }
+        kit::vdivider(ui, 16.0);
         let items: usize = layers.iter().map(|l| l.items.len()).sum();
-        ui.weak(trf("{} geometries", &[&items]));
+        ui.label(egui::RichText::new(trf("{} geometries", &[&items])).color(pal.text_faint));
         let errors: usize = layers.iter().map(|l| l.errors.len()).sum();
         if errors > 0 {
             let detail = layers
@@ -640,10 +648,10 @@ fn toolbar(ui: &mut Ui, layers: &[SpatialLayer], state: &mut SpatialState, srid:
             .on_hover_text(detail);
         }
         if let Some(s) = srid {
-            ui.weak(format!("SRID {s}"));
+            ui.label(egui::RichText::new(format!("SRID {s}")).color(pal.text_faint));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.weak(tr("No base map: geometries only"));
+            ui.label(egui::RichText::new(tr("No base map: geometries only")).color(pal.text_faint));
             if let Some([x, y]) = state.pointer_world {
                 ui.monospace(format!("{x:.6}, {y:.6}"));
             }

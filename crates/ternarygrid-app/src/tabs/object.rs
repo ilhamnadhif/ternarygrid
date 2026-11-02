@@ -150,9 +150,9 @@ impl ObjectEditorTab {
             (TablePage::VirtualModel, tr("Virtual model"), None),
         ];
         let tabs = ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().item_spacing.x = 4.0;
             for (page, label, n) in sub_pages {
-                if kit::underline_tab(ui, None, label, n.as_deref(), self.table_page == page, 30.0).clicked() {
+                if pill_tab(ui, label, n.as_deref(), self.table_page == page).clicked() {
                     self.table_page = page;
                 }
             }
@@ -162,8 +162,8 @@ impl ObjectEditorTab {
                 }
             });
         });
-        ui.painter().hline(ui.max_rect().x_range(), tabs.response.rect.bottom() - 0.5, egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border));
-        ui.add_space(4.0);
+        let _ = tabs;
+        ui.add_space(6.0);
         if !widgets::load_state(ui, &self.table, &mut retry) {
             if retry {
                 self.table = Loadable::NotLoaded;
@@ -415,20 +415,21 @@ impl ObjectEditorTab {
                 None => raw,
             };
             ui.horizontal(|ui| {
-                if ui.button((ternarygrid_icons::ic(icon::FILE_SQL), tr("Open in SQL editor"))).clicked() {
+                if kit::button_full(ui, kit::Kind::Secondary, Some(icon::FILE_SQL), tr("Open in SQL editor"), true, false).clicked() {
                     cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: Some(self.obj.schema_ref()), text: Some(text.clone()) });
                 }
-                if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).clicked() {
+                if kit::button_full(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), true, false).clicked() {
                     ui.ctx().copy_text(text.clone());
                 }
-                if ui
-                    .toggle_value(&mut formatted, (ternarygrid_icons::ic(icon::TEXT_ALIGN_LEFT), tr("Format")))
+                if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TEXT_ALIGN_LEFT), tr("Format"), true, formatted)
                     .on_hover_text(tr("Show the DDL formatted with the SQL editor's formatter settings"))
-                    .changed()
+                    .clicked()
                 {
+                    formatted = !formatted;
                     ui.data_mut(|d| d.insert_temp(format_id, formatted));
                 }
             });
+            ui.add_space(4.0);
             crate::tabs::code(ui, cx, &self.conn.clone(), ("ddl", &self.obj), &text);
         }
         if retry {
@@ -444,7 +445,7 @@ impl ObjectEditorTab {
         if widgets::load_state(ui, &self.deps, &mut retry) {
             let deps = self.deps.get().cloned().unwrap_or_default();
             if deps.is_empty() {
-                ui.weak(tr("No dependencies."));
+                ui.label(RichText::new(tr("No dependencies.")).color(ternarygrid_ui::pal(ui).text_muted));
             }
             let rows: Vec<Vec<String>> = deps
                 .iter()
@@ -480,12 +481,41 @@ impl ObjectEditorTab {
         if widgets::load_state(ui, &self.stats, &mut retry) {
             let stats = self.stats.get().cloned().unwrap_or_default();
             if stats.is_empty() {
-                ui.weak(tr("No statistics available."));
+                ui.label(RichText::new(tr("No statistics available.")).color(ternarygrid_ui::pal(ui).text_muted));
             }
-            egui::ScrollArea::vertical().show(ui, |ui| widgets::property_grid(ui, "obj_stats", &stats));
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                stat_tiles(ui, &stats);
+                widgets::property_grid(ui, "obj_stats", &stats);
+            });
         }
         if retry {
             self.stats = Loadable::NotLoaded;
+        }
+    }
+}
+
+impl ObjectEditorTab {
+    fn page_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        match self.page {
+            ObjectPage::Properties => self.properties_page(ui, cx),
+            ObjectPage::Data => {
+                if self.data.is_none() {
+                    self.data = crate::tabs::make_table_data_view(cx, &self.conn, &self.obj);
+                }
+                match &mut self.data {
+                    Some(d) => d.ui(ui, cx),
+                    None => {
+                        ui.weak(tr("The data editor is not available."));
+                    }
+                }
+            }
+            ObjectPage::Ddl => self.ddl_page(ui, cx),
+            ObjectPage::Dependencies => self.deps_page(ui, cx),
+            ObjectPage::Statistics => self.stats_page(ui, cx),
+            ObjectPage::Diagram => {
+                let diagram = self.diagram.get_or_insert_with(|| crate::tabs::er::ErTab::embedded(self.conn.clone(), self.obj.schema_ref(), self.obj.name.clone()));
+                diagram.ui(ui, cx);
+            }
         }
     }
 }
@@ -610,27 +640,10 @@ impl TabView for ObjectEditorTab {
             }
         });
         ui.painter().hline(ui.max_rect().x_range(), tabs.response.rect.bottom() - 0.5, egui::Stroke::new(1.0, p.border));
-        match self.page {
-            ObjectPage::Properties => self.properties_page(ui, cx),
-            ObjectPage::Data => {
-                if self.data.is_none() {
-                    self.data = crate::tabs::make_table_data_view(cx, &self.conn, &self.obj);
-                }
-                match &mut self.data {
-                    Some(d) => d.ui(ui, cx),
-                    None => {
-                        ui.weak(tr("The data editor is not available."));
-                    }
-                }
-            }
-            ObjectPage::Ddl => self.ddl_page(ui, cx),
-            ObjectPage::Dependencies => self.deps_page(ui, cx),
-            ObjectPage::Statistics => self.stats_page(ui, cx),
-            ObjectPage::Diagram => {
-                let diagram = self.diagram.get_or_insert_with(|| crate::tabs::er::ErTab::embedded(self.conn.clone(), self.obj.schema_ref(), self.obj.name.clone()));
-                diagram.ui(ui, cx);
-            }
-        }
+        // The pages other than Data and Diagram sit 16 px off the edges, as the mockups' tables.
+        let padded = !matches!(self.page, ObjectPage::Data | ObjectPage::Diagram);
+        let pad = if padded { egui::Margin { left: 16, right: 16, top: 6, bottom: 8 } } else { egui::Margin::ZERO };
+        egui::Frame::new().inner_margin(pad).show(ui, |ui| self.page_ui(ui, cx));
     }
 
     fn on_action(&mut self, action: crate::keys::Action, cx: &mut AppContext) -> bool {
@@ -659,4 +672,63 @@ impl TabView for ObjectEditorTab {
     }
 
     crate::impl_tab_any!();
+}
+
+/// A sub page of the table's properties: a pill, its count in a badge.
+fn pill_tab(ui: &mut Ui, label: &str, count: Option<&str>, selected: bool) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let size = ternarygrid_ui::style::body_size(ui.ctx()) - 0.5;
+    let font = if selected { ternarygrid_ui::style::medium(ui.ctx(), size) } else { egui::FontId::proportional(size) };
+    let g = ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER);
+    let badge = count.map(|c| ui.painter().layout_no_wrap(c.to_string(), ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::SMALL), egui::Color32::PLACEHOLDER));
+    let badge_w = badge.as_ref().map_or(0.0, |b| (b.size().x + 10.0).max(18.0) + 6.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 20.0 + badge_w, 28.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label));
+    if selected {
+        ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, p.subtle);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, p.hover);
+    }
+    let color = if selected { p.text } else { p.text_muted };
+    let x = rect.left() + 10.0;
+    let gw = g.size().x;
+    ui.painter().galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, color);
+    if let Some(b) = badge {
+        let r = egui::Rect::from_min_size(egui::pos2(x + gw + 6.0, rect.center().y - 8.0), egui::vec2((b.size().x + 10.0).max(18.0), 16.0));
+        let (fill, fg) = if selected { (p.accent_soft, p.accent_text) } else { (p.subtle, p.text_muted) };
+        ui.painter().rect_filled(r, 8, fill);
+        ui.painter().galley(r.center() - b.size() / 2.0, b, fg);
+    }
+    if resp.has_focus() {
+        ternarygrid_ui::style::focus_halo(ui, rect, ternarygrid_ui::style::RADIUS);
+    }
+    resp
+}
+
+/// The figures worth a glance on top of a table's statistics, when the driver reports them.
+fn stat_tiles(ui: &mut Ui, stats: &[Property]) {
+    let get = |name: &str| stats.iter().find(|p| p.name.eq_ignore_ascii_case(name)).map(|p| p.value.clone()).filter(|v| !v.is_empty());
+    let num = |v: String| v.parse::<i64>().map(|n| ternarygrid_grid::format::group_thousands(&n.to_string())).unwrap_or(v);
+    let mut tiles: Vec<(&str, String, Option<String>)> = Vec::new();
+    if let Some(v) = get("total_size") {
+        tiles.push((tr("Total size"), v, None));
+    }
+    if let Some(v) = get("n_live_tup") {
+        tiles.push((tr("Live rows"), num(v), get("n_dead_tup").map(|d| ternarygrid_core::trf("dead {}", &[&num(d)]))));
+    }
+    if let Some(v) = get("seq_scan") {
+        tiles.push((tr("Sequential scans"), num(v), get("seq_tup_read").map(|d| ternarygrid_core::trf("rows read {}", &[&num(d)]))));
+    }
+    if let Some(v) = get("idx_scan") {
+        tiles.push((tr("Index scans"), num(v), get("idx_tup_fetch").map(|d| ternarygrid_core::trf("rows fetched {}", &[&num(d)]))));
+    }
+    if tiles.is_empty() {
+        return;
+    }
+    ui.columns(tiles.len(), |cols| {
+        for (c, (label, value, sub)) in cols.iter_mut().zip(tiles) {
+            ternarygrid_ui::parts::stat_tile(c, label, &value, sub.as_deref());
+        }
+    });
+    ui.add_space(8.0);
 }

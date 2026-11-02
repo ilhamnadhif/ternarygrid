@@ -451,21 +451,33 @@ pub fn show_plan_diagram(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewStat
 }
 
 fn plan_toolbar(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) {
+    use ternarygrid_ui::kit;
     ui.horizontal(|ui| {
-        ui.selectable_value(
-            &mut state.orientation,
-            PlanOrientation::TopDown,
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if kit::icon_button_ex(
+            ui,
             icon::ARROW_DOWN,
+            tr("Top down"),
+            state.orientation == PlanOrientation::TopDown,
+            26.0,
         )
-        .on_hover_text(tr("Top down"));
-        ui.selectable_value(
-            &mut state.orientation,
-            PlanOrientation::LeftRight,
+        .clicked()
+        {
+            state.orientation = PlanOrientation::TopDown;
+        }
+        if kit::icon_button_ex(
+            ui,
             icon::ARROW_RIGHT,
+            tr("Left to right"),
+            state.orientation == PlanOrientation::LeftRight,
+            26.0,
         )
-        .on_hover_text(tr("Left to right"));
-        ui.separator();
-        ui.label(tr("Color by"));
+        .clicked()
+        {
+            state.orientation = PlanOrientation::LeftRight;
+        }
+        kit::vdivider(ui, 16.0);
+        ui.label(egui::RichText::new(tr("Color by")).color(ternarygrid_ui::pal(ui).text_muted));
         egui::ComboBox::from_id_salt("ternarygrid_plan_metric")
             .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(tr(state.metric.label()))
@@ -474,20 +486,25 @@ fn plan_toolbar(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) {
                     ui.selectable_value(&mut state.metric, m, tr(m.label()));
                 }
             });
-        if ui
-            .button(ternarygrid_icons::ic(icon::CORNERS_OUT))
-            .on_hover_text(tr("Zoom to fit"))
-            .clicked()
-        {
+        if kit::icon_button_ex(ui, icon::CORNERS_OUT, tr("Zoom to fit"), false, 26.0).clicked() {
             state.fit_pending = true;
         }
-        ui.toggle_value(
-            &mut state.show_details,
-            ternarygrid_icons::ic(icon::SIDEBAR_SIMPLE),
+        if kit::icon_button_ex(
+            ui,
+            icon::SIDEBAR_SIMPLE,
+            tr("Show node details"),
+            state.show_details,
+            26.0,
         )
-        .on_hover_text(tr("Show node details"));
-        ui.separator();
-        ui.weak(summary_line(&plan_summary(plan)));
+        .clicked()
+        {
+            state.show_details = !state.show_details;
+        }
+        kit::vdivider(ui, 16.0);
+        ui.label(
+            egui::RichText::new(summary_line(&plan_summary(plan)))
+                .color(ternarygrid_ui::pal(ui).text_faint),
+        );
     });
 }
 

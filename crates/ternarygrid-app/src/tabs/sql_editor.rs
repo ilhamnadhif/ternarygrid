@@ -1475,14 +1475,20 @@ impl SqlEditorTab {
             };
             let elapsed = crate::widgets::format_duration(e.started.elapsed());
             let mut cancel = false;
-            egui::Frame::new().fill(ui.visuals().faint_bg_color).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+            let pal = ternarygrid_ui::pal(ui);
+            // On the accent's soft colour: what runs, for how long, and Cancel at the right.
+            egui::Frame::new().fill(pal.accent_soft).inner_margin(egui::Margin::symmetric(16, 7)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(what);
-                    ui.weak(elapsed);
-                    let stop = RichText::new(format!("{} {}", icon::STOP, tr("Cancel"))).color(crate::theme::error_color(ui.visuals().dark_mode));
-                    let keys = crate::keys::label(cx.keymap, Action::CancelQuery);
-                    cancel = ui.button(stop).on_hover_text(format!("{} ({keys})", crate::keys::action_label(Action::CancelQuery))).clicked();
+                    ui.add(egui::Spinner::new().size(14.0).color(pal.accent_text));
+                    ui.label(RichText::new(what).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))).color(pal.text));
+                    ui.label(RichText::new(elapsed).color(pal.text_muted));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let keys = crate::keys::label(cx.keymap, Action::CancelQuery);
+                        cancel = kit::button_full(ui, kit::Kind::Danger, Some(icon::STOP), tr("Cancel"), true, false)
+                            .on_hover_text(format!("{} ({keys})", crate::keys::action_label(Action::CancelQuery)))
+                            .clicked();
+                    });
                 });
             });
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
@@ -1494,18 +1500,17 @@ impl SqlEditorTab {
             Bottom::Result(i) => match self.results.get_mut(i) {
                 Some(ResultItem::Rows(p)) => p.ui(ui, cx),
                 Some(ResultItem::Plan { sql, plan, state, view }) => {
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(view, PlanView::Diagram, tr("Diagram"));
-                        ui.selectable_value(view, PlanView::Tree, tr("Tree"));
-                        ui.selectable_value(view, PlanView::Text, tr("Text"));
+                    ternarygrid_ui::parts::toolbar(ui, |ui| {
+                        let pal = ternarygrid_ui::pal(ui);
+                        ternarygrid_ui::parts::segmented_small(ui, view, &[(PlanView::Diagram, tr("Diagram")), (PlanView::Tree, tr("Tree")), (PlanView::Text, tr("Text"))]);
                         let s = ternarygrid_visual::plan::plan_summary(plan);
                         if let Some(ms) = s.execution_ms {
-                            ui.weak(trf("Execution {} ms", &[&format!("{ms:.1}")]));
+                            ui.label(RichText::new(trf("Execution {} ms", &[&format!("{ms:.1}")])).color(pal.text_faint));
                         }
                         if let Some(c) = s.total_cost {
-                            ui.weak(trf("Cost {}", &[&format!("{c:.1}")]));
+                            ui.label(RichText::new(trf("Cost {}", &[&format!("{c:.1}")])).color(pal.text_faint));
                         }
-                        if ui.small_button((ternarygrid_icons::ic(icon::FLOPPY_DISK), tr("Save plan…"))).clicked()
+                        if kit::button_full(ui, kit::Kind::Ghost, Some(icon::FLOPPY_DISK), tr("Save plan…"), true, false).clicked()
                             && let Some(path) = rfd::FileDialog::new().add_filter(tr("Execution plan"), &["json"]).set_file_name("plan.json").save_file()
                         {
                             match std::fs::write(&path, plan_file_json(sql, plan)) {
@@ -1513,7 +1518,7 @@ impl SqlEditorTab {
                                 Err(e) => cx.toasts.error(tr("Cannot save the plan"), Some(e.to_string())),
                             }
                         }
-                        ui.weak(sql.lines().next().unwrap_or(""));
+                        ui.add(egui::Label::new(RichText::new(sql.lines().next().unwrap_or("")).monospace().color(pal.text_faint)).truncate());
                     });
                     match view {
                         PlanView::Diagram => {
@@ -1525,11 +1530,10 @@ impl SqlEditorTab {
                         PlanView::Text => ternarygrid_visual::plan::show_plan_text(ui, plan),
                     }
                 }
-                Some(ResultItem::Error { sql, text }) => {
-                    crate::widgets::error_box(ui, text);
-                    ui.weak(sql.lines().next().unwrap_or(""));
+                Some(ResultItem::Error { sql, text }) if error_card(ui, sql, text) => {
+                    cx.push(AppCommand::AskAi { connection: self.conn.clone(), sql: sql.clone(), error: Some(text.clone()) });
                 }
-                None => {}
+                Some(ResultItem::Error { .. }) | None => {}
             },
             Bottom::Statistics => {
                 let rows: Vec<Vec<String>> = self
@@ -1608,13 +1612,45 @@ impl SqlEditorTab {
                 });
             }
             Bottom::Transaction => {
-                let log = match &self.session {
-                    SessionSlot::Ready(s) => s.tx_state().log,
-                    _ => Vec::new(),
+                let (log, manual) = match &self.session {
+                    SessionSlot::Ready(s) => {
+                        let st = s.tx_state();
+                        (st.log, st.mode == TransactionMode::Manual)
+                    }
+                    _ => (Vec::new(), false),
                 };
                 if log.is_empty() {
-                    ui.weak(tr("No uncommitted statements."));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(tr("No uncommitted statements.")).color(ternarygrid_ui::pal(ui).text_muted));
                 } else {
+                    // What is pending, and the two ways out, above the log.
+                    if manual {
+                        let pal = ternarygrid_ui::pal(ui);
+                        let mut decision = None;
+                        egui::Frame::new().fill(ternarygrid_ui::parts::Tone::Warning.fill(ui)).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 9)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(icon::PAUSE).color(pal.warn));
+                                ui.label(
+                                    RichText::new(trf("{} statements are not committed yet.", &[&log.len()])).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text),
+                                );
+                                ui.label(RichText::new(tr("Other sessions do not see them until you commit.")).color(pal.text));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let keys = crate::keys::label(cx.keymap, Action::Commit);
+                                    if kit::button_full(ui, kit::Kind::Primary, Some(icon::CHECK), tr("Commit"), true, false).on_hover_text(keys).clicked() {
+                                        decision = Some(true);
+                                    }
+                                    if kit::button_full(ui, kit::Kind::Ghost, None, tr("Rollback"), true, false).clicked() {
+                                        decision = Some(false);
+                                    }
+                                });
+                            });
+                        });
+                        if let Some(commit) = decision {
+                            self.commit(cx, commit);
+                        }
+                        ui.add_space(8.0);
+                    }
                     let rows: Vec<Vec<String>> = log
                         .iter()
                         .map(|e| {
@@ -2317,4 +2353,47 @@ impl SqlEditorTab {
     pub fn variables(&self) -> &BTreeMap<String, String> {
         &self.variables
     }
+}
+
+/// A failed statement: the first line of the error with its SQLSTATE and Copy, the rest of the
+/// message (position, hint), and "Fix error" (the AI assistant). Returns true when it is clicked.
+fn error_card(ui: &mut Ui, sql: &str, text: &str) -> bool {
+    use ternarygrid_ui::parts::Tone;
+    let pal = ternarygrid_ui::pal(ui);
+    let mut fix = false;
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or("");
+    let rest: Vec<&str> = lines.collect();
+    let state = text.find("SQLSTATE").map(|i| text[i..].chars().take(14).collect::<String>().trim_end_matches([')', ']', '.', ',']).to_string());
+    egui::Frame::new()
+        .fill(Tone::Error.fill(ui))
+        .stroke(egui::Stroke::new(1.0, ternarygrid_ui::soft(pal.err, 0.35)))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .outer_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::X_CIRCLE).font(ternarygrid_ui::style::icon_font(18.0)).color(pal.err));
+                ui.add(egui::Label::new(RichText::new(first).font(ternarygrid_ui::style::semibold(ui.ctx(), 14.0)).color(pal.text)).wrap().selectable(true));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if kit::button_full(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), true, false).clicked() {
+                        ui.ctx().copy_text(text.to_string());
+                    }
+                    if let Some(s) = &state {
+                        kit::pill(ui, s, pal.text_muted);
+                    }
+                });
+            });
+            if !rest.is_empty() {
+                ui.add(egui::Label::new(RichText::new(rest.join("\n")).monospace().color(pal.text)).wrap().selectable(true));
+            }
+            ui.horizontal(|ui| {
+                fix = kit::button_full(ui, kit::Kind::Ghost, Some(icon::SPARKLE), tr("Fix error"), true, true).clicked();
+                ui.label(RichText::new(tr("The AI assistant reads the statement and the error and proposes a fix.")).color(pal.text_muted));
+            });
+            ui.add(egui::Label::new(RichText::new(sql.lines().next().unwrap_or("")).monospace().color(pal.text_faint)).truncate());
+        });
+    fix
 }

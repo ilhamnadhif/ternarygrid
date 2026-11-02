@@ -675,6 +675,10 @@ impl TernaryGridApp {
                     self.ai_open = true;
                 }
             },
+            AppCommand::AskAi { connection, sql, error } => {
+                self.ai_panel = Some(crate::tabs::ai::AiAssistantTab::ask_about(connection, sql, error));
+                self.ai_open = true;
+            }
             AppCommand::OpenDataCompare { connection, table } => {
                 self.open_tab(Box::new(crate::tabs::data_compare::DataCompareTab::new(connection, table)));
             }

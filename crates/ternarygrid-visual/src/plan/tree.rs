@@ -49,15 +49,28 @@ pub fn show_plan_tree(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) 
     }
 
     ui.horizontal(|ui| {
-        if ui
-            .small_button((ternarygrid_icons::ic(icon::CARET_DOWN), tr("Expand all")))
-            .clicked()
+        use ternarygrid_ui::kit;
+        if kit::button_full(
+            ui,
+            kit::Kind::Ghost,
+            Some(icon::CARET_DOWN),
+            tr("Expand all"),
+            true,
+            false,
+        )
+        .clicked()
         {
             state.collapsed.clear();
         }
-        if ui
-            .small_button((ternarygrid_icons::ic(icon::CARET_RIGHT), tr("Collapse all")))
-            .clicked()
+        if kit::button_full(
+            ui,
+            kit::Kind::Ghost,
+            Some(icon::CARET_RIGHT),
+            tr("Collapse all"),
+            true,
+            false,
+        )
+        .clicked()
         {
             state.collapsed = flat
                 .iter()
@@ -65,8 +78,8 @@ pub fn show_plan_tree(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) 
                 .map(|f| f.path.clone())
                 .collect();
         }
-        ui.separator();
-        ui.label(tr("Color by"));
+        kit::vdivider(ui, 16.0);
+        ui.label(RichText::new(tr("Color by")).color(ternarygrid_ui::pal(ui).text_muted));
         egui::ComboBox::from_id_salt("ternarygrid_plan_tree_metric")
             .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(tr(state.metric.label()))

@@ -4,8 +4,9 @@ use super::frame::GridFrame;
 use super::{selection_copy_data_limited, sql_table_name};
 use crate::copy::{CopyFormat, QuoteMode, render};
 use crate::expr::Expr;
-use egui::{ComboBox, Grid, Key, Modal, ScrollArea, TextEdit, Ui, Window};
+use egui::{ComboBox, Key, ScrollArea, TextEdit, Ui};
 use ternarygrid_core::{tr, trf};
+use ternarygrid_ui::parts::{Dialog, form_row};
 
 impl GridFrame<'_> {
     /// Show open dialogs.
@@ -32,72 +33,69 @@ impl GridFrame<'_> {
             Ok(data) => render(&data, &opts, &self.options.format, self.options.dialect.as_deref()),
             Err(e) => e,
         };
-        let resp = Modal::new(self.id.with("copy_dialog")).show(ui.ctx(), |ui| {
-            ui.set_width(460.0);
-            ui.heading(tr("Advanced copy"));
-            ui.add_space(4.0);
-            Grid::new(self.id.with("copy_grid")).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label(tr("Format"));
-                ComboBox::from_id_salt(self.id.with("copy_format")).icon(ternarygrid_ui::kit::combo_caret).selected_text(opts.format.label()).show_ui(ui, |ui| {
-                    for f in CopyFormat::ALL {
-                        ui.selectable_value(&mut opts.format, f, f.label());
-                    }
+        let id = self.id;
+        let lw = 110.0;
+        let (resp, ()) = Dialog::new(tr("Advanced copy")).icon(egui_phosphor::regular::COPY).width(540.0).show_modal(
+            ui.ctx(),
+            id.with("copy_dialog"),
+            |ui| {
+                form_row(ui, tr("Format"), lw, |ui| {
+                    ComboBox::from_id_salt(id.with("copy_format")).icon(ternarygrid_ui::kit::combo_caret).width(220.0).selected_text(opts.format.label()).show_ui(ui, |ui| {
+                        for f in CopyFormat::ALL {
+                            ui.selectable_value(&mut opts.format, f, f.label());
+                        }
+                    });
                 });
-                ui.end_row();
-                ui.label(tr("Options"));
-                ui.horizontal(|ui| {
+                form_row(ui, tr("Options"), lw, |ui| {
                     ui.checkbox(&mut opts.include_header, tr("Column names"));
                     ui.checkbox(&mut opts.include_row_numbers, tr("Row numbers"));
                     ui.checkbox(&mut opts.formatted, tr("Formatted values"));
                 });
-                ui.end_row();
                 if opts.format.is_delimited() {
-                    ui.label(tr("Delimiter"));
-                    ui.horizontal(|ui| {
+                    form_row(ui, tr("Delimiter"), lw, |ui| {
                         let default = if opts.format == CopyFormat::Csv { "," } else { "\\t" };
-                        ui.add(TextEdit::singleline(&mut opts.delimiter).desired_width(60.0).hint_text(default));
-                        ui.label(tr("Quote"));
-                        ComboBox::from_id_salt(self.id.with("copy_quote"))
-                            .icon(ternarygrid_ui::kit::combo_caret)
-                            .selected_text(match opts.quote {
-                                QuoteMode::Auto => tr("When needed"),
-                                QuoteMode::Always => tr("Always"),
-                                QuoteMode::Never => tr("Never"),
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut opts.quote, QuoteMode::Auto, tr("When needed"));
-                                ui.selectable_value(&mut opts.quote, QuoteMode::Always, tr("Always"));
-                                ui.selectable_value(&mut opts.quote, QuoteMode::Never, tr("Never"));
-                            });
+                        ui.add(TextEdit::singleline(&mut opts.delimiter).desired_width(70.0).hint_text(default).font(egui::TextStyle::Monospace));
                     });
-                    ui.end_row();
+                    form_row(ui, tr("Quote"), lw, |ui| {
+                        ternarygrid_ui::parts::segmented(
+                            ui,
+                            &mut opts.quote,
+                            &[(QuoteMode::Auto, tr("When needed")), (QuoteMode::Always, tr("Always")), (QuoteMode::Never, tr("Never"))],
+                        );
+                    });
                 }
-                ui.label(tr("NULL as"));
-                ui.add(TextEdit::singleline(&mut opts.null_text).desired_width(120.0).hint_text(tr("(empty)")));
-                ui.end_row();
+                form_row(ui, tr("NULL as"), lw, |ui| {
+                    ui.add(TextEdit::singleline(&mut opts.null_text).desired_width(140.0).hint_text(tr("(empty)")));
+                });
                 if opts.format == CopyFormat::SqlInsert {
-                    ui.label(tr("Table"));
-                    ui.add(TextEdit::singleline(&mut opts.sql_table).desired_width(240.0));
-                    ui.end_row();
+                    form_row(ui, tr("Table"), lw, |ui| {
+                        ui.add(TextEdit::singleline(&mut opts.sql_table).desired_width(260.0));
+                    });
                 }
-            });
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(tr("Preview")).strong());
-            ScrollArea::both().max_height(160.0).id_salt(self.id.with("copy_preview")).show(ui, |ui| {
-                let mut p = preview.as_str();
-                ui.add(TextEdit::multiline(&mut p).code_editor().desired_width(f32::INFINITY).desired_rows(4));
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button(tr("Copy")).clicked() || ui.input(|i| i.key_pressed(Key::Enter) && i.modifiers.command) {
-                    do_copy = true;
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    close = true;
-                }
-            });
-        });
-        if resp.should_close() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(tr("Preview")).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)));
+                ternarygrid_ui::parts::code_frame()(ui).show(ui, |ui| {
+                    ScrollArea::both().max_height(160.0).id_salt(id.with("copy_preview")).show(ui, |ui| {
+                        let mut p = preview.as_str();
+                        ui.add(TextEdit::multiline(&mut p).code_editor().frame(egui::Frame::NONE).desired_width(f32::INFINITY).desired_rows(4));
+                    });
+                });
+            },
+            |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    use ternarygrid_ui::kit;
+                    if kit::primary_icon(ui, egui_phosphor::regular::COPY, tr("Copy")).on_hover_text("⌘↩").clicked()
+                        || ui.input(|i| i.key_pressed(Key::Enter) && i.modifiers.command)
+                    {
+                        do_copy = true;
+                    }
+                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                        close = true;
+                    }
+                });
+            },
+        );
+        if resp.close {
             close = true;
         }
         self.state.copy_options = opts.clone();
@@ -115,17 +113,24 @@ impl GridFrame<'_> {
         let Some((title, sql)) = self.state.rt.sql_window.clone() else { return };
         let mut open = true;
         let mut copy = false;
-        Window::new(title).id(self.id.with("sql_window")).open(&mut open).default_size([560.0, 320.0]).resizable(true).collapsible(false).show(ui.ctx(), |ui| {
-            ui.horizontal(|ui| {
-                if ui.button(format!("{}  {}", egui_phosphor::regular::COPY, tr("Copy"))).clicked() {
+        Dialog::new(&title).icon(egui_phosphor::regular::FILE_SQL).width(620.0).show_window(
+            ui.ctx(),
+            self.id.with("sql_window"),
+            &mut open,
+            None,
+            |ui| {
+                if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy"), true, false).clicked() {
                     copy = true;
                 }
-            });
-            ScrollArea::both().show(ui, |ui| {
-                let mut s = sql.as_str();
-                ui.add(TextEdit::multiline(&mut s).code_editor().desired_width(f32::INFINITY));
-            });
-        });
+                ternarygrid_ui::parts::code_frame()(ui).show(ui, |ui| {
+                    ScrollArea::both().max_height(340.0).show(ui, |ui| {
+                        let mut s = sql.as_str();
+                        ui.add(TextEdit::multiline(&mut s).code_editor().frame(egui::Frame::NONE).desired_width(f32::INFINITY));
+                    });
+                });
+            },
+            None,
+        );
         if copy {
             ui.ctx().copy_text(sql);
             self.notify(tr("SQL copied to the clipboard"), false);
@@ -141,44 +146,51 @@ impl GridFrame<'_> {
         let check = if dlg.expression.trim().is_empty() { None } else { Some(Expr::compile(&dlg.expression, &names).map_err(|e| e.display_with_position(&dlg.expression))) };
         let mut apply = false;
         let mut close = false;
-        let resp = Modal::new(self.id.with("virtual_dialog")).show(ui.ctx(), |ui| {
-            ui.set_width(480.0);
-            ui.heading(if dlg.editing.is_some() { tr("Edit virtual column") } else { tr("Add virtual column") });
-            Grid::new(self.id.with("virtual_grid")).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label(tr("Name"));
-                ui.add(TextEdit::singleline(&mut dlg.name).desired_width(300.0));
-                ui.end_row();
-                ui.label(tr("Expression"));
-                ui.add(TextEdit::multiline(&mut dlg.expression).code_editor().desired_rows(3).desired_width(300.0).hint_text("price * quantity"));
-                ui.end_row();
-            });
-            match &check {
-                Some(Err(e)) => {
-                    ui.colored_label(ui.visuals().error_fg_color, e);
+        let editing = dlg.editing.is_some();
+        let lw = 100.0;
+        let title = if editing { tr("Edit virtual column") } else { tr("Add virtual column") };
+        let (resp, ()) = Dialog::new(title).icon(egui_phosphor::regular::FUNCTION).subtitle(tr("Computed on the client from the row's values")).width(540.0).show_modal(
+            ui.ctx(),
+            self.id.with("virtual_dialog"),
+            |ui| {
+                form_row(ui, tr("Name"), lw, |ui| {
+                    ui.add(TextEdit::singleline(&mut dlg.name).desired_width(300.0));
+                });
+                form_row(ui, tr("Expression"), lw, |ui| {
+                    ui.add(TextEdit::multiline(&mut dlg.expression).code_editor().desired_rows(3).desired_width(360.0).hint_text("price * quantity"));
+                });
+                match &check {
+                    Some(Err(e)) => {
+                        ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Error, e);
+                    }
+                    Some(Ok(_)) => {
+                        ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Success, tr("Expression is valid"));
+                    }
+                    None => {}
                 }
-                Some(Ok(_)) => {
-                    ui.weak(tr("Expression is valid"));
+                if let Some(e) = &dlg.error {
+                    ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Error, e);
                 }
-                None => {}
-            }
-            if let Some(e) = &dlg.error {
-                ui.colored_label(ui.visuals().error_fg_color, e);
-            }
-            ui.collapsing(tr("Expression help"), |ui| {
-                ui.label(crate::expr::help_text());
-                ui.label(trf("Columns: {}", &[&names.join(", ")]));
-            });
-            ui.horizontal(|ui| {
-                let ok = matches!(check, Some(Ok(_)));
-                if ui.add_enabled(ok, egui::Button::new(if dlg.editing.is_some() { tr("Save") } else { tr("Add") })).clicked() {
-                    apply = true;
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    close = true;
-                }
-            });
-        });
-        if resp.should_close() {
+                ui.collapsing(tr("Expression help"), |ui| {
+                    ui.label(crate::expr::help_text());
+                    ui.label(trf("Columns: {}", &[&names.join(", ")]));
+                });
+            },
+            |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    use ternarygrid_ui::kit;
+                    let ok = matches!(check, Some(Ok(_)));
+                    let label = if editing { tr("Save") } else { tr("Add") };
+                    if ui.add_enabled_ui(ok, |ui| kit::button_ex(ui, kit::Kind::Primary, None, label, false).clicked()).inner {
+                        apply = true;
+                    }
+                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                        close = true;
+                    }
+                });
+            },
+        );
+        if resp.close {
             close = true;
         }
         if apply {

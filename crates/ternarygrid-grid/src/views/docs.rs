@@ -93,8 +93,10 @@ impl<'a> DocumentView<'a> {
             state.key = Some(key);
             state.built_at = ui.input(|i| i.time);
         }
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.button(format!("{}  {}", egui_phosphor::regular::COPY, tr("Copy"))).clicked() {
+            ui.add_space(8.0);
+            if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy"), true, false).clicked() {
                 ui.ctx().copy_text(state.text.as_str().to_string());
             }
             ui.checkbox(&mut state.selected_only, tr("Selected rows only"));

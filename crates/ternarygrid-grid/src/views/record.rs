@@ -239,25 +239,28 @@ impl<'a> RecordView<'a> {
         }
         focus.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, trf("Record view, row {} of {}", &[&(row + 1), &nrows])));
         let total_columns = grid.visible_columns().len();
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(4, 4)).show(ui, |ui| {
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
             ui.horizontal(|ui| {
+                use ternarygrid_ui::kit;
                 ui.spacing_mut().item_spacing.x = 4.0;
-                if ui.add_enabled(row > 0, Button::new(ternarygrid_icons::ic(icon::CARET_DOUBLE_LEFT))).on_hover_text(tr("First row")).clicked() {
+                let pal = ternarygrid_ui::pal(ui);
+                let nav = |ui: &mut Ui, on: bool, glyph: &str, tip: &str| ui.add_enabled_ui(on, |ui| kit::icon_button_ex(ui, glyph, tip, false, 26.0).clicked()).inner;
+                if nav(ui, row > 0, icon::CARET_DOUBLE_LEFT, tr("First row")) {
                     go_to = Some(0);
                 }
-                if ui.add_enabled(row > 0, Button::new(ternarygrid_icons::ic(icon::CARET_LEFT))).on_hover_text(tr("Previous row (←)")).clicked() {
+                if nav(ui, row > 0, icon::CARET_LEFT, tr("Previous row (←)")) {
                     go_to = Some(row - 1);
                 }
-                ui.label(tr("Row"));
+                ui.label(RichText::new(tr("Row")).color(pal.text_muted));
                 let mut n = row + 1;
                 if ui.add(egui::DragValue::new(&mut n).range(1..=nrows).speed(0.25)).on_hover_text(tr("Type or drag to go to a row")).changed() {
                     go_to = Some(n.clamp(1, nrows) - 1);
                 }
-                ui.label(RichText::new(trf("of {}", &[&crate::format::group_thousands(&nrows.to_string())])).weak());
-                if ui.add_enabled(row + 1 < nrows, Button::new(ternarygrid_icons::ic(icon::CARET_RIGHT))).on_hover_text(tr("Next row (→)")).clicked() {
+                ui.label(RichText::new(trf("of {}", &[&crate::format::group_thousands(&nrows.to_string())])).color(pal.text_muted));
+                if nav(ui, row + 1 < nrows, icon::CARET_RIGHT, tr("Next row (→)")) {
                     go_to = Some(row + 1);
                 }
-                if ui.add_enabled(row + 1 < nrows, Button::new(ternarygrid_icons::ic(icon::CARET_DOUBLE_RIGHT))).on_hover_text(tr("Last row")).clicked() {
+                if nav(ui, row + 1 < nrows, icon::CARET_DOUBLE_RIGHT, tr("Last row")) {
                     go_to = Some(nrows - 1);
                 }
                 let state_label = match model.row_state(row) {
@@ -267,13 +270,10 @@ impl<'a> RecordView<'a> {
                     RowState::Unchanged => None,
                 };
                 if let Some(s) = state_label {
-                    let warn = ui.visuals().warn_fg_color;
-                    egui::Frame::new().fill(warn.gamma_multiply(0.15)).corner_radius(8).inner_margin(egui::Margin::symmetric(8, 1)).show(ui, |ui| {
-                        ui.label(RichText::new(s).small().color(warn));
-                    });
+                    kit::pill(ui, s, pal.warn);
                 }
-                ui.add_space(12.0);
-                ui.add(TextEdit::singleline(&mut state.column_filter).hint_text(format!("{}  {}", icon::MAGNIFYING_GLASS, tr("Filter columns"))).desired_width(220.0));
+                kit::vdivider(ui, 16.0);
+                kit::search_field(ui, ui.id().with("record_column_filter"), &mut state.column_filter, tr("Filter columns"), 220.0);
                 ui.add_space(8.0);
                 if hide_empty_toggle(ui, state, options, tr("Hide the columns that are NULL or empty in this row")) {
                     actions.push(state.prefs(options));

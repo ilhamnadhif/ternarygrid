@@ -92,51 +92,47 @@ pub struct ResultViewer<'a> {
 /// An error in a pop-up, in full (selectable, scrolls when long), with what
 /// can be done about it: define a virtual key for a table without a key.
 fn error_popup(ui: &Ui, id: Id, message: &str, model: &ResultModel, state: &mut ResultViewState, actions: &mut Vec<GridAction>) {
-    use egui::{Button, RichText};
+    use egui::{RichText, ScrollArea};
     use egui_phosphor::regular as icon;
+    use ternarygrid_ui::{kit, parts::Dialog};
     let no_key = model.read_only_reason().is_some_and(|r| r.virtual_key_helps() && r.message() == message);
     let mut close = false;
-    let modal = egui::Modal::new(id.with("error_popup")).show(ui.ctx(), |ui| {
-        ui.set_width(480.0);
-        let error = ui.visuals().error_fg_color;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(if no_key { icon::LOCK_SIMPLE } else { icon::WARNING_CIRCLE }).color(error).size(24.0));
-            ui.heading(if no_key { tr("This table is read-only") } else { tr("Error") });
-        });
-        ui.add_space(6.0);
-        if no_key {
-            ui.label(tr("TernaryGrid saves a change with UPDATE … WHERE <key> = …, so it needs a primary key, a unique key or a unique index to find exactly that row. This table has none in the result."));
-            ui.add_space(4.0);
-            ui.label(tr("Define a virtual key (columns whose values identify a row) to edit it here, or add a primary key to the table."));
-        } else {
-            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                ui.add(egui::Label::new(message).wrap().selectable(true));
-            });
-        }
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if ui.button(format!("{} {}", icon::COPY, tr("Copy"))).clicked() {
+    let title = if no_key { tr("This table is read-only") } else { tr("Error") };
+    let dialog = Dialog::new(title).icon(if no_key { icon::LOCK_SIMPLE } else { icon::WARNING_CIRCLE }).width(520.0);
+    let (resp, ()) = dialog.show_modal(
+        ui.ctx(),
+        id.with("error_popup"),
+        |ui| {
+            let pal = ternarygrid_ui::pal(ui);
+            if no_key {
+                ui.add(egui::Label::new(tr("TernaryGrid saves a change with UPDATE … WHERE <key> = …, so it needs a primary key, a unique key or a unique index to find exactly that row. This table has none in the result.")).wrap());
+                ui.add(egui::Label::new(RichText::new(tr("Define a virtual key (columns whose values identify a row) to edit it here, or add a primary key to the table.")).color(pal.text_muted)).wrap());
+            } else {
+                ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    ui.add(egui::Label::new(message).wrap().selectable(true));
+                });
+            }
+        },
+        |ui| {
+            if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), false).clicked() {
                 ui.ctx().copy_text(message.to_string());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let accent = ui.visuals().selection.stroke.color;
-                let on_accent = if ui.visuals().dark_mode { egui::Color32::BLACK } else { egui::Color32::WHITE };
-                let primary = |text: String| Button::new(RichText::new(text).color(on_accent).strong()).fill(accent);
                 if no_key {
-                    if ui.add(primary(format!("{} {}", icon::KEY, tr("Define virtual key…")))).clicked() {
+                    if kit::primary_icon(ui, icon::KEY, tr("Define virtual key…")).clicked() {
                         actions.push(GridAction::DefineVirtualKey { table: crate::model::source_table(model.columns()).ok() });
                         close = true;
                     }
-                    if ui.button(tr("Close")).clicked() {
+                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Close"), false).clicked() {
                         close = true;
                     }
-                } else if ui.add(primary(tr("OK").to_string())).clicked() {
+                } else if kit::primary(ui, tr("OK")).clicked() {
                     close = true;
                 }
             });
-        });
-    });
-    if close || modal.should_close() {
+        },
+    );
+    if close || resp.close {
         state.toolbar.error_popup = None;
     }
 }
@@ -144,24 +140,27 @@ fn error_popup(ui: &Ui, id: Id, message: &str, model: &ResultModel, state: &mut 
 /// The error of a failed fetch above the result: the message (selectable, scrolls
 /// when long), Copy and ×. Returns true when it was closed.
 fn fetch_error_bar(ui: &mut Ui, message: &str) -> bool {
-    use egui::{Button, Label, Margin, RichText, ScrollArea, Stroke};
+    use egui::{Label, Margin, RichText, ScrollArea};
     use egui_phosphor::regular as icon;
-    let error = ui.visuals().error_fg_color;
+    use ternarygrid_ui::parts::Tone;
+    let pal = ternarygrid_ui::pal(ui);
     let mut close = false;
-    Frame::new().fill(error.gamma_multiply(0.12)).stroke(Stroke::new(1.0, error.gamma_multiply(0.45))).inner_margin(Margin::symmetric(8, 5)).show(ui, |ui| {
+    Frame::new().fill(Tone::Error.fill(ui)).inner_margin(Margin::symmetric(16, 9)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
         ui.horizontal_top(|ui| {
-            ui.label(RichText::new(icon::WARNING_CIRCLE).color(error));
-            let text_width = (ui.available_width() - 90.0).max(80.0);
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.label(RichText::new(icon::X_CIRCLE).font(ternarygrid_ui::style::icon_font(16.0)).color(pal.err));
+            let text_width = (ui.available_width() - 70.0).max(80.0);
             ui.allocate_ui(egui::vec2(text_width, 0.0), |ui| {
                 ScrollArea::vertical().max_height(72.0).id_salt("fetch_error").show(ui, |ui| {
-                    ui.add(Label::new(message).wrap().selectable(true));
+                    ui.add(Label::new(RichText::new(message).color(pal.text)).wrap().selectable(true));
                 });
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                if ui.add(Button::new(icon::X).frame(false)).on_hover_text(tr("Close")).clicked() {
+                if ternarygrid_ui::kit::icon_button_ex(ui, icon::X, tr("Close"), false, 24.0).clicked() {
                     close = true;
                 }
-                if ui.add(Button::new(icon::COPY).frame(false)).on_hover_text(tr("Copy")).clicked() {
+                if ternarygrid_ui::kit::icon_button_ex(ui, icon::COPY, tr("Copy"), false, 24.0).clicked() {
                     ui.ctx().copy_text(message.to_string());
                 }
             });
@@ -298,7 +297,9 @@ impl<'a> ResultViewer<'a> {
                                         ui.spacing_mut().item_spacing.x = 2.0;
                                         for p in state.toolbar.open_panels.clone() {
                                             let selected = state.active_panel == Some(p);
-                                            let (select, close) = panel_tab(ui, p, selected, selected || !compact);
+                                            // Only the shown panel names itself; the others are icons (their name in a tooltip).
+                                            let _ = compact;
+                                            let (select, close) = panel_tab(ui, p, selected, selected);
                                             if close {
                                                 state.toolbar.set_panel_open(p, false);
                                             } else if select {

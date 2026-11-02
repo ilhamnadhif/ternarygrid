@@ -90,11 +90,14 @@ impl<'a> GroupingPanel<'a> {
         }
         let names = model.column_names();
         let mut changed = false;
+        let pal = ternarygrid_ui::pal(ui);
         ui.horizontal_wrapped(|ui| {
-            ui.label(tr("Group by"));
+            ui.label(RichText::new(tr("Group by")).color(pal.text_muted));
             let mut remove = None;
             for (i, c) in state.spec.columns.iter().enumerate() {
-                if ui.small_button(format!("{} ✕", names.get(*c).map_or("?", String::as_str))).clicked() {
+                // A chip per grouping column; its × removes it.
+                let label = format!("{}  {}", names.get(*c).map_or("?", String::as_str), egui_phosphor::regular::X);
+                if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, None, &label, true, false).clicked() {
                     remove = Some(i);
                 }
             }
@@ -112,7 +115,7 @@ impl<'a> GroupingPanel<'a> {
             });
         });
         ui.horizontal(|ui| {
-            ui.label(tr("Measure"));
+            ui.label(RichText::new(tr("Measure")).color(pal.text_muted));
             let current = state.spec.measure.and_then(|m| names.get(m)).cloned().unwrap_or_else(|| tr("(none)").to_string());
             ComboBox::from_id_salt("ternarygrid_group_measure").icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
                 if ui.selectable_label(state.spec.measure.is_none(), tr("(none)")).clicked() {
@@ -128,7 +131,7 @@ impl<'a> GroupingPanel<'a> {
                 }
             });
             ui.checkbox(&mut state.live, tr("Live"));
-            if ui.button(tr("Refresh")).clicked() {
+            if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::ARROWS_CLOCKWISE), tr("Refresh"), true, false).clicked() {
                 changed = true;
             }
         });
@@ -137,21 +140,18 @@ impl<'a> GroupingPanel<'a> {
         if !state.spec.columns.is_empty() && (changed || (stale && (state.live || state.result.is_none()))) {
             Self::start(model, state, ui.ctx());
         }
-        ui.separator();
+        ui.add_space(4.0);
         if state.spec.columns.is_empty() {
-            ui.weak(tr("Choose one or more columns to group the fetched rows"));
+            ui.label(RichText::new(tr("Choose one or more columns to group the fetched rows")).color(pal.text_muted));
             return None;
         }
         if state.task.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.weak(tr("Grouping…"));
-            });
+            ternarygrid_ui::parts::spinner_label(ui, tr("Grouping…"));
         }
         let Some(result) = &state.result else { return None };
-        ui.weak(trf("{} groups in {} rows", &[&result.groups.len(), &crate::format::group_thousands(&result.rows.to_string())]));
+        ui.label(RichText::new(trf("{} groups in {} rows", &[&result.groups.len(), &crate::format::group_thousands(&result.rows.to_string())])).color(pal.text_faint));
         if result.truncated {
-            ui.colored_label(ui.visuals().warn_fg_color, trf("More than {} groups; the rest were dropped", &[&MAX_GROUPS]));
+            ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Warning, &trf("More than {} groups; the rest were dropped", &[&MAX_GROUPS]));
         }
         let spec = state.spec.clone();
         let has_measure = spec.measure.is_some();
@@ -159,13 +159,14 @@ impl<'a> GroupingPanel<'a> {
         let mut clicked: Option<usize> = None;
         ScrollArea::both().auto_shrink([false, false]).show_rows(ui, row_h, result.groups.len(), |ui, range| {
             egui::Grid::new("ternarygrid_groups").striped(true).num_columns(spec.columns.len() + 3).show(ui, |ui| {
+                let head = |ui: &mut Ui, t: &str| ui.label(RichText::new(t).font(ternarygrid_ui::style::semibold(ui.ctx(), 12.0)).color(pal.text_muted));
                 for &c in &spec.columns {
-                    ui.strong(names.get(c).map_or("?", String::as_str));
+                    head(ui, names.get(c).map_or("?", String::as_str));
                 }
-                ui.strong(tr("Count"));
+                head(ui, tr("Count"));
                 if has_measure {
-                    ui.strong(tr("Sum"));
-                    ui.strong(tr("Avg"));
+                    head(ui, tr("Sum"));
+                    head(ui, tr("Avg"));
                 }
                 ui.end_row();
                 for i in range {

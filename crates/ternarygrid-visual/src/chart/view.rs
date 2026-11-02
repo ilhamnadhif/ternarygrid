@@ -594,19 +594,30 @@ fn column_name(columns: &[ColumnMeta], i: Option<usize>, none: &str) -> String {
 /// Chart configuration editor (type, X, Y, series, aggregate, options).
 /// Returns true when something changed.
 pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartConfig) -> bool {
+    use ternarygrid_ui::{kit, parts};
     let before = config.clone();
-    ui.horizontal_wrapped(|ui| {
-        for k in ChartKind::ALL {
-            ui.selectable_value(
-                &mut config.kind,
-                k,
-                format!("{} {}", k.icon(), tr(k.label())),
-            );
-        }
-        ui.separator();
-        ui.label(tr("X"));
+    ui.spacing_mut().item_spacing.y = 10.0;
+    // The chart type: one icon group.
+    let segments: Vec<kit::Segment> = ChartKind::ALL
+        .iter()
+        .map(|k| kit::Segment {
+            icon: k.icon(),
+            tooltip: tr(k.label()),
+            on: config.kind == *k,
+        })
+        .collect();
+    if let Some(i) = kit::button_group(ui, &segments)
+        .iter()
+        .position(|r| r.clicked())
+    {
+        config.kind = ChartKind::ALL[i];
+    }
+    let lw = 74.0;
+    let width = (ui.available_width() - lw - 8.0).max(80.0);
+    parts::form_row(ui, tr("X"), lw, |ui| {
         egui::ComboBox::from_id_salt("ternarygrid_chart_x")
-            .icon(ternarygrid_ui::kit::combo_caret)
+            .icon(kit::combo_caret)
+            .width(width)
             .selected_text(column_name(columns, config.x_column, tr("(row number)")))
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut config.x_column, None, tr("(row number)"));
@@ -614,18 +625,19 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
                     ui.selectable_value(&mut config.x_column, Some(i), c.name.as_str());
                 }
             });
-        ui.label(tr("Y"));
-        let y_text = if config.y_columns.is_empty() {
-            tr("(none)").to_string()
-        } else {
-            config
-                .y_columns
-                .iter()
-                .filter_map(|&i| columns.get(i))
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+    });
+    let y_text = if config.y_columns.is_empty() {
+        tr("(none)").to_string()
+    } else {
+        config
+            .y_columns
+            .iter()
+            .filter_map(|&i| columns.get(i))
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    parts::form_row(ui, tr("Y"), lw, |ui| {
         ui.menu_button(
             format!("{y_text} {}", egui_phosphor::regular::CARET_DOWN),
             |ui| {
@@ -647,9 +659,11 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
                 }
             },
         );
-        ui.label(tr("Series"));
+    });
+    parts::form_row(ui, tr("Series"), lw, |ui| {
         egui::ComboBox::from_id_salt("ternarygrid_chart_series")
-            .icon(ternarygrid_ui::kit::combo_caret)
+            .icon(kit::combo_caret)
+            .width(width)
             .selected_text(column_name(columns, config.series_column, tr("(none)")))
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut config.series_column, None, tr("(none)"));
@@ -657,23 +671,26 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
                     ui.selectable_value(&mut config.series_column, Some(i), c.name.as_str());
                 }
             });
-        ui.label(tr("Aggregate"));
+    });
+    parts::form_row(ui, tr("Aggregate"), lw, |ui| {
         egui::ComboBox::from_id_salt("ternarygrid_chart_agg")
-            .icon(ternarygrid_ui::kit::combo_caret)
+            .icon(kit::combo_caret)
+            .width(width)
             .selected_text(tr(config.aggregate.label()))
             .show_ui(ui, |ui| {
                 for a in ChartAggregate::ALL {
                     ui.selectable_value(&mut config.aggregate, a, tr(a.label()));
                 }
             });
-        ui.checkbox(&mut config.sort_x, tr("Sort X"));
-        if config.kind.can_stack() {
-            ui.checkbox(&mut config.stacked, tr("Stacked"));
-        }
-        if config.kind == ChartKind::Pie {
-            ui.checkbox(&mut config.donut, tr("Donut"));
-        }
-        ui.label(tr("Max points"));
+    });
+    ui.checkbox(&mut config.sort_x, tr("Sort X"));
+    if config.kind.can_stack() {
+        ui.checkbox(&mut config.stacked, tr("Stacked"));
+    }
+    if config.kind == ChartKind::Pie {
+        ui.checkbox(&mut config.donut, tr("Donut"));
+    }
+    parts::form_row(ui, tr("Max points"), lw, |ui| {
         ui.add(
             egui::DragValue::new(&mut config.max_points)
                 .range(10..=1_000_000)

@@ -107,8 +107,10 @@ impl<'a> TextView<'a> {
             state.key = Some(key);
             state.built_at = ui.input(|i| i.time);
         }
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.button(format!("{}  {}", egui_phosphor::regular::COPY, tr("Copy text"))).clicked() {
+            ui.add_space(8.0);
+            if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy text"), true, false).clicked() {
                 ui.ctx().copy_text(state.lines.join("\n"));
             }
             if model.row_count() > MAX_TEXT_ROWS {
