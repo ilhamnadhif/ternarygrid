@@ -100,7 +100,12 @@ fn button_impl(ui: &mut Ui, kind: Kind, icon: Option<&str>, text: &str, keys: Op
             Kind::Secondary | Kind::Danger => (quiet(p.surface), Stroke::new(1.0, p.border_strong)),
             Kind::Ghost => (if on { p.accent_soft } else { quiet(Color32::TRANSPARENT) }, Stroke::NONE),
         };
-        let painter = ui.painter();
+        // A disabled `ui` fades everything it paints; the design keeps a disabled button's fill
+        // and only turns its text faint (below), so take that fade back for the button.
+        let mut painter = ui.painter().clone();
+        if !enabled {
+            painter.set_opacity((painter.opacity() / ui.visuals().disabled_alpha()).min(1.0));
+        }
         let radius = CornerRadius::same(RADIUS);
         painter.rect(rect, radius, fill, stroke, StrokeKind::Inside);
         if resp.has_focus() {

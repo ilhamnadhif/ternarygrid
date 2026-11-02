@@ -94,6 +94,8 @@ impl<'a> Dialog<'a> {
         Frame::new().inner_margin(Margin { left: 20, right: 16, top: 16, bottom: 14 }).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
+                // As tall as the close button from the start, so a lone title is centred on it.
+                ui.set_min_height(28.0);
                 if let Some(icon) = self.icon {
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
                     ui.painter().rect_filled(r, CornerRadius::same(RADIUS_LG), p.accent_soft);
@@ -131,11 +133,13 @@ impl<'a> Dialog<'a> {
         // Footer.
         if let Some(footer) = footer {
             let top = ui.cursor().top();
-            let rect = Rect::from_min_max(egui::pos2(ui.max_rect().left(), top), egui::pos2(ui.max_rect().right(), top + 54.0));
-            let r = CornerRadius { nw: 0, ne: 0, sw: RADIUS_LG + 2, se: RADIUS_LG + 2 };
-            ui.painter().rect_filled(rect.shrink(1.0), r, p.chrome);
+            // A hairline, then the design's 54 point band.
+            let rect = Rect::from_min_max(egui::pos2(ui.max_rect().left(), top), egui::pos2(ui.max_rect().right(), top + 55.0));
+            // The content is already inside the frame's 1 point border: fill up to it.
+            let r = CornerRadius { nw: 0, ne: 0, sw: RADIUS_LG + 1, se: RADIUS_LG + 1 };
+            ui.painter().rect_filled(rect, r, p.chrome);
             ui.painter().hline(rect.x_range(), top + 0.5, Stroke::new(1.0, p.border));
-            Frame::new().inner_margin(Margin { left: 20, right: 16, top: 12, bottom: 12 }).show(ui, |ui| {
+            Frame::new().inner_margin(Margin { left: 20, right: 16, top: 13, bottom: 12 }).show(ui, |ui| {
                 // The row is the buttons' height from its first widget on, so a leading label or
                 // check box sits centred on them.
                 ui.allocate_ui_with_layout(vec2(ui.available_width(), style::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
@@ -476,7 +480,9 @@ pub fn switch(ui: &mut Ui, on: &mut bool, label: &str, sub: Option<&str>) -> Res
     let p = style::pal(ui);
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        let (rect, mut resp) = ui.allocate_exact_size(vec2(30.0, 18.0), Sense::click());
+        // 19 high: the 18 point track 1 point down, as in the design.
+        let (row, mut resp) = ui.allocate_exact_size(vec2(30.0, 19.0), Sense::click());
+        let rect = Rect::from_min_size(row.min + vec2(0.0, 1.0), vec2(30.0, 18.0));
         let t = ui.ctx().animate_bool(resp.id, *on);
         let track = if *on { p.accent } else { p.border_strong };
         ui.painter().rect_filled(rect, CornerRadius::same(9), blend(p.border_strong, track, t));
