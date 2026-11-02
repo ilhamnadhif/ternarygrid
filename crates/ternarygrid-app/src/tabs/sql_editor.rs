@@ -277,7 +277,8 @@ impl SqlEditorTab {
             bottom: Bottom::Output,
             stats: Vec::new(),
             output: Vec::new(),
-            show_results: true,
+            // The results panel opens with the first run (an editor that has not run fills the tab).
+            show_results: false,
             maximized: false,
             show_outline: false,
             variables: BTreeMap::new(),
@@ -691,6 +692,7 @@ impl SqlEditorTab {
             let s = session.clone();
             let q = sql.clone();
             self.explain_job = Some((sql, cx.backend.spawn(async move { s.lock().await.explain(&q, analyze).await })));
+            self.show_results = true;
             self.log("INFO", if analyze { tr("Explain analyze…") } else { tr("Explain…") });
             return;
         }
@@ -725,6 +727,8 @@ impl SqlEditorTab {
         self.variables = prepared.variables.clone();
         self.log("INFO", trf("Executing {} statement(s)…", &[&prepared.plans.len()]));
         self.exec = Some(Execution::start(cx.backend, session, prepared.plans, opts, history));
+        // What runs shows its progress, results and messages under the editor.
+        self.show_results = true;
         self.editor.set_diagnostics(Vec::new());
     }
 

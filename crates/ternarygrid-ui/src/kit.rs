@@ -303,7 +303,7 @@ pub fn checkbox(ui: &mut Ui, on: &mut bool, label: impl Into<egui::WidgetText>) 
     let label_text = text.text().to_string();
     let galley = (!label_text.is_empty()).then(|| text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body));
     let w = 16.0 + galley.as_ref().map_or(0.0, |g| 10.0 + g.size().x);
-    let h = galley.as_ref().map_or(18.0, |g| g.size().y.max(18.0));
+    let h = galley.as_ref().map_or(17.0, |g| g.size().y.max(17.0));
     let (rect, mut resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     if resp.clicked() {
         *on = !*on;
@@ -317,8 +317,9 @@ pub fn checkbox(ui: &mut Ui, on: &mut bool, label: impl Into<egui::WidgetText>) 
         let painter = ui.painter();
         if *on {
             painter.rect_filled(b, CornerRadius::same(4), fade(if hovered { p.accent_hover } else { p.accent }));
-            let pts = vec![egui::pos2(b.left() + 4.0, b.center().y + 0.2), egui::pos2(b.left() + 6.9, b.center().y + 3.0), egui::pos2(b.right() - 3.8, b.center().y - 2.8)];
-            painter.add(egui::Shape::line(pts, Stroke::new(1.9, fade(p.on_accent))));
+            // The design's check: an 11-point mark (2.8 on 24) centred in the box.
+            let pts = vec![egui::pos2(b.left() + 5.0, b.top() + 8.2), egui::pos2(b.left() + 6.9, b.top() + 10.1), egui::pos2(b.left() + 11.0, b.top() + 6.2)];
+            painter.add(egui::Shape::line(pts, Stroke::new(1.3, fade(p.on_accent))));
         } else {
             painter.rect(b, CornerRadius::same(4), p.surface, Stroke::new(1.5, fade(if hovered { p.accent } else { p.border_strong })), StrokeKind::Inside);
         }
@@ -340,7 +341,7 @@ pub fn radio(ui: &mut Ui, selected: bool, label: impl Into<egui::WidgetText>) ->
     let label_text = text.text().to_string();
     let galley = (!label_text.is_empty()).then(|| text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body));
     let w = 16.0 + galley.as_ref().map_or(0.0, |g| 8.0 + g.size().x);
-    let h = galley.as_ref().map_or(18.0, |g| g.size().y.max(18.0));
+    let h = galley.as_ref().map_or(17.0, |g| g.size().y.max(17.0));
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     resp.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, enabled, selected, &label_text));
     if ui.is_rect_visible(rect) {

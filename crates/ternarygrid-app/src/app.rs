@@ -1508,61 +1508,62 @@ impl TernaryGridApp {
         let state = self.menu_state();
         let chosen: std::cell::Cell<Option<M>> = std::cell::Cell::new(None);
         egui::MenuBar::new().ui(ui, |ui| {
-            // An item: an optional (coloured) icon and its text.
+            // An item as in the design's menus: a muted icon (or its room) and the text.
             let item = |ui: &mut Ui, enabled: bool, glyph: Option<&str>, text: &str, action: M| {
-                let button = match glyph {
-                    Some(g) => egui::Button::new((ternarygrid_icons::ic(g), text)),
-                    None => egui::Button::new(text),
-                };
-                if ui.add_enabled(enabled, button).clicked() {
+                if ui.add_enabled_ui(enabled, |ui| kit::menu_item(ui, glyph, text, "")).inner.clicked() {
                     chosen.set(Some(action));
                     ui.close();
                 }
             };
             ui.menu_button(tr("File"), |ui| {
-                item(ui, true, Some(icon::FILE_SQL), tr("New SQL editor"), M::NewSqlEditor);
+                kit::menu_look(ui, 230.0);
+                item(ui, true, Some(icon::FILE_CODE), tr("New SQL editor"), M::NewSqlEditor);
                 item(ui, true, Some(icon::FOLDER_OPEN), tr("Open script…"), M::OpenScript);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::GEAR), tr("Settings…"), M::Settings);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, None, tr("Quit"), M::Quit);
             });
             ui.menu_button(tr("Database"), |ui| {
+                kit::menu_look(ui, 230.0);
                 item(ui, true, Some(icon::PLUS), tr("New connection…"), M::NewConnection);
                 item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), M::ImportConnections);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, state.new_database, Some(icon::DATABASE), tr("New database…"), M::NewDatabase);
                 item(ui, state.new_schema, Some(icon::STACK), tr("New schema…"), M::NewSchema);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::PLUGS), tr("Disconnect all"), M::DisconnectAll);
                 item(ui, true, Some(icon::QUEUE), tr("Pending transactions…"), M::PendingTransactions);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::GIT_DIFF), tr("Compare schemas…"), M::CompareSchemas);
                 item(ui, true, Some(icon::ARROWS_LEFT_RIGHT), tr("Compare data…"), M::CompareData);
                 item(ui, true, Some(icon::MAGNIFYING_GLASS), tr("Search…"), M::Search);
             });
             ui.menu_button(tr("Tools"), |ui| {
-                item(ui, true, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Query history"), M::QueryHistory);
+                kit::menu_look(ui, 230.0);
+                item(ui, true, Some(icon::CLOCK), tr("Query history"), M::QueryHistory);
                 item(ui, true, Some(icon::LIST_CHECKS), tr("Tasks"), M::Tasks);
                 item(ui, true, Some(icon::SPARKLE), tr("AI assistant"), M::AiAssistant);
-                item(ui, true, Some(icon::HOURGLASS), tr("Background operations"), M::BackgroundOperations);
-                ui.separator();
+                item(ui, true, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Background operations"), M::BackgroundOperations);
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::EXPORT), tr("Export data…"), M::ExportData);
                 item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import data…"), M::ImportData);
                 item(ui, true, Some(icon::GRAPH), tr("ER diagram"), M::ErDiagram);
                 item(ui, true, Some(icon::USERS), tr("Session manager"), M::SessionManager);
             });
             ui.menu_button(tr("View"), |ui| {
+                kit::menu_look(ui, 230.0);
                 item(ui, true, None, tr("Toggle navigator"), M::ToggleNavigator);
                 let mut props = state.properties;
-                if ternarygrid_ui::kit::checkbox(ui, &mut props, tr("Properties panel")).clicked() {
+                if kit::menu_check(ui, &mut props, tr("Properties panel")).clicked() {
                     chosen.set(Some(M::PropertiesPanel));
                     ui.close();
                 }
-                ui.menu_button((ternarygrid_icons::ic(icon::CIRCLE_HALF), tr("Theme")), |ui| {
+                kit::submenu(ui, Some(icon::CIRCLE_HALF), tr("Theme"), 160.0, &mut |ui| {
                     use ternarygrid_config::settings::Theme;
                     for (t, label) in [(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))] {
-                        if ternarygrid_ui::kit::radio(ui, state.theme == t, label).clicked() {
+                        let mut on = state.theme == t;
+                        if kit::menu_check(ui, &mut on, label).clicked() {
                             chosen.set(Some(M::Theme(t)));
                             ui.close();
                         }
@@ -1571,14 +1572,15 @@ impl TernaryGridApp {
                 item(ui, true, None, tr("Command palette"), M::CommandPalette);
             });
             ui.menu_button(tr("Help"), |ui| {
+                kit::menu_look(ui, 230.0);
                 item(ui, true, None, tr("Keyboard shortcuts"), M::KeyboardShortcuts);
                 item(ui, true, None, tr("Database drivers"), M::DatabaseDrivers);
                 item(ui, true, None, tr("Create sample database"), M::CreateSampleDatabase);
                 item(ui, true, Some(icon::LIGHTBULB), tr("Tip of the day"), M::TipOfTheDay);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::WARNING_OCTAGON), tr("Error log"), M::ErrorLog);
                 item(ui, state.diagnostics, Some(icon::FILE_ZIP), tr("Collect diagnostic info"), M::CollectDiagnostics);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::SPARKLE), tr("What's new"), M::WhatsNew);
                 item(ui, state.updates, Some(icon::ARROW_CIRCLE_UP), tr("Check for updates…"), M::CheckForUpdates);
                 item(ui, true, None, tr("About TernaryGrid"), M::About);

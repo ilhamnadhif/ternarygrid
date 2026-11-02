@@ -21,14 +21,15 @@ enum Lead<'a> {
 }
 
 /// A flat button of the top bar: the lead (16-point logo or 14-point muted icon), the text in
-/// the medium weight and a faint chevron, 28 points high and padded by `pad`; `framed`: on
-/// the surface with the strong hairline (New).
+/// the medium weight and a faint chevron, 28 points high, padded by 8; `framed`: on the surface
+/// with the strong hairline, padded by 10 and the hairline, the chevron muted (New).
 fn bar_button(ui: &mut Ui, lead: Lead, text: &str, tip: &str, framed: bool) -> egui::Response {
     let p = ternarygrid_ui::pal(ui);
     let size = ternarygrid_ui::style::body_size(ui.ctx());
     let painter = ui.painter().clone();
     let galley = painter.layout_no_wrap(text.to_string(), ternarygrid_ui::style::medium(ui.ctx(), size), p.text);
-    let chevron = painter.layout_no_wrap(icon::CARET_DOWN.to_string(), ternarygrid_ui::style::icon_font(12.0), if framed { p.text_muted } else { p.text_faint });
+    let chevron_color = if framed { p.text_muted } else { p.text_faint };
+    let chevron = painter.layout_no_wrap(icon::CARET_DOWN.to_string(), ternarygrid_ui::style::icon_font(12.0), chevron_color);
     let (lead_w, pad) = match lead {
         Lead::Logo(_) => (16.0, 8.0),
         Lead::Icon(_) if framed => (14.0, 11.0),
@@ -72,7 +73,7 @@ fn bar_button(ui: &mut Ui, lead: Lead, text: &str, tip: &str, framed: bool) -> e
     let w = galley.size().x;
     painter.galley(egui::pos2(x, cy - galley.size().y / 2.0), galley, p.text);
     x += w + gap;
-    painter.galley(egui::pos2(x + (12.0 - chevron.size().x) / 2.0, cy - chevron.size().y / 2.0), chevron, p.text_faint);
+    painter.galley(egui::pos2(x + (12.0 - chevron.size().x) / 2.0, cy - chevron.size().y / 2.0), chevron, chevron_color);
     resp
 }
 

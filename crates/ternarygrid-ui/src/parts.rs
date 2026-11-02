@@ -244,7 +244,7 @@ pub fn stepper(ui: &mut Ui, steps: &[&str], active: usize, reachable: usize) -> 
         ui.spacing_mut().item_spacing.x = 10.0;
         for (i, s) in steps.iter().enumerate() {
             let w = 22.0 + 8.0 + label_w[i];
-            let (rect, resp) = ui.allocate_exact_size(vec2(w, 26.0), if i <= reachable { Sense::click() } else { Sense::hover() });
+            let (rect, resp) = ui.allocate_exact_size(vec2(w, 22.0), if i <= reachable { Sense::click() } else { Sense::hover() });
             resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, i <= reachable, i == active, *s));
             let c = egui::pos2(rect.left() + 11.0, rect.center().y);
             let painter = ui.painter();
@@ -259,8 +259,15 @@ pub fn stepper(ui: &mut Ui, steps: &[&str], active: usize, reachable: usize) -> 
                 painter.text(c, Align2::CENTER_CENTER, (i + 1).to_string(), style::medium(ui.ctx(), 11.5), p.text_muted);
             }
             let color = if i == active { p.text } else { p.text_muted };
+            // The active step's name in the design's semibold.
             let font = if i == active { style::semibold(ui.ctx(), size) } else { egui::FontId::proportional(size) };
-            painter.text(egui::pos2(rect.left() + 30.0, rect.center().y), Align2::LEFT_CENTER, *s, font, color);
+            let g = painter.layout_no_wrap(s.to_string(), font, color);
+            let pos = egui::pos2(rect.left() + 30.0, rect.center().y - g.size().y / 2.0);
+            if i == active {
+                kit::paint_semibold(painter, pos, g, color);
+            } else {
+                painter.galley(pos, g, color);
+            }
             if resp.hovered() && i <= reachable && i != active {
                 painter.rect_stroke(rect.expand(3.0), CornerRadius::same(RADIUS), Stroke::new(1.0, p.border), StrokeKind::Outside);
             }
@@ -268,7 +275,7 @@ pub fn stepper(ui: &mut Ui, steps: &[&str], active: usize, reachable: usize) -> 
                 clicked = Some(i);
             }
             if i + 1 < n {
-                let (r, _) = ui.allocate_exact_size(vec2(line_w, 26.0), Sense::hover());
+                let (r, _) = ui.allocate_exact_size(vec2(line_w, 22.0), Sense::hover());
                 ui.painter().hline(r.x_range(), r.center().y, Stroke::new(1.0, p.border));
             }
         }
@@ -592,7 +599,7 @@ pub fn stat_tile(ui: &mut Ui, label: &str, value: &str, sub: Option<&str>) -> Re
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.label(RichText::new(label).size(12.0).color(p.text_muted));
-            ui.label(RichText::new(value).font(style::semibold(ui.ctx(), 22.0)).color(p.text));
+            kit::semibold_label(ui, value, 22.0, p.text);
             if let Some(s) = sub {
                 ui.label(RichText::new(s).size(12.0).color(p.text_faint));
             }

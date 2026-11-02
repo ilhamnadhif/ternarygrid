@@ -279,11 +279,12 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         let size = self.style.text_styles.get(&egui::TextStyle::Body).map_or(13.0, |f| f.size);
         let format = |font: egui::FontId, color: egui::Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
         let mut job = egui::text::LayoutJob::default();
-        // egui_dock pads the title by 8 points: 6 more on the left, the rest on the right.
-        job.append(tab.view.icon(), 6.0, format(ternarygrid_ui::style::icon_font(14.0), if open { p.text_muted } else { p.text_faint }));
+        // egui_dock pads the title by 8 points: 6 more on the left (7 inside the open tab's
+        // hairline), the icon in a 14-point slot, 8 points, the title, then the × room.
+        job.append(tab.view.icon(), if open { 7.0 } else { 6.0 }, format(ternarygrid_ui::style::icon_font(14.0), if open { p.text_muted } else { p.text_faint }));
         let font = if open { egui::FontId::new(size, egui::FontFamily::Name(ternarygrid_ui::style::MEDIUM.into())) } else { egui::FontId::proportional(size) };
-        job.append(&title, 8.0, format(font, egui::Color32::PLACEHOLDER));
-        job.append("\u{200b}", if open { TAB_CLOSE_ROOM } else { 4.0 }, format(egui::FontId::proportional(size), egui::Color32::PLACEHOLDER));
+        job.append(&title, 8.0 + 14.0 * (1.0 - ternarygrid_ui::style::ICON_SCALE), format(font, egui::Color32::PLACEHOLDER));
+        job.append("\u{200b}", if open { TAB_CLOSE_ROOM + 1.0 } else { 4.0 }, format(egui::FontId::proportional(size), egui::Color32::PLACEHOLDER));
         job.into()
     }
 
@@ -324,9 +325,9 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
             let line = egui::Rect::from_min_max(egui::pos2(r.left() + 8.0, top), egui::pos2(r.right() - 8.0, top + thick));
             painter.rect_filled(line, egui::CornerRadius { nw: 0, ne: 0, sw: 2, se: 2 }, color);
         }
-        // The open tab's ×: 20 points, 10 from its right edge.
+        // The open tab's ×: 20 points, 10 from its right hairline.
         if open {
-            let x = egui::Rect::from_center_size(egui::pos2(r.right() - 20.0, r.center().y + 0.5), egui::vec2(20.0, 20.0));
+            let x = egui::Rect::from_center_size(egui::pos2(r.right() - 21.0, r.center().y + 0.5), egui::vec2(20.0, 20.0));
             let hover = response.ctx.input(|i| i.pointer.hover_pos()).is_some_and(|q| x.contains(q)) && response.hovered();
             if hover {
                 painter.rect_filled(x, ternarygrid_ui::style::RADIUS, p.hover);
