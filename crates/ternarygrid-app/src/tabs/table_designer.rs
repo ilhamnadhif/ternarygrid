@@ -17,7 +17,7 @@ use crate::conn::session::SessionHandle;
 use crate::cx::AppContext;
 use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
-use egui::{Align, Color32, CornerRadius, FontId, Layout, Margin, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType, vec2};
+use egui::{Align, CornerRadius, Layout, Margin, Rect, Response, RichText, Sense, Stroke, Ui, vec2};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1085,9 +1085,10 @@ impl TableDesignerTab {
             (Page::Triggers, tr("Triggers"), n(m.triggers.len())),
             (Page::Options, tr("Options"), None),
         ];
-        egui::Frame::new().inner_margin(Margin { left: 10, right: 16, top: 0, bottom: 0 }).show(ui, |ui| {
+        // As the design's page tabs: 16 from the sides, 18 apart.
+        egui::Frame::new().inner_margin(Margin::symmetric(16, 0)).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = 18.0;
                 for (page, label, count) in pages {
                     if kit::underline_tab(ui, None, label, count.as_deref(), self.page == page, 34.0).clicked() {
                         self.page = page;
@@ -1147,9 +1148,11 @@ impl TableDesignerTab {
         let n = columns.len();
         egui::Frame::new().inner_margin(Margin { left: 16, right: 16, top: 0, bottom: 12 }).show(ui, |ui| {
             table_frame(ui, |ui| {
-                // Widths of the mockup's grid: fixed for the flags, shares of the rest for the texts.
-                let spacing = ui.spacing().item_spacing.x;
-                let unit = ((ui.available_width() - (30.0 + 84.0 + 70.0 + 44.0 + 50.0) - 8.0 * spacing) / 4.9).max(40.0);
+                // The mockup's grid (36, 1.2fr, 1.3fr, 84, 70, 1fr, 44, 50, 1.4fr of the table's
+                // width), each cell padded by 10: the columns are 20 narrower, 20 apart.
+                let line_x = ui.max_rect().x_range().expand(CELL_PAD);
+                let unit = ((line_x.span() - (36.0 + 84.0 + 70.0 + 44.0 + 50.0)) / 4.9).max(50.0);
+                let w = |design: f32| (design - 2.0 * CELL_PAD).max(16.0);
                 let max_h = (ui.available_height() - HEADER_H - 4.0).max(ROW_H * 2.0);
                 TableBuilder::new(ui)
                     .id_salt(("td_cols", uid))
@@ -1159,14 +1162,14 @@ impl TableDesignerTab {
                     .auto_shrink([false, true])
                     .max_scroll_height(max_h)
                     .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(Column::exact(30.0))
-                    .column(Column::initial(unit * 1.2).at_least(60.0).clip(true))
-                    .column(Column::initial(unit * 1.3).at_least(90.0).clip(true))
-                    .column(Column::initial(84.0).at_least(40.0).clip(true))
-                    .column(Column::exact(70.0))
-                    .column(Column::initial(unit).at_least(50.0).clip(true))
-                    .column(Column::exact(44.0))
-                    .column(Column::exact(50.0))
+                    .column(Column::exact(w(36.0)))
+                    .column(Column::initial(w(unit * 1.2)).at_least(60.0).clip(true))
+                    .column(Column::initial(w(unit * 1.3)).at_least(90.0).clip(true))
+                    .column(Column::exact(w(84.0)))
+                    .column(Column::exact(w(70.0)))
+                    .column(Column::initial(w(unit)).at_least(50.0).clip(true))
+                    .column(Column::exact(w(44.0)))
+                    .column(Column::exact(w(50.0)))
                     .column(Column::remainder().at_least(80.0).clip(true))
                     .header(HEADER_H, |mut h| {
                         for (label, tip) in [
@@ -1197,7 +1200,6 @@ impl TableDesignerTab {
                             let mut focus = false;
                             row.col(|ui| {
                                 let p = ternarygrid_ui::pal(ui);
-                                ui.add_space(4.0);
                                 if ui.add(egui::Label::new(RichText::new(format!("{}", i + 1)).size(12.0).color(p.text_faint)).sense(Sense::click())).clicked() {
                                     focus = true;
                                 }
@@ -1211,9 +1213,10 @@ impl TableDesignerTab {
                                 focus |= field(ui, &mut c.type_text, ("td_ct", uid, cu), w, FIELD_H, "", true).gained_focus();
                                 let b = kit::icon_button_ex(ui, icon::CARET_DOWN, tr("Common types"), false, 22.0);
                                 egui::Popup::menu(&b).show(|ui| {
+                                    kit::menu_look(ui, 180.0);
                                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                                         for t in types {
-                                            if ui.button(*t).clicked() {
+                                            if kit::menu_item(ui, None, t, "").clicked() {
                                                 c.type_text = t.to_string();
                                                 c.length = default_length(t).map(str::to_string).unwrap_or_default();
                                                 ui.close();
@@ -1223,19 +1226,17 @@ impl TableDesignerTab {
                                 });
                             });
                             row.col(|ui| {
-                                focus |= field(ui, &mut c.length, ("td_cl", uid, cu), 70.0, FIELD_H, "", false).gained_focus();
+                                focus |= field(ui, &mut c.length, ("td_cl", uid, cu), f32::INFINITY, FIELD_H, "", false).gained_focus();
                             });
                             row.col(|ui| {
-                                ui.add_space(4.0);
-                                check(ui, &mut c.not_null, "");
+                                kit::checkbox(ui, &mut c.not_null, "");
                             });
                             row.col(|ui| {
                                 focus |= field(ui, &mut c.default, ("td_cd", uid, cu), f32::INFINITY, FIELD_H, "", true).gained_focus();
                             });
                             row.col(|ui| {
-                                ui.add_space(4.0);
                                 let mut on = pk.contains(&cu);
-                                if check(ui, &mut on, "").changed() {
+                                if kit::checkbox(ui, &mut on, "").changed() {
                                     if on {
                                         pk.push(cu);
                                         c.not_null = true;
@@ -1245,9 +1246,8 @@ impl TableDesignerTab {
                                 }
                             });
                             row.col(|ui| {
-                                ui.add_space(4.0);
                                 ui.add_enabled_ui(auto_ok, |ui| {
-                                    if check(ui, &mut c.auto_increment, "").changed() && !c.auto_increment {
+                                    if kit::checkbox(ui, &mut c.auto_increment, "").changed() && !c.auto_increment {
                                         let d = c.default.trim_start().to_ascii_uppercase();
                                         if d.starts_with("GENERATED ") || d.starts_with("NEXTVAL(") {
                                             c.default.clear();
@@ -1257,6 +1257,7 @@ impl TableDesignerTab {
                             });
                             row.col(|ui| {
                                 focus |= field(ui, &mut c.comment, ("td_cc", uid, cu), f32::INFINITY, FIELD_H, "", false).gained_focus();
+                                row_line(ui, line_x);
                             });
                             if focus || row.response().clicked() {
                                 *selected = Some(i);
@@ -1278,7 +1279,7 @@ impl TableDesignerTab {
             for c in columns {
                 let pos = cols.iter().position(|r| matches!(r, ColRef::Col(u, _) if *u == c.uid));
                 let mut on = pos.is_some();
-                if check(ui, &mut on, c.name.trim()).changed() {
+                if kit::menu_check(ui, &mut on, c.name.trim()).changed() {
                     match pos {
                         Some(p) => {
                             cols.remove(p);
@@ -1396,6 +1397,7 @@ impl TableDesignerTab {
         let indexes = &mut self.model.indexes;
         let n = indexes.len();
         table_frame(ui, |ui| {
+            let line_x = ui.max_rect().x_range().expand(CELL_PAD);
             TableBuilder::new(ui)
                 .id_salt(("td_idx", uid))
                 .striped(true)
@@ -1403,12 +1405,12 @@ impl TableDesignerTab {
                 .auto_shrink([false, true])
                 .vscroll(false)
                 .cell_layout(Layout::left_to_right(Align::Center))
-                .column(Column::initial(200.0).at_least(80.0).clip(true))
-                .column(Column::initial(260.0).at_least(100.0).clip(true))
-                .column(Column::exact(60.0))
-                .column(Column::initial(120.0).at_least(60.0).clip(true))
+                .column(Column::initial(188.0).at_least(80.0).clip(true))
+                .column(Column::initial(248.0).at_least(100.0).clip(true))
+                .column(Column::exact(48.0))
+                .column(Column::initial(108.0).at_least(60.0).clip(true))
                 .column(Column::remainder().at_least(80.0).clip(true))
-                .column(Column::exact(32.0))
+                .column(Column::exact(26.0))
                 .header(HEADER_H, |mut h| {
                     for label in [tr("Name"), tr("Columns"), tr("Unique"), tr("Method"), if pg { tr("Partial (WHERE)") } else { "" }, ""] {
                         h.col(|ui| {
@@ -1442,8 +1444,7 @@ impl TableDesignerTab {
                             }
                         });
                         row.col(|ui| {
-                            ui.add_space(4.0);
-                            changed |= check(ui, &mut x.unique, "").changed();
+                            changed |= kit::checkbox(ui, &mut x.unique, "").changed();
                         });
                         row.col(|ui| {
                             changed |= field(ui, &mut x.method, ("td_ixm", uid, x.uid), f32::INFINITY, FIELD_H, tr("default"), true).changed();
@@ -1454,6 +1455,7 @@ impl TableDesignerTab {
                             }
                         });
                         row.col(|ui| {
+                            row_line(ui, line_x);
                             if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 26.0).clicked() {
                                 remove = Some(i);
                             }
@@ -1536,7 +1538,7 @@ impl TableDesignerTab {
                     let schema_text = if f.ref_schema.is_empty() { "—".to_string() } else { f.ref_schema.clone() };
                     select(ui, ("td_fks", uid, f.uid), schema_text, 120.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                         for s in &schema_names {
-                            if ui.selectable_label(&f.ref_schema == s, s).clicked() && &f.ref_schema != s {
+                            if pick(ui, &f.ref_schema == s, s) && &f.ref_schema != s {
                                 f.ref_schema = s.clone();
                                 f.ref_table.clear();
                                 f.ref_columns.clear();
@@ -1551,7 +1553,7 @@ impl TableDesignerTab {
                     let label = if f.ref_table.is_empty() { tr("Table…").to_string() } else { f.ref_table.clone() };
                     select(ui, ("td_fkt", uid, f.uid), label, 180.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                         for t in &tables {
-                            if ui.selectable_label(&f.ref_table == t, t).clicked() && &f.ref_table != t {
+                            if pick(ui, &f.ref_table == t, t) && &f.ref_table != t {
                                 f.ref_table = t.clone();
                                 // Referenced key: primary key of the chosen table.
                                 f.ref_columns = snap.and_then(|s| s.table(t)).and_then(|t| t.row_key()).map(|k| k.columns.clone()).unwrap_or_default();
@@ -1588,7 +1590,7 @@ impl TableDesignerTab {
                         let text = if cur.is_empty() { tr("column…").to_string() } else { cur.clone() };
                         select(ui, ("td_fkc", uid, f.uid, j), text, 180.0, FIELD_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                             for rc in &ref_cols {
-                                if ui.selectable_label(&cur == rc, rc).clicked()
+                                if pick(ui, &cur == rc, rc)
                                     && let Some(slot) = f.ref_columns.get_mut(j)
                                 {
                                     *slot = rc.clone();
@@ -1604,7 +1606,9 @@ impl TableDesignerTab {
                         ui.label(RichText::new(label).size(12.5).color(p.text_muted));
                         select(ui, ("td_fka", uid, f.uid, salt), action.sql(), 140.0, FIELD_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                             for a in FkAction::ALL {
-                                ui.selectable_value(action, a, a.sql());
+                                if pick(ui, *action == a, a.sql()) {
+                                    *action = a;
+                                }
                             }
                         });
                     }
@@ -1688,7 +1692,7 @@ impl TableDesignerTab {
                     changed |= field(ui, &mut t.name, ("td_trn", uid, t.uid), 240.0, style::CONTROL_H, "", false).changed();
                     select(ui, ("td_trt", uid, t.uid), t.timing.clone(), 130.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                         for timing in ["BEFORE", "AFTER", "INSTEAD OF"] {
-                            if ui.selectable_label(t.timing == timing, timing).clicked() && t.timing != timing {
+                            if pick(ui, t.timing == timing, timing) && t.timing != timing {
                                 t.timing = timing.to_string();
                                 changed = true;
                             }
@@ -1696,7 +1700,7 @@ impl TableDesignerTab {
                     });
                     for e in events {
                         let mut on = t.events.iter().any(|x| x == e);
-                        if check(ui, &mut on, e).changed() {
+                        if kit::checkbox(ui, &mut on, *e).changed() {
                             if on {
                                 t.events.push(e.to_string());
                             } else {
@@ -1709,14 +1713,17 @@ impl TableDesignerTab {
                         let mut row = t.for_each_row;
                         let level = if row { tr("for each row") } else { tr("for each statement") };
                         select(ui, ("td_trl", uid, t.uid), level, 150.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-                            ui.selectable_value(&mut row, true, tr("for each row"));
-                            ui.selectable_value(&mut row, false, tr("for each statement"));
+                            for (v, label) in [(true, tr("for each row")), (false, tr("for each statement"))] {
+                                if pick(ui, row == v, label) {
+                                    row = v;
+                                }
+                            }
                         });
                         if row != t.for_each_row {
                             t.for_each_row = row;
                             changed = true;
                         }
-                        check(ui, &mut t.enabled, tr("Enabled"));
+                        kit::checkbox(ui, &mut t.enabled, tr("Enabled"));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 26.0).clicked() {
@@ -1728,9 +1735,11 @@ impl TableDesignerTab {
                 let body = egui::TextEdit::multiline(&mut t.body)
                     .hint_text(RichText::new(hint).color(p.text_faint))
                     .code_editor()
-                    .desired_rows(2)
+                    // The design's one-line code block (lines of 20, 8 above and below).
+                    .desired_rows(1)
+                    .min_size(vec2(0.0, 38.0))
                     .desired_width(f32::INFINITY)
-                    .margin(Margin::symmetric(10, 8))
+                    .margin(Margin { left: 10, right: 10, top: 10, bottom: 8 })
                     .id_salt(("td_trb", uid, t.uid));
                 let r = ui.add(body);
                 if r.has_focus() {
@@ -1773,8 +1782,9 @@ impl TableDesignerTab {
             if !suggestions.is_empty() {
                 let b = kit::button_ex(ui, kit::Kind::Ghost, Some(icon::CARET_DOWN), tr("Suggestions"), true);
                 egui::Popup::menu(&b).show(|ui| {
+                    kit::menu_look(ui, 200.0);
                     for s in suggestions {
-                        if ui.button(*s).clicked() {
+                        if kit::menu_item(ui, None, s, "").clicked() {
                             if !self.model.options.iter().any(|o| o.key.trim() == *s) {
                                 self.model.options.push(OptionRow { key: s.to_string(), value: String::new() });
                             }
@@ -1809,11 +1819,11 @@ impl TableDesignerTab {
         let p = ternarygrid_ui::pal(ui);
         let stmts = self.statements();
         let text = script_text(&stmts);
-        egui::Frame::new().inner_margin(Margin { left: 16, right: 12, top: 8, bottom: 8 }).show(ui, |ui| {
+        egui::Frame::new().inner_margin(Margin::symmetric(16, 8)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                ui.set_min_height(24.0);
-                ui.label(RichText::new(tr("DDL preview")).font(style::semibold(ui.ctx(), 13.0)).color(p.text));
+                ui.set_min_height(style::SMALL_H);
+                kit::semibold_label(ui, tr("DDL preview"), 13.0, p.text);
                 if stmts.is_empty() {
                     let none = if self.is_create() { tr("Nothing to create yet.") } else { tr("No changes.") };
                     ui.label(RichText::new(none).size(12.0).color(p.text_faint));
@@ -1878,7 +1888,7 @@ impl TableDesignerTab {
                 },
                 |ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if danger_solid(ui, icon::PLAY, tr("Execute")).clicked() {
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::PLAY), tr("Execute"), false).clicked() {
                             run = true;
                         }
                         if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -2052,9 +2062,14 @@ fn fk_incomplete(m: &Model, f: &FkRow) -> bool {
 
 /// Height of a table's header row and of its editable rows.
 const HEADER_H: f32 = 32.0;
-const ROW_H: f32 = 36.0;
+const ROW_H: f32 = 37.0;
+/// The padding of a table's cells (the columns are twice that apart).
+const CELL_PAD: f32 = 10.0;
 /// Height of the fields inside rows (cards and the toolbar use `style::CONTROL_H`).
 const FIELD_H: f32 = 26.0;
+/// The text of the design's inputs is 13 from their left edge (10 of padding, the border and
+/// the 2 of an HTML input's own padding).
+const FIELD_MARGIN: Margin = Margin { left: 13, right: 10, top: 2, bottom: 2 };
 
 /// A single-line field `h` tall (monospace for SQL), outlined like the mockups' inputs, with
 /// the kit's focus halo.
@@ -2066,7 +2081,7 @@ fn plain_code() -> ternarygrid_editor::EditorOptions {
     options.mark_occurrences = false;
     options.highlight_current_line = false;
     // 21 points a line, as the design's code.
-    options.line_spacing = 5.0;
+    options.line_spacing = 6.0;
     options
 }
 
@@ -2076,7 +2091,7 @@ pub(crate) fn field(ui: &mut Ui, text: &mut String, id: impl Hash + std::fmt::De
         ui.visuals_mut().widgets.inactive.bg_stroke.color = p.border;
         // A selected row keeps its text colours (only the fill shows the selection).
         ui.visuals_mut().override_text_color = None;
-        let mut edit = egui::TextEdit::singleline(text).id_salt(id).desired_width(width).min_size(vec2(0.0, h)).vertical_align(Align::Center).margin(Margin::symmetric(10, 2));
+        let mut edit = egui::TextEdit::singleline(text).id_salt(id).desired_width(width).min_size(vec2(0.0, h)).vertical_align(Align::Center).margin(FIELD_MARGIN);
         if !hint.is_empty() {
             edit = edit.hint_text(RichText::new(hint).color(p.text_faint));
         }
@@ -2110,70 +2125,25 @@ pub(crate) fn select<R>(
         s.button_padding = vec2(10.0, ((h - text_h) / 2.0).max(2.0));
         ui.visuals_mut().widgets.inactive.bg_stroke.color = p.border;
         ui.set_max_width(width);
-        egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).selected_text(text).width(width).truncate().close_behavior(close).show_ui(ui, add).inner
+        egui::ComboBox::from_id_salt(id)
+            .icon(kit::combo_caret)
+            .selected_text(text)
+            .width(width)
+            .truncate()
+            .close_behavior(close)
+            .show_ui(ui, |ui| {
+                kit::menu_look(ui, width.max(160.0));
+                add(ui)
+            })
+            .inner
     })
     .inner
 }
 
-/// A check box (accent fill and a white tick when on) with an optional label.
-pub(crate) fn check(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
-    let p = ternarygrid_ui::pal(ui);
-    let galley = (!label.is_empty()).then(|| ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(style::body_size(ui.ctx())), Color32::PLACEHOLDER));
-    let width = 16.0 + galley.as_ref().map_or(0.0, |g| g.size().x + 8.0);
-    let (rect, mut resp) = ui.allocate_exact_size(vec2(width, 20.0), Sense::click());
-    if resp.clicked() {
-        *on = !*on;
-        resp.mark_changed();
-    }
-    let (enabled, checked) = (ui.is_enabled(), *on);
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, checked, label));
-    if ui.is_rect_visible(rect) {
-        let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
-        let b = Rect::from_center_size(egui::pos2(rect.left() + 8.0, rect.center().y), Vec2::splat(16.0));
-        let hovered = enabled && resp.hovered();
-        let (fill, stroke) = if checked { (p.accent, p.accent) } else { (p.surface, if hovered { p.text_muted } else { p.border_strong }) };
-        let painter = ui.painter();
-        painter.rect(b, CornerRadius::same(4), fade(fill), Stroke::new(1.5, fade(stroke)), StrokeKind::Inside);
-        if checked {
-            let c = b.center();
-            let tick = vec![egui::pos2(c.x - 3.8, c.y + 0.2), egui::pos2(c.x - 1.2, c.y + 2.8), egui::pos2(c.x + 3.8, c.y - 2.6)];
-            painter.add(egui::Shape::line(tick, Stroke::new(1.8, fade(p.on_accent))));
-        }
-        if let Some(g) = galley {
-            painter.galley(egui::pos2(b.right() + 8.0, rect.center().y - g.size().y / 2.0), g, fade(p.text));
-        }
-        if resp.has_focus() {
-            style::focus_halo(ui, b, 4);
-        }
-    }
-    resp
-}
-
-/// A red, filled button: the confirmation that changes the database.
-fn danger_solid(ui: &mut Ui, glyph: &str, text: &str) -> Response {
-    let p = ternarygrid_ui::pal(ui);
-    let base = if ui.visuals().dark_mode { Color32::from_rgb(0xc4, 0x35, 0x2b) } else { p.err };
-    let size = style::body_size(ui.ctx());
-    let label = ui.painter().layout_no_wrap(text.to_string(), style::medium(ui.ctx(), size), Color32::PLACEHOLDER);
-    let glyph = ui.painter().layout_no_wrap(glyph.to_string(), style::icon_font(size + 2.0), Color32::PLACEHOLDER);
-    let content_w = label.size().x + glyph.size().x + 6.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(content_w + 24.0, style::CONTROL_H), Sense::click());
-    let enabled = ui.is_enabled();
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, text));
-    if ui.is_rect_visible(rect) {
-        let fill = if enabled && resp.hovered() { crate::theme::darken(base, 0.12) } else { base };
-        let fg = if enabled { Color32::WHITE } else { Color32::WHITE.gamma_multiply(0.6) };
-        let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(style::RADIUS), if enabled { fill } else { fill.gamma_multiply(0.5) });
-        if resp.has_focus() {
-            painter.rect_stroke(rect.expand(2.0), CornerRadius::same(style::RADIUS + 2), Stroke::new(1.5, base), StrokeKind::Outside);
-        }
-        let x = rect.center().x - content_w / 2.0;
-        let gw = glyph.size().x;
-        painter.galley(egui::pos2(x, rect.center().y - glyph.size().y / 2.0), glyph, fg);
-        painter.galley(egui::pos2(x + gw + 6.0, rect.center().y - label.size().y / 2.0), label, fg);
-    }
-    resp
+/// An item of a [`select`]'s menu, a check mark beside the chosen one; true when clicked.
+pub(crate) fn pick(ui: &mut Ui, on: bool, text: &str) -> bool {
+    let mut on = on;
+    kit::menu_check(ui, &mut on, text).clicked()
 }
 
 /// A problem of the design: a warning icon and the text in the warning colour.
@@ -2181,7 +2151,9 @@ fn warning_line(ui: &mut Ui, text: &str) {
     let p = ternarygrid_ui::pal(ui);
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(RichText::new(icon::WARNING).size(14.0).color(p.warn));
+        // The design's 14 point icon on the text's line.
+        let (r, _) = ui.allocate_exact_size(vec2(14.0, 15.0), Sense::hover());
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icon::WARNING, style::icon_font(14.0), p.warn);
         ui.add(egui::Label::new(RichText::new(text).size(12.5).color(p.warn)).wrap());
     });
 }
@@ -2195,8 +2167,7 @@ fn arrow(ui: &mut Ui, size: f32) {
 /// A column name in a table's header row.
 fn header_label(ui: &mut Ui, text: &str) -> Response {
     let p = ternarygrid_ui::pal(ui);
-    ui.add_space(2.0);
-    ui.add(egui::Label::new(RichText::new(text).font(style::semibold(ui.ctx(), 12.0)).color(p.text_muted)).truncate())
+    kit::semibold_label(ui, text, 12.0, p.text_muted)
 }
 
 /// The card of one key, foreign key, check or trigger; its border warns while it is incomplete.
@@ -2220,20 +2191,37 @@ fn item_card<R>(ui: &mut Ui, warn: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
 /// is [`HEADER_H`] tall; its band on the header colour is painted here.
 fn table_frame<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     let p = ternarygrid_ui::pal(ui);
+    // The design stripes the second, fourth… row; egui the first, third…: the frame shows the
+    // stripe through the rows egui leaves bare, and egui's stripes are the surface.
     parts::bordered(ui)
-        .inner_margin(Margin { left: 6, right: 6, top: 0, bottom: 0 })
+        .fill(p.stripe)
+        .inner_margin(Margin { left: CELL_PAD as i8, right: CELL_PAD as i8, top: 0, bottom: 0 })
         .show(ui, |ui| {
             let r = ui.max_rect();
-            let band = Rect::from_min_max(egui::pos2(r.left() - 6.0, r.top()), egui::pos2(r.right() + 6.0, r.top() + HEADER_H));
+            let band = Rect::from_min_max(egui::pos2(r.left() - CELL_PAD, r.top()), egui::pos2(r.right() + CELL_PAD, r.top() + HEADER_H));
             ui.painter().rect_filled(band, CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, p.header);
             ui.painter().hline(band.x_range(), band.bottom() - 0.5, Stroke::new(1.0, p.border));
-            ui.spacing_mut().item_spacing = vec2(8.0, 2.0);
+            // Rows edge to edge (their hairline is painted by `row_line`).
+            ui.spacing_mut().item_spacing = vec2(2.0 * CELL_PAD, 0.0);
+            ui.visuals_mut().faint_bg_color = p.surface;
+            ui.visuals_mut().selection.bg_fill = p.sel;
             // egui_extras draws the resize handles of resizable columns as lines in this
             // colour at rest: the mockups' tables have no column lines (hovered ones still show).
             ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
             add(ui)
         })
         .inner
+}
+
+/// The hairline under a table's row across `x` (the table's width), painted from its last cell
+/// (after the row's fills).
+fn row_line(ui: &Ui, x: egui::Rangef) {
+    let p = ternarygrid_ui::pal(ui);
+    let bottom = ui.max_rect().bottom() - 0.5;
+    // Beyond the cell's clip, across the row (still inside the table's scroll area vertically).
+    let mut painter = ui.painter().clone();
+    painter.set_clip_rect(Rect::from_x_y_ranges(x, ui.clip_rect().y_range()));
+    painter.hline(x, bottom, Stroke::new(1.0, p.line));
 }
 
 /// Statements as one script.
@@ -2335,7 +2323,7 @@ impl TabView for TableDesignerTab {
         let p = ternarygrid_ui::pal(ui);
         egui::Panel::bottom(egui::Id::new(("td_preview", self.uid)))
             .resizable(true)
-            .default_size(250.0)
+            .default_size(251.0)
             .size_range(80.0..=f32::INFINITY)
             .frame(egui::Frame::new().fill(p.canvas))
             .show(ui, |ui| {

@@ -61,13 +61,14 @@ const LABEL_W: f32 = 120.0;
 
 /// A section of the editor: a hairline above (except the first), its title in semibold.
 fn section(ui: &mut Ui, title: &str, first: bool) {
+    // The design's sections are 16 apart, the hairline between them.
     if !first {
-        ui.add_space(6.0);
+        ui.add_space(16.0 - ui.spacing().item_spacing.y);
         ternarygrid_ui::parts::hline(ui);
-        ui.add_space(6.0);
+        ui.add_space(16.0);
     }
     let p = ternarygrid_ui::pal(ui);
-    ui.label(RichText::new(title).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(p.text));
+    kit::semibold_label(ui, title, 13.0, p.text);
 }
 
 /// A form row of the editor: the label 6 points down in a column of 120, the controls 16
@@ -118,13 +119,15 @@ fn schema_input(ui: &mut Ui, cx: &mut AppContext, conn: &str, value: &mut String
     r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("Choose a schema")));
     ui.painter().text(caret.center(), egui::Align2::CENTER_CENTER, icon::CARET_DOWN, ternarygrid_ui::style::icon_font(13.0), if r.hovered() { p.text } else { p.text_muted });
     egui::Popup::menu(&r).show(|ui| {
+        kit::menu_look(ui, 200.0);
         let main = live.main.clone();
         live.meta.request_schemas(backend, &main, None);
         match live.meta.schemas_of(None).get() {
             Some(list) => {
                 egui::ScrollArea::vertical().id_salt("task_schema_list").max_height(280.0).show(ui, |ui| {
                     for s in list.iter().filter(|s| !s.is_system) {
-                        if ui.selectable_label(*value == s.name, &s.name).clicked() {
+                        let mut on = *value == s.name;
+                        if kit::menu_check(ui, &mut on, &s.name).clicked() {
                             *value = s.name.clone();
                             ui.close();
                         }
@@ -163,6 +166,8 @@ fn code_area(ui: &mut Ui, cx: &AppContext, conn: &str, text: &mut String, hint: 
                     // A custom frame's margin is the text's margin (`margin` is ignored with it).
                     .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 46, right: 12, top: 10, bottom: 10 }))
                     .desired_rows(lines.max(2))
+                    // Lines of 20 (egui counts the font's own line height).
+                    .min_size(egui::vec2(0.0, lines.max(2) as f32 * 20.0 + 20.0))
                     .desired_width(f32::INFINITY)
                     .hint_text(hint)
                     .layouter(&mut layouter),
@@ -222,8 +227,9 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
                     .on_hover_text(tr("minute hour day-of-month month day-of-week, e.g. 30 9 * * 1-5 (also @hourly, @daily, @weekly, @monthly)"));
                 let b = kit::button_ex(ui, Kind::Ghost, Some(icon::CARET_DOWN), tr("Examples"), true);
                 egui::Popup::menu(&b).show(|ui| {
+                    kit::menu_look(ui, 260.0);
                     for expr in CRON_PRESETS {
-                        if ui.button(format!("{}   {expr}", preset_label(expr))).clicked() {
+                        if kit::menu_item(ui, None, preset_label(expr), expr).clicked() {
                             s.cron = expr.to_string();
                             ui.close();
                         }
@@ -235,8 +241,12 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
             row(ui, tr("Every"), |ui| {
                 ui.add_sized(egui::vec2(80.0, ternarygrid_ui::style::CONTROL_H), egui::DragValue::new(&mut s.every).range(1..=100_000).speed(1));
                 egui::ComboBox::from_id_salt("sched_unit").icon(kit::combo_caret).selected_text(s.unit.label()).show_ui(ui, |ui| {
+                    kit::menu_look(ui, 140.0);
                     for u in IntervalUnit::ALL {
-                        ui.selectable_value(&mut s.unit, u, u.label());
+                        let mut on = s.unit == u;
+                        if kit::menu_check(ui, &mut on, u.label()).clicked() {
+                            s.unit = u;
+                        }
                     }
                 });
             });
@@ -327,13 +337,16 @@ impl TaskEditor {
         // 720 points wide (a composite task's list: 680).
         let full = if matches!(self.draft.kind, KindDraft::Composite { .. }) { 680.0 } else { 720.0 };
         let width = (screen.width() - 80.0).clamp(420.0, full);
-        let max_h = (screen.height() - 220.0).max(200.0);
+        // The design's body: at most 690 high.
+        let max_h = (screen.height() - 210.0).max(200.0);
         let (glyph, kind) = self.kind_title();
         let title = if self.draft.is_new() { tr("New task") } else { tr("Edit task") };
         let saving = self.saving;
         let (save, cancel) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
         let state: std::cell::RefCell<Option<(Result<TaskDef, String>, Option<String>)>> = std::cell::RefCell::new(None);
-        let dialog = ternarygrid_ui::parts::Dialog::new(title).icon(glyph).subtitle(kind).width(width);
+        // The scroll bar in the right padding: the fields end 20 from the edge, as designed.
+        let pad = egui::Margin { left: 20, right: 6, top: 16, bottom: 16 };
+        let dialog = ternarygrid_ui::parts::Dialog::new(title).icon(glyph).subtitle(kind).width(width).body_padding(pad);
         let mut footer = |ui: &mut Ui| {
             let st = state.borrow();
             let problem = st.as_ref().and_then(|(_, p)| p.clone());
@@ -408,12 +421,13 @@ impl TaskEditor {
                     .add_sized(egui::vec2(44.0, look::FIELD_H), egui::Button::new(RichText::new(icon::CARET_DOWN).font(ternarygrid_ui::style::icon_font(13.0))))
                     .on_hover_text(tr("Folders"));
                 egui::Popup::menu(&b).show(|ui| {
-                    if ui.button(tr("(top level)")).clicked() {
+                    kit::menu_look(ui, 200.0);
+                    if kit::menu_item(ui, None, tr("(top level)"), "").clicked() {
                         d.folder.clear();
                         ui.close();
                     }
                     for f in folders {
-                        if ui.button(format!("{} {f}", icon::FOLDER)).clicked() {
+                        if kit::menu_item(ui, Some(icon::FOLDER), f, "").clicked() {
                             d.folder = f.clone();
                             ui.close();
                         }
@@ -427,7 +441,7 @@ impl TaskEditor {
                 egui::TextEdit::multiline(&mut d.description)
                     .desired_rows(1)
                     .desired_width(ui.available_width())
-                    .margin(egui::Margin::symmetric(10, 15))
+                    .margin(egui::Margin { left: 13, right: 10, top: 15, bottom: 15 })
                     .min_size(egui::vec2(0.0, 48.0)),
             );
         });
@@ -540,34 +554,36 @@ impl TaskEditor {
                         ui.set_width(ui.available_width());
                         ui.spacing_mut().item_spacing.y = 0.0;
                         for (i, id) in steps.iter().enumerate() {
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::hover());
+                            // Rows of 32 and their hairline, the parts 8 apart, as designed.
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 33.0), egui::Sense::hover());
                             if i + 1 < n {
-                                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, ternarygrid_ui::soft(pal.border, 0.75)));
+                                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, pal.line));
                             }
                             let mut child =
                                 ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
                             let ui = &mut child;
-                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.spacing_mut().item_spacing.x = 8.0;
                             ui.label(RichText::new(format!("{}.", i + 1)).color(pal.text_faint));
-                            match name_of(id) {
-                                Some((g, name)) => {
-                                    ui.label(RichText::new(g).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.text_muted));
+                            let found = name_of(id);
+                            let (glyph, color) = found.as_ref().map_or((icon::X_CIRCLE, pal.err), |(g, _)| (*g, pal.text_muted));
+                            let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, ternarygrid_ui::style::icon_font(14.0), color);
+                            match found {
+                                Some((_, name)) => {
                                     ui.add(egui::Label::new(name).truncate());
                                 }
                                 None => {
-                                    ui.label(RichText::new(icon::X_CIRCLE).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.err));
                                     ui.label(RichText::new(tr("(missing task)")).color(pal.err));
                                 }
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                if kit::icon_button_ex(ui, icon::X, tr("Remove"), false, 24.0).clicked() {
+                                if kit::icon_button_sized(ui, icon::X, tr("Remove"), false, 24.0, 12.0).clicked() {
                                     action = Some((i, 0));
                                 }
-                                if ui.add_enabled_ui(i + 1 < n, |ui| kit::icon_button_ex(ui, icon::ARROW_DOWN, tr("Move down"), false, 24.0)).inner.clicked() {
+                                if ui.add_enabled_ui(i + 1 < n, |ui| kit::icon_button_sized(ui, icon::ARROW_DOWN, tr("Move down"), false, 24.0, 12.0)).inner.clicked() {
                                     action = Some((i, 1));
                                 }
-                                if ui.add_enabled_ui(i > 0, |ui| kit::icon_button_ex(ui, icon::ARROW_UP, tr("Move up"), false, 24.0)).inner.clicked() {
+                                if ui.add_enabled_ui(i > 0, |ui| kit::icon_button_sized(ui, icon::ARROW_UP, tr("Move up"), false, 24.0, 12.0)).inner.clicked() {
                                     action = Some((i, -1));
                                 }
                             });
@@ -588,8 +604,11 @@ impl TaskEditor {
                     let candidates: Vec<&TaskDef> = tasks.iter().filter(|t| Some(&t.id) != own_id.as_ref()).collect();
                     let label = self.add_step.as_ref().and_then(|id| candidates.iter().find(|t| &t.id == id)).map(|t| t.path()).unwrap_or_else(|| tr("Choose a task…").to_string());
                     egui::ComboBox::from_id_salt("task_add_step").icon(kit::combo_caret).selected_text(label).width(260.0).show_ui(ui, |ui| {
+                        kit::menu_look(ui, 260.0);
                         for t in &candidates {
-                            ui.selectable_value(&mut self.add_step, Some(t.id.clone()), format!("{} {}", kind_icon(&t.kind), t.path()));
+                            if kit::menu_item(ui, Some(kind_icon(&t.kind)), &t.path(), "").clicked() {
+                                self.add_step = Some(t.id.clone());
+                            }
                         }
                     });
                     if ui.add_enabled_ui(self.add_step.is_some(), |ui| kit::button_ex(ui, Kind::Secondary, Some(icon::PLUS), tr("Add step"), true)).inner.clicked()

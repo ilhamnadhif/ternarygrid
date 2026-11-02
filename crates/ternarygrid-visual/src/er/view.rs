@@ -846,7 +846,10 @@ fn toolbar_combo<R>(
             .icon(ternarygrid_ui::kit::combo_caret)
             .selected_text(text)
             .width(width)
-            .show_ui(ui, add)
+            .show_ui(ui, |ui| {
+                ternarygrid_ui::kit::menu_look(ui, width.max(160.0));
+                add(ui)
+            })
             .response
     })
     .inner
@@ -927,7 +930,10 @@ fn toolbar(
                 140.0,
                 |ui| {
                     for d in ColumnDisplay::ALL {
-                        ui.selectable_value(&mut diagram.settings.columns, d, tr(d.label()));
+                        let mut on = diagram.settings.columns == d;
+                        if kit::menu_check(ui, &mut on, tr(d.label())).clicked() {
+                            diagram.settings.columns = d;
+                        }
                     }
                 },
             )
@@ -952,7 +958,10 @@ fn toolbar(
                 130.0,
                 |ui| {
                     for n in [Notation::CrowsFoot, Notation::Simple] {
-                        ui.selectable_value(&mut diagram.settings.notation, n, tr(n.label()));
+                        let mut on = diagram.settings.notation == n;
+                        if kit::menu_check(ui, &mut on, tr(n.label())).clicked() {
+                            diagram.settings.notation = n;
+                        }
                     }
                 },
             );
@@ -1072,28 +1081,27 @@ fn context_menu_ui(
     selection: &BTreeSet<String>,
     edit_mode: bool,
 ) -> Option<MenuAction> {
-    use ternarygrid_ui::kit::with_icon;
-    let p = ternarygrid_ui::pal(ui);
+    use ternarygrid_ui::kit;
     let mut action = None;
-    // 230 points wide with the menu's padding, as designed.
-    ui.set_min_width(220.0);
-    // An item: its icon and text (in red for the destructive ones).
+    // The design's menu look, 230 points wide.
+    kit::menu_look(ui, 230.0);
+    // An item: its icon (none for "") and text (in red for the destructive ones).
     let mut item = |ui: &mut Ui, glyph: &str, text: &str, a: MenuAction, danger: bool| {
-        let label = egui::RichText::new(with_icon(glyph, text));
-        let label = if danger { label.color(p.err) } else { label };
-        if ui.button(label).clicked() {
+        let glyph = Some(glyph).filter(|g| !g.is_empty());
+        let r = if danger {
+            kit::menu_item_danger(ui, glyph, text, "")
+        } else {
+            kit::menu_item(ui, glyph, text, "")
+        };
+        if r.clicked() {
             action = Some(a);
             ui.close();
         }
     };
-    // The menu's title: what it acts on, faint.
+    // The menu's title: what it acts on, as a disabled item.
     let title = |ui: &mut Ui, text: &str| {
-        ui.add(
-            egui::Label::new(egui::RichText::new(text).color(p.text_faint))
-                .truncate()
-                .selectable(false),
-        );
-        ui.separator();
+        ui.add_enabled_ui(false, |ui| kit::menu_item(ui, None, text, ""));
+        kit::menu_separator(ui);
     };
     match target {
         ContextTarget::Table(key) => {
@@ -1133,7 +1141,7 @@ fn context_menu_ui(
             );
             item(
                 ui,
-                icon::LINK,
+                "",
                 tr("Select related tables"),
                 MenuAction::SelectRelated(key.clone()),
                 false,
@@ -1146,7 +1154,7 @@ fn context_menu_ui(
                 false,
             );
             if edit_mode {
-                ui.separator();
+                kit::menu_separator(ui);
                 item(
                     ui,
                     icon::PENCIL_SIMPLE,
@@ -1251,7 +1259,7 @@ fn context_menu_ui(
                 false,
             );
             if edit_mode {
-                ui.separator();
+                kit::menu_separator(ui);
                 item(
                     ui,
                     icon::PLUS,

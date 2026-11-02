@@ -85,11 +85,16 @@ impl TabView for ErrorLogTab {
         let pal = ternarygrid_ui::pal(ui);
         ui.spacing_mut().item_spacing.y = 0.0;
         ternarygrid_ui::parts::toolbar(ui, |ui| {
-            // The select at the height of the design's fields.
+            // The select at the height of the design's fields, its text 11 points in.
             ui.spacing_mut().interact_size.y = 30.0;
+            ui.spacing_mut().button_padding = egui::vec2(11.0, 5.0);
             egui::ComboBox::from_id_salt("error_log_level").icon(ternarygrid_ui::kit::combo_caret).width(190.0).selected_text(tr(level_label(self.level))).show_ui(ui, |ui| {
+                ternarygrid_ui::kit::menu_look(ui, 190.0);
                 for l in [Level::ERROR, Level::WARN, Level::INFO] {
-                    ui.selectable_value(&mut self.level, l, tr(level_label(l)));
+                    let mut on = self.level == l;
+                    if ternarygrid_ui::kit::menu_check(ui, &mut on, tr(level_label(l))).clicked() {
+                        self.level = l;
+                    }
                 }
             });
             ternarygrid_ui::kit::search_field(ui, egui::Id::new("error_log_search"), &mut self.search, tr("Search"), 260.0);
@@ -122,7 +127,7 @@ impl TabView for ErrorLogTab {
             for e in &shown[range] {
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
                 let painter = ui.painter();
-                painter.hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, ternarygrid_ui::soft(pal.border, 0.75)));
+                painter.hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, pal.line));
                 let cy = rect.center().y;
                 let t = painter.text(egui::pos2(rect.left() + 16.0, cy), egui::Align2::LEFT_CENTER, e.time.format("%H:%M:%S").to_string(), mono.clone(), pal.text_faint);
                 // The level in a bold monospace (drawn twice, half a pixel apart: the
