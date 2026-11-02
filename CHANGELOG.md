@@ -3,6 +3,15 @@
 All notable changes to DBiji. The newest version comes first; DBiji shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.5.1 — 2026-11-02
+
+### Fixed
+- macOS: DBiji no longer crashes when it quits on MacBooks with a Touch Bar. The fix in 0.3.5 did not reach the cause: the accessibility layer changed the window's view while the Touch Bar was still watching it. On macOS that layer is now off, so VoiceOver no longer reads DBiji's contents there (Windows and Linux keep screen reader support).
+
+### Changed
+- The interface is in English only: the language choice is gone from Settings and the status bar.
+- The AI assistant answers in the language you write in.
+
 ## 0.5.0 — 2026-10-31
 
 ### Added
