@@ -7,7 +7,6 @@
 use crate::types::ChatMessage;
 use dbiji_core::DbKind;
 use dbiji_core::ddl::{ForeignKeyDef, SchemaSnapshot, TableDef};
-use dbiji_core::i18n::Locale;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Default character budget of the schema context.
@@ -56,18 +55,11 @@ fn dialect_notes(kind: DbKind) -> &'static str {
     }
 }
 
-fn language_name(l: Locale) -> &'static str {
-    match l {
-        Locale::En => "English",
-        Locale::Id => "Indonesian (Bahasa Indonesia)",
-    }
-}
-
 /// System prompt for the SQL assistant of a connection: expert in the
-/// dialect and version, answers in the UI language, SQL in ```sql fences,
+/// dialect and version, answers in the user's language, SQL in ```sql fences,
 /// only objects from the schema, read-only by default, warnings before
 /// destructive statements.
-pub fn system_prompt(kind: DbKind, server_version: &str, schema_context: &str, ui_language: Locale) -> String {
+pub fn system_prompt(kind: DbKind, server_version: &str, schema_context: &str) -> String {
     let product = kind.display_name();
     let version = server_version.trim();
     let target = if version.is_empty() { product.to_string() } else { format!("{product} {version}") };
@@ -82,7 +74,7 @@ pub fn system_prompt(kind: DbKind, server_version: &str, schema_context: &str, u
     s.push_str("- Prefer read-only queries. Add a row limit when a query could return many rows, and qualify columns when several tables are joined.\n");
     s.push_str("- Before any statement that changes data or schema (INSERT, UPDATE, DELETE, MERGE, TRUNCATE, DROP, ALTER, CREATE, GRANT, REVOKE), warn clearly about its effect. Always include a WHERE clause in UPDATE and DELETE, and suggest running such statements in a transaction or after a backup.\n");
     s.push_str("- You cannot see or execute anything: never claim results, and say when an answer depends on the data.\n");
-    s.push_str(&format!("- Answer in {}. Keep SQL keywords, identifiers and code in their original form.\n\n", language_name(ui_language)));
+    s.push_str("- Answer in the language the user writes in. Keep SQL keywords, identifiers and code in their original form.\n\n");
     s.push_str("Database schema (structure only, no data):\n");
     if schema_context.trim().is_empty() {
         s.push_str("(no schema information is available)\n");
@@ -709,19 +701,19 @@ mod tests {
 
     #[test]
     fn system_prompt_content() {
-        let p = system_prompt(DbKind::Postgres, "16.2", "table public.users (id integer PK)", Locale::Id);
+        let p = system_prompt(DbKind::Postgres, "16.2", "table public.users (id integer PK)");
         assert!(p.contains("expert in PostgreSQL 16.2"));
         assert!(p.contains("```sql"));
         assert!(p.contains("Use only the tables"));
         assert!(p.contains("Prefer read-only"));
         assert!(p.contains("warn clearly"));
-        assert!(p.contains("Answer in Indonesian"));
+        assert!(p.contains("Answer in the language the user writes in"));
         assert!(p.ends_with("table public.users (id integer PK)\n"));
-        let m = system_prompt(DbKind::MySql, "", "", Locale::En);
-        assert!(m.contains("expert in MySQL and") && m.contains("backticks") && m.contains("Answer in English"));
+        let m = system_prompt(DbKind::MySql, "", "");
+        assert!(m.contains("expert in MySQL and") && m.contains("backticks"));
         assert!(m.contains("(no schema information is available)"));
         // stable: no timestamps or other volatile content
-        assert_eq!(system_prompt(DbKind::Sqlite, "3.45", "x", Locale::En), system_prompt(DbKind::Sqlite, "3.45", "x", Locale::En));
+        assert_eq!(system_prompt(DbKind::Sqlite, "3.45", "x"), system_prompt(DbKind::Sqlite, "3.45", "x"));
     }
 
     #[test]

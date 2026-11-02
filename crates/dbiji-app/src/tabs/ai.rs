@@ -25,7 +25,6 @@ use dbiji_ai::prompts;
 use dbiji_ai::{AiClient, AiConfig, AiProviderKind, ChatMessage, ChatRequest, ChatResponse, SchemaContextBuilder, Usage};
 use dbiji_config::settings::{AiProvider, AiSettings};
 use dbiji_core::ddl::SchemaSnapshot;
-use dbiji_core::i18n::Locale;
 use dbiji_core::meta::{ObjectKind, ObjectRef, SchemaRef};
 use dbiji_core::{DbError, DbKind, DbResult, Dialect, ErrorKind, Secret, tr, trf};
 use dbiji_editor::{EditorLanguage, EditorTheme};
@@ -227,8 +226,6 @@ pub struct RequestContext<'a> {
     pub snapshot: Option<&'a SchemaSnapshot>,
     /// `AiSettings::include_schema_context`.
     pub include_schema: bool,
-    /// Answer language.
-    pub locale: Locale,
 }
 
 /// The complete request: system prompt (instructions, dialect, schema
@@ -239,7 +236,7 @@ pub fn build_request(ctx: &RequestContext<'_>, history: &[(ChatMessage, String)]
         (true, Some(s)) => SchemaContextBuilder::new().snapshot(s).question(question).budget(SCHEMA_CONTEXT_BUDGET).build(),
         _ => String::new(),
     };
-    let system = prompts::system_prompt(ctx.kind, ctx.server_version, &schema_text, ctx.locale);
+    let system = prompts::system_prompt(ctx.kind, ctx.server_version, &schema_text);
     let mut used = message.content.len();
     let mut kept: Vec<(&ChatMessage, &String)> = Vec::new();
     for (q, a) in history.iter().rev() {
@@ -829,7 +826,6 @@ impl AiAssistantTab {
         let snapshot = if ai.include_schema_context { self.snapshot(cx) } else { None };
         let history = self.history();
         let question = format!("{} {}", input.text, input.error);
-        let locale = dbiji_core::i18n::locale();
         let include_schema = ai.include_schema_context;
         let preparing = !matches!(prep, Prep::None);
         let mut agent = match live {
@@ -852,7 +848,7 @@ impl AiAssistantTab {
                 return Err(DbError::cancelled());
             }
             let message = user_message(action, &input)?;
-            let ctx = RequestContext { kind, server_version: &version, snapshot: snapshot.as_deref(), include_schema, locale };
+            let ctx = RequestContext { kind, server_version: &version, snapshot: snapshot.as_deref(), include_schema };
             let req = build_request(&ctx, &history, message.clone(), &question);
             let _ = tx.send(Event::Prepared(message));
             repaint.request();

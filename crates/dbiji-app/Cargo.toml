@@ -77,8 +77,13 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.21.2", default-features = false }
-objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSUserDefaults", "NSDictionary", "NSString", "NSValue", "NSObject"] }
+
+# Screen readers (AccessKit) on Windows and Linux. Not on macOS: there its
+# adapter changes the class of the window's view at run time and puts it back
+# on quit, while AppKit's Touch Bar still observes that view (KVO); AppKit
+# then fails to remove its observer and crashes the app on Macs with a Touch Bar.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+eframe = { workspace = true, features = ["accesskit"] }
 
 # Windows without OpenGL 2 draws with Direct3D 12 instead (see run()).
 [target.'cfg(windows)'.dependencies]

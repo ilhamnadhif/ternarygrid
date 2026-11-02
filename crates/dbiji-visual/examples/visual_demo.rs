@@ -11,7 +11,6 @@
 mod demo_data;
 
 use dbiji_core::ddl::TableDef;
-use dbiji_core::i18n::{Locale, set_locale};
 use dbiji_core::plan::QueryPlan;
 use dbiji_core::value::{ColumnMeta, DataKind, Row, Value};
 use dbiji_core::{admin::Metric, tr, trf};
@@ -88,7 +87,6 @@ struct DemoApp {
     // spatial
     layers: Vec<SpatialLayer>,
     spatial_state: SpatialState,
-    indonesian: bool,
 }
 
 impl DemoApp {
@@ -197,7 +195,6 @@ impl DemoApp {
             custom_state: CustomDashboardState::default(),
             layers,
             spatial_state: SpatialState::default(),
-            indonesian: false,
         }
     }
 
@@ -522,16 +519,6 @@ impl eframe::App for DemoApp {
                 ui.selectable_value(&mut self.tab, Tab::Spatial, tr("Spatial"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::widgets::global_theme_preference_switch(ui);
-                    if ui
-                        .checkbox(&mut self.indonesian, "Bahasa Indonesia")
-                        .changed()
-                    {
-                        set_locale(if self.indonesian {
-                            Locale::Id
-                        } else {
-                            Locale::En
-                        });
-                    }
                 });
             });
         });

@@ -128,8 +128,7 @@ pub fn html_report(diff: &SchemaDiff, source_label: &str, target_label: &str) ->
     let title = format!("{}: {} \u{2192} {}", tr("Schema comparison"), source_label, target_label);
     let _ = write!(
         out,
-        "<!DOCTYPE html>\n<html lang=\"{}\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<style>{}</style>\n</head>\n<body>\n",
-        dbiji_core::i18n::locale().code(),
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<style>{}</style>\n</head>\n<body>\n",
         html_escape(&title),
         CSS
     );

@@ -8,7 +8,6 @@ use crate::tabs::TabView;
 use dbiji_config::settings::{AiEffort, AiProvider, BlankLineDelimiter, KeywordCase, NavigatorSort, ResultsLayout, RowDensity, SecretBackend, SortFilterMode, Theme};
 use dbiji_config::{KeymapPreset, SecretsManager};
 use dbiji_core::config::{ConnectionType, NavigatorView};
-use dbiji_core::i18n::Locale;
 use dbiji_core::value::{BinaryFormat, BoolStyle};
 use dbiji_core::{Secret, tr, trf};
 use egui::{RichText, Ui};
@@ -106,13 +105,11 @@ pub struct SettingsTab {
     confirm_reset: bool,
 }
 
-/// Every setting back to its default, except the language and the state
-/// of the update checks (seen version, skipped release).
+/// Every setting back to its default, except the state of the update
+/// checks (seen version, skipped release).
 pub fn reset_settings(settings: &mut dbiji_config::settings::AppSettings) {
-    let locale = settings.general.locale;
     let updates = settings.updates.clone();
     *settings = Default::default();
-    settings.general.locale = locale;
     settings.updates = updates;
 }
 
@@ -189,12 +186,6 @@ impl SettingsTab {
         let s = &mut cx.settings.general;
         grid(ui, "set_general", |ui| {
             let mut c = false;
-            c |= row(ui, tr("Language"), |ui| {
-                let mut v = s.locale;
-                let ch = combo(ui, "set_locale", &mut v, &[(None, tr("System")), (Some(Locale::En), "English"), (Some(Locale::Id), "Bahasa Indonesia")]);
-                s.locale = v;
-                ch
-            });
             c |= row(ui, tr("Time zone"), |ui| {
                 let choices = crate::conn::time_zone_choices();
                 let items: Vec<_> = choices.iter().map(|(v, l)| (*v, l.as_str())).collect();

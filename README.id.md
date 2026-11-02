@@ -8,7 +8,7 @@ hasil query jutaan baris tidak perlu muat di memori.
 
 [English](README.md)
 
-![DBiji dengan tema gelap dan bahasa Indonesia](docs/screenshots/editor-dark-id.png)
+![DBiji: navigator, editor SQL dan grid hasil](docs/screenshots/editor.png)
 
 ## Sorotan
 
@@ -43,7 +43,7 @@ hasil query jutaan baris tidak perlu muat di memori.
 - **Asisten AI** (opsional, dengan kunci API Anda sendiri: Anthropic, OpenAI, atau layanan yang
   kompatibel) di panel samping: mengenal skema, menulis dan menjelaskan SQL, menyimpan percakapannya,
   dan, jika diizinkan, menjalankan query read-only sendiri.
-- Antarmuka Inggris dan Indonesia, tema terang dan gelap (View → Theme atau tombol matahari / bulan di
+- Antarmuka berbahasa Inggris, tema terang dan gelap (View → Theme atau tombol matahari / bulan di
   status bar), pintasan dan toolbar yang bisa diubah, tanpa telemetri.
 - **Pembaruan otomatis** dari rilis GitHub (opsional), pasang dengan satu klik, dan catatan rilis setelah setiap pembaruan.
 

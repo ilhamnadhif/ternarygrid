@@ -164,7 +164,6 @@ Legend: ✅ implemented and tested · 🟡 implemented, partially tested ·
 | Feature | Status | Where | Tests |
 | --- | --- | --- | --- |
 | Themes (light, dark, system), high contrast | ✅ | `theme.rs` | `dbiji-app::tabs_smoke` |
-| Interface language (English, Indonesian) | ✅ | `dbiji-core::i18n`, `locales/id.tsv` | `dbiji-app::i18n_coverage`, `i18n_labels` |
 | Keyboard shortcuts (customisable, DBiji / DBeaver presets) | ✅ | `dbiji-config::keymap`, `keys.rs` | `dbiji-config::keymap` tests, `dbiji-app::keys::tests` |
 | Toolbar customisation | ✅ | settings → Toolbar | `dbiji-config::settings` tests |
 | Accessibility | 🟡 | AccessKit tree (egui), editor text runs, keyboard navigation everywhere; screen reader support per grid cell is not implemented (one node per grid) | `dbiji-editor` AccessKit test |

@@ -80,12 +80,11 @@ pub fn system_info(paths: &dbiji_config::AppPaths, settings: &Settings, conns: &
         }
     }
     format!(
-        "DBiji {version}\nOS: {os} ({family}, {arch})\nLocale: {locale:?}\nTheme: {theme:?}\nPortable: {portable}\nConnections: {count} ({kinds})\nTime: {time}\n",
+        "DBiji {version}\nOS: {os} ({family}, {arch})\nTheme: {theme:?}\nPortable: {portable}\nConnections: {count} ({kinds})\nTime: {time}\n",
         version = env!("CARGO_PKG_VERSION"),
         os = std::env::consts::OS,
         family = std::env::consts::FAMILY,
         arch = std::env::consts::ARCH,
-        locale = settings.general.effective_locale(),
         theme = settings.general.theme,
         portable = paths.is_portable(),
         count = conns.len(),

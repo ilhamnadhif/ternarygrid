@@ -61,7 +61,6 @@
 //!   [`EditorState::view_state`].
 //! * Install the egui-phosphor font (`egui_phosphor::add_to_fonts`) for the
 //!   completion and context-menu icons.
-//! * Translations: every string is listed in [`TRANSLATABLE_STRINGS`].
 //!
 //! # Default key bindings
 //!
@@ -120,50 +119,6 @@ pub use state::{Diagnostic, EditorState, Severity, ViewState};
 pub use text::LineEnding;
 pub use theme::EditorTheme;
 pub use widget::{ContextAction, EditorEvent, EditorResponse, SqlEditor};
-
-/// Every user-visible English string of this crate (all of them go through
-/// `dbiji_core::tr` / `trf`). Used to check locale coverage.
-pub const TRANSLATABLE_STRINGS: &[&str] = &[
-    "Find",
-    "Replace",
-    "Replace all",
-    "Toggle replace",
-    "Match case",
-    "Whole word",
-    "Use regular expression",
-    "Invalid regular expression: {}",
-    "No results",
-    "{} of {}",
-    "{} matches",
-    "Previous match",
-    "Next match",
-    "Close",
-    "Go to line (1 - {}):",
-    "Go to line",
-    "Execute statement",
-    "Execute script",
-    "Execute in new tab",
-    "Explain execution plan",
-    "Format SQL",
-    "Cut",
-    "Copy",
-    "Paste",
-    "Select all",
-    "Undo",
-    "Redo",
-    "Toggle comment",
-    "Toggle block comment",
-    "Upper case",
-    "Lower case",
-    "Add \"{}\" to dictionary",
-    "No suggestions",
-    "Error",
-    "Warning",
-    "Info",
-    "{} columns",
-    "Table {}",
-    "Function {}",
-];
 
 /// Consume `shortcut` from egui's input together with the text it typed.
 ///

@@ -1164,10 +1164,9 @@ impl DbijiApp {
         self.pending_generate = still;
     }
 
-    /// Apply edited preferences (theme, language, limits, keymap) and save them.
+    /// Apply edited preferences (theme, limits, keymap) and save them.
     fn apply_settings(&mut self, ctx: &egui::Context) {
         crate::theme::apply_settings(ctx, &self.settings);
-        dbiji_core::i18n::set_locale(self.settings.general.effective_locale());
         // Another time zone: the connections whose sessions have one reconnect.
         if self.conns.time_zone != self.settings.general.time_zone {
             self.conns.time_zone = self.settings.general.time_zone;
@@ -1630,17 +1629,8 @@ impl DbijiApp {
                 let mem = dbiji_core::rowstore::global_resident_bytes();
                 ui.weak(format!("{} {}", icon::MEMORY, crate::widgets::format_bytes(mem as i64))).on_hover_text(tr("Memory used by result sets"));
                 ui.separator();
-                // Language and time zone, as in DBeaver ("en", "WIB"): a click chooses another.
-                let locale = self.settings.general.effective_locale();
-                let lang = ui.add(egui::Button::new(locale.code()).frame_when_inactive(false)).on_hover_text(tr("Language"));
+                // Time zone, as in DBeaver ("WIB"): a click chooses another.
                 let mut changed = false;
-                egui::Popup::menu(&lang).show(|ui| {
-                    let mut v = self.settings.general.locale;
-                    for (choice, label) in [(None, tr("System")), (Some(dbiji_core::i18n::Locale::En), "English"), (Some(dbiji_core::i18n::Locale::Id), "Bahasa Indonesia")] {
-                        changed |= ui.radio_value(&mut v, choice, label).changed();
-                    }
-                    self.settings.general.locale = v;
-                });
                 let tz = self.settings.general.time_zone;
                 let tz_button = ui.add(egui::Button::new(crate::conn::time_zone_label(tz)).frame_when_inactive(false));
                 let tz_tip = crate::conn::time_zone_choices().into_iter().find(|(c, _)| *c == tz).map(|(_, l)| l).unwrap_or_default();

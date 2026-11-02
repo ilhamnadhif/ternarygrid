@@ -14,7 +14,6 @@ use crate::keymap::{self, KeymapConfig};
 use crate::paths::{AppPaths, backup_corrupt_file, write_json};
 use dbiji_core::DbResult;
 use dbiji_core::config::NavigatorView;
-use dbiji_core::i18n::Locale;
 use dbiji_core::value::FormatOptions;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -120,9 +119,6 @@ pub enum TimeZoneChoice {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralSettings {
-    /// UI language; `None` follows the operating system.
-    #[serde(deserialize_with = "lenient")]
-    pub locale: Option<Locale>,
     /// Colour theme.
     #[serde(deserialize_with = "lenient")]
     pub theme: Theme,
@@ -146,7 +142,6 @@ pub struct GeneralSettings {
 impl Default for GeneralSettings {
     fn default() -> Self {
         GeneralSettings {
-            locale: None,
             theme: Theme::System,
             time_zone: TimeZoneChoice::System,
             ui_font_size: 13.0,
@@ -156,13 +151,6 @@ impl Default for GeneralSettings {
             show_tips: true,
             next_tip: 0,
         }
-    }
-}
-
-impl GeneralSettings {
-    /// The configured locale or, when unset, the operating system locale.
-    pub fn effective_locale(&self) -> Locale {
-        self.locale.unwrap_or_else(dbiji_core::i18n::system_locale)
     }
 }
 
@@ -1010,7 +998,6 @@ mod tests {
         let (_d, p) = paths();
         let mut s = AppSettings::default();
         s.general.theme = Theme::Dark;
-        s.general.locale = Some(Locale::Id);
         s.editor.format.comma_first = true;
         s.results.fetch_size = 500;
         s.keymap.preset = KeymapPreset::Dbeaver;
@@ -1112,6 +1099,5 @@ mod tests {
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["ai"]["effort"], "high");
         assert_eq!(json["general"]["theme"], "system");
-        let _ = s.general.effective_locale();
     }
 }

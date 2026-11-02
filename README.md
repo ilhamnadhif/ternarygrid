@@ -44,7 +44,7 @@ millions of rows never have to fit in memory.
 - **AI assistant** (optional, with your own API key: Anthropic, OpenAI or any compatible service) in a
   side panel: it knows the schema, writes and explains SQL, keeps its conversations and, if you
   allow it, runs read-only queries itself.
-- English and Indonesian UI, light and dark themes (View → Theme or the sun / moon button in the status
+- Light and dark themes (View → Theme or the sun / moon button in the status
   bar), customisable shortcuts and toolbar, no telemetry.
 - **Automatic updates** from GitHub releases (optional), with one click to install, and release notes after every update.
 
@@ -254,7 +254,7 @@ before running `scripts/bundle-macos.sh`.
 | Crate | Role |
 | --- | --- |
 | `dbiji-app` | The application: window, tabs, navigator, execution engine, CLI |
-| `dbiji-core` | Shared contract: values, driver/session traits, metadata, DDL, dialects, row store, i18n |
+| `dbiji-core` | Shared contract: values, driver/session traits, metadata, DDL, dialects, row store, UI strings |
 | `dbiji-sql` | Tokenizer, splitter, formatter, autocomplete, analysis, parameters |
 | `dbiji-driver-*` | PostgreSQL, MySQL, SQLite, SQL Server, Oracle, ClickHouse, Cassandra, Redis, MongoDB, Elasticsearch drivers |
 | `dbiji-editor` / `dbiji-grid` / `dbiji-visual` | Editor widget, data grid, diagrams and charts |

@@ -140,12 +140,11 @@ impl Drop for Dir {
     }
 }
 
-/// The UI language is process-wide: the walkthroughs run one at a time.
+/// The walkthroughs share process-wide state (environment): one at a time.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn setup() -> (Dir, H, String) {
     let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    dbiji_core::i18n::set_locale(dbiji_core::i18n::Locale::En);
     let dir = Dir(std::env::temp_dir().join(format!("dbiji-ui-{}", uuid::Uuid::new_v4().simple())), guard);
     std::fs::create_dir_all(dir.0.join("Downloads")).unwrap();
     // Exports and backups go to ~/Downloads by default: never the real one.
@@ -730,12 +729,7 @@ fn settings_grid_menu_and_editor_helpers() {
     }
     combo_pick(&mut h, "Theme", "Dark");
     assert_eq!(h.ctx.theme(), egui::Theme::Dark, "dark theme applied");
-    combo_pick(&mut h, "Language", "Bahasa Indonesia");
-    frames(&mut h, 3);
-    assert!(has(&h, "Umum"), "Indonesian UI: {:?}", labels(&h));
-    combo_pick(&mut h, "Bahasa", "English");
-    frames(&mut h, 3);
-    assert!(has(&h, "General"), "back to English: {:?}", labels(&h));
+    assert!(!has(&h, "Language"), "English only, no language choice: {:?}", labels(&h));
     no_errors(&mut h, "settings");
 
     // Result grid context menu on a table data tab.
@@ -1075,7 +1069,6 @@ fn tool_tabs_run() {
 #[test]
 fn themes_whats_new_and_updates() {
     let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    dbiji_core::i18n::set_locale(dbiji_core::i18n::Locale::En);
     let dir = Dir(std::env::temp_dir().join(format!("dbiji-ui-{}", uuid::Uuid::new_v4().simple())), guard);
     // An existing installation: a settings file from an older version.
     let paths = dbiji_config::AppPaths::with_root(dir.0.join("home"));
@@ -1689,7 +1682,6 @@ fn workspace_from_dbeaver() {
 fn create_database_from_the_navigator() {
     let Some(url) = std::env::var("DBIJI_TEST_PG").ok().filter(|u| !u.trim().is_empty()) else { return };
     let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    dbiji_core::i18n::set_locale(dbiji_core::i18n::Locale::En);
     let dir = Dir(std::env::temp_dir().join(format!("dbiji-ui-{}", uuid::Uuid::new_v4().simple())), guard);
     std::fs::create_dir_all(&dir.0).unwrap();
     // SAFETY: the walkthroughs run one at a time (SERIAL).

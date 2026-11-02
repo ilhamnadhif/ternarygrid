@@ -170,7 +170,6 @@ pub fn run() -> ExitCode {
     }
     tracing::info!("DBiji {} started", env!("CARGO_PKG_VERSION"));
     let (settings, mut warnings) = dbiji_config::settings::load_with_warnings(&paths);
-    dbiji_core::i18n::set_locale(settings.general.effective_locale());
     settings.results.apply_memory_limits();
 
     let backend = match backend::Backend::new() {
@@ -188,8 +187,6 @@ pub fn run() -> ExitCode {
     let (conns, mut conn_warnings) = connection_manager(&services);
     services.warnings.append(&mut conn_warnings);
 
-    #[cfg(target_os = "macos")]
-    macmenu::disable_touch_bar();
     let mut viewport = egui::ViewportBuilder::default().with_title("DBiji").with_app_id("dev.dbiji.DBiji").with_inner_size([1280.0, 820.0]).with_min_inner_size([640.0, 400.0]);
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);

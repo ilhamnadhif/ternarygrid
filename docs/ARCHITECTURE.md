@@ -19,7 +19,7 @@ changed, so the application uses ~0% CPU while idle.
    dbiji-sql (tokenizer,       dbiji-core (Value, RowStore,   dbiji-net (SSH tunnel,
    splitter, formatter,        Driver/Session traits,         SOCKS/HTTP proxy as a
    autocomplete, analysis)     metadata/DDL/plan model,       local forwarder)
-                               Dialect, i18n, Secret)
+                               Dialect, UI strings, Secret)
          │                           │
    dbiji-grid / dbiji-editor   drivers: postgres (+CockroachDB), mysql (+MariaDB),
    dbiji-visual (egui          sqlite, mssql (tiberius), clickhouse (HTTP),
@@ -35,7 +35,7 @@ changed, so the application uses ~0% CPU while idle.
 
 | Crate | Responsibility |
 | --- | --- |
-| `dbiji-core` | Shared contract: `Value`/`DataKind`/`ColumnMeta`, `Driver`/`Session`/`QueryCursor` traits, metadata, DDL and plan models, `Dialect` + ANSI DDL helpers, `RowStore` (paged, spills to disk), `Secret`, i18n. |
+| `dbiji-core` | Shared contract: `Value`/`DataKind`/`ColumnMeta`, `Driver`/`Session`/`QueryCursor` traits, metadata, DDL and plan models, `Dialect` + ANSI DDL helpers, `RowStore` (paged, spills to disk), `Secret`, UI strings. |
 | `dbiji-sql` | Dialect-aware tokenizer, statement splitter (DELIMITER, GO, compound blocks, dollar quotes), classifier (read-only enforcement, dangerous statements), formatter, autocomplete and semantic analysis, parameters, client commands, outline, spell checker, SQL generation, fuzzy matching. |
 | `dbiji-driver-*` | One crate per product. Each implements `Driver`, `Session`, `QueryCursor`, `Dialect` and `DdlGenerator` and reads metadata from the system catalogs. |
 | `dbiji-net` | SSH tunnels (russh) and SOCKS5/HTTP CONNECT proxies, all exposed as a local TCP forwarder so every driver works through them unchanged. |
@@ -74,7 +74,7 @@ changed, so the application uses ~0% CPU while idle.
   Argon2id + XChaCha20-Poly1305 vault protected by a master password. Config files
   are written atomically with mode 0600. `Secret` has no `Serialize` impl and
   redacts itself in `Debug`/`Display`.
-* **Localisation.** English source strings are keys; `locales/id.tsv` holds the
-  Indonesian translations (`dbiji_core::tr`).
+* **UI language.** English only; user visible strings go through `dbiji_core::tr`
+  (unchanged) and `trf` (placeholders).
 * **Privacy.** No telemetry. The only outbound connections are the configured
   database servers, SSH/proxy hosts and — only when enabled — the AI provider.
