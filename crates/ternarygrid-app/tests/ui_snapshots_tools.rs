@@ -7,8 +7,10 @@
 //! cargo test -p ternarygrid-app --test ui_snapshots_tools -- --ignored
 //! ```
 //!
-//! writes `target/ui-snapshots/tools/<shot>-<light|dark>.png`. Server-only states
-//! (sessions, locks, metrics, a stopped debugger) are filled in with sample data.
+//! writes `target/ui-snapshots/tools/<shot>-<light|dark>.png` (`tools-<label>` with
+//! `TERNARYGRID_SNAPSHOT_LABEL=<label>`; `TERNARYGRID_SNAPSHOT_ONLY=a,b` writes the shots whose
+//! names start with `a` or `b`, `TERNARYGRID_SNAPSHOT_THEME=light|dark` one theme). Server-only
+//! states (sessions, locks, metrics, a stopped debugger) are filled in with sample data.
 
 use egui::epaint::{ClippedPrimitive, Primitive};
 use egui::{Color32, ColorImage, TextureId};
@@ -33,8 +35,12 @@ use ternarygrid_core::{DbKind, Value};
 
 type H = Harness<'static, TernaryGridApp>;
 
-/// Pixels per point of the screenshots (a Retina display).
-const PPP: f32 = 2.0;
+/// Pixels per point of the screenshots: a Retina display (2), or
+/// `TERNARYGRID_SNAPSHOT_PPP` (1 for quick reviews).
+fn ppp() -> f32 {
+    static PPP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *PPP.get_or_init(|| std::env::var("TERNARYGRID_SNAPSHOT_PPP").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0))
+}
 
 #[derive(Default)]
 struct Raster {
@@ -77,11 +83,11 @@ impl Raster {
             let Primitive::Mesh(mesh) = &p.primitive else { continue };
             let Some(tex) = self.textures.get(&mesh.texture_id) else { continue };
             let clip = p.clip_rect;
-            let (cx0, cy0) = ((clip.min.x * PPP).max(0.0) as i64, (clip.min.y * PPP).max(0.0) as i64);
-            let (cx1, cy1) = (((clip.max.x * PPP).ceil() as i64).min(w as i64), ((clip.max.y * PPP).ceil() as i64).min(h as i64));
+            let (cx0, cy0) = ((clip.min.x * ppp()).max(0.0) as i64, (clip.min.y * ppp()).max(0.0) as i64);
+            let (cx1, cy1) = (((clip.max.x * ppp()).ceil() as i64).min(w as i64), ((clip.max.y * ppp()).ceil() as i64).min(h as i64));
             for tri in mesh.indices.as_chunks::<3>().0 {
                 let v = tri.map(|i| mesh.vertices[i as usize]);
-                let pts = v.map(|v| (v.pos.x * PPP, v.pos.y * PPP));
+                let pts = v.map(|v| (v.pos.x * ppp(), v.pos.y * ppp()));
                 let minx = pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min).floor().max(cx0 as f32) as i64;
                 let maxx = pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max).ceil().min(cx1 as f32) as i64;
                 let miny = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min).floor().max(cy0 as f32) as i64;
@@ -159,6 +165,8 @@ struct Shots {
     raster: Rc<RefCell<Raster>>,
     dir: PathBuf,
     theme: &'static str,
+    /// `TERNARYGRID_SNAPSHOT_ONLY`: the prefixes of the shots to write.
+    only: Option<String>,
     /// Source ("tplus-staging") and target ("slypee-prod") SQLite connections.
     a: String,
     b: String,
@@ -258,7 +266,7 @@ impl Shots {
         conns.upsert(my);
         let h = Harness::builder()
             .with_size(egui::vec2(1440.0, 900.0))
-            .with_pixels_per_point(PPP)
+            .with_pixels_per_point(ppp())
             .with_max_steps(400)
             .with_step_dt(1.0 / 60.0)
             .renderer(CpuTextures(raster.clone()))
@@ -274,7 +282,8 @@ impl Shots {
             });
         ternarygrid_app::theme::apply_settings(&h.ctx, &h.state().settings);
         let theme = if theme == Theme::Dark { "dark" } else { "light" };
-        let mut s = Shots { h, raster, dir, theme, a: ids[0].clone(), b: ids[1].clone(), pg: pg_id, my: my_id };
+        let only = std::env::var("TERNARYGRID_SNAPSHOT_ONLY").ok().filter(|s| !s.is_empty());
+        let mut s = Shots { h, raster, dir, theme, only, a: ids[0].clone(), b: ids[1].clone(), pg: pg_id, my: my_id };
         s.frames(4);
         for (id, ddl, target) in [(ids[0].clone(), SOURCE_DDL, false), (ids[1].clone(), TARGET_DDL, true)] {
             let backend = s.h.state().backend.clone();
@@ -317,13 +326,17 @@ impl Shots {
     }
 
     fn shot(&mut self, name: &str) {
+        if self.only.as_deref().is_some_and(|o| !o.split(',').any(|o| name.starts_with(o.trim()))) {
+            self.frames(4);
+            return;
+        }
         self.h.state_mut().toasts.clear();
         // The pointer away from the content: no hover effects.
         self.h.event(egui::Event::PointerMoved(egui::pos2(1439.0, 899.0)));
         self.frames(30);
         let out = self.h.output();
-        let prims = self.h.ctx.tessellate(out.shapes.clone(), PPP);
-        let size = self.h.ctx.content_rect().size() * PPP;
+        let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
+        let size = self.h.ctx.content_rect().size() * ppp();
         let bg = self.h.ctx.global_style().visuals.panel_fill;
         let mut img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
         traffic_lights(&mut img);
@@ -371,7 +384,7 @@ impl Shots {
 /// The macOS window buttons, as the system paints them over the top bar's left end.
 fn traffic_lights(img: &mut image::RgbaImage) {
     for (i, c) in [[0xff, 0x5f, 0x57], [0xfe, 0xbc, 0x2e], [0x28, 0xc8, 0x40]].iter().enumerate() {
-        let (cx, cy, r) = ((16.0 + 6.0 + 20.0 * i as f32) * PPP, 22.0 * PPP, 6.0 * PPP);
+        let (cx, cy, r) = ((16.0 + 6.0 + 20.0 * i as f32) * ppp(), 22.0 * ppp(), 6.0 * ppp());
         for y in (cy - r - 2.0) as u32..=(cy + r + 2.0) as u32 {
             for x in (cx - r - 2.0) as u32..=(cx + r + 2.0) as u32 {
                 let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
@@ -676,7 +689,11 @@ fn sample_query(m: &mut ternarygrid_visual::builder::QueryModel) {
 #[test]
 #[ignore = "writes screenshots for visual review; run with --ignored"]
 fn ui_snapshots_tools() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots/tools");
+    let folder = match std::env::var("TERNARYGRID_SNAPSHOT_LABEL") {
+        Ok(l) if !l.is_empty() => format!("tools-{l}"),
+        _ => "tools".to_string(),
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots").join(folder);
     std::fs::create_dir_all(&root).unwrap();
     let only = std::env::var("TERNARYGRID_SNAPSHOT_THEME").ok();
     for theme in [Theme::Dark, Theme::Light] {

@@ -4,6 +4,13 @@ use super::model::{Connector, JoinKind, QbCondition, QbJoin, QueryModel};
 use std::collections::BTreeSet;
 use ternarygrid_core::{DbKind, Dialect};
 
+/// A table the FROM clause attaches: through these joins (their index, and whether the
+/// table is the join's left side), or cross joined when there are none.
+struct FromStep {
+    table: usize,
+    joins: Vec<(usize, bool)>,
+}
+
 impl QueryModel {
     /// Renders an expression: `alias.column` references of tables in the
     /// model (and `alias.*`) are quoted with the dialect, anything else is
@@ -104,11 +111,18 @@ impl QueryModel {
         )
     }
 
-    /// FROM clause with joins: tables are attached in model order, each one
-    /// through all join conditions to tables already attached; tables
-    /// without a join are cross joined.
-    fn render_from(&self, dialect: &dyn Dialect) -> String {
+    /// The order the FROM clause attaches the tables in: model order, each one through all
+    /// its joins to tables already attached (the first table has none; a table without a
+    /// join is cross joined).
+    fn join_plan(&self) -> Vec<FromStep> {
         let n = self.tables.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut plan = vec![FromStep {
+            table: 0,
+            joins: Vec::new(),
+        }];
         let mut included: Vec<usize> = vec![0];
         let mut aliases: BTreeSet<&str> = self
             .tables
@@ -117,7 +131,6 @@ impl QueryModel {
             .into_iter()
             .collect();
         let mut used = vec![false; self.joins.len()];
-        let mut out = format!("FROM {}", self.table_ref(0, dialect));
         while included.len() < n {
             let connected = (0..n).filter(|i| !included.contains(i)).find(|&i| {
                 let a = self.tables[i].alias.as_str();
@@ -126,67 +139,114 @@ impl QueryModel {
                         || (j.right_alias == a && aliases.contains(j.left_alias.as_str()))
                 })
             });
-            match connected {
-                Some(i) => {
-                    let a = self.tables[i].alias.clone();
-                    let mut kind: Option<JoinKind> = None;
-                    let mut conds = Vec::new();
-                    for (ji, j) in self.joins.iter().enumerate() {
-                        if used[ji] {
-                            continue;
-                        }
-                        let new_is_right =
-                            j.right_alias == a && aliases.contains(j.left_alias.as_str());
-                        let new_is_left =
-                            j.left_alias == a && aliases.contains(j.right_alias.as_str());
-                        if new_is_right || new_is_left {
-                            used[ji] = true;
-                            conds.push(self.join_condition(j, dialect));
-                            if kind.is_none() {
-                                kind = Some(if new_is_right {
-                                    j.kind
-                                } else {
-                                    j.kind.flipped()
-                                });
-                            }
-                        }
+            let Some(i) = connected.or_else(|| (0..n).find(|i| !included.contains(i))) else {
+                break;
+            };
+            let a = self.tables[i].alias.as_str();
+            let mut joins = Vec::new();
+            if connected.is_some() {
+                for (ji, j) in self.joins.iter().enumerate() {
+                    if used[ji] {
+                        continue;
                     }
-                    let kind = kind.unwrap_or_default();
-                    // A loaded model can carry a FULL JOIN although the UI
-                    // does not offer it for MySQL / MariaDB: keep it (so the
-                    // server rejects the statement instead of silently
-                    // returning other rows) and say why.
-                    let note = match (kind, dialect.kind()) {
-                        (JoinKind::Full, DbKind::MySql) => {
-                            " /* FULL JOIN is not supported by MySQL: choose another join type */"
-                        }
-                        (JoinKind::Full, DbKind::MariaDb) => {
-                            " /* FULL JOIN is not supported by MariaDB: choose another join type */"
-                        }
-                        _ => "",
-                    };
-                    out.push_str(&format!(
-                        "\n    {}{note} {} ON {}",
-                        kind.sql(),
-                        self.table_ref(i, dialect),
-                        conds.join(" AND ")
-                    ));
-                    included.push(i);
-                    if let Some(t) = self.tables.get(i) {
-                        aliases.insert(t.alias.as_str());
-                    }
-                }
-                None => {
-                    let Some(i) = (0..n).find(|i| !included.contains(i)) else {
-                        break;
-                    };
-                    out.push_str(&format!("\n    CROSS JOIN {}", self.table_ref(i, dialect)));
-                    included.push(i);
-                    if let Some(t) = self.tables.get(i) {
-                        aliases.insert(t.alias.as_str());
+                    let new_is_right =
+                        j.right_alias == a && aliases.contains(j.left_alias.as_str());
+                    let new_is_left = j.left_alias == a && aliases.contains(j.right_alias.as_str());
+                    if new_is_right || new_is_left {
+                        used[ji] = true;
+                        joins.push((ji, new_is_left));
                     }
                 }
             }
+            plan.push(FromStep { table: i, joins });
+            included.push(i);
+            aliases.insert(a);
+        }
+        plan
+    }
+
+    /// The kind a step's clause is written with: its first join's, seen from the table
+    /// attached (`LEFT JOIN new` keeps every row of the tables before it).
+    fn step_kind(&self, step: &FromStep) -> Option<JoinKind> {
+        let (ji, new_is_left) = *step.joins.first()?;
+        let k = self.joins.get(ji)?.kind;
+        Some(if new_is_left { k.flipped() } else { k })
+    }
+
+    /// The step of the FROM clause that writes join `index`.
+    fn step_of(&self, index: usize) -> Option<FromStep> {
+        self.join_plan()
+            .into_iter()
+            .find(|s| s.joins.iter().any(|(ji, _)| *ji == index))
+    }
+
+    /// The kind of join `index` as the generated SQL writes it: a LEFT join drawn from
+    /// `order_line` to `orders` attaches `order_line` as `RIGHT JOIN order_line`. `None`
+    /// when the join is not part of the query (one of its tables is missing).
+    pub fn join_kind_as_written(&self, index: usize) -> Option<JoinKind> {
+        self.step_kind(&self.step_of(index)?)
+    }
+
+    /// Make the SQL write join `index` (and the joins of the same clause) as `kind`.
+    pub fn set_join_kind_as_written(&mut self, index: usize, kind: JoinKind) {
+        let Some(step) = self.step_of(index) else {
+            if let Some(j) = self.joins.get_mut(index) {
+                j.kind = kind;
+            }
+            return;
+        };
+        for (ji, new_is_left) in step.joins {
+            if let Some(j) = self.joins.get_mut(ji) {
+                j.kind = if new_is_left { kind.flipped() } else { kind };
+            }
+        }
+    }
+
+    /// The clause of the FROM that writes join `index` ("LEFT JOIN main.order_line ol ON …").
+    pub fn join_clause(&self, index: usize, dialect: &dyn Dialect) -> Option<String> {
+        let step = self.step_of(index)?;
+        Some(self.render_step(&step, dialect))
+    }
+
+    /// One attached table of the FROM clause, without the line break before it.
+    fn render_step(&self, step: &FromStep, dialect: &dyn Dialect) -> String {
+        let Some(kind) = self.step_kind(step) else {
+            return format!("CROSS JOIN {}", self.table_ref(step.table, dialect));
+        };
+        let conds: Vec<String> = step
+            .joins
+            .iter()
+            .filter_map(|(ji, _)| self.joins.get(*ji))
+            .map(|j| self.join_condition(j, dialect))
+            .collect();
+        // A loaded model can carry a FULL JOIN although the UI does not offer it for MySQL /
+        // MariaDB: keep it (so the server rejects the statement instead of silently returning
+        // other rows) and say why.
+        let note = match (kind, dialect.kind()) {
+            (JoinKind::Full, DbKind::MySql) => {
+                " /* FULL JOIN is not supported by MySQL: choose another join type */"
+            }
+            (JoinKind::Full, DbKind::MariaDb) => {
+                " /* FULL JOIN is not supported by MariaDB: choose another join type */"
+            }
+            _ => "",
+        };
+        format!(
+            "{}{note} {} ON {}",
+            kind.sql(),
+            self.table_ref(step.table, dialect),
+            conds.join(" AND ")
+        )
+    }
+
+    /// FROM clause with joins: tables are attached in model order, each one
+    /// through all join conditions to tables already attached; tables
+    /// without a join are cross joined.
+    fn render_from(&self, dialect: &dyn Dialect) -> String {
+        let mut out = format!("FROM {}", self.table_ref(0, dialect));
+        for step in self.join_plan().iter().skip(1) {
+            out.push_str("\n    ");
+            out.push_str(&self.render_step(step, dialect));
         }
         out
     }
@@ -641,6 +701,31 @@ pub(crate) mod tests {
             m.to_sql(&d)
                 .contains("ON oi.order_id = o.id AND oi.qty = o.total")
         );
+    }
+
+    #[test]
+    fn joins_as_the_sql_writes_them() {
+        let d = dialect(DbKind::Postgres);
+        let mut m = QueryModel::default();
+        m.add_table(&customers());
+        m.add_table(&orders());
+        m.joins[0].kind = JoinKind::Left; // drawn o → c: all rows of o
+        // The canvas labels it as the SQL does: orders are attached second.
+        assert_eq!(m.join_kind_as_written(0), Some(JoinKind::Right));
+        assert_eq!(
+            m.join_clause(0, &d).as_deref(),
+            Some("RIGHT JOIN shop.orders o ON o.customer_id = c.id")
+        );
+        // Chosen as written: the model keeps its own orientation.
+        m.set_join_kind_as_written(0, JoinKind::Left);
+        assert_eq!(m.joins[0].kind, JoinKind::Right);
+        assert!(
+            m.to_sql(&d).contains("LEFT JOIN shop.orders o"),
+            "{}",
+            m.to_sql(&d)
+        );
+        m.set_join_kind_as_written(0, JoinKind::Inner);
+        assert_eq!(m.join_kind_as_written(0), Some(JoinKind::Inner));
     }
 
     #[test]

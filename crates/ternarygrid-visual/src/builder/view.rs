@@ -288,7 +288,7 @@ fn toolbar(ui: &mut Ui, model: &mut QueryModel, sql: &str, events: &mut Vec<QbEv
                 ui,
                 kit::Kind::Ghost,
                 Some(icon::ARROW_SQUARE_OUT),
-                tr("Open in editor"),
+                tr("Open in SQL editor"),
                 true,
             )
             .clicked()
@@ -298,7 +298,7 @@ fn toolbar(ui: &mut Ui, model: &mut QueryModel, sql: &str, events: &mut Vec<QbEv
         });
         kit::vdivider(ui, 18.0);
         ui.spacing_mut().item_spacing.x = 12.0;
-        check(ui, &mut model.distinct, "DISTINCT");
+        check(ui, &mut model.distinct, tr("Distinct"));
         let mut limited = model.limit.is_some();
         if check(ui, &mut limited, tr("Limit")).changed() {
             model.limit = if limited { Some(100) } else { None };
@@ -396,7 +396,7 @@ fn sql_preview(ui: &mut Ui, sql: &str, events: &mut Vec<QbEvent>) {
                     if kit::icon_button_sized(
                         ui,
                         icon::ARROW_SQUARE_OUT,
-                        tr("Open in editor"),
+                        tr("Open in SQL editor"),
                         false,
                         26.0,
                         13.0,
@@ -460,6 +460,8 @@ fn sql_preview(ui: &mut Ui, sql: &str, events: &mut Vec<QbEvent>) {
                         .layouter(&mut layouter),
                 );
             });
+            // Room for the horizontal scroll bar: it never covers the last line.
+            ui.add_space(14.0);
         });
 }
 
@@ -621,13 +623,18 @@ fn canvas(
             Some(QbHit::Close(a)) => model.remove_table(&a),
             Some(QbHit::Join(i)) => {
                 // quick toggle; the full menu is on right click
-                if let Some(j) = model.joins.get_mut(i) {
-                    j.kind = match j.kind {
+                // (in the SQL's terms: the badge shows the kind as the SQL writes it)
+                if let Some(k) = model
+                    .join_kind_as_written(i)
+                    .or_else(|| model.joins.get(i).map(|j| j.kind))
+                {
+                    let next = match k {
                         JoinKind::Inner => JoinKind::Left,
                         JoinKind::Left => JoinKind::Right,
                         JoinKind::Right if full_join => JoinKind::Full,
                         JoinKind::Right | JoinKind::Full => JoinKind::Inner,
                     };
+                    model.set_join_kind_as_written(i, next);
                 }
             }
             _ => {}
@@ -649,7 +656,9 @@ fn canvas(
             kit::menu_look(ui, 220.0);
             match &ctx_target {
                 QbContext::Join(i) => {
-                    if let Some(j) = model.joins.get_mut(*i) {
+                    let written = model.join_kind_as_written(*i);
+                    if let Some(j) = model.joins.get(*i) {
+                        let current = written.unwrap_or(j.kind);
                         kit::menu_caption(
                             ui,
                             &format!(
@@ -658,15 +667,19 @@ fn canvas(
                             ),
                         );
                         kit::menu_separator(ui);
+                        let mut chosen = None;
                         for k in JoinKind::ALL {
-                            if k == JoinKind::Full && !full_join && j.kind != k {
+                            if k == JoinKind::Full && !full_join && current != k {
                                 continue;
                             }
-                            let mut on = j.kind == k;
+                            let mut on = current == k;
                             if kit::menu_check(ui, &mut on, tr(k.label())).clicked() {
-                                j.kind = k;
+                                chosen = Some(k);
                                 ui.close();
                             }
+                        }
+                        if let Some(k) = chosen {
+                            model.set_join_kind_as_written(*i, k);
                         }
                         kit::menu_separator(ui);
                         if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Remove join"), "")
@@ -776,8 +789,10 @@ fn canvas(
         let screen: Vec<Pos2> = pts.iter().map(|p| view.to_screen(origin, *p)).collect();
         painter.line(screen.clone(), stroke);
         if let (Some(pos), Some(px)) = (join_label_pos(&pts), font_px(10.5, zoom)) {
+            // As the generated SQL writes it (a join drawn the other way is flipped there).
+            let kind = model.join_kind_as_written(i).unwrap_or(j.kind);
             let galley = painter.layout_no_wrap(
-                kind_symbol(j.kind).to_string(),
+                kind_symbol(kind).to_string(),
                 style::semibold(ui.ctx(), px),
                 p.on_accent,
             );
@@ -943,10 +958,22 @@ fn canvas(
         Some(QbHit::Header(..)) => ui.ctx().set_cursor_icon(CursorIcon::Grab),
         None => {}
     }
-    if let Some(QbHit::Row(..)) = &hover {
-        response.on_hover_text_at_pointer(tr(
-            "Click to select the column, drag onto a column of another table to join",
-        ));
+    match &hover {
+        Some(QbHit::Row(..)) => {
+            response.on_hover_text_at_pointer(tr(
+                "Click to select the column, drag onto a column of another table to join",
+            ));
+        }
+        // The clause the join is written as, and how to change it.
+        Some(QbHit::Join(i)) if state.drag.is_none() => {
+            if let Some(clause) = model.join_clause(*i, state.dialect.as_ref()) {
+                response.on_hover_text_at_pointer(format!(
+                    "{clause}\n{}",
+                    tr("Click to change the join type; right-click for the menu")
+                ));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1069,17 +1096,36 @@ fn grid(
         });
 }
 
-/// Text field with a menu of column references next to it.
+/// Text field with a menu of column references behind the caret at its right end (the look
+/// of a combo box: type an expression or pick a column).
 fn expr_field(ui: &mut Ui, value: &mut String, refs: &[String], width: f32) {
-    ui.spacing_mut().item_spacing.x = 4.0;
-    ui.add(
+    const CARET_W: f32 = 24.0;
+    let field = ui.add(
         egui::TextEdit::singleline(value)
-            .desired_width((width - 30.0).max(60.0))
+            .desired_width(width.max(60.0) - 8.0 - CARET_W)
             .font(egui::FontId::monospace(12.5))
-            .margin(egui::Margin::symmetric(8, 4))
+            .margin(egui::Margin {
+                left: 8,
+                right: CARET_W as i8,
+                top: 4,
+                bottom: 4,
+            })
             .hint_text(tr("column or expression")),
     );
-    ui.menu_button(icon::LIST, |ui| {
+    let caret = Rect::from_min_max(
+        pos2(field.rect.right() - CARET_W, field.rect.top()),
+        field.rect.max,
+    );
+    let pick = ui
+        .interact(caret, field.id.with("pick_column"), Sense::click())
+        .on_hover_text(tr("Pick a column"));
+    if pick.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&pick));
+    let visuals = *ui.style().interact(&pick);
+    kit::combo_caret(ui, caret, &visuals, open);
+    egui::Popup::menu(&pick).show(|ui| {
         kit::menu_look(ui, 220.0);
         egui::ScrollArea::vertical()
             .max_height(260.0)
@@ -1091,9 +1137,7 @@ fn expr_field(ui: &mut Ui, value: &mut String, refs: &[String], width: f32) {
                     }
                 }
             });
-    })
-    .response
-    .on_hover_text(tr("Pick a column"));
+    });
 }
 
 /// An item of a combo box's list in the menu look: a check mark at the selected one; true
@@ -1248,15 +1292,29 @@ fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &
         grid(ui, &names, &widths, n, 36.0, |ui, i, c| {
             let cond = &mut list[i];
             match c {
+                // The SQL's keywords, in its monospace capitals: WHERE, then the connector
+                // of each further condition, their text at the same x.
                 0 if i == 0 => {
-                    ui.label(egui::RichText::new(tr("where")).color(p.text_faint));
+                    ui.add_space(ui.spacing().button_padding.x);
+                    ui.label(
+                        egui::RichText::new(if salt.ends_with("having") {
+                            "HAVING"
+                        } else {
+                            "WHERE"
+                        })
+                        .font(egui::FontId::monospace(12.5))
+                        .color(p.text_muted),
+                    );
                 }
                 0 => {
                     egui::ComboBox::from_id_salt((salt, "conn", i))
                         .icon(kit::combo_caret)
                         .popup_style(egui::containers::menu::menu_style.into())
                         .width(66.0)
-                        .selected_text(cond.connector.sql())
+                        .selected_text(
+                            egui::RichText::new(cond.connector.sql())
+                                .font(egui::FontId::monospace(12.5)),
+                        )
                         .show_ui(ui, |ui| {
                             kit::menu_look(ui, 90.0);
                             for c in [Connector::And, Connector::Or] {
@@ -1499,7 +1557,7 @@ mod tests {
         let sql = model.to_sql(state.dialect.as_ref());
         assert!(sql.contains("INNER JOIN"), "{sql}");
 
-        // click the join label: kind cycles to LEFT
+        // click the join label: the kind the SQL writes (and the label shows) cycles to LEFT
         let pts = join_points(&model, &model.joins[0]).unwrap();
         let label = ViewTransform::new(state.zoom, state.pan)
             .to_screen(state.last_canvas.min, join_label_pos(&pts).unwrap());
@@ -1507,7 +1565,9 @@ mod tests {
             |ui: &mut Ui| events.extend(show_query_builder(ui, &mut model, &mut state).events);
         h.click(label, &mut ui_fn);
         drop(ui_fn);
-        assert_eq!(model.joins[0].kind, JoinKind::Left);
+        assert_eq!(model.join_kind_as_written(0), Some(JoinKind::Left));
+        let sql = model.to_sql(state.dialect.as_ref());
+        assert!(sql.contains("\n    LEFT JOIN "), "{sql}");
 
         // every tab renders
         for tab in QbTab::ALL {

@@ -87,6 +87,23 @@ fn cells(data: &TabularData, fmt: &FormatOptions) -> Vec<Vec<String>> {
     data.rows.iter().map(|r| r.iter().map(|v| v.display(fmt).into_owned()).collect()).collect()
 }
 
+/// The refresh interval picker of the administration views ("Every 5 s"); `off` offers
+/// "Off" (0). Returns the interval chosen.
+fn interval_combo(ui: &mut Ui, id: egui::Id, current: f32, choices: &[u32], off: bool) -> Option<u32> {
+    let shown = |s: f32| if s <= 0.0 { tr("Auto-refresh off").to_string() } else { trf("Every {} s", &[&((s * 10.0).round() / 10.0)]) };
+    let mut chosen = None;
+    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).width(120.0).selected_text(shown(current)).show_ui(ui, |ui| {
+        kit::menu_look(ui, 120.0);
+        for s in off.then_some(0).into_iter().chain(choices.iter().copied()) {
+            let label = if s == 0 { tr("Off").to_string() } else { trf("Every {} s", &[&s]) };
+            if crate::tabs::transfer::wizard::choice(ui, (current - s as f32).abs() < 0.01, &label) {
+                chosen = Some(s);
+            }
+        }
+    });
+    chosen
+}
+
 /// Shared refresh controls: manual refresh plus an auto-refresh interval.
 struct Refresh {
     interval: u32,
@@ -98,20 +115,9 @@ impl Refresh {
         // The toolbar's pickers are 28 high.
         ui.spacing_mut().interact_size.y = 28.0;
         let mut now = look::small(ui, kit::Kind::Secondary, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked();
-        egui::ComboBox::from_id_salt(ui.next_auto_id())
-            .icon(kit::combo_caret)
-            .popup_style(egui::containers::menu::menu_style.into())
-            .width(120.0)
-            .selected_text(if self.interval == 0 { tr("Auto-refresh off").to_string() } else { trf("Every {} s", &[&self.interval]) })
-            .show_ui(ui, |ui| {
-                kit::menu_look(ui, 120.0);
-                for s in [0u32, 1, 2, 5, 10, 30, 60] {
-                    let label = if s == 0 { tr("Off").to_string() } else { trf("{} s", &[&s]) };
-                    if crate::tabs::transfer::wizard::choice(ui, self.interval == s, &label) {
-                        self.interval = s;
-                    }
-                }
-            });
+        if let Some(s) = interval_combo(ui, ui.next_auto_id(), self.interval as f32, &[1, 2, 5, 10, 30, 60], true) {
+            self.interval = s;
+        }
         if self.interval > 0 {
             let due = self.last.is_none_or(|t| t.elapsed() >= Duration::from_secs(self.interval as u64));
             now |= due;
@@ -146,6 +152,48 @@ fn styled(column: &str, text: String, p: &style::Palette, null_text: &str) -> Ce
         return Cell::new(text).color(p.text_muted);
     }
     Cell::new(text)
+}
+
+/// The header of a column of the session and lock lists: a label for the catalog's name
+/// ("application_name" → "Application"); others in sentence case.
+fn column_label(column: &str) -> String {
+    let label = match column.to_ascii_lowercase().as_str() {
+        "pid" | "spid" => tr("PID"),
+        "id" => tr("ID"),
+        "user" | "usename" | "login_name" | "username" => tr("User"),
+        "database" | "datname" | "db" => tr("Database"),
+        "application_name" | "program_name" | "application" => tr("Application"),
+        "client_addr" | "client" | "host" | "host_name" => tr("Client"),
+        "state" | "status" => tr("State"),
+        "wait_event_type" => tr("Wait"),
+        "wait_event" => tr("Wait event"),
+        "blocked_by" | "blocking_session_id" => tr("Blocked by"),
+        "query_duration" | "duration" | "time" => tr("Duration"),
+        "query" | "sql" | "info" | "sql_text" => tr("Query"),
+        "locktype" | "lock_type" => tr("Lock type"),
+        "mode" | "request_mode" => tr("Mode"),
+        "granted" => tr("Granted"),
+        "relation" | "object" => tr("Relation"),
+        "command" => tr("Command"),
+        "backend_start" => tr("Connected"),
+        "xact_start" => tr("Transaction start"),
+        "query_start" => tr("Query start"),
+        "session_id" => tr("Session"),
+        _ => {
+            let words = column.replace('_', " ");
+            let mut chars = words.chars();
+            return match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                None => String::new(),
+            };
+        }
+    };
+    label.to_string()
+}
+
+/// The header cells of a list: the labels, the catalog's names in their tooltips.
+fn header_cells(columns: &[String]) -> Vec<Cell> {
+    columns.iter().map(|c| Cell::new(column_label(c)).hover(c.clone())).collect()
 }
 
 /// The design's width of a column of the session and lock lists (`None`: a share of the rest).
@@ -192,35 +240,61 @@ fn load_note<T>(ui: &mut Ui, data: &Loadable<T>, shown: bool, retry: &mut bool) 
     }
 }
 
-/// The confirmation of Cancel query / Terminate session.
-fn kill_dialog(ui: &Ui, id: egui::Id, session: &str, mode: KillMode) -> (bool, bool) {
-    let (title, glyph, explain) = match mode {
-        KillMode::Terminate => (tr("Terminate session"), icon::X_CIRCLE, tr("The client is disconnected and its open transaction is rolled back.")),
-        KillMode::CancelQuery => (tr("Cancel query"), icon::STOP, tr("The running statement is cancelled; the session stays connected.")),
+/// Who a session is, for its confirmation: "app · api · 10.0.2.15" (user, application, client).
+fn session_facts(list: &SessionList, id: &str, fmt: &FormatOptions) -> Option<String> {
+    let row = list.data.rows.iter().find(|r| r.get(list.id_column).is_some_and(|v| v.to_text() == id))?;
+    let column = |names: &[&str]| list.data.columns.iter().position(|c| names.contains(&c.to_ascii_lowercase().as_str()));
+    let facts: Vec<String> =
+        [&["user", "usename", "login_name", "username"][..], &["application_name", "program_name", "application"], &["client_addr", "client", "host", "host_name"]]
+            .iter()
+            .filter_map(|names| column(names))
+            .filter_map(|c| row.get(c))
+            .filter(|v| !v.is_null())
+            .map(|v| v.display(fmt).into_owned())
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+    (!facts.is_empty()).then(|| facts.join(" · "))
+}
+
+/// The confirmation of Cancel query / Terminate session; (confirmed, closed).
+fn kill_dialog(ui: &Ui, id: egui::Id, session: &str, facts: Option<&str>, mode: KillMode) -> (bool, bool) {
+    let (title, tone, verb, explain) = match mode {
+        KillMode::Terminate => {
+            (trf("Terminate session {}?", &[&session]), parts::Tone::Error, tr("Terminate session"), tr("The client is disconnected and its open transaction is rolled back."))
+        }
+        KillMode::CancelQuery => {
+            (trf("Cancel the query of session {}?", &[&session]), parts::Tone::Warning, tr("Cancel query"), tr("The running statement is cancelled; the session stays connected."))
+        }
     };
-    let question = trf("Session {} — continue?", &[&session]);
     let (mut yes, mut no) = (false, false);
-    let (resp, _) = parts::Dialog::new(title).icon(glyph).width(440.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
+    let (resp, _) = parts::Dialog::new(&title).icon(icon::WARNING).tone(tone).width(460.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
         ui.ctx(),
         id,
         |ui| {
             let p = style::pal(ui);
             ui.spacing_mut().item_spacing.y = 8.0;
-            ui.label(RichText::new(&question).size(13.5));
-            ui.label(RichText::new(explain).size(12.5).color(p.text_muted));
+            if let Some(f) = facts {
+                ui.add(egui::Label::new(RichText::new(f).font(look::mono(12.5)).color(p.text)).truncate());
+            }
+            ui.add(egui::Label::new(RichText::new(explain).color(p.text_muted)).wrap());
         },
         |ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if kit::button_ex(ui, kit::Kind::DangerFilled, None, tr("Yes"), false).clicked() {
+                if kit::button_ex(ui, kit::Kind::DangerFilled, Some(if mode == KillMode::Terminate { icon::X_CIRCLE } else { icon::STOP_CIRCLE }), verb, false).clicked() {
                     yes = true;
                 }
-                if kit::button_ex(ui, kit::Kind::Ghost, None, tr("No"), false).clicked() {
+                if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
                     no = true;
                 }
             });
         },
     );
     (yes, no || resp.close)
+}
+
+/// A request (from the lock list) to select a session in the session list of `conn`.
+fn select_request(conn: &str) -> egui::Id {
+    egui::Id::new(("ternarygrid_select_session", conn))
 }
 
 // --------------------------------------------------------------- sessions
@@ -237,7 +311,7 @@ pub struct SessionManagerTab {
     filter: String,
     hide_idle: bool,
     kill: Option<(String, KillMode)>,
-    kill_job: Option<Job<DbResult<()>>>,
+    kill_job: Option<(Job<DbResult<()>>, KillMode, String)>,
 }
 
 impl SessionManagerTab {
@@ -285,18 +359,24 @@ impl TabView for SessionManagerTab {
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let conn = self.conn.clone();
+        // Asked by the lock list (a blocking session).
+        if let Some(id) = ui.ctx().data_mut(|d| d.remove_temp::<String>(select_request(&conn))) {
+            self.selected = Some(id);
+        }
         let Some(session) = self.admin.get(ui, cx, &conn, "sessions") else { return };
         if self.data.poll()
             && let Loadable::Loaded(l) = &self.data
         {
             self.shown = Some(l.clone());
         }
-        if let Some(j) = self.kill_job.as_mut()
+        if let Some((j, mode, id)) = self.kill_job.as_mut()
             && let Some(r) = j.poll()
         {
+            let (mode, id) = (*mode, id.clone());
             self.kill_job = None;
             match r {
-                Ok(()) => cx.toasts.success(tr("Done")),
+                Ok(()) if mode == KillMode::Terminate => cx.toasts.success(trf("Session {} terminated", &[&id])),
+                Ok(()) => cx.toasts.success(trf("The query of session {} was cancelled", &[&id])),
                 Err(e) => cx.toasts.error(tr("Cannot end the session"), Some(e.full_text())),
             }
             self.refresh.last = None;
@@ -341,7 +421,7 @@ impl TabView for SessionManagerTab {
             look::checkbox(ui, &mut self.hide_idle, tr("Hide idle"));
             kit::vdivider(ui, 18.0);
             ui.add_enabled_ui(sel_id.is_some(), |ui| {
-                if look::small(ui, kit::Kind::Ghost, icon::STOP, tr("Cancel query")).clicked() {
+                if look::small(ui, kit::Kind::Secondary, icon::STOP_CIRCLE, tr("Cancel query")).clicked() {
                     self.kill = sel_id.clone().map(|i| (i, KillMode::CancelQuery));
                 }
                 if look::small(ui, kit::Kind::Danger, icon::X_CIRCLE, tr("Terminate session")).clicked() {
@@ -358,7 +438,7 @@ impl TabView for SessionManagerTab {
         egui::Frame::new().inner_margin(Margin::symmetric(16, 10)).show(ui, |ui| {
             load_note(ui, &self.data, self.shown.is_some(), &mut retry);
             let Some(list) = &self.shown else { return };
-            let headers = look::headers(&list.data.columns.iter().map(String::as_str).collect::<Vec<_>>());
+            let headers = header_cells(&list.data.columns);
             let styled_rows: Vec<Vec<Cell>> = rows
                 .iter()
                 .map(|r| {
@@ -400,11 +480,14 @@ impl TabView for SessionManagerTab {
             self.refresh.last = None;
         }
         if let Some((id, mode)) = self.kill.clone() {
-            let (yes, close) = kill_dialog(ui, egui::Id::new(("kill", &self.conn)), &id, mode);
+            let facts = self.shown.as_ref().and_then(|l| session_facts(l, &id, &fmt));
+            let (yes, close) = kill_dialog(ui, egui::Id::new(("kill", &self.conn)), &id, facts.as_deref(), mode);
             if yes {
                 let s = session.clone();
                 let id = id.clone();
-                self.kill_job = Some(cx.backend.spawn(async move { s.lock().await.kill_session(&id, mode).await }));
+                let shown = id.clone();
+                let job = cx.backend.spawn(async move { s.lock().await.kill_session(&id, mode).await });
+                self.kill_job = Some((job, mode, shown));
             }
             if yes || close {
                 self.kill = None;
@@ -498,7 +581,8 @@ impl TabView for LockManagerTab {
         egui::Frame::new().inner_margin(Margin::symmetric(16, 10)).show(ui, |ui| {
             load_note(ui, &self.data, self.shown.is_some(), &mut retry);
             let Some(list) = &self.shown else { return };
-            let headers = look::headers(&list.data.columns.iter().map(String::as_str).collect::<Vec<_>>());
+            let headers = header_cells(&list.data.columns);
+            let blocker = |r: &Vec<String>| list.blocked_by_column.and_then(|c| r.get(c)).filter(|b| !b.is_empty() && *b != &fmt.null_text).cloned();
             let styled_rows: Vec<Vec<Cell>> = rows
                 .iter()
                 .map(|r| {
@@ -507,9 +591,12 @@ impl TabView for LockManagerTab {
                         .map(|(c, v)| {
                             let name = list.data.columns.get(c).map(String::as_str).unwrap_or("");
                             if Some(c) == list.granted_column {
-                                if is_false(v) { Cell::new(tr("waiting")).color(p.warn) } else { Cell::new("").glyph(icon::CHECK, p.ok).hover(v.clone()) }
+                                if is_false(v) { Cell::new(tr("Waiting")).pill(p.warn) } else { Cell::new(tr("Granted")).pill(p.ok) }
                             } else if Some(c) == list.blocked_by_column {
-                                if v.is_empty() || v == &fmt.null_text { Cell::new("") } else { Cell::new(v.clone()).mono().color(p.err) }
+                                match blocker(r) {
+                                    Some(b) => Cell::new(b.clone()).mono().color(p.err).hover(trf("Double-click the row to show session {} in Sessions", &[&b])),
+                                    None => Cell::new(""),
+                                }
                             } else if c == list.session_column {
                                 Cell::new(v.clone()).mono()
                             } else {
@@ -520,7 +607,14 @@ impl TabView for LockManagerTab {
                 })
                 .collect();
             let widths: Vec<W> = list.data.columns.iter().map(|c| column_width(c)).collect();
-            look::table_w(ui, ("locks", &self.conn), &headers, &styled_rows, None, &widths);
+            let r = look::table_w(ui, ("locks", &self.conn), &headers, &styled_rows, None, &widths);
+            // The session holding the lock (else the row's own) in the session list.
+            if let Some(row) = r.double_clicked.and_then(|i| rows.get(i))
+                && let Some(id) = blocker(row).or_else(|| row.get(list.session_column).cloned())
+            {
+                ui.ctx().data_mut(|d| d.insert_temp(select_request(&self.conn), id));
+                cx.push(AppCommand::OpenSessionManager { connection: self.conn.clone() });
+            }
         });
         if retry {
             self.refresh.last = None;
@@ -612,19 +706,17 @@ impl TabView for DashboardTab {
         }
         let interval = &mut self.interval;
         let error = self.error.clone();
+        let picker = egui::Id::new(("dash_interval", &conn));
         let r = show_dashboard_with(
             ui,
             &self.state,
             &self.layout,
             |ui| {
-                look::muted(ui, tr("Sample every"));
-                // "1 s", "0.5 s": no needless decimals; typed as "2" or "2 s".
-                let shown = format!("{} s", (interval.as_secs_f32() * 10.0).round() / 10.0);
-                crate::tabs::transfer::parsed_line(ui, shown, 70.0, 28.0, |t| {
-                    if let Ok(secs) = t.trim().trim_end_matches('s').trim().parse::<f32>() {
-                        *interval = Duration::from_secs_f32(secs.clamp(0.5, 60.0));
-                    }
-                });
+                // The sessions' and locks' picker ("Every 1 s"); Pause stops the sampling.
+                ui.spacing_mut().interact_size.y = 28.0;
+                if let Some(s) = interval_combo(ui, picker, interval.as_secs_f32(), &[1, 2, 5, 10, 30], false) {
+                    *interval = Duration::from_secs(s as u64);
+                }
                 kit::vdivider(ui, 18.0);
             },
             |ui| {

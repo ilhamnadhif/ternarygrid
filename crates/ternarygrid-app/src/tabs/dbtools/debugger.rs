@@ -213,6 +213,8 @@ pub struct DebuggerTab {
     tokens: Vec<(Range<usize>, TokenStyle)>,
     /// Length of the source `tokens` were made for.
     tokens_for: Option<usize>,
+    /// A stopped session is shown without a server (screenshots).
+    sample: bool,
 }
 
 impl DebuggerTab {
@@ -247,6 +249,7 @@ impl DebuggerTab {
             line_starts: Vec::new(),
             tokens: Vec::new(),
             tokens_for: None,
+            sample: false,
         }
     }
 
@@ -506,6 +509,10 @@ impl DebuggerTab {
     /// Abort the debugging session.
     pub fn abort(&mut self, cx: &AppContext) {
         self.pending_start = false;
+        if std::mem::take(&mut self.sample) && self.dbg.is_none() {
+            self.state = Some(DebugState { line: None, finished: true, result: None, messages: Vec::new() });
+            return;
+        }
         let Some(dbg) = self.dbg.clone() else { return };
         if let Some(j) = self.step_job.as_mut() {
             // releases the session lock held by a running step
@@ -546,8 +553,13 @@ impl DebuggerTab {
         }));
     }
 
+    /// A debugging session is open (or shown as if it were: [`show_sample`](Self::show_sample)).
+    fn has_session(&self) -> bool {
+        self.dbg.is_some() || self.sample
+    }
+
     fn stopped(&self) -> bool {
-        self.dbg.is_some() && !self.is_busy() && self.state.as_ref().is_some_and(|s| !s.finished)
+        self.has_session() && !self.is_busy() && self.state.as_ref().is_some_and(|s| !s.finished)
     }
 
     fn toolbar(&mut self, ui: &mut Ui, cx: &mut AppContext) {
@@ -566,11 +578,12 @@ impl DebuggerTab {
                 ui.label(RichText::new(l.as_str()).size(12.0).color(p.text_faint));
             }
             kit::vdivider(ui, 18.0);
-            let can_start = self.dbg.is_none() && !busy && self.unsupported.is_none();
+            // One filled button at a time: Start before a session, Resume while it is stopped.
+            let can_start = !self.has_session() && !busy && self.unsupported.is_none();
             let clicked = ui
                 .add_enabled_ui(can_start, |ui| {
                     if self.state.is_some() {
-                        look::small(ui, kit::Kind::Ghost, icon::ARROW_CLOCKWISE, tr("Restart"))
+                        look::small(ui, kit::Kind::Secondary, icon::ARROW_CLOCKWISE, tr("Restart"))
                     } else {
                         look::small(ui, kit::Kind::Primary, icon::PLAY, tr("Start"))
                     }
@@ -581,17 +594,18 @@ impl DebuggerTab {
                 self.start(cx);
             }
             ui.add_enabled_ui(stopped, |ui| {
-                if kit::icon_button(ui, icon::ARROW_ELBOW_DOWN_RIGHT, &format!("{} (F11)", tr("Step into"))).clicked() {
+                if kit::button_kbd(ui, kit::Kind::Secondary, Some(icon::ARROW_ELBOW_DOWN_RIGHT), tr("Step into"), "F11", true).clicked() {
                     self.command(cx, Command::StepInto);
                 }
-                if kit::icon_button(ui, icon::ARROW_ARC_RIGHT, &format!("{} (F10)", tr("Step over"))).clicked() {
+                if kit::button_kbd(ui, kit::Kind::Secondary, Some(icon::ARROW_ARC_RIGHT), tr("Step over"), "F10", true).clicked() {
                     self.command(cx, Command::StepOver);
                 }
-                if look::small(ui, kit::Kind::Secondary, icon::FAST_FORWARD, tr("Resume")).on_hover_text("F8").clicked() {
+                let kind = if stopped { kit::Kind::Primary } else { kit::Kind::Secondary };
+                if kit::button_kbd(ui, kind, Some(icon::FAST_FORWARD), tr("Resume"), "F8", true).clicked() {
                     self.command(cx, Command::Resume);
                 }
             });
-            if ui.add_enabled_ui(self.dbg.is_some(), |ui| look::small(ui, kit::Kind::Danger, icon::STOP, tr("Abort"))).inner.clicked() {
+            if ui.add_enabled_ui(self.has_session(), |ui| look::small(ui, kit::Kind::Danger, icon::STOP_CIRCLE, tr("Abort"))).inner.clicked() {
                 self.abort(cx);
             }
             kit::vdivider(ui, 18.0);
@@ -624,7 +638,7 @@ impl DebuggerTab {
             look::faint(ui, if self.definition_loaded() { tr("The routine has no arguments.") } else { tr("Loading…") });
             return;
         }
-        let editable = self.dbg.is_none() && !self.is_busy();
+        let editable = !self.has_session() && !self.is_busy();
         let p = ternarygrid_ui::pal(ui);
         let id = ("dbg_args", self.conn.clone(), self.routine.name.clone());
         let args = &mut self.args;
@@ -903,6 +917,7 @@ impl DebuggerTab {
         self.variables = variables;
         self.stack = stack;
         self.messages = messages;
+        self.sample = true;
     }
 }
 
