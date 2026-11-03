@@ -12,7 +12,7 @@ use std::cell::Cell;
 use ternarygrid_core::driver::TransactionMode;
 use ternarygrid_core::{DbKind, DbResult, NewDatabase, tr, trf};
 use ternarygrid_ui::kit::{self, Kind};
-use ternarygrid_ui::parts::Dialog;
+use ternarygrid_ui::parts::{self, Dialog, Tone};
 
 pub struct CreateDatabaseDialog {
     conn: String,
@@ -50,6 +50,29 @@ impl CreateDatabaseDialog {
         self.db.name = name.to_string();
     }
 
+    /// The product creates what this dialog asks for with SQL (any name).
+    fn supported(&self, dialect: &dyn ternarygrid_core::Dialect) -> bool {
+        match &self.schema_in {
+            None => dialect.create_database_sql(&NewDatabase { name: "x".into(), ..Default::default() }).is_some(),
+            Some(_) => dialect.create_schema_sql("x", None).is_some(),
+        }
+    }
+
+    /// Why the product cannot, and what to do instead.
+    fn unsupported_text(&self, kind: DbKind) -> String {
+        let schema = self.schema_in.is_some();
+        match (schema, kind) {
+            (false, k) if k.is_file_based() => trf(
+                "{} can't create a database with SQL: each database is a file. To add one, create a new connection with a new file (New connection → {} → New file…).",
+                &[&k.display_name(), &k.display_name()],
+            ),
+            (true, k) if k.is_file_based() => trf("{} can't create a schema with SQL: its schemas are attached database files.", &[&k.display_name()]),
+            (true, DbKind::MySql | DbKind::MariaDb | DbKind::ClickHouse) => trf("In {} a schema is a database: create a new database instead.", &[&kind.display_name()]),
+            (true, k) => trf("{} can't create a schema with SQL.", &[&k.display_name()]),
+            (false, k) => trf("{} can't create a database with SQL.", &[&k.display_name()]),
+        }
+    }
+
     /// Draw; returns false when closed.
     pub fn show(&mut self, ctx: &egui::Context, cx: &mut AppContext) -> bool {
         let schema = self.schema_in.is_some();
@@ -82,14 +105,49 @@ impl CreateDatabaseDialog {
         let offer_show_all = !schema && !live.config.init.show_all_databases && live.driver.info().capabilities.multiple_databases;
         let (driver, params, cfg) = (live.driver.clone(), live.params().clone(), live.config.clone());
         let sql = self.sql(live.dialect.as_ref());
+        let supported = self.supported(live.dialect.as_ref());
         let dialect = live.dialect.clone();
         let busy = self.job.is_some();
         let enter = Cell::new(false);
-        let (create, editor, cancel) = (Cell::new(false), Cell::new(false), Cell::new(false));
+        let (create, editor, cancel, instead) = (Cell::new(false), Cell::new(false), Cell::new(false), Cell::new(false));
         let title = if schema { tr("New schema") } else { tr("New database") };
         let subtitle = trf("On {}", &[&conn_name]);
         let error = self.error.clone();
-        let (resp, _) = Dialog::new(title).icon(icon::DATABASE).subtitle(&subtitle).width(560.0).body_padding(super::BODY).show_modal(
+        if !supported {
+            // Nothing to fill in: why, and the way it is done instead.
+            let text = self.unsupported_text(kind);
+            let other = match (schema, kind) {
+                (false, k) if k.is_file_based() => Some(tr("New connection…")),
+                (true, DbKind::MySql | DbKind::MariaDb | DbKind::ClickHouse) => Some(tr("New database…")),
+                _ => None,
+            };
+            let (resp, _) = Dialog::new(title).icon(icon::DATABASE).subtitle(&subtitle).width(super::WIDTH_M).body_padding(super::BODY).show_modal(
+                ctx,
+                egui::Id::new(("create_database", &self.conn)),
+                |ui| {
+                    parts::callout(ui, Tone::Info, None, &text, |ui| {
+                        if let Some(label) = other
+                            && kit::secondary(ui, None, label).clicked()
+                        {
+                            instead.set(true);
+                        }
+                    });
+                },
+                |ui| {
+                    super::right(ui, |ui| {
+                        if kit::primary(ui, tr("Close")).clicked() {
+                            cancel.set(true);
+                        }
+                    });
+                },
+            );
+            if instead.get() {
+                cx.push(if schema { AppCommand::NewDatabase { connection: self.conn.clone() } } else { AppCommand::NewConnection { kind: Some(kind), folder: None } });
+                return false;
+            }
+            return !(cancel.get() || resp.close);
+        }
+        let (resp, _) = Dialog::new(title).icon(icon::DATABASE).subtitle(&subtitle).width(super::WIDTH_M).body_padding(super::BODY).show_modal(
             ctx,
             egui::Id::new(("create_database", &self.conn)),
             |ui| {
@@ -128,11 +186,8 @@ impl CreateDatabaseDialog {
                     // A bounded preview: a view that fills the available space
                     // would make the dialog grow every frame (and move its buttons).
                     Some(s) => super::sql_preview(ui, ("create_db_sql", &self.conn), Some(dialect.clone()), &format!("{s};"), 120.0, false),
-                    None if self.db.name.trim().is_empty() => {
-                        super::muted(ui, tr("Enter a name."));
-                    }
                     None => {
-                        super::muted(ui, tr("This database type cannot create it with SQL."));
+                        super::muted(ui, tr("Enter a name: the statement is shown here."));
                     }
                 }
                 if read_only {

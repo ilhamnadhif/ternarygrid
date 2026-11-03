@@ -7,7 +7,10 @@
 //! cargo test -p ternarygrid-app --test ui_snapshots_dialogs -- --ignored
 //! ```
 //!
-//! writes `target/ui-snapshots/dialogs/<shot>-<light|dark>.png`.
+//! writes `target/ui-snapshots/dialogs/<shot>-<light|dark>.png` (the folder is
+//! `dialogs-<label>` with `TERNARYGRID_SNAPSHOT_LABEL=<label>`; `TERNARYGRID_SNAPSHOT_ONLY=a,b`
+//! takes only the shots whose names contain those, `TERNARYGRID_SNAPSHOT_THEME=dark|light` one
+//! theme, `TERNARYGRID_SNAPSHOT_PPP=1` quick shots at one pixel per point).
 
 use egui::epaint::{ClippedPrimitive, Primitive};
 use egui::{Color32, ColorImage, TextureId};
@@ -32,8 +35,11 @@ use ternarygrid_core::ObjectRef;
 
 type H = Harness<'static, TernaryGridApp>;
 
-/// Pixels per point of the screenshots (a Retina display).
-const PPP: f32 = 2.0;
+/// Pixels per point of the screenshots: a Retina display (2), or
+/// `TERNARYGRID_SNAPSHOT_PPP` (1 for quick reviews).
+fn ppp() -> f32 {
+    std::env::var("TERNARYGRID_SNAPSHOT_PPP").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0)
+}
 
 /// Textures the frames set, kept for rasterising.
 #[derive(Default)]
@@ -72,17 +78,18 @@ impl Raster {
 
     /// Rasterise tessellated `prims` (barycentric, textured, alpha blended).
     fn render(&self, prims: &[ClippedPrimitive], size: [usize; 2], bg: Color32) -> image::RgbaImage {
+        let ppp = ppp();
         let (w, h) = (size[0], size[1]);
         let mut fb: Vec<[f32; 4]> = vec![[bg.r() as f32, bg.g() as f32, bg.b() as f32, 255.0]; w * h];
         for p in prims {
             let Primitive::Mesh(mesh) = &p.primitive else { continue };
             let Some(tex) = self.textures.get(&mesh.texture_id) else { continue };
             let clip = p.clip_rect;
-            let (cx0, cy0) = ((clip.min.x * PPP).max(0.0) as i64, (clip.min.y * PPP).max(0.0) as i64);
-            let (cx1, cy1) = (((clip.max.x * PPP).ceil() as i64).min(w as i64), ((clip.max.y * PPP).ceil() as i64).min(h as i64));
+            let (cx0, cy0) = ((clip.min.x * ppp).max(0.0) as i64, (clip.min.y * ppp).max(0.0) as i64);
+            let (cx1, cy1) = (((clip.max.x * ppp).ceil() as i64).min(w as i64), ((clip.max.y * ppp).ceil() as i64).min(h as i64));
             for tri in mesh.indices.as_chunks::<3>().0 {
                 let v = tri.map(|i| mesh.vertices[i as usize]);
-                let pts = v.map(|v| (v.pos.x * PPP, v.pos.y * PPP));
+                let pts = v.map(|v| (v.pos.x * ppp, v.pos.y * ppp));
                 let minx = pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min).floor().max(cx0 as f32) as i64;
                 let maxx = pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max).ceil().min(cx1 as f32) as i64;
                 let miny = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min).floor().max(cy0 as f32) as i64;
@@ -99,16 +106,26 @@ impl Raster {
                     dy > 0.0 || (dy == 0.0 && dx > 0.0)
                 };
                 let edge = [owns(pts[1], pts[2]), owns(pts[2], pts[0]), owns(pts[0], pts[1])];
+                // The edge function of a→b at p, computed from the edge's endpoints in one fixed
+                // order: the two triangles of a shared edge get exactly opposite values, so a
+                // pixel on it is neither lost (a dark speck) nor drawn twice.
+                let side = |a: (f32, f32), b: (f32, f32), p: (f32, f32)| {
+                    let (a, b, flip) = if (a.0, a.1) <= (b.0, b.1) { (a, b, 1.0) } else { (b, a, -1.0) };
+                    flip * ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0))
+                };
                 for y in miny..maxy {
                     for x in minx..maxx {
-                        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                        let w0 = ((pts[1].0 - px) * (pts[2].1 - py) - (pts[2].0 - px) * (pts[1].1 - py)) / area;
-                        let w1 = ((pts[2].0 - px) * (pts[0].1 - py) - (pts[0].0 - px) * (pts[2].1 - py)) / area;
-                        let w2 = 1.0 - w0 - w1;
-                        let outside = |w: f32, own: bool| w < -1e-5 || (w <= 1e-5 && !own);
-                        if outside(w0, edge[0]) || outside(w1, edge[1]) || outside(w2, edge[2]) {
+                        let p = (x as f32 + 0.5, y as f32 + 0.5);
+                        let e = [side(pts[1], pts[2], p), side(pts[2], pts[0], p), side(pts[0], pts[1], p)];
+                        let inside = |i: usize| {
+                            let s = e[i] * area.signum();
+                            s > 0.0 || (s == 0.0 && edge[i])
+                        };
+                        if !(inside(0) && inside(1) && inside(2)) {
                             continue;
                         }
+                        let (w0, w1) = (e[0] / area, e[1] / area);
+                        let w2 = 1.0 - w0 - w1;
                         let u = w0 * v[0].uv.x + w1 * v[1].uv.x + w2 * v[2].uv.x;
                         let vv = w0 * v[0].uv.y + w1 * v[1].uv.y + w2 * v[2].uv.y;
                         let tx = ((u * tex.size[0] as f32) as usize).min(tex.size[0] - 1);
@@ -168,7 +185,7 @@ impl Shots {
         let conns = ConnectionManager::new(ternarygrid_app::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
         let h = Harness::builder()
             .with_size(egui::vec2(1440.0, 900.0))
-            .with_pixels_per_point(PPP)
+            .with_pixels_per_point(ppp())
             .with_max_steps(400)
             .with_step_dt(1.0 / 60.0)
             .renderer(CpuTextures(raster.clone()))
@@ -220,11 +237,11 @@ impl Shots {
             return;
         }
         let out = self.h.output();
-        let prims = self.h.ctx.tessellate(out.shapes.clone(), PPP);
-        let size = self.h.ctx.content_rect().size() * PPP;
+        let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
+        let size = self.h.ctx.content_rect().size() * ppp();
         let bg = self.h.ctx.global_style().visuals.panel_fill;
         let mut img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
-        traffic_lights(&mut img, PPP);
+        traffic_lights(&mut img, ppp());
         let path = self.dir.join(format!("{name}-{}.png", self.theme));
         img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
@@ -427,7 +444,11 @@ fn slypee_prod() -> ternarygrid_core::config::ConnectionConfig {
 #[test]
 #[ignore = "writes screenshots for visual review; run with --ignored"]
 fn ui_snapshots_dialogs() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots/dialogs");
+    let folder = match std::env::var("TERNARYGRID_SNAPSHOT_LABEL") {
+        Ok(l) if !l.is_empty() => format!("dialogs-{l}"),
+        _ => "dialogs".to_string(),
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots").join(folder);
     std::fs::create_dir_all(&root).unwrap();
     let themes: Vec<Theme> = match std::env::var("TERNARYGRID_SNAPSHOT_THEME").as_deref() {
         Ok("dark") => vec![Theme::Dark],
@@ -471,7 +492,7 @@ fn ui_snapshots_dialogs() {
         s.h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: Some(BACKDROP_SQL.into()) });
         s.frames(4);
 
-        // New connection: Main (as filled in), a missing name after a failed test, a SQLite file.
+        // New connection: Main (as filled in), a failed test and a missing host, a SQLite file.
         let ctx = s.h.ctx.clone();
         s.h.state_mut().dispatch_action(&ctx, Action::NewConnection);
         s.frames(3);
@@ -494,8 +515,10 @@ fn ui_snapshots_dialogs() {
         }
         s.click("Test connection");
         s.wait_label("refused");
-        s.clear_right_of("Connection name");
+        // (An empty name is saved as its placeholder: the host is what is missing.)
+        s.clear_right_of("Host");
         s.click("Save");
+        s.unfocus();
         s.shot("conn_error");
         s.reset();
         s.h.state_mut().dispatch_action(&ctx, Action::NewConnection);
@@ -623,12 +646,8 @@ fn ui_snapshots_dialogs() {
         // Unsaved changes: a table designer with a change, closed.
         s.h.state_mut().push_command(AppCommand::CreateTable { connection: conn.clone(), schema: ternarygrid_core::meta::SchemaRef::new(None, Some("main".into())) });
         s.frames(6);
-        {
-            let f = s.h.query_all_by_role(egui::accesskit::Role::TextInput).find(|n| n.rect().left() > 400.0 && n.rect().top() > 120.0).expect("a field of the table designer");
-            f.click();
-        }
-        s.frames(2);
-        s.h.event(egui::Event::Text("orders".into()));
+        // The table's name (its field right of "Table").
+        s.type_right_of("Table", "orders");
         s.frames(3);
         {
             let app = s.h.state_mut();

@@ -611,9 +611,10 @@ fn menus_actions_commands_and_dialogs() {
     nav_row(&h, "zz_drop_me").unwrap().click_secondary();
     frames(&mut h, 2);
     click(&mut h, "Drop…");
-    assert!(has(&h, "Drop objects"), "drop dialog: {:?}", labels(&h));
+    assert!(has(&h, "Drop object"), "drop dialog: {:?}", labels(&h));
     pause(&mut h);
-    h.query_all_by_label("Drop").last().unwrap().click();
+    // The button names the verb and the object.
+    h.query_all_by_label("Drop table").last().unwrap().click();
     wait(&mut h, "dropped", |h| nav_row(h, "zz_drop_me").is_none());
     no_errors(&mut h, "drop");
     assert_eq!(query_one(&db, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'zz_drop_me'"), "0");
@@ -694,7 +695,7 @@ fn menus_actions_commands_and_dialogs() {
     let cancelled = h.output().viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose));
     assert!(cancelled, "close cancelled while a tab is dirty");
     frames(&mut h, 2);
-    assert!(has(&h, "Quit TernaryGrid?"), "quit confirmation: {:?}", labels(&h));
+    assert!(has(&h, "Quit TernaryGrid") && has(&h, "Quit without saving"), "quit confirmation: {:?}", labels(&h));
     no_errors(&mut h, "quit");
 }
 
@@ -1880,7 +1881,10 @@ fn connection_folders() {
     // Deleted: the connection moves to the top level, nothing else is lost.
     h.state_mut().push_command(AppCommand::DeleteFolder("Prod".into()));
     frames(&mut h, 3);
-    click(&mut h, "Delete folder");
+    // The footer's button (the dialog's title says the same).
+    pause(&mut h);
+    h.query_all_by_label("Delete folder").last().expect("Delete folder button").click();
+    frames(&mut h, 2);
     assert!(h.state().conns.folders().is_empty(), "{:?}", h.state().conns.folders());
     assert_eq!(folder_of(&h), None);
     assert!(h.state().conns.config(&conn).is_some(), "the connection is kept");

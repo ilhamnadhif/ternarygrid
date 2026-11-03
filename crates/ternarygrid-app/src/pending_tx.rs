@@ -12,7 +12,7 @@ use egui::RichText;
 use egui_dock::DockState;
 use egui_phosphor::regular as icon;
 use std::cell::Cell;
-use ternarygrid_core::{DbResult, tr, trf};
+use ternarygrid_core::{DbResult, tr, trf, trn};
 use ternarygrid_ui::kit::{self, Kind};
 use ternarygrid_ui::parts::Dialog;
 use ternarygrid_ui::style;
@@ -76,6 +76,14 @@ impl PendingTxDialog {
         !self.jobs.is_empty()
     }
 
+    /// Commit every transaction of `items` (in the background; a failure is a toast and its
+    /// transaction stays open).
+    pub fn commit_all(&mut self, backend: &Backend, items: &[PendingTx]) {
+        for p in items {
+            self.end(backend, p, true);
+        }
+    }
+
     fn end(&mut self, backend: &Backend, p: &PendingTx, commit: bool) {
         let s = p.session.clone();
         let job = backend.spawn(async move { if commit { s.commit().await } else { s.rollback().await } });
@@ -103,12 +111,8 @@ impl PendingTxDialog {
         let action: Cell<Option<(Option<usize>, bool)>> = Cell::new(None);
         let busy = self.busy();
         let statements: usize = items.iter().map(|p| p.statements).sum();
-        let summary = match (statements, items.len()) {
-            (1, 1) => tr("1 statement in 1 transaction").to_string(),
-            (s, 1) => trf("{} statements in 1 transaction", &[&s]),
-            (s, n) => trf("{} statements in {} transactions", &[&s, &n]),
-        };
-        let (resp, _) = Dialog::new(tr("Pending transactions")).icon(icon::PAUSE).width(760.0).body_padding(egui::Margin::symmetric(20, 16)).show_window(
+        let summary = trf("{} in {}", &[&trn(statements, "1 statement", "{} statements"), &trn(items.len(), "1 transaction", "{} transactions")]);
+        let (resp, _) = Dialog::new(tr("Pending transactions")).icon(icon::PAUSE).width(dialogs::WIDTH_L).body_padding(egui::Margin::symmetric(20, 16)).show_window(
             ctx,
             egui::Id::new("pending_transactions"),
             &mut open,
@@ -120,23 +124,26 @@ impl PendingTxDialog {
                     return;
                 }
                 let cols = [
-                    Column::new(tr("Connection"), W::Fr(1.1)),
-                    Column::new(tr("Opened by"), W::Fr(1.5)),
-                    Column::new(tr("Statements"), W::Fr(0.8)).right(),
-                    Column::new(tr("Since"), W::Fr(0.8)),
-                    Column::new("", W::Px(200.0)),
+                    Column::new(tr("Connection"), W::Fr(1.6)),
+                    Column::new(tr("Opened by"), W::Fr(1.0)),
+                    Column::new(tr("Statements"), W::Fr(0.7)).right(),
+                    Column::new(tr("Since"), W::Fr(0.7)),
+                    Column::new("", W::Px(220.0)),
                 ];
                 let max_h = (ui.ctx().content_rect().height() - 300.0).max(120.0);
+                // A long name is cut with …, the whole name in its tooltip.
+                let cell = |ui: &mut egui::Ui, text: &str| {
+                    let r = ui.add(egui::Label::new(RichText::new(text).color(p.text)).truncate());
+                    if r.rect.width() + 1.0 >= ui.max_rect().width() {
+                        r.on_hover_text(text);
+                    }
+                };
                 table(ui, "pending_tx", &cols, items.len(), 40.0, max_h, |ui, row, col| {
                     let Some(i) = row else { return };
                     let tx = &items[i];
                     match col {
-                        0 => {
-                            ui.label(RichText::new(&tx.conn_name).color(p.text));
-                        }
-                        1 => {
-                            ui.label(RichText::new(&tx.owner).color(p.text));
-                        }
+                        0 => cell(ui, &tx.conn_name),
+                        1 => cell(ui, &tx.owner),
                         2 => {
                             ui.label(RichText::new(tx.statements.to_string()).color(p.text));
                         }
@@ -148,7 +155,7 @@ impl PendingTxDialog {
                                 if kit::button_ex(ui, Kind::Secondary, Some(icon::CHECK_CIRCLE), tr("Commit"), true).clicked() {
                                     action.set(Some((Some(i), true)));
                                 }
-                                if kit::button_ex(ui, Kind::Ghost, Some(icon::ARROW_LEFT), tr("Rollback"), true).clicked() {
+                                if kit::button_ex(ui, Kind::Ghost, Some(icon::ARROW_COUNTER_CLOCKWISE), tr("Roll back"), true).clicked() {
                                     action.set(Some((Some(i), false)));
                                 }
                             });
@@ -161,7 +168,7 @@ impl PendingTxDialog {
                     if kit::secondary(ui, None, tr("Commit all")).clicked() {
                         action.set(Some((None, true)));
                     }
-                    if kit::button_ex(ui, Kind::Ghost, None, tr("Rollback all"), false).clicked() {
+                    if kit::button_ex(ui, Kind::Ghost, None, tr("Roll back all"), false).clicked() {
                         action.set(Some((None, false)));
                     }
                 });
@@ -169,7 +176,7 @@ impl PendingTxDialog {
                     ui.add(egui::Spinner::new().size(14.0));
                 }
                 if !items.is_empty() {
-                    dialogs::right(ui, |ui| ui.label(RichText::new(&summary).size(12.0).color(style::pal(ui).text_faint)));
+                    dialogs::right(ui, |ui| ui.label(RichText::new(&summary).size(12.0).color(style::pal(ui).text_muted)));
                 }
             }),
         );

@@ -2,13 +2,13 @@
 
 use super::{Column, W, add_field, cancel_button, hint, muted, rest, right, table, text_field};
 use crate::cx::AppContext;
-use egui::{Id, RichText, Ui};
+use egui::{CornerRadius, Id, RichText, Sense, Stroke, StrokeKind, Ui, WidgetInfo, WidgetType, vec2};
 use egui_phosphor::regular as icon;
 use std::cell::Cell;
 use std::path::PathBuf;
 use ternarygrid_config::ImportResult;
 use ternarygrid_config::import::{DuplicatePolicy, merge_into_store};
-use ternarygrid_core::{DbResult, tr, trf};
+use ternarygrid_core::{DbResult, tr, trf, trn};
 use ternarygrid_ui::kit::{self, Kind};
 use ternarygrid_ui::parts::{self, Dialog};
 use ternarygrid_ui::style;
@@ -121,9 +121,16 @@ impl ImportDialog {
         }
         cx.conns.dirty = true;
         let detail = if warnings.is_empty() { None } else { Some(warnings.join("\n")) };
-        cx.toasts.success(trf("Imported {} connection(s), replaced {}, skipped {}", &[&summary.added, &summary.replaced, &summary.skipped]));
+        let mut parts = vec![trn(summary.added, "Imported 1 connection", "Imported {} connections")];
+        if summary.replaced > 0 {
+            parts.push(trf("replaced {}", &[&summary.replaced]));
+        }
+        if summary.skipped > 0 {
+            parts.push(trf("skipped {} already there", &[&summary.skipped]));
+        }
+        cx.toasts.success(parts.join(", "));
         if let Some(d) = detail {
-            cx.toasts.warning(tr("Import notes"), Some(d));
+            cx.toasts.warning(trn(warnings.len(), "1 import warning", "{} import warnings"), Some(d));
         }
         true
     }
@@ -135,8 +142,8 @@ impl ImportDialog {
         let cancel = Cell::new(false);
         let selected = self.selected.iter().filter(|s| **s).count();
         let has_result = self.result.as_ref().is_some_and(|r| !r.connections.is_empty());
-        let label = if selected == 1 { tr("Import 1 connection").to_string() } else { trf("Import {} connections", &[&selected]) };
-        let (resp, _) = Dialog::new(tr("Import connections")).icon(icon::DOWNLOAD_SIMPLE).width(760.0).body_padding(egui::Margin::symmetric(20, 16)).show_window(
+        let label = trn(selected, "Import 1 connection", "Import {} connections");
+        let (resp, _) = Dialog::new(tr("Import connections")).icon(icon::DOWNLOAD_SIMPLE).width(super::WIDTH_L).body_padding(egui::Margin::symmetric(20, 16)).show_window(
             ctx,
             Id::new("ternarygrid_import_connections"),
             &mut open,
@@ -170,6 +177,13 @@ impl ImportDialog {
         let find_w = kit::button_width(ui, Some(icon::MAGNIFYING_GLASS), tr("Find connections"), false);
         let browse_w = kit::button_width(ui, Some(icon::FOLDER_OPEN), tr("Browse…"), false);
         let mut find = false;
+        // The search is the main action until it found something: then it is the footer's
+        // Import (one filled button).
+        let searched = self.result.is_some();
+        let find_button = |ui: &mut Ui| {
+            let kind = if searched { Kind::Secondary } else { Kind::Primary };
+            kit::button_ex(ui, kind, Some(icon::MAGNIFYING_GLASS), tr("Find connections"), false).clicked()
+        };
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             match self.source {
@@ -177,7 +191,7 @@ impl ImportDialog {
                     muted(ui, tr("Workspace folder (contains General/.dbeaver/data-sources.json)"));
                     ui.horizontal(|ui| {
                         let current = self.workspace.as_deref().map(home_relative).unwrap_or_else(|| tr("(none found)").to_string());
-                        let w = rest(ui, find_w + browse_w + 16.0).min(420.0);
+                        let w = rest(ui, find_w + browse_w + 16.0);
                         // At most `w` wide: a long path is cut, the dialog does not grow.
                         ui.allocate_ui_with_layout(egui::vec2(w, ternarygrid_ui::style::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let combo = egui::ComboBox::from_id_salt("dbeaver_ws")
@@ -202,9 +216,9 @@ impl ImportDialog {
                             self.workspaces.push(p.clone());
                             self.workspace = Some(p);
                         }
-                        find |= kit::primary_icon(ui, icon::MAGNIFYING_GLASS, tr("Find connections")).clicked();
+                        find |= find_button(ui);
                     });
-                    ui.label(RichText::new(tr("Passwords saved by DBeaver with the default key are imported into the secure store.")).size(12.0).color(p.text_faint));
+                    ui.label(RichText::new(tr("Passwords saved by DBeaver with the default key are imported into the secure store.")).size(12.0).color(p.text_muted));
                 }
                 Source::Pgpass => {
                     muted(ui, tr("File"));
@@ -216,7 +230,7 @@ impl ImportDialog {
                         {
                             self.pgpass_path = p.display().to_string();
                         }
-                        find |= kit::primary_icon(ui, icon::MAGNIFYING_GLASS, tr("Find connections")).clicked();
+                        find |= find_button(ui);
                     });
                     ternarygrid_ui::kit::checkbox(ui, &mut self.pgpass_store_passwords, tr("Copy the passwords into the secure store (otherwise the connections read .pgpass)"));
                 }
@@ -224,13 +238,16 @@ impl ImportDialog {
                     super::form_row_w(ui, tr("URL"), 80.0, |ui| {
                         let w = rest(ui, find_w + 8.0);
                         add_field(ui, text_field(&mut self.url, w).font(egui::FontId::monospace(12.5)).hint_text(super::mono_hint(ui, "postgres://user@host:5432/db")));
-                        find |= kit::primary_icon(ui, icon::MAGNIFYING_GLASS, tr("Find connections")).clicked();
+                        find |= find_button(ui);
                     });
-                    super::form_row_w(ui, tr("Name"), 80.0, |ui| add_field(ui, text_field(&mut self.url_name, 260.0)));
+                    super::form_row_w(ui, tr("Name"), 80.0, |ui| {
+                        let w = rest(ui, find_w + 8.0);
+                        add_field(ui, text_field(&mut self.url_name, w).hint_text(hint(ui, tr("database@host"))))
+                    });
                     ui.label(
                         RichText::new(tr("Supported: postgres://, mysql://, mariadb://, sqlserver://, oracle://, clickhouse://, cassandra://, sqlite:, jdbc:…"))
                             .size(12.0)
-                            .color(p.text_faint),
+                            .color(p.text_muted),
                     );
                 }
             }
@@ -249,38 +266,28 @@ impl ImportDialog {
             muted(ui, tr("No connections found."));
             return;
         }
-        // As tall as its small buttons, not a form row (the label centred on them).
-        let control_h = ui.spacing().interact_size.y;
-        ui.spacing_mut().interact_size.y = style::SMALL_H;
+        let n = r.connections.len();
+        let chosen = self.selected.iter().filter(|s| **s).count();
+        let found = trn(n, "1 connection found", "{} connections found");
         ui.horizontal(|ui| {
-            let n = r.connections.len();
-            let found = if n == 1 { tr("1 connection found").to_string() } else { trf("{} connections found", &[&n]) };
             kit::semibold_label(ui, &found, 13.0, p.text);
-            if kit::button_ex(ui, Kind::Ghost, None, tr("Select all"), true).clicked() {
-                self.selected.iter_mut().for_each(|s| *s = true);
-            }
-            if kit::button_ex(ui, Kind::Ghost, None, tr("Select none"), true).clicked() {
-                self.selected.iter_mut().for_each(|s| *s = false);
-            }
+            ui.label(RichText::new(trf("· {} selected", &[&chosen])).size(12.5).color(p.text_muted));
         });
-        ui.spacing_mut().interact_size.y = control_h;
         let cols = [
             Column::new("", W::Px(32.0)).center(),
             Column::new(tr("Connection"), W::Fr(1.3)),
             Column::new(tr("Host"), W::Fr(1.6)),
             Column::new(tr("Folder"), W::Fr(1.0)),
-            Column::new("", W::Px(40.0)),
+            // The warning of a shell command, with its caption.
+            Column::new("", W::Px(190.0)),
         ];
         let max_h = (ui.ctx().content_rect().height() - 560.0).max(120.0);
         let selected = &mut self.selected;
         table(ui, "import_conns", &cols, r.connections.len(), 30.0, max_h, |ui, row, col| {
             let Some(row) = row else {
-                // The header's box selects all or none.
+                // The header's box selects all or none (a dash while only some are).
                 if col == 0 {
-                    let mut all = !selected.is_empty() && selected.iter().all(|s| *s);
-                    if ternarygrid_ui::kit::checkbox(ui, &mut all, "").on_hover_text(tr("Select all")).changed() {
-                        selected.iter_mut().for_each(|s| *s = all);
-                    }
+                    header_checkbox(ui, selected);
                 }
                 return;
             };
@@ -307,13 +314,15 @@ impl ImportDialog {
                 }
                 _ => {
                     if c.init.shell_before_connect.is_some() || c.init.shell_after_disconnect.is_some() {
-                        ui.label(RichText::new(icon::TERMINAL_WINDOW).font(style::icon_font(14.0)).color(p.warn))
-                            .on_hover_text(tr("Runs a shell command when connecting or disconnecting."));
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        ui.label(RichText::new(icon::TERMINAL_WINDOW).font(style::icon_font(14.0)).color(p.warn));
+                        ui.label(RichText::new(tr("Runs a shell command")).size(12.0).color(p.text_muted))
+                            .on_hover_text(tr("It runs a shell command when connecting or disconnecting: kept only with the option below."));
                     }
                 }
             }
         });
-        let notes = if r.warnings.len() == 1 { tr("1 note").to_string() } else { trf("{} notes", &[&r.warnings.len()]) };
+        let notes = trn(r.warnings.len(), "1 import warning", "{} import warnings");
         if !r.warnings.is_empty() && super::disclosure(ui, Id::new("import_notes"), &notes, false) {
             for w in &r.warnings {
                 muted(ui, w);
@@ -327,9 +336,37 @@ impl ImportDialog {
                 ternarygrid_ui::kit::radio_value(ui, &mut self.policy, DuplicatePolicy::Replace, tr("Replace"));
                 ternarygrid_ui::kit::radio_value(ui, &mut self.policy, DuplicatePolicy::KeepBoth, tr("Keep both"));
             });
-            super::form_row(ui, tr("Put into folder"), |ui| add_field(ui, text_field(&mut self.folder_prefix, 260.0).hint_text(hint(ui, tr("(top level)")))));
+            super::form_row(ui, tr("Put into folder"), |ui| add_field(ui, text_field(&mut self.folder_prefix, f32::INFINITY).hint_text(hint(ui, tr("their own folders")))));
             super::form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.keep_shell_commands, tr("Keep shell commands that run on connect / disconnect")));
         });
+    }
+}
+
+/// The table header's check box: all rows, none, or a dash while only some are (a click
+/// selects all, or none when all are).
+fn header_checkbox(ui: &mut Ui, selected: &mut [bool]) {
+    let p = style::pal(ui);
+    let n = selected.iter().filter(|s| **s).count();
+    let all = n > 0 && n == selected.len();
+    let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 17.0), Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, all, tr("Select all")));
+    let resp = resp.on_hover_text(if all { tr("Select none") } else { tr("Select all") });
+    if resp.clicked() {
+        selected.iter_mut().for_each(|s| *s = !all);
+    }
+    // As `kit::checkbox` draws it: the accent with a white mark, or an empty box.
+    let b = egui::Rect::from_center_size(rect.center(), vec2(16.0, 16.0));
+    let fill = if resp.hovered() { p.accent_hover } else { p.accent };
+    if all {
+        ui.painter().rect_filled(b, CornerRadius::same(4), fill);
+        let pts = vec![egui::pos2(b.left() + 5.0, b.top() + 8.2), egui::pos2(b.left() + 6.9, b.top() + 10.1), egui::pos2(b.left() + 11.0, b.top() + 6.2)];
+        ui.painter().add(egui::Shape::line(pts, Stroke::new(1.3, p.on_accent)));
+    } else if n > 0 {
+        ui.painter().rect_filled(b, CornerRadius::same(4), fill);
+        ui.painter().hline(b.left() + 4.5..=b.right() - 4.5, b.center().y, Stroke::new(1.5, p.on_accent));
+    } else {
+        let ring = if resp.hovered() { p.accent } else { p.border_strong };
+        ui.painter().rect(b, CornerRadius::same(4), p.surface, Stroke::new(1.5, ring), StrokeKind::Inside);
     }
 }
 
