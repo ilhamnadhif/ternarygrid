@@ -9,6 +9,7 @@ use base64::Engine;
 use serde_json::{Value as J, json};
 use std::collections::VecDeque;
 use std::io::Read;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use ternarygrid_core::admin::{KillMode, Metric, SessionList, TabularData};
@@ -21,18 +22,123 @@ use ternarygrid_core::plan::{PlanNode, QueryPlan};
 use ternarygrid_core::value::{ColumnMeta, DataKind};
 use ternarygrid_core::{
     CancelHandle, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions, QueryCursor,
-    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value,
+    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value, tr, trf,
 };
 use ureq::Agent;
-use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
+use ureq::config::Config;
+use ureq::tls::{Certificate, ClientCert, PemItem, PrivateKey, RootCerts, TlsConfig, TlsProvider};
+use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 /// Rows per SQL page.
 const FETCH: u64 = 1000;
+/// How long Elasticsearch keeps an SQL cursor between pages: longer than the
+/// application leaves an unread cursor open (5 minutes) before closing it.
+const PAGE_TIMEOUT: &str = "10m";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Product {
     Elasticsearch,
     OpenSearch,
+}
+
+/// Resolver sending every lookup to a fixed address: through an SSH tunnel or
+/// proxy the URL carries the real server name (TLS SNI and certificate
+/// verification) while the socket goes to the local forwarder.
+#[derive(Debug)]
+struct FixedResolver {
+    addrs: Vec<SocketAddr>,
+}
+
+impl Resolver for FixedResolver {
+    fn resolve(
+        &self,
+        _uri: &ureq::http::Uri,
+        _config: &Config,
+        _timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let mut out = self.empty();
+        for a in self.addrs.iter().take(16) {
+            out.push(*a);
+        }
+        if out.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(out)
+        }
+    }
+}
+
+/// TLS settings of a connection: the trusted roots (the system's and/or the
+/// connection's CA file) when it verifies, and the client certificate.
+fn tls_config(params: &ConnectParams) -> DbResult<TlsConfig> {
+    let mut b = TlsConfig::builder()
+        .provider(TlsProvider::Rustls)
+        .unversioned_rustls_crypto_provider(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        );
+    let ca = params.ssl.ca_cert.as_deref().filter(|c| !c.is_empty());
+    if params.ssl.mode.verifies_chain() {
+        let mut roots: Vec<Certificate<'static>> = Vec::new();
+        if !params.ssl.only_custom_ca || ca.is_none() {
+            roots.extend(
+                rustls_native_certs::load_native_certs()
+                    .certs
+                    .into_iter()
+                    .map(|c| Certificate::from_der(c.as_ref()).to_owned()),
+            );
+        }
+        if let Some(ca) = ca {
+            roots.extend(load_pem_certs(ca)?);
+        }
+        b = if roots.is_empty() {
+            b.root_certs(RootCerts::WebPki)
+        } else {
+            b.root_certs(RootCerts::new_with_certs(&roots))
+        };
+    } else {
+        b = b.disable_verification(true);
+    }
+    let cert = params.ssl.client_cert.as_deref().filter(|c| !c.is_empty());
+    let key = params.ssl.client_key.as_deref().filter(|c| !c.is_empty());
+    match (cert, key) {
+        (Some(cert), Some(key)) => {
+            let certs = load_pem_certs(cert)?;
+            let pem = read_file(key, "client key")?;
+            let key = PrivateKey::from_pem(&pem)
+                .map_err(|e| DbError::config(format!("Invalid client key '{key}': {e}")))?;
+            b = b.client_cert(Some(ClientCert::new_with_certs(&certs, key)));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(DbError::config(
+                "A client certificate needs both the certificate and the key file",
+            ));
+        }
+    }
+    Ok(b.build())
+}
+
+fn read_file(path: &str, what: &str) -> DbResult<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| DbError::config(format!("Cannot read {what} file '{path}': {e}")))
+}
+
+/// Certificates of a PEM file.
+fn load_pem_certs(path: &str) -> DbResult<Vec<Certificate<'static>>> {
+    let pem = read_file(path, "certificate")?;
+    let mut out = Vec::new();
+    for item in ureq::tls::parse_pem(&pem) {
+        match item {
+            Ok(PemItem::Certificate(c)) => out.push(c),
+            Ok(_) => {}
+            Err(e) => return Err(DbError::config(format!("Invalid PEM in '{path}': {e}"))),
+        }
+    }
+    if out.is_empty() {
+        return Err(DbError::config(format!("No certificate found in '{path}'")));
+    }
+    Ok(out)
 }
 
 /// The HTTP client of a session (cheap to clone, shared by its cursors).
@@ -51,6 +157,9 @@ impl Http {
         ) || params.property("https") == Some("true");
         let mut cfg = Agent::config_builder()
             .http_status_as_error(false)
+            // Tunnels and proxies are local forwarders at `host:port`, not
+            // proxies from the environment.
+            .proxy(None)
             .timeout_connect(Some(params.connect_timeout))
             .timeout_resolve(Some(params.connect_timeout))
             .timeout_global(Some(Duration::from_secs(600)))
@@ -59,28 +168,33 @@ impl Http {
                 params.application_name
             ));
         if https {
-            let mut b = TlsConfig::builder()
-                .provider(TlsProvider::Rustls)
-                .unversioned_rustls_crypto_provider(Arc::new(
-                    rustls::crypto::aws_lc_rs::default_provider(),
-                ));
-            if params.ssl.mode.verifies_chain() {
-                let roots: Vec<Certificate<'static>> = rustls_native_certs::load_native_certs()
-                    .certs
-                    .into_iter()
-                    .map(|c| Certificate::from_der(c.as_ref()).to_owned())
-                    .collect();
-                b = if roots.is_empty() {
-                    b.root_certs(RootCerts::WebPki)
-                } else {
-                    b.root_certs(RootCerts::new_with_certs(&roots))
-                };
-            } else {
-                b = b.disable_verification(true);
-            }
-            cfg = cfg.tls_config(b.build());
+            cfg = cfg.tls_config(tls_config(params)?);
         }
-        let host = params.tls_host();
+        // `host:port` may be a local forwarder (SSH tunnel, proxy): the socket
+        // goes there, TLS checks the real server name (`tls_server_name`).
+        let tunnelled = https
+            && params
+                .tls_server_name
+                .as_deref()
+                .is_some_and(|n| n != params.host);
+        let agent = if tunnelled {
+            let addrs: Vec<SocketAddr> = (params.host.as_str(), params.port)
+                .to_socket_addrs()
+                .map_err(|e| DbError::connection(format!("{}: {e}", params.host)))?
+                .collect();
+            Agent::with_parts(
+                cfg.build(),
+                DefaultConnector::default(),
+                FixedResolver { addrs },
+            )
+        } else {
+            Agent::new_with_config(cfg.build())
+        };
+        let host = if https {
+            params.tls_host()
+        } else {
+            params.host.as_str()
+        };
         let host = if host.contains(':') && !host.starts_with('[') {
             format!("[{host}]")
         } else {
@@ -109,11 +223,7 @@ impl Http {
                 )
             })
         };
-        Ok(Http {
-            agent: Agent::new_with_config(cfg.build()),
-            base,
-            auth,
-        })
+        Ok(Http { agent, base, auth })
     }
 
     /// One request; the JSON reply (or `{"text": …}`), errors as DbError.
@@ -428,6 +538,143 @@ impl SqlPager {
             Product::OpenSearch => "/_plugins/_sql/close",
         }
     }
+    /// The request for the page after `cursor`.
+    fn page_body(&self, cursor: &str) -> String {
+        let mut body = json!({"cursor": cursor});
+        // Each page extends the cursor's life by its `page_timeout` (default 45 s).
+        // OpenSearch keeps cursors for its `plugins.sql.cursor.keep_alive`.
+        if self.product == Product::Elasticsearch {
+            body["page_timeout"] = json!(PAGE_TIMEOUT);
+        }
+        body.to_string()
+    }
+}
+
+/// The SQL request for `sql` with its parameters.
+fn sql_body(product: Product, sql: &str, params: &[Value]) -> DbResult<J> {
+    let mut body = json!({"query": sql, "fetch_size": FETCH});
+    if product == Product::Elasticsearch {
+        body["page_timeout"] = json!(PAGE_TIMEOUT);
+    }
+    if params.is_empty() {
+        return Ok(body);
+    }
+    // OpenSearch would run the statement without its values.
+    if product == Product::OpenSearch {
+        return Err(DbError::unsupported(tr(
+            "OpenSearch SQL takes no query parameters; write the values into the statement",
+        )));
+    }
+    body["params"] = J::Array(
+        params
+            .iter()
+            .map(|v| match v {
+                Value::Null => J::Null,
+                Value::Bool(b) => J::Bool(*b),
+                Value::Int(i) => json!(i),
+                Value::Float(f) => json!(f),
+                other => J::String(other.to_text().into_owned()),
+            })
+            .collect(),
+    );
+    Ok(body)
+}
+
+/// The first word of an SQL statement (after comments and parentheses), upper case.
+fn sql_keyword(sql: &str) -> String {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(r) = rest.strip_prefix("--") {
+            rest = r.split_once('\n').map_or("", |(_, r)| r).trim_start();
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.split_once("*/").map_or("", |(_, r)| r).trim_start();
+        } else if let Some(r) = rest.strip_prefix('(') {
+            rest = r.trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase()
+}
+
+/// SQL that only reads (OpenSearch's SQL can also DELETE).
+fn sql_reads(sql: &str) -> bool {
+    matches!(
+        sql_keyword(sql).as_str(),
+        "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "WITH" | ""
+    )
+}
+
+/// `%XX` escapes of a URL path decoded (as the server reads them).
+fn percent_decode(path: &str) -> String {
+    let b = path.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) = path
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// POST endpoints that only read: searches, counts, SQL and the like.
+const READ_ENDPOINTS: &[&str] = &[
+    "_search",
+    "_msearch",
+    "_count",
+    "_explain",
+    "_field_caps",
+    "_validate",
+    "_async_search",
+    "_pit",
+    "_mget",
+    "_termvectors",
+    "_mtermvectors",
+    "_terms_enum",
+    "_eql",
+    "_ppl",
+];
+
+/// A REST request that only reads: GET and HEAD, and POST to a read endpoint
+/// (the path's first `_` segment, so `/i/_doc/_search` indexes a document).
+fn rest_reads(method: &str, path: &str, body: Option<&str>) -> bool {
+    match method {
+        "GET" | "HEAD" => true,
+        "POST" => {
+            let path = percent_decode(path.split(['?', '#']).next().unwrap_or(""));
+            let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if segments.iter().any(|s| *s == "." || *s == "..") {
+                return false;
+            }
+            let mut api = segments.into_iter().skip_while(|s| !s.starts_with('_'));
+            let mut endpoint = api.next();
+            if matches!(endpoint, Some("_plugins" | "_opendistro")) {
+                endpoint = api.next();
+            }
+            match endpoint {
+                // The SQL API (also `/translate`, `/close`, cursors).
+                Some("_sql") => body
+                    .and_then(|b| serde_json::from_str::<J>(b).ok())
+                    .and_then(|b| b.get("query").and_then(J::as_str).map(sql_reads))
+                    .unwrap_or(true),
+                Some(e) => READ_ENDPOINTS.contains(&e),
+                None => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 struct SearchCursor {
@@ -454,14 +701,8 @@ impl QueryCursor for SearchCursor {
             };
             let http = pager.http.clone();
             let endpoint = pager.endpoint();
-            let reply = blocking(move || {
-                http.call(
-                    "POST",
-                    endpoint,
-                    Some(&json!({"cursor": cursor}).to_string()),
-                )
-            })
-            .await?;
+            let body = pager.page_body(&cursor);
+            let reply = blocking(move || http.call("POST", endpoint, Some(&body))).await?;
             let rows = pager.rows_of(&reply);
             pager.cursor = reply
                 .get("cursor")
@@ -494,6 +735,28 @@ impl QueryCursor for SearchCursor {
     }
 }
 
+/// A cursor dropped without `close` still releases its server cursor (in the
+/// background: the request blocks).
+impl Drop for SearchCursor {
+    fn drop(&mut self) {
+        let Some(mut p) = self.pager.take() else {
+            return;
+        };
+        let Some(cursor) = p.cursor.take() else {
+            return;
+        };
+        let endpoint = p.close_endpoint();
+        let body = json!({"cursor": cursor}).to_string();
+        let close = move || {
+            let _ = p.http.call("POST", endpoint, Some(&body));
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => drop(rt.spawn_blocking(close)),
+            Err(_) => drop(std::thread::spawn(close)),
+        }
+    }
+}
+
 pub struct SearchSession {
     http: Http,
     product: Product,
@@ -502,6 +765,8 @@ pub struct SearchSession {
     dialect: Arc<SearchDialect>,
     mode: TransactionMode,
     closed: bool,
+    /// Only requests that read are sent.
+    read_only: bool,
 }
 
 /// `METHOD /path` and the JSON body after it.
@@ -570,6 +835,7 @@ impl SearchSession {
             dialect: Arc::new(SearchDialect::new()),
             mode: TransactionMode::Auto,
             closed: false,
+            read_only: params.read_only,
         })
     }
 
@@ -580,21 +846,7 @@ impl SearchSession {
     }
 
     async fn sql(&self, sql: &str, params: &[Value]) -> DbResult<Box<dyn QueryCursor>> {
-        let mut body = json!({"query": sql, "fetch_size": FETCH});
-        if !params.is_empty() && self.product == Product::Elasticsearch {
-            body["params"] = J::Array(
-                params
-                    .iter()
-                    .map(|v| match v {
-                        Value::Null => J::Null,
-                        Value::Bool(b) => J::Bool(*b),
-                        Value::Int(i) => json!(i),
-                        Value::Float(f) => json!(f),
-                        other => J::String(other.to_text().into_owned()),
-                    })
-                    .collect(),
-            );
-        }
+        let body = sql_body(self.product, sql, params)?;
         let pager = SqlPager {
             http: self.http.clone(),
             product: self.product,
@@ -709,16 +961,23 @@ impl Session for SearchSession {
     ) -> DbResult<Box<dyn QueryCursor>> {
         let text = sql.trim().trim_end_matches(';').trim();
         if !is_rest(text) {
+            if self.read_only && !sql_reads(text) {
+                return Err(DbError::read_only(trf(
+                    "The connection is read-only: {} changes data",
+                    &[&sql_keyword(text)],
+                )));
+            }
             return self.sql(text, params).await;
         }
         let (method, path, body) = split_request(text);
+        let write = !rest_reads(&method, &path, body.as_deref());
+        if write && self.read_only {
+            return Err(DbError::read_only(trf(
+                "The connection is read-only: {} changes data",
+                &[&format!("{method} {path}")],
+            )));
+        }
         let reply = self.call(&method, &path, body).await?;
-        let write = matches!(method.as_str(), "PUT" | "DELETE")
-            || method == "POST"
-                && !path.contains("_search")
-                && !path.contains("_count")
-                && !path.contains("_sql")
-                && !path.contains("_msearch");
         if write && reply.pointer("/hits/hits").is_none() {
             let n = num(reply.get("deleted"))
                 .or_else(|| num(reply.get("updated")))
@@ -1176,6 +1435,227 @@ impl Session for SearchSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::mpsc::Receiver;
+    use ternarygrid_core::config::ConnectionConfig;
+
+    /// The connection's CA file and client certificate are used (they were ignored).
+    #[test]
+    fn tls_files_of_the_connection_are_used() {
+        const CA: &str = "-----BEGIN CERTIFICATE-----\nMIIBpDCCAUmgAwIBAgIUL2XsEFf1kDk7vY67A16GzGsrhuowCgYIKoZIzj0EAwIw\nHjEcMBoGA1UEAwwTVGVybmFyeUdyaWQgVGVzdCBDQTAgFw0yMDAxMDEwMDAwMDBa\nGA8yMTIwMDEwMTAwMDAwMFowHjEcMBoGA1UEAwwTVGVybmFyeUdyaWQgVGVzdCBD\nQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABLU6noWJYkgaGqqgE5iWtmEW1w2M\n6ZTOqqfnt/xCrUcLhVazZCwfOzyvc/uhxYp+CfW0Ah9/Lj5JE5TJYjt6W3KjYzBh\nMB0GA1UdDgQWBBQfodv+SRCKWh6Gln6RIZw7gngPSjAfBgNVHSMEGDAWgBQfodv+\nSRCKWh6Gln6RIZw7gngPSjAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB\nBjAKBggqhkjOPQQDAgNJADBGAiEAkyy4iZASrY8b4eAYKphrjfBXb6YpCzh0SP3J\nUaeQ7uwCIQC37CXScPmDgqF4DB901w/aH1kQaoHAVWZNnwHj2SwZrA==\n-----END CERTIFICATE-----\n";
+        let dir = std::env::temp_dir().join(format!("tg-es-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, CA).unwrap();
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "not a certificate").unwrap();
+
+        let mut p = params("db.example.com", 9200, SslMode::VerifyFull);
+        p.ssl.ca_cert = Some(ca.to_string_lossy().into_owned());
+        p.ssl.only_custom_ca = true;
+        assert!(tls_config(&p).is_ok());
+
+        p.ssl.ca_cert = Some(dir.join("missing.pem").to_string_lossy().into_owned());
+        let e = tls_config(&p).unwrap_err();
+        assert!(e.message.contains("missing.pem"), "{e}");
+        p.ssl.ca_cert = Some(empty.to_string_lossy().into_owned());
+        assert!(
+            tls_config(&p).is_err(),
+            "a CA file without a certificate is an error"
+        );
+
+        // A certificate without its key (or the other way round) is a configuration error.
+        let mut p = params("db.example.com", 9200, SslMode::Require);
+        p.ssl.client_cert = Some(ca.to_string_lossy().into_owned());
+        assert!(tls_config(&p).unwrap_err().message.contains("both"));
+        p.ssl.client_cert = None;
+        p.ssl.client_key = Some(ca.to_string_lossy().into_owned());
+        assert!(tls_config(&p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn params(host: &str, port: u16, mode: SslMode) -> ConnectParams {
+        let mut cfg = ConnectionConfig::new(DbKind::Elasticsearch, "t");
+        cfg.host = host.into();
+        cfg.port = Some(port);
+        cfg.ssl.mode = mode;
+        ConnectParams::from_config(&cfg, None)
+    }
+
+    /// A server answering one request with `reply` (HTTP) or closing after
+    /// the first bytes (`None`: TLS); the receiver gets what the client sent.
+    fn one_request_server(reply: Option<&'static str>) -> (u16, Receiver<Vec<u8>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut c, _)) = l.accept() else { return };
+            c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = c.read(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).into_owned();
+                let complete = text.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    body.len() >= len
+                });
+                if n == 0 || reply.is_none() || complete {
+                    break;
+                }
+            }
+            let _ = tx.send(got);
+            if let Some(r) = reply {
+                let _ = c.write_all(r.as_bytes());
+            }
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn tunnels_connect_to_the_forwarder_and_verify_the_real_name() {
+        // Plain HTTP: the URL is the forwarder.
+        let mut p = params("127.0.0.1", 41234, SslMode::Disable);
+        p.tls_server_name = Some("es.example.invalid".into());
+        assert_eq!(Http::new(&p).unwrap().base, "http://127.0.0.1:41234");
+        // HTTPS: the URL carries the real name (SNI, certificate), the socket
+        // goes to the forwarder.
+        let (port, rx) = one_request_server(None);
+        let mut p = params("127.0.0.1", port, SslMode::Require);
+        p.tls_server_name = Some("es.example.invalid".into());
+        let http = Http::new(&p).unwrap();
+        assert_eq!(http.base, format!("https://es.example.invalid:{port}"));
+        assert!(http.call("GET", "/", None).is_err());
+        let hello = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no connection");
+        assert_eq!(hello.first(), Some(&0x16), "not a TLS handshake");
+        assert!(
+            hello.windows(18).any(|w| w == b"es.example.invalid"),
+            "SNI is not the real server name"
+        );
+        // Without a tunnel the host is the server.
+        let p = params("es.local", 9200, SslMode::Require);
+        assert_eq!(Http::new(&p).unwrap().base, "https://es.local:9200");
+    }
+
+    #[test]
+    fn sql_requests_keep_cursors_alive() {
+        let b = sql_body(Product::Elasticsearch, "SELECT 1", &[Value::Int(3)]).unwrap();
+        assert_eq!(b["page_timeout"], json!(PAGE_TIMEOUT));
+        assert_eq!(b["params"], json!([3]));
+        let b = sql_body(Product::OpenSearch, "SELECT 1", &[]).unwrap();
+        assert!(b.get("page_timeout").is_none());
+        // OpenSearch would drop the values.
+        let e = sql_body(Product::OpenSearch, "SELECT ?", &[Value::Int(1)]).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Unsupported);
+        let pager = |product| SqlPager {
+            http: Http::new(&params("h", 1, SslMode::Disable)).unwrap(),
+            product,
+            cursor: None,
+            kinds: Vec::new(),
+        };
+        let page: J = serde_json::from_str(&pager(Product::Elasticsearch).page_body("c1")).unwrap();
+        assert_eq!(page, json!({"cursor": "c1", "page_timeout": PAGE_TIMEOUT}));
+        let page: J = serde_json::from_str(&pager(Product::OpenSearch).page_body("c1")).unwrap();
+        assert_eq!(page, json!({"cursor": "c1"}));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_cursor_closes_its_server_cursor() {
+        let (port, rx) = one_request_server(Some(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"succeeded\":true}",
+        ));
+        let cursor = SearchCursor {
+            header: None,
+            rows: VecDeque::new(),
+            pager: Some(SqlPager {
+                http: Http::new(&params("127.0.0.1", port, SslMode::Disable)).unwrap(),
+                product: Product::Elasticsearch,
+                cursor: Some("sql-cursor-42".into()),
+                kinds: Vec::new(),
+            }),
+        };
+        drop(cursor);
+        let req = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("the cursor was not closed");
+        let req = String::from_utf8_lossy(&req);
+        assert!(req.starts_with("POST /_sql/close "), "{req}");
+        assert!(req.contains("sql-cursor-42"), "{req}");
+    }
+
+    #[test]
+    fn read_only_requests() {
+        for (m, p, b) in [
+            ("GET", "/logs/_search", None),
+            ("HEAD", "/logs", None),
+            ("GET", "/_cat/indices", None),
+            ("POST", "/logs/_search", Some("{}")),
+            ("POST", "/logs,metrics/_search?size=5", None),
+            ("POST", "/_search/scroll", Some("{}")),
+            ("POST", "/logs/_count", None),
+            ("POST", "/_msearch", Some("{}\n{}")),
+            (
+                "POST",
+                "/_sql?format=json",
+                Some("{\"query\": \"SELECT * FROM logs\"}"),
+            ),
+            ("POST", "/_sql/translate", Some("{\"query\": \"select 1\"}")),
+            ("POST", "/_sql/close", Some("{\"cursor\": \"c\"}")),
+            (
+                "POST",
+                "/_plugins/_sql",
+                Some("{\"query\": \"SHOW TABLES LIKE %\"}"),
+            ),
+            ("POST", "/logs/_explain/1", Some("{}")),
+            ("POST", "/logs/_field_caps?fields=*", None),
+            ("POST", "/logs/_validate/query", Some("{}")),
+            ("POST", "/logs/_async_search", Some("{}")),
+            ("POST", "/logs/_pit?keep_alive=1m", None),
+            ("POST", "/%5Fsearch", None),
+        ] {
+            assert!(rest_reads(m, p, b), "{m} {p}");
+        }
+        for (m, p, b) in [
+            ("PUT", "/logs", None),
+            ("DELETE", "/logs", None),
+            ("DELETE", "/_search/scroll", None),
+            ("POST", "/logs/_doc", Some("{}")),
+            ("POST", "/logs/_doc/_search", Some("{}")),
+            ("POST", "/my_search_logs/_doc", Some("{}")),
+            ("POST", "/logs/_delete_by_query", Some("{}")),
+            ("POST", "/logs/_update_by_query", Some("{}")),
+            ("POST", "/_bulk", Some("{}")),
+            ("POST", "/logs/_refresh", None),
+            ("POST", "/_aliases", Some("{}")),
+            ("POST", "/logs", Some("{}")),
+            ("POST", "/", None),
+            ("POST", "/_search/../_delete_by_query", None),
+            ("POST", "/logs/%5Fdelete_by_query", None),
+            (
+                "POST",
+                "/_plugins/_sql",
+                Some("{\"query\": \"DELETE FROM logs\"}"),
+            ),
+            ("POST", "/_tasks/n:1/_cancel", None),
+            ("PATCH", "/logs", None),
+        ] {
+            assert!(!rest_reads(m, p, b), "{m} {p}");
+        }
+        assert!(sql_reads("  -- c\n/* d */ (select 1)"));
+        assert!(sql_reads("DESCRIBE logs"));
+        assert!(!sql_reads("DELETE FROM logs WHERE a = 1"));
+        assert_eq!(sql_keyword("/* x */ delete from t"), "DELETE");
+    }
 
     #[test]
     fn rest_requests_and_replies() {

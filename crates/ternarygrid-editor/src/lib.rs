@@ -125,27 +125,33 @@ pub use widget::{ContextAction, EditorEvent, EditorResponse, SqlEditor};
 /// On macOS, Option+letter shortcuts (e.g. ⌥X "execute script") also emit
 /// the typed character (`≈`). Call this *before* showing the editor for
 /// application shortcuts that use Alt/Option so the character is not
-/// inserted. Returns `true` if the shortcut was pressed.
+/// inserted. Only text that the shortcut's key press produced (the
+/// [`egui::Event::Text`] directly following it) is dropped; text typed by
+/// other keys in the same frame is kept. Returns `true` if the shortcut was
+/// pressed.
 pub fn consume_shortcut_with_text(ctx: &egui::Context, shortcut: &egui::KeyboardShortcut) -> bool {
     ctx.input_mut(|i| {
         let mut found = false;
         let mut drop_text = false;
-        i.events.retain(|e| match e {
-            egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } if *key == shortcut.logical_key && modifiers.matches_exact(shortcut.modifiers) => {
+        i.events.retain(|e| {
+            let matches_key = matches!(
+                e,
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if *key == shortcut.logical_key && modifiers.matches_exact(shortcut.modifiers)
+            );
+            if matches_key {
                 found = true;
                 drop_text = true;
-                false
+                return false;
             }
-            egui::Event::Text(_) if drop_text => {
-                drop_text = false;
-                false
-            }
-            _ => true,
+            // Integrations emit a key's text right after its key event.
+            let produced_by_key = drop_text && matches!(e, egui::Event::Text(_));
+            drop_text = false;
+            !produced_by_key
         });
         found
     })

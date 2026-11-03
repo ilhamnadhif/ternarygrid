@@ -475,6 +475,14 @@ impl SqliteDialect {
             ddl: SqliteDdl::with_foreign_keys(foreign_keys),
         }
     }
+
+    /// The dialect of a connection whose main database is `main_file`
+    /// (`None`: in memory); see [`SqliteDdl::for_connection`].
+    pub fn for_connection(foreign_keys: bool, main_file: Option<&std::path::Path>) -> Self {
+        SqliteDialect {
+            ddl: SqliteDdl::for_connection(foreign_keys, main_file),
+        }
+    }
 }
 
 impl Default for SqliteDialect {

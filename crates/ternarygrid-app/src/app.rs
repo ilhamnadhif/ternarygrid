@@ -1,10 +1,12 @@
-//! Main window: menu bar, toolbar, navigator, dock area, status bar, dialogs.
+//! Main window: top bar, icon rail, navigator, dock area, status bar, dialogs.
+
+mod shell;
 
 use crate::backend::Backend;
 use crate::command::AppCommand;
 use crate::conn::{ConnectionManager, Credentials};
 use crate::cx::AppContext;
-use crate::dialogs::{Dialogs, FolderAction};
+use crate::dialogs::{self, Dialogs, FolderAction};
 use crate::nav::Navigator;
 use crate::ops::Operations;
 use crate::services::{Services, Settings};
@@ -16,6 +18,39 @@ use egui_phosphor::regular as icon;
 use std::sync::Arc;
 use std::time::Instant;
 use ternarygrid_core::tr;
+use ternarygrid_ui::kit;
+use ternarygrid_ui::parts::Dialog;
+
+/// Width kept free at the left of the top bar for the window buttons of macOS, where the top
+/// bar is the title bar (with the bar's 16 points of padding, "New" starts 84 points in).
+pub const MAC_TITLEBAR_INSET: f32 = 68.0;
+
+/// Settings changed are written after this long without another change.
+const SETTINGS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Where the window chrome was drawn in the last frame. Tests find the toolbar,
+/// the navigator … by these areas rather than by fixed coordinates, so the
+/// layout can change without them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ChromeRects {
+    /// In-window menu bar (the menus are in the top bar now: unused).
+    pub menu: Option<egui::Rect>,
+    /// The top bar.
+    pub toolbar: Option<egui::Rect>,
+    /// Left icon rail.
+    pub rail: Option<egui::Rect>,
+    /// Navigator / project panel.
+    pub nav: Option<egui::Rect>,
+    /// Status bar.
+    pub status: Option<egui::Rect>,
+}
+
+impl ChromeRects {
+    /// Bottom edge of the chrome at the top of the window (menu and toolbar).
+    pub fn top_bottom(&self) -> f32 {
+        [self.menu, self.toolbar].into_iter().flatten().map(|r| r.bottom()).fold(0.0, f32::max)
+    }
+}
 
 /// SQLite database file (by extension).
 pub fn database_file_kind(path: &std::path::Path) -> Option<ternarygrid_core::DbKind> {
@@ -67,6 +102,13 @@ pub struct TernaryGridApp {
     /// Dirty tabs waiting for "discard and close?" (the first is asked).
     close_confirm: Vec<u64>,
     quit_confirmed: bool,
+    /// The settings changed: written once they stayed unchanged for a moment (a
+    /// dragged value changes them every frame), or at exit.
+    settings_save_at: Option<Instant>,
+    /// The sample database being created.
+    sample_job: Option<(std::path::PathBuf, crate::backend::Job<ternarygrid_core::DbResult<()>>)>,
+    /// The history retention applied last (applying it deletes rows: not at every change of the settings).
+    history_retention: Option<ternarygrid_config::history::RetentionPolicy>,
     /// "Generate SQL" requests waiting for the table definition.
     pending_generate: Vec<(String, ternarygrid_core::ObjectRef, String)>,
     /// Tab last revealed in the navigator (Link with editor).
@@ -96,6 +138,15 @@ pub struct TernaryGridApp {
     pub pending_tx: crate::pending_tx::PendingTxDialog,
     /// Collect diagnostic info running.
     diagnostics: Option<crate::backend::Job<ternarygrid_core::DbResult<std::path::PathBuf>>>,
+    /// Where the chrome was drawn in the last frame.
+    pub chrome: ChromeRects,
+    /// Width kept free at the left of the top bar for the window buttons
+    /// (macOS, where the top bar is the title bar).
+    pub titlebar_inset: f32,
+    /// The menus are in the system's menu bar (macOS), not at the left of the top bar.
+    pub native_menu_bar: bool,
+    /// Where each tab's button was drawn in the last frame (the tab bar's + after them).
+    tab_rects: std::collections::HashMap<u64, egui::Rect>,
 }
 
 impl TernaryGridApp {
@@ -137,6 +188,9 @@ impl TernaryGridApp {
             confirm_disconnect: None,
             close_confirm: Vec::new(),
             quit_confirmed: false,
+            settings_save_at: None,
+            sample_job: None,
+            history_retention: None,
             bench_workload: None,
             updates: Default::default(),
             popups: Vec::new(),
@@ -148,10 +202,52 @@ impl TernaryGridApp {
             tip: None,
             pending_tx: Default::default(),
             diagnostics: None,
+            chrome: ChromeRects::default(),
+            titlebar_inset: 0.0,
+            native_menu_bar: false,
+            tab_rects: Default::default(),
         };
         app.existing_install = crate::updates::is_existing_install(&app.services.paths);
         app.updates.data_dir = Some(app.services.paths.data_dir().to_path_buf());
         app
+    }
+
+    /// What the design's tab bars have besides the tabs: the hairline under the bar (1 point,
+    /// open under the open tab) and "+" (a new SQL editor) after the last tab.
+    fn tab_bar_extras(ui: &mut Ui, dock: &DockState<Tab>, tab_rects: &std::collections::HashMap<u64, egui::Rect>, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
+        for (path, leaf) in dock.iter_leaves() {
+            if leaf.tabs.is_empty() || !leaf.rect.is_positive() {
+                continue;
+            }
+            let bar = leaf.rect.with_max_y(leaf.rect.top() + crate::tabs::TAB_BAR_H);
+            let painter = ui.painter().with_clip_rect(bar);
+            let y = bar.bottom() - 0.5;
+            let open = leaf.tabs.get(leaf.active.0).and_then(|t| tab_rects.get(&t.id)).copied();
+            let stroke = egui::Stroke::new(1.0, p.border);
+            match open {
+                Some(r) if r.left() > bar.left() => {
+                    painter.hline(bar.left()..=r.left() + 1.0, y, stroke);
+                    painter.hline(r.right() - 1.0..=bar.right(), y, stroke);
+                }
+                _ => {
+                    painter.hline(bar.x_range(), y, stroke);
+                }
+            }
+            let last = leaf.tabs.iter().filter_map(|t| tab_rects.get(&t.id)).map(|r| r.right()).fold(f32::NEG_INFINITY, f32::max);
+            let at = egui::Rect::from_min_size(egui::pos2(last + 2.0, bar.top() + 6.0), egui::vec2(26.0, 26.0));
+            if last.is_finite() && at.right() <= bar.right() - 8.0 {
+                let mut b = ui.new_child(egui::UiBuilder::new().max_rect(at).id_salt(("tab_bar_new", path.node)));
+                if kit::icon_button_sized(&mut b, icon::PLUS, tr("New SQL editor"), false, 26.0, 14.0).clicked() {
+                    cx.commands.push(AppCommand::Action(crate::keys::Action::NewSqlEditor));
+                }
+            }
+        }
+    }
+
+    /// Where the button of tab `id` was drawn in the last frame.
+    pub fn tab_rect(&self, id: u64) -> Option<egui::Rect> {
+        self.tab_rects.get(&id).copied()
     }
 
     /// Queue a command for the next frame (as a menu item would).
@@ -269,6 +365,14 @@ impl TernaryGridApp {
         }
     }
 
+    /// Ask before closing the tab `id` (screenshots of the question).
+    #[doc(hidden)]
+    pub fn ask_close(&mut self, id: u64) {
+        if !self.close_confirm.contains(&id) {
+            self.close_confirm.push(id);
+        }
+    }
+
     /// "Discard the unsaved changes of … and close?" for the first waiting tab.
     fn close_confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(&id) = self.close_confirm.first() else { return };
@@ -277,26 +381,30 @@ impl TernaryGridApp {
             self.close_confirm.remove(0);
             return;
         };
-        let mut decided: Option<bool> = None;
-        let modal = egui::Modal::new(egui::Id::new(("confirm_close", id))).show(ctx, |ui| {
-            // Pending edits, or edits saved inside a transaction that closing rolls back.
-            let (heading, text, button) = if dirty {
-                (tr("Unsaved changes"), ternarygrid_core::trf("\"{}\" has unsaved changes; closing it discards them.", &[&title]), tr("Discard and close"))
-            } else {
-                (tr("Uncommitted transaction"), ternarygrid_core::trf("\"{}\" has uncommitted changes; closing it rolls them back.", &[&title]), tr("Roll back and close"))
-            };
-            ui.heading(heading);
-            ui.label(text);
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new(button).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                    decided = Some(true);
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    decided = Some(false);
-                }
-            });
-        });
-        if decided.is_none() && modal.should_close() {
+        // Pending edits, or edits saved inside a transaction that closing rolls back.
+        let (heading, text, button) = if dirty {
+            (tr("Unsaved changes"), ternarygrid_core::trf("\"{}\" has unsaved changes; closing it discards them.", &[&title]), tr("Discard and close"))
+        } else {
+            (tr("Uncommitted transaction"), ternarygrid_core::trf("\"{}\" has uncommitted changes; closing it rolls them back.", &[&title]), tr("Roll back and close"))
+        };
+        let answer = std::cell::Cell::new(None::<bool>);
+        let (resp, _) = Dialog::new(heading).icon(icon::WARNING).width(460.0).body_padding(dialogs::BODY).show_modal(
+            ctx,
+            egui::Id::new(("confirm_close", id)),
+            |ui| dialogs::body_text(ui, &text),
+            |ui| {
+                dialogs::right(ui, |ui| {
+                    if kit::button_ex(ui, kit::Kind::DangerFilled, None, button, false).clicked() {
+                        answer.set(Some(true));
+                    }
+                    if dialogs::cancel_button(ui).clicked() {
+                        answer.set(Some(false));
+                    }
+                });
+            },
+        );
+        let mut decided = answer.get();
+        if decided.is_none() && resp.close {
             decided = Some(false);
         }
         if let Some(close) = decided {
@@ -338,32 +446,39 @@ impl TernaryGridApp {
     fn confirm_disconnect_ui(&mut self, ctx: &egui::Context) {
         let Some((ids, reconnect)) = self.confirm_disconnect.clone() else { return };
         let pending: Vec<_> = crate::pending_tx::collect(&self.dock, &self.conns).into_iter().filter(|p| ids.contains(&p.conn)).collect();
-        let mut decided: Option<bool> = None;
+        let mut decided: Option<bool>;
         let mut review = false;
         if pending.is_empty() {
             // Committed or rolled back meanwhile (Review transactions): nothing is lost any more.
             decided = Some(true);
         } else {
-            let modal = egui::Modal::new(egui::Id::new("confirm_disconnect")).show(ctx, |ui| {
-                ui.heading(tr("Uncommitted transactions"));
-                ui.label(tr("Disconnecting rolls back the uncommitted changes of:"));
-                for p in pending.iter().take(10) {
-                    ui.label(format!("• {} — {}", p.conn_name, p.owner));
-                }
-                ui.horizontal(|ui| {
-                    if ui.button(tr("Review transactions")).clicked() {
-                        review = true;
+            let (answer, reviewed) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false));
+            let (resp, _) = Dialog::new(tr("Uncommitted transactions")).icon(icon::WARNING).width(520.0).body_padding(dialogs::BODY).show_modal(
+                ctx,
+                egui::Id::new("confirm_disconnect"),
+                |ui| {
+                    dialogs::body_text(ui, tr("Disconnecting rolls back the uncommitted changes of:"));
+                    let p = ternarygrid_ui::pal(ui);
+                    dialogs::bullets(ui, pending.iter().take(10).map(|p| format!("{} — {}", p.conn_name, p.owner)), p.text);
+                },
+                |ui| {
+                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Review transactions"), false).clicked() {
+                        reviewed.set(true);
                     }
-                    let label = if reconnect { tr("Roll back and reconnect") } else { tr("Roll back and disconnect") };
-                    if ui.button(RichText::new(label).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        decided = Some(false);
-                    }
-                });
-            });
-            if modal.should_close() && decided.is_none() && !review {
+                    dialogs::right(ui, |ui| {
+                        let label = if reconnect { tr("Roll back and reconnect") } else { tr("Roll back and disconnect") };
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, None, label, false).clicked() {
+                            answer.set(Some(true));
+                        }
+                        if dialogs::cancel_button(ui).clicked() {
+                            answer.set(Some(false));
+                        }
+                    });
+                },
+            );
+            decided = answer.get();
+            review = reviewed.get();
+            if resp.close && decided.is_none() && !review {
                 decided = Some(false);
             }
         }
@@ -465,12 +580,10 @@ impl TernaryGridApp {
                     path = dir.join(format!("ternarygrid-sample-{n}.db"));
                     n += 1;
                 }
-                match crate::sample::create(&path) {
-                    Ok(()) => {
-                        self.open_path(&path, false);
-                        self.toasts.success(tr("Sample database created"));
-                    }
-                    Err(e) => self.toasts.error(tr("Cannot create the sample database"), Some(e.full_text())),
+                // A few thousand inserts: in the background ([`Self::poll_sample`]).
+                if self.sample_job.is_none() {
+                    let p = path.clone();
+                    self.sample_job = Some((path, self.backend.spawn(async move { crate::sample::create(&p).await })));
                 }
             }
             AppCommand::ImportConnections => {
@@ -528,6 +641,10 @@ impl TernaryGridApp {
                 self.open_tab(Box::new(crate::tabs::settings::SettingsTab::default()));
             }
             AppCommand::SettingsChanged => self.apply_settings(ctx),
+            AppCommand::UnlockVault => {
+                self.dialogs.vault.skipped = false;
+                self.dialogs.vault_open = true;
+            }
             AppCommand::OpenErDiagram { connection, schema, tables } => {
                 self.open_tab(Box::new(crate::tabs::er::ErTab::new(connection, schema, tables)));
             }
@@ -627,6 +744,10 @@ impl TernaryGridApp {
                     self.ai_open = true;
                 }
             },
+            AppCommand::AskAi { connection, sql, error } => {
+                self.ai_panel = Some(crate::tabs::ai::AiAssistantTab::ask_about(connection, sql, error));
+                self.ai_open = true;
+            }
             AppCommand::OpenDataCompare { connection, table } => {
                 self.open_tab(Box::new(crate::tabs::data_compare::DataCompareTab::new(connection, table)));
             }
@@ -1188,6 +1309,7 @@ impl TernaryGridApp {
         match (self.settings.history.enabled, self.services.history.is_some()) {
             (true, false) => {
                 let mut warnings = Vec::new();
+                self.history_retention = None;
                 self.services.history = crate::services::Services::open_history(&self.services.paths, &self.settings, &mut warnings);
                 for w in warnings {
                     self.toasts.warning(w, None);
@@ -1199,7 +1321,11 @@ impl TernaryGridApp {
         if let Some(h) = &self.services.history {
             let mut h = h.lock();
             h.set_redaction(self.settings.history.redact_secrets);
-            let _ = h.set_retention(Some(self.settings.history.retention()));
+            let retention = self.settings.history.retention();
+            if self.history_retention != Some(retention) {
+                self.history_retention = Some(retention);
+                let _ = h.set_retention(Some(retention));
+            }
         }
         if let Some(s) = &self.services.scheduler {
             match (self.settings.tasks.scheduler_enabled, s.is_started()) {
@@ -1212,7 +1338,34 @@ impl TernaryGridApp {
                 _ => {}
             }
         }
-        self.save_settings();
+        self.settings_save_at = Some(Instant::now() + SETTINGS_SAVE_DELAY);
+    }
+
+    /// Open the sample database once it is created.
+    fn poll_sample(&mut self) {
+        let Some((path, job)) = self.sample_job.as_mut() else { return };
+        let Some(r) = job.poll() else { return };
+        let path = path.clone();
+        self.sample_job = None;
+        match r {
+            Ok(()) => {
+                self.open_path(&path, false);
+                self.toasts.success(tr("Sample database created"));
+            }
+            Err(e) => self.toasts.error(tr("Cannot create the sample database"), Some(e.full_text())),
+        }
+    }
+
+    /// Write the settings once they stayed unchanged for [`SETTINGS_SAVE_DELAY`].
+    fn save_settings_when_due(&mut self, ctx: &egui::Context) {
+        let Some(at) = self.settings_save_at else { return };
+        let now = Instant::now();
+        if now >= at {
+            self.settings_save_at = None;
+            self.save_settings();
+        } else {
+            ctx.request_repaint_after(at - now);
+        }
     }
 
     /// Use `theme` from now on (and save it).
@@ -1310,6 +1463,10 @@ impl TernaryGridApp {
             M::Tasks => Some(AppCommand::OpenTasks),
             M::AiAssistant => Some(AppCommand::OpenAiAssistant { connection: self.nav.selected.as_ref().and_then(|n| n.connection()).map(str::to_string) }),
             M::BackgroundOperations => Some(AppCommand::ToggleOperations),
+            M::ExportData => Some(AppCommand::Action(crate::keys::Action::Export)),
+            M::ImportData => Some(AppCommand::Action(crate::keys::Action::Import)),
+            M::ErDiagram => Some(AppCommand::Action(crate::keys::Action::OpenErDiagram)),
+            M::SessionManager => Some(AppCommand::Action(crate::keys::Action::OpenSessionManager)),
             M::ToggleNavigator => Some(AppCommand::ToggleNavigator),
             M::PropertiesPanel => {
                 self.settings.navigator.show_properties = !self.settings.navigator.show_properties;
@@ -1359,56 +1516,62 @@ impl TernaryGridApp {
         let state = self.menu_state();
         let chosen: std::cell::Cell<Option<M>> = std::cell::Cell::new(None);
         egui::MenuBar::new().ui(ui, |ui| {
-            // An item: an optional (coloured) icon and its text.
+            // An item as in the design's menus: a muted icon (or its room) and the text.
             let item = |ui: &mut Ui, enabled: bool, glyph: Option<&str>, text: &str, action: M| {
-                let button = match glyph {
-                    Some(g) => egui::Button::new((ternarygrid_icons::ic(g), text)),
-                    None => egui::Button::new(text),
-                };
-                if ui.add_enabled(enabled, button).clicked() {
+                if ui.add_enabled_ui(enabled, |ui| kit::menu_item(ui, glyph, text, "")).inner.clicked() {
                     chosen.set(Some(action));
                     ui.close();
                 }
             };
             ui.menu_button(tr("File"), |ui| {
-                item(ui, true, Some(icon::FILE_SQL), tr("New SQL editor"), M::NewSqlEditor);
+                kit::menu_look(ui, 230.0);
+                item(ui, true, Some(icon::FILE_CODE), tr("New SQL editor"), M::NewSqlEditor);
                 item(ui, true, Some(icon::FOLDER_OPEN), tr("Open script…"), M::OpenScript);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::GEAR), tr("Settings…"), M::Settings);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, None, tr("Quit"), M::Quit);
             });
             ui.menu_button(tr("Database"), |ui| {
+                kit::menu_look(ui, 230.0);
                 item(ui, true, Some(icon::PLUS), tr("New connection…"), M::NewConnection);
                 item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), M::ImportConnections);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, state.new_database, Some(icon::DATABASE), tr("New database…"), M::NewDatabase);
                 item(ui, state.new_schema, Some(icon::STACK), tr("New schema…"), M::NewSchema);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::PLUGS), tr("Disconnect all"), M::DisconnectAll);
                 item(ui, true, Some(icon::QUEUE), tr("Pending transactions…"), M::PendingTransactions);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::GIT_DIFF), tr("Compare schemas…"), M::CompareSchemas);
                 item(ui, true, Some(icon::ARROWS_LEFT_RIGHT), tr("Compare data…"), M::CompareData);
                 item(ui, true, Some(icon::MAGNIFYING_GLASS), tr("Search…"), M::Search);
             });
             ui.menu_button(tr("Tools"), |ui| {
-                item(ui, true, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Query history"), M::QueryHistory);
+                kit::menu_look(ui, 230.0);
+                item(ui, true, Some(icon::CLOCK), tr("Query history"), M::QueryHistory);
                 item(ui, true, Some(icon::LIST_CHECKS), tr("Tasks"), M::Tasks);
                 item(ui, true, Some(icon::SPARKLE), tr("AI assistant"), M::AiAssistant);
-                item(ui, true, Some(icon::HOURGLASS), tr("Background operations"), M::BackgroundOperations);
+                item(ui, true, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Background operations"), M::BackgroundOperations);
+                kit::menu_separator(ui);
+                item(ui, true, Some(icon::EXPORT), tr("Export data…"), M::ExportData);
+                item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import data…"), M::ImportData);
+                item(ui, true, Some(icon::GRAPH), tr("ER diagram"), M::ErDiagram);
+                item(ui, true, Some(icon::USERS), tr("Session manager"), M::SessionManager);
             });
             ui.menu_button(tr("View"), |ui| {
+                kit::menu_look(ui, 230.0);
                 item(ui, true, None, tr("Toggle navigator"), M::ToggleNavigator);
                 let mut props = state.properties;
-                if ui.checkbox(&mut props, tr("Properties panel")).clicked() {
+                if kit::menu_check(ui, &mut props, tr("Properties panel")).clicked() {
                     chosen.set(Some(M::PropertiesPanel));
                     ui.close();
                 }
-                ui.menu_button((ternarygrid_icons::ic(icon::CIRCLE_HALF), tr("Theme")), |ui| {
+                kit::submenu(ui, Some(icon::CIRCLE_HALF), tr("Theme"), 160.0, &mut |ui| {
                     use ternarygrid_config::settings::Theme;
                     for (t, label) in [(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))] {
-                        if ui.radio(state.theme == t, label).clicked() {
+                        let mut on = state.theme == t;
+                        if kit::menu_check(ui, &mut on, label).clicked() {
                             chosen.set(Some(M::Theme(t)));
                             ui.close();
                         }
@@ -1417,14 +1580,15 @@ impl TernaryGridApp {
                 item(ui, true, None, tr("Command palette"), M::CommandPalette);
             });
             ui.menu_button(tr("Help"), |ui| {
+                kit::menu_look(ui, 230.0);
                 item(ui, true, None, tr("Keyboard shortcuts"), M::KeyboardShortcuts);
                 item(ui, true, None, tr("Database drivers"), M::DatabaseDrivers);
                 item(ui, true, None, tr("Create sample database"), M::CreateSampleDatabase);
                 item(ui, true, Some(icon::LIGHTBULB), tr("Tip of the day"), M::TipOfTheDay);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::WARNING_OCTAGON), tr("Error log"), M::ErrorLog);
                 item(ui, state.diagnostics, Some(icon::FILE_ZIP), tr("Collect diagnostic info"), M::CollectDiagnostics);
-                ui.separator();
+                kit::menu_separator(ui);
                 item(ui, true, Some(icon::SPARKLE), tr("What's new"), M::WhatsNew);
                 item(ui, state.updates, Some(icon::ARROW_CIRCLE_UP), tr("Check for updates…"), M::CheckForUpdates);
                 item(ui, true, None, tr("About TernaryGrid"), M::About);
@@ -1433,226 +1597,6 @@ impl TernaryGridApp {
         if let Some(a) = chosen.get() {
             self.run_menu_action(ui.ctx(), a);
         }
-    }
-
-    /// Whether a toolbar action can run now, with the reason when not.
-    fn toolbar_action_state(&self, action: crate::keys::Action) -> Result<(), &'static str> {
-        use crate::keys::Action as A;
-        let tab = self.active_tab.and_then(|id| self.dock.iter_all_tabs().find(|(_, t)| t.id == id)).map(|(_, t)| t);
-        if let Some(enabled) = tab.and_then(|t| t.view.action_enabled(action)) {
-            return if enabled {
-                Ok(())
-            } else {
-                match action {
-                    A::CancelQuery => Err(tr("No query is running.")),
-                    A::Commit | A::Rollback => Err(tr("Auto-commit is on: every statement is committed already.")),
-                    _ => Err(tr("Not available right now.")),
-                }
-            };
-        }
-        let editor_only = matches!(action, A::CancelQuery | A::Commit | A::Rollback | A::ToggleAutoCommit | A::SelectConnection | A::SelectSchema)
-            || action.context() == crate::keys::ActionContext::SqlEditor;
-        if editor_only {
-            return Err(tr("Available in a SQL editor: open one with New SQL editor."));
-        }
-        let needs_connection = matches!(
-            action,
-            A::EditConnection | A::Connect | A::Disconnect | A::Reconnect | A::OpenSqlConsole | A::OpenSessionManager | A::OpenErDiagram | A::NewDatabase | A::Export | A::Import
-        );
-        if needs_connection && self.selected_connection().is_none() {
-            return Err(tr("Select a connection in the navigator first."));
-        }
-        Ok(())
-    }
-
-    /// Main toolbar (customisable in the settings): its groups' buttons with
-    /// short labels, as the grid's toolbar; when the window is too narrow for
-    /// them all, the last ones show their icon only.
-    fn toolbar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let hidden = &self.settings.toolbar.hidden;
-            let items: Vec<Option<crate::keys::Action>> = self
-                .settings
-                .toolbar
-                .items
-                .iter()
-                .filter(|id| !hidden.contains(id))
-                .filter_map(|id| if id == "|" { Some(None) } else { crate::keys::Action::from_id(id).map(Some) })
-                .collect();
-            // Labels from the first button on, as many as fit next to the connection and schema.
-            let font = egui::TextStyle::Button.resolve(ui.style());
-            let pad = 2.0 * ui.spacing().button_padding.x + ui.spacing().item_spacing.x;
-            let icon_w = 16.0 + pad;
-            let label_w = |a: crate::keys::Action| {
-                ui.fonts_mut(|f| f.layout_no_wrap(crate::keys::toolbar_label(a).to_string(), font.clone(), egui::Color32::WHITE).size().x) + ui.spacing().icon_spacing + 4.0
-            };
-            let actions: Vec<crate::keys::Action> = items.iter().flatten().copied().collect();
-            let widths: Vec<f32> = actions.iter().map(|&a| label_w(a)).collect();
-            let separators = items.iter().filter(|i| i.is_none()).count() as f32 * 8.0;
-            let budget = ui.available_width() - 300.0 - separators - icon_w * actions.len() as f32;
-            let mut labelled = 0;
-            let mut used = 0.0;
-            for w in &widths {
-                if used + w > budget {
-                    break;
-                }
-                used += w;
-                labelled += 1;
-            }
-            let mut index = 0;
-            for item in items {
-                let Some(action) = item else {
-                    ui.separator();
-                    continue;
-                };
-                let with_label = index < labelled;
-                index += 1;
-                let keys = crate::keys::label(&self.keymap, action);
-                let name = crate::keys::action_label(action);
-                let tip = if keys.is_empty() { name.to_string() } else { format!("{name}  ({keys})") };
-                let state = self.toolbar_action_state(action);
-                let mut icon = RichText::new(crate::keys::action_icon(action)).size(16.0);
-                if let Some(c) = crate::keys::action_color(action, ui.visuals().dark_mode).filter(|_| state.is_ok()) {
-                    icon = icon.color(c);
-                }
-                // The AI assistant's button shows whether its panel is open.
-                let open = action == crate::keys::Action::AiAssistant && self.ai_open;
-                let b = if with_label { egui::Button::new((icon, crate::keys::toolbar_label(action))) } else { egui::Button::new(icon) };
-                let b = b.selected(open).min_size(egui::vec2(26.0, 22.0));
-                let resp = ui.add_enabled(state.is_ok(), b).on_hover_text(&tip);
-                let resp = match state {
-                    Err(why) => resp.on_disabled_hover_text(format!("{tip}\n{why}")),
-                    Ok(()) => resp,
-                };
-                if resp.clicked() {
-                    self.commands.push(AppCommand::Action(action));
-                }
-            }
-            self.toolbar_location(ui);
-            // An update to install.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.updates.toolbar_button(ui));
-        });
-    }
-
-    /// Connection (logo, name, type colour) and schema@database of the
-    /// focused tab; a click shows it in the navigator.
-    fn toolbar_location(&mut self, ui: &mut Ui) {
-        let Some((_, tab)) = self.dock.find_active_focused() else { return };
-        let Some(loc) = crate::tabs::tab_location(tab.view.as_ref(), &self.conns) else { return };
-        let object = tab.view.navigator_object();
-        ui.separator();
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let dark = ui.visuals().dark_mode;
-        let color = crate::theme::logo_color(loc.kind, dark);
-        let name = RichText::new(&loc.name).strong();
-        let mut button = match crate::dblogo::image(ui.ctx(), loc.kind, 16.0, color) {
-            Some(logo) => egui::Button::new((logo, name)),
-            None => egui::Button::new((RichText::new(crate::nav::db_icon(loc.kind)).color(color), name)),
-        };
-        let ty = self.conns.type_of(&loc.conn);
-        if let Some(c) = crate::theme::connection_marker(ty.color) {
-            button = button.fill(crate::theme::tint(c, dark));
-        }
-        let tip = format!("{}: {} ({})\n{}", tr("Connection"), loc.name, ty.name, tr("Show in the navigator"));
-        let mut reveal = ui.add(button).on_hover_text(&tip).clicked();
-        if let Some(place) = &loc.place {
-            let text = (ternarygrid_icons::ic(icon::STACK), place.as_str());
-            reveal |= ui.add(egui::Button::new(text)).on_hover_text(format!("{}\n{}", tr("Schema"), tr("Show in the navigator"))).clicked();
-        }
-        if reveal {
-            self.show_nav = true;
-            self.show_project = false;
-            match object {
-                Some((conn, obj)) => self.nav.reveal(&conn, &obj, &self.conns),
-                None => self.nav.select(crate::nav::NavNode::Connection(loc.conn)),
-            }
-        }
-    }
-
-    fn status_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            // Where the active tab works, as DBeaver's status bar:
-            // connection › database › schema › object.
-            let active = self.dock.find_active_focused();
-            let location = active.as_ref().and_then(|(_, t)| crate::tabs::tab_location(t.view.as_ref(), &self.conns));
-            let object = active.as_ref().and_then(|(_, t)| t.view.navigator_object());
-            match location {
-                Some(loc) => {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let ty = self.conns.type_of(&loc.conn);
-                    if let Some(color) = crate::theme::connection_marker(ty.color) {
-                        ui.label(RichText::new(format!("■ {}", ty.name)).color(color)).on_hover_text(tr("Connection type"));
-                        ui.separator();
-                    }
-                    let dark = ui.visuals().dark_mode;
-                    match crate::dblogo::image(ui.ctx(), loc.kind, 14.0, crate::theme::logo_color(loc.kind, dark)) {
-                        Some(img) => ui.add(img),
-                        None => ui.label(ternarygrid_icons::ic(crate::nav::db_icon(loc.kind))),
-                    };
-                    let server = match self.conns.live(&loc.conn) {
-                        // `version()` texts repeat the product ("PostgreSQL 16.4 on …"): show the number.
-                        Some(live) => {
-                            let number = live.server.version.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit())).unwrap_or("");
-                            format!("{} {number}", live.server.product)
-                        }
-                        None => tr("not connected").to_string(),
-                    };
-                    ui.label(&loc.name).on_hover_text(server);
-                    let crumb = |ui: &mut Ui, kind: ternarygrid_core::meta::ObjectKind, name: &str| {
-                        ui.weak(icon::CARET_RIGHT);
-                        ui.label(ternarygrid_icons::ic(crate::nav::kind_icon(kind)));
-                        ui.label(name);
-                    };
-                    if self.conns.is_connected(&loc.conn) {
-                        if let Some(d) = &loc.database {
-                            crumb(ui, ternarygrid_core::meta::ObjectKind::Database, d);
-                        }
-                        if let Some(s) = &loc.schema {
-                            crumb(ui, ternarygrid_core::meta::ObjectKind::Schema, s);
-                        }
-                    }
-                    if let Some((_, obj)) = object.filter(|(c, _)| *c == loc.conn) {
-                        crumb(ui, obj.kind, &obj.name);
-                    }
-                }
-                None => {
-                    ui.weak(tr("No active connection"));
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let running = self.ops.running();
-                let label = if running > 0 { format!("{} {running}", icon::HOURGLASS) } else { icon::HOURGLASS.to_string() };
-                if ui.small_button(label).on_hover_text(tr("Background operations")).clicked() {
-                    self.ops.panel_open = !self.ops.panel_open;
-                }
-                let dark = ui.visuals().dark_mode;
-                let (theme_icon, tip) = if dark { (icon::SUN, tr("Switch to the light theme")) } else { (icon::MOON, tr("Switch to the dark theme")) };
-                if ui.small_button(theme_icon).on_hover_text(tip).clicked() {
-                    self.toggle_theme(ui.ctx());
-                }
-                let mem = ternarygrid_core::rowstore::global_resident_bytes();
-                ui.weak(format!("{} {}", icon::MEMORY, crate::widgets::format_bytes(mem as i64))).on_hover_text(tr("Memory used by result sets"));
-                ui.separator();
-                // Time zone, as in DBeaver ("WIB"): a click chooses another.
-                let mut changed = false;
-                let tz = self.settings.general.time_zone;
-                let tz_button = ui.add(egui::Button::new(crate::conn::time_zone_label(tz)).frame_when_inactive(false));
-                let tz_tip = crate::conn::time_zone_choices().into_iter().find(|(c, _)| *c == tz).map(|(_, l)| l).unwrap_or_default();
-                let tz_button = tz_button.on_hover_text(format!("{}: {tz_tip}", tr("Time zone")));
-                egui::Popup::menu(&tz_button).show(|ui| {
-                    let mut v = tz;
-                    for (choice, label) in crate::conn::time_zone_choices() {
-                        changed |= ui.radio_value(&mut v, choice, label).changed();
-                    }
-                    self.settings.general.time_zone = v;
-                });
-                if changed {
-                    self.commands.push(AppCommand::SettingsChanged);
-                    self.save_settings();
-                }
-            });
-        });
     }
 }
 
@@ -1728,38 +1672,46 @@ impl eframe::App for TernaryGridApp {
         if self.confirm_quit {
             let dirty: Vec<String> = self.dock.iter_all_tabs().filter(|(_, t)| t.view.is_dirty()).map(|(_, t)| t.view.title()).collect();
             let pending = crate::pending_tx::collect(&self.dock, &self.conns);
-            let mut decided: Option<bool> = None;
-            let mut review = false;
-            let modal = egui::Modal::new(egui::Id::new("confirm_quit")).show(&ctx, |ui| {
-                ui.heading(tr("Quit TernaryGrid?"));
-                if !dirty.is_empty() {
-                    ui.label(tr("These tabs have unsaved changes:"));
-                    for t in dirty.iter().take(10) {
-                        ui.label(format!("• {t}"));
+            let running = self.ops.running();
+            let (answer, reviewed) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false));
+            let (resp, _) = Dialog::new(tr("Quit TernaryGrid?")).icon(icon::WARNING).width(560.0).body_padding(dialogs::BODY).show_modal(
+                &ctx,
+                egui::Id::new("confirm_quit"),
+                |ui| {
+                    let p = ternarygrid_ui::pal(ui);
+                    if !dirty.is_empty() {
+                        dialogs::strong(ui, tr("These tabs have unsaved changes:"));
+                        let tabs: Vec<String> = dirty.iter().take(10).map(|t| format!("• {t}")).collect();
+                        ui.add(egui::Label::new(RichText::new(tabs.join(" ")).color(p.text_muted)).wrap());
                     }
-                }
-                if !pending.is_empty() {
-                    ui.label(tr("These connections have uncommitted transactions; quitting rolls them back:"));
-                    for p in pending.iter().take(10) {
-                        ui.label(format!("• {} — {}", p.conn_name, p.owner));
+                    if !pending.is_empty() {
+                        dialogs::strong(ui, tr("These connections have uncommitted transactions; quitting rolls them back:"));
+                        dialogs::bullets(ui, pending.iter().take(10).map(|p| format!("{} — {}", p.conn_name, p.owner)), p.text_muted);
                     }
-                }
-                let running = self.ops.running();
-                if running > 0 {
-                    ui.label(ternarygrid_core::trf("{} operation(s) are still running (export, import, migration …); quitting stops them half way.", &[&running]));
-                }
-                ui.horizontal(|ui| {
-                    if !pending.is_empty() && ui.button(tr("Review transactions")).clicked() {
-                        review = true;
+                    if running > 0 {
+                        let text = if running == 1 {
+                            tr("1 operation is still running (export, import, migration …); quitting stops it half way.").to_string()
+                        } else {
+                            ternarygrid_core::trf("{} operations are still running (export, import, migration …); quitting stops them half way.", &[&running])
+                        };
+                        dialogs::note(ui, ternarygrid_ui::parts::Tone::Warning, &text);
                     }
-                    if ui.button(RichText::new(tr("Quit without saving")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                        decided = Some(true);
+                },
+                |ui| {
+                    if !pending.is_empty() && kit::button_ex(ui, kit::Kind::Ghost, None, tr("Review transactions"), false).clicked() {
+                        reviewed.set(true);
                     }
-                    if ui.button(tr("Cancel")).clicked() {
-                        decided = Some(false);
-                    }
-                });
-            });
+                    dialogs::right(ui, |ui| {
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, None, tr("Quit without saving"), false).clicked() {
+                            answer.set(Some(true));
+                        }
+                        if dialogs::cancel_button(ui).clicked() {
+                            answer.set(Some(false));
+                        }
+                    });
+                },
+            );
+            let (mut decided, review) = (answer.get(), reviewed.get());
             if review {
                 self.pending_tx.open = true;
                 decided = Some(false);
@@ -1774,7 +1726,7 @@ impl eframe::App for TernaryGridApp {
                     self.confirm_quit = false;
                     self.updates.quit_cancelled();
                 }
-                None if modal.should_close() => {
+                None if resp.close => {
                     self.confirm_quit = false;
                     self.updates.quit_cancelled();
                 }
@@ -1789,16 +1741,30 @@ impl eframe::App for TernaryGridApp {
             self.open_path(&path, false);
         }
 
-        // On macOS the menus are in the system's menu bar (as in DBeaver).
-        #[cfg(target_os = "macos")]
-        let native_menu = self.app_menu.is_some();
-        #[cfg(not(target_os = "macos"))]
-        let native_menu = false;
-        if !native_menu {
-            egui::Panel::top("ternarygrid_menu").frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.menu_bar(ui));
-        }
-        egui::Panel::top("ternarygrid_toolbar").frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.toolbar(ui));
-        egui::Panel::bottom("ternarygrid_status").exact_size(24.0).frame(crate::theme::chrome_frame(ui.style())).show(ui, |ui| self.status_bar(ui));
+        let mut chrome = ChromeRects::default();
+        // On macOS the menus are in the system's menu bar; elsewhere at the left of the top bar.
+        let native_menu = self.native_menu_bar;
+        // The window buttons of a macOS window whose title bar is the top bar (none in full screen).
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let inset = if fullscreen { 0.0 } else { self.titlebar_inset };
+        // The chrome's panels in the chrome colour, their hairline (drawn by the panel on its
+        // inner edge) left out of the content: the top bar 16 / 10 points from the sides.
+        let bar = |style: &egui::Style, m: egui::Margin| egui::Frame::new().fill(crate::theme::chrome(&style.visuals)).inner_margin(m);
+        let top_margin = egui::Margin { left: 16, right: 10, top: 0, bottom: 1 };
+        chrome.toolbar = Some(
+            egui::Panel::top("ternarygrid_topbar")
+                .exact_size(shell::TOP_BAR_H)
+                .frame(bar(ui.style(), top_margin))
+                .show(ui, |ui| self.top_bar(ui, inset, !native_menu))
+                .response
+                .rect,
+        );
+        let status_margin = egui::Margin { left: 12, right: 12, top: 1, bottom: 0 };
+        chrome.status =
+            Some(egui::Panel::bottom("ternarygrid_status").exact_size(shell::STATUS_H).frame(bar(ui.style(), status_margin)).show(ui, |ui| self.status_bar(ui)).response.rect);
+        let rail_margin = egui::Margin { left: 0, right: 1, top: 0, bottom: 0 };
+        chrome.rail =
+            Some(egui::Panel::left("ternarygrid_rail").exact_size(shell::RAIL_W).resizable(false).frame(bar(ui.style(), rail_margin)).show(ui, |ui| self.rail(ui)).response.rect);
 
         let mut cx = AppContext {
             backend: &self.backend,
@@ -1814,29 +1780,24 @@ impl eframe::App for TernaryGridApp {
             popup: false,
         };
         if self.show_nav {
-            egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(280.0).size_range(160.0..=600.0).show(ui, |ui| {
-                // The tree's toolbar on the switch's row (as in DBeaver); below it
-                // when the panel is too narrow for both.
-                let mut toolbar_below = false;
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(!self.show_project, (ternarygrid_icons::ic(icon::DATABASE), tr("Database"))).clicked() {
-                        self.show_project = false;
-                    }
-                    if ui.selectable_label(self.show_project, (ternarygrid_icons::ic(icon::FOLDER_SIMPLE), tr("Project"))).clicked() {
-                        self.show_project = true;
-                    }
+            // 272 points and the hairline at its right, on the canvas; the header 38 points
+            // high over a hairline, the title at 14, its buttons 8 from the edge.
+            let frame = egui::Frame::new().fill(ternarygrid_ui::pal(ui).canvas).inner_margin(egui::Margin { left: 0, right: 1, top: 0, bottom: 0 });
+            let nav_panel = egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(273.0).size_range(180.0..=600.0).frame(frame).show(ui, |ui| {
+                let title = if self.show_project { tr("Projects") } else { tr("Database Navigator") };
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 38.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_height(38.0);
+                    ui.add_space(14.0);
+                    kit::semibold_label(ui, title, 13.0, ternarygrid_ui::pal(ui).text);
                     if !self.show_project {
-                        if ui.available_width() >= crate::nav::Navigator::TOOLBAR_WIDTH {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
                             self.nav.toolbar_ui(ui, &mut cx);
-                        } else {
-                            toolbar_below = true;
-                        }
+                        });
                     }
                 });
-                if toolbar_below {
-                    ui.horizontal(|ui| self.nav.toolbar_ui(ui, &mut cx));
-                }
-                ui.separator();
+                ternarygrid_ui::parts::hline(ui);
                 if self.show_project {
                     self.project.ui(ui, &mut cx);
                     self.nav.has_focus = false;
@@ -1845,24 +1806,38 @@ impl eframe::App for TernaryGridApp {
                     self.nav.track_focus(ui);
                 }
             });
+            chrome.nav = Some(nav_panel.response.rect);
         }
+        self.chrome = chrome;
         // The AI assistant at the right of the tabs (as an agent panel), resizable up
         // to 720 points while the tabs keep 640 (narrower, their toolbars no longer fit).
         if self.ai_open
             && let Some(ai) = self.ai_panel.as_mut()
         {
             let max = (ui.available_width() - 640.0).clamp(320.0, 720.0);
-            egui::Panel::right("ternarygrid_ai").resizable(true).default_size(440.0).size_range(320.0..=max).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} {}", icon::SPARKLE, tr("AI assistant"))).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close = egui::Button::new(ternarygrid_icons::ic(icon::X)).frame_when_inactive(false);
-                        if ui.add(close).on_hover_text(tr("Hide the AI assistant")).clicked() {
-                            self.ai_open = false;
-                        }
+            let pal = ternarygrid_ui::pal(ui);
+            let frame = egui::Frame::new().fill(pal.canvas);
+            // 460 points as in the design, plus the panel's 1 point edge.
+            egui::Panel::right("ternarygrid_ai").resizable(true).default_size(461.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
+                // Header: the sparkle, the name and ×, 40 points over a hairline (no item gap
+                // between them).
+                let spacing = ui.spacing().item_spacing.y;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                egui::Frame::new().inner_margin(egui::Margin { left: 14, right: 8, top: 6, bottom: 6 }).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.set_min_height(28.0);
+                        ui.label(RichText::new(icon::SPARKLE).font(ternarygrid_ui::style::icon_font(16.0)).color(pal.accent_text));
+                        ui.label(RichText::new(tr("AI assistant")).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.5)).color(pal.text));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ternarygrid_ui::kit::icon_button_ex(ui, icon::X, tr("Hide the AI assistant"), false, 26.0).clicked() {
+                                self.ai_open = false;
+                            }
+                        });
                     });
                 });
-                ui.separator();
+                ternarygrid_ui::parts::hline(ui);
+                ui.spacing_mut().item_spacing.y = spacing;
                 crate::tabs::TabView::ui(ai, ui, &mut cx);
             });
         }
@@ -1891,8 +1866,26 @@ impl eframe::App for TernaryGridApp {
                 crate::tabs::welcome::show(ui, &mut cx);
                 return;
             }
-            let mut viewer = DockViewer { cx: &mut cx, close_vetoed: Vec::new(), close_confirm: Vec::new(), active_tab: self.active_tab, style: ui.style().clone(), suffixes };
-            DockArea::new(&mut self.dock).style(crate::theme::dock_style(ui.style())).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
+            let open_tabs = self.dock.iter_leaves().filter_map(|(_, l)| l.tabs.get(l.active.0).map(|t| t.id)).collect();
+            let mut viewer = DockViewer {
+                cx: &mut cx,
+                close_vetoed: Vec::new(),
+                close_confirm: Vec::new(),
+                active_tab: self.active_tab,
+                style: ui.style().clone(),
+                suffixes,
+                tab_rects: Default::default(),
+                open_tabs,
+            };
+            // The open tab's × is the viewer's (the others have none, as in the design).
+            DockArea::new(&mut self.dock)
+                .style(crate::theme::dock_style(ui.style()))
+                .show_leaf_collapse_buttons(false)
+                .show_close_buttons(false)
+                .show_leaf_close_all_buttons(false)
+                .show_inside(ui, &mut viewer);
+            self.tab_rects = std::mem::take(&mut viewer.tab_rects);
+            Self::tab_bar_extras(ui, &self.dock, &self.tab_rects, viewer.cx);
             for id in viewer.close_confirm {
                 if !self.close_confirm.contains(&id) {
                     self.close_confirm.push(id);
@@ -1904,39 +1897,78 @@ impl eframe::App for TernaryGridApp {
         let raise = self.raise_popup.take();
         let pressed = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten());
         let mut clicked_popup = None;
+        // As in the design, the app dims behind the tool window being worked in. It still
+        // answers clicks (they move the focus back to it, and the dimming goes).
+        let focus = self.popup_focus.filter(|id| self.popups.iter().any(|t| t.id == *id));
+        let scrim_id = egui::Id::new("ternarygrid_popup_scrim");
+        let dim = ctx.animate_bool_with_time(scrim_id, focus.is_some(), 0.15);
+        let mut scrim_layer = None;
+        if dim > 0.0 {
+            let dark = ctx.global_style().visuals.dark_mode;
+            let scrim = if dark { egui::Color32::from_rgba_unmultiplied(8, 9, 12, 140) } else { egui::Color32::from_rgba_unmultiplied(30, 30, 45, 70) };
+            let rect = ctx.content_rect();
+            let shown = egui::Area::new(scrim_id)
+                .order(egui::Order::Middle)
+                .interactable(false)
+                .fixed_pos(rect.min)
+                .show(&ctx, |ui| ui.painter().rect_filled(rect, 0.0, scrim.gamma_multiply(dim)));
+            scrim_layer = Some(shown.response.layer_id);
+        }
+        let mut focused_layer = None;
         for tab in &mut self.popups {
-            let mut open = true;
-            let size = tab.view.popup_size().unwrap_or(egui::vec2(720.0, 520.0));
-            // Title: coloured icon, the tab's title and its connection.
-            let mut title = egui::text::LayoutJob::default();
-            let style = ctx.global_style();
-            let font = egui::FontSelection::Default;
-            ternarygrid_icons::ic(tab.view.icon()).append_to(&mut title, &style, font.clone(), egui::Align::Center);
-            RichText::new(format!("  {}", tab.view.title())).append_to(&mut title, &style, font.clone(), egui::Align::Center);
-            if let Some(name) = tab.view.connection_id().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()) {
-                RichText::new(format!("  ·  {name}")).weak().append_to(&mut title, &style, font, egui::Align::Center);
-            }
-            let shown = egui::Window::new(title)
+            // In the header of the dialogs: the tab's icon, its title and its connection, and ×.
+            // `popup_size` is the design's window inside its 1-point border (the modal's CSS
+            // width and height, header included), as `Dialog::width`; the window adds the border.
+            let size = tab.view.popup_size().unwrap_or(egui::vec2(720.0, 520.0)) + egui::vec2(2.0, 2.0);
+            let title = tab.view.title();
+            let name = |id: Option<&str>| id.and_then(|c| cx.conns.config(c)).map(|c| c.name.clone());
+            let subtitle = match (name(tab.view.connection_id()), name(tab.view.popup_target())) {
+                (Some(source), Some(target)) => format!("{source} → {target}"),
+                (source, _) => source.unwrap_or_default(),
+            };
+            let tab_icon = tab.view.icon();
+            let shown = egui::Window::new(&title)
                 .id(egui::Id::new(("ternarygrid_popup", tab.id)))
+                .title_bar(false)
+                .frame(dialogs::window_frame(&ctx))
                 .default_size(size)
                 .min_size(egui::vec2(360.0, 240.0))
                 .pivot(egui::Align2::CENTER_CENTER)
                 .default_pos(center)
                 .collapsible(false)
                 .resizable(true)
-                .open(&mut open)
                 .show(&ctx, |ui| {
-                    cx.tab_active = true;
-                    cx.current_tab = Some(tab.id);
-                    cx.popup = true;
-                    tab.view.ui(ui, &mut cx);
-                    cx.popup = false;
-                    cx.current_tab = None;
+                    // The tab is laid out with the usual spacing, not the dialogs'.
+                    let spacing = ui.spacing().item_spacing;
+                    let width = ui.available_width();
+                    let dialog = Dialog::new(&title).icon(tab_icon).subtitle(&subtitle).width(width).body_padding(egui::Margin::ZERO);
+                    dialog
+                        .contents(
+                            ui,
+                            |ui| {
+                                ui.spacing_mut().item_spacing = spacing;
+                                cx.tab_active = true;
+                                cx.current_tab = Some(tab.id);
+                                cx.popup = true;
+                                tab.view.ui(ui, &mut cx);
+                                cx.popup = false;
+                                cx.current_tab = None;
+                            },
+                            None,
+                        )
+                        .0
                 });
+            // Closed by its ×.
+            let open = !shown.as_ref().and_then(|s| s.inner).unwrap_or(false);
             if let Some(shown) = &shown
                 && raise == Some(tab.id)
             {
                 ctx.move_to_top(shown.response.layer_id);
+            }
+            if let Some(shown) = &shown
+                && focus == Some(tab.id)
+            {
+                focused_layer = Some(shown.response.layer_id);
             }
             if let (Some(p), Some(shown)) = (pressed, &shown)
                 && shown.response.rect.contains(p)
@@ -1951,13 +1983,16 @@ impl eframe::App for TernaryGridApp {
         if pressed.is_some() {
             self.popup_focus = clicked_popup;
         }
+        // The dimming over the other windows, the focused one right above it.
+        if let (Some(scrim), Some(window)) = (scrim_layer, focused_layer) {
+            ctx.move_to_top(scrim);
+            ctx.set_sublayer(scrim, window);
+        }
 
         self.dialogs.show(&ctx, &mut cx);
-        if self.ops.panel_open {
-            let mut open = true;
-            egui::Window::new(format!("{} {}", icon::HOURGLASS, tr("Background operations"))).open(&mut open).default_width(360.0).show(&ctx, |ui| self.ops.ui(ui));
-            self.ops.panel_open = open;
-        }
+        // Beside its button at the bottom of the rail, where the design has it.
+        let at = egui::pos2(shell::RAIL_W + 10.0, ctx.content_rect().bottom() - shell::STATUS_H - 66.0);
+        self.ops.window(&ctx, at);
         if self.updates.ui(&ctx, &self.backend, &mut self.settings, &mut self.toasts) {
             self.save_settings();
         }
@@ -1981,6 +2016,8 @@ impl eframe::App for TernaryGridApp {
             let items = crate::pending_tx::collect(&self.dock, &self.conns);
             self.pending_tx.show(&ctx, &self.backend, &items);
         }
+        // As in the design, the app is dimmed behind the dialog windows.
+        dialogs::dim_topmost(&ctx);
         if let Some(job) = &mut self.diagnostics {
             match job.poll() {
                 Some(Ok(path)) => {
@@ -2004,6 +2041,8 @@ impl eframe::App for TernaryGridApp {
         }
         self.ensure_focus();
         self.process_commands(&ctx);
+        self.poll_sample();
+        self.save_settings_when_due(&ctx);
         if self.conns.dirty {
             self.conns.dirty = false;
             if let Err(e) = self.conns.store.save(&self.services.paths) {
@@ -2016,6 +2055,9 @@ impl eframe::App for TernaryGridApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.settings_save_at.take().is_some() {
+            self.save_settings();
+        }
         self.save_session();
         self.updates.install_on_exit();
         if let Some(s) = self.services.scheduler.clone() {

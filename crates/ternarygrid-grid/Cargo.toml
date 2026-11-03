@@ -11,6 +11,7 @@ authors.workspace = true
 uuid.workspace = true
 ternarygrid-core.workspace = true
 ternarygrid-icons.workspace = true
+ternarygrid-ui.workspace = true
 egui.workspace = true
 egui-phosphor.workspace = true
 serde.workspace = true
@@ -18,8 +19,6 @@ serde_json.workspace = true
 tracing.workspace = true
 image.workspace = true
 chrono.workspace = true
-regex.workspace = true
-parking_lot.workspace = true
 quick-xml.workspace = true
 
 [dev-dependencies]

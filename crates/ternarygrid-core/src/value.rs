@@ -211,13 +211,13 @@ pub struct FormatOptions {
 impl Default for FormatOptions {
     fn default() -> Self {
         FormatOptions {
-            null_text: "[NULL]".into(),
+            null_text: "NULL".into(),
             date_format: "%Y-%m-%d".into(),
             time_format: "%H:%M:%S".into(),
             datetime_format: "%Y-%m-%d %H:%M:%S".into(),
             show_fractional_seconds: true,
             float_max_decimals: None,
-            thousands_separator: false,
+            thousands_separator: true,
             binary_format: BinaryFormat::Hex,
             binary_max_len: 64,
             max_text_len: 512,
@@ -940,10 +940,14 @@ pub fn is_sql_expression(text: &str) -> bool {
     (call || keyword) && balanced(t)
 }
 
-/// Parentheses closed and quotes ended (outside of quotes).
+/// Parentheses closed and quotes ended (outside of quotes), and no statement
+/// separator or comment outside of quotes: the text is inserted verbatim into
+/// `UPDATE … SET c = <text> WHERE …`, where `--`, `/*`, `#` or `;` would cut
+/// off the `WHERE` clause.
 fn balanced(t: &str) -> bool {
     let (mut depth, mut quote) = (0i32, None);
-    for c in t.chars() {
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => {}
@@ -956,6 +960,9 @@ fn balanced(t: &str) -> bool {
                         return false;
                     }
                 }
+                ';' | '#' => return false,
+                '-' if chars.peek() == Some(&'-') => return false,
+                '/' if chars.peek() == Some(&'*') => return false,
                 _ => {}
             },
         }
@@ -1073,7 +1080,9 @@ mod tests {
 
     #[test]
     fn grid_shows_floats_and_text_as_copied() {
-        let o = FormatOptions::default();
+        // Grouped by default, as in the design; otherwise as copied.
+        assert_eq!(Value::Float(1932.78).display(&FormatOptions::default()), "1,932.78");
+        let o = FormatOptions { thousands_separator: false, ..Default::default() };
         assert_eq!(Value::Float(1932.7799999999997).display(&o), "1932.7799999999997");
         assert_eq!(Value::Float(0.1 + 0.2).display(&o), Value::Float(0.1 + 0.2).to_text());
         // Multi-line text keeps every line, joined by ¶.
@@ -1193,6 +1202,14 @@ mod tests {
         for t in ["", "now", "abc", "2025-11-24", "1(2)", "now(", "now())", "f('a)", "{\"a\": 1}", "(1)", "current_timestamps"] {
             assert!(!is_sql_expression(t), "{t}");
         }
+        // Inserted verbatim before `WHERE`: a comment or a second statement would cut it off.
+        for t in ["abs(1) --", "abs(1) -- x", "now() /* x */", "now(); DELETE FROM t", "now() # x", "CURRENT_DATE --"] {
+            assert!(!is_sql_expression(t), "{t}");
+        }
+        // Inside quotes they are text.
+        for t in ["concat('a--b')", "concat('a;b', \"c/*d\")", "datetime('now', '#')"] {
+            assert!(is_sql_expression(t), "{t}");
+        }
     }
 
     #[test]
@@ -1201,7 +1218,7 @@ mod tests {
         assert_eq!(Value::Int(1234567).display(&o), "1,234,567");
         assert_eq!(Value::Int(-1234).display(&o), "-1,234");
         assert_eq!(Value::decimal("1234.50").display(&o), "1,234.50");
-        assert_eq!(Value::Null.display(&o), "[NULL]");
+        assert_eq!(Value::Null.display(&o), "NULL");
         assert_eq!(Value::text("a\nb").display(&o), "a¶b");
     }
 

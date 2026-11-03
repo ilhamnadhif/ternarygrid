@@ -2,8 +2,11 @@
 //! disconnect" and "password from command" ([`ternarygrid_core::config::AuthMethod::Command`]).
 //!
 //! Commands run through `sh -c` on Unix and `cmd /C` on Windows, with stdin
-//! closed. On timeout the whole process group is killed (Unix) so helper
-//! processes spawned by the command do not linger.
+//! closed. On timeout or cancellation (the future is dropped, e.g. a
+//! cancelled task) the whole process group (Unix) / process tree (Windows)
+//! is killed so helper processes spawned by the command do not linger.
+//! Helpers a command leaves running after it *finished* (`ssh -fN …`) are
+//! left alone.
 
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -15,7 +18,8 @@ use zeroize::Zeroizing;
 
 /// Maximum number of bytes kept from stdout / stderr; the rest is drained and discarded.
 const MAX_CAPTURE: usize = 1024 * 1024;
-/// Maximum number of stderr characters quoted in error messages.
+/// Maximum number of stderr characters quoted in error messages (not for
+/// password commands, whose stderr is never shown).
 const MAX_STDERR_IN_ERROR: usize = 2000;
 
 struct CommandOutput {
@@ -35,18 +39,20 @@ struct CommandOutput {
 ///   and its process group are killed).
 pub async fn run_shell_command(command: &str, timeout: Duration) -> DbResult<String> {
     let out = run_capture(command, timeout).await?;
-    check_status(&out)?;
+    check_status(&out, true)?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Runs a "password command" and returns the first line of its standard
 /// output as a [`Secret`] (trailing `\r`/`\n` removed, other whitespace kept).
 ///
-/// The output is never logged or included in error messages; captured
+/// The output is never logged or included in error messages, stderr
+/// included (a helper may print the password there, e.g. with `set -x` or
+/// in a usage message): a failure reports the exit code only. Captured
 /// buffers are wiped after use. An empty first line is an [`ErrorKind::Auth`] error.
 pub async fn password_from_command(command: &str, timeout: Duration) -> DbResult<Secret> {
     let out = run_capture(command, timeout).await?;
-    check_status(&out)?;
+    check_status(&out, false)?;
     let text = std::str::from_utf8(&out.stdout)
         .map_err(|_| DbError::auth("The password command printed non UTF-8 output"))?;
     let first = text
@@ -62,7 +68,7 @@ pub async fn password_from_command(command: &str, timeout: Duration) -> DbResult
     Ok(Secret::new(first))
 }
 
-fn check_status(out: &CommandOutput) -> DbResult<()> {
+fn check_status(out: &CommandOutput, show_stderr: bool) -> DbResult<()> {
     if out.status.success() {
         return Ok(());
     }
@@ -73,12 +79,33 @@ fn check_status(out: &CommandOutput) -> DbResult<()> {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stderr = stderr.trim();
     let mut msg = format!("Shell command failed with {code}");
-    if !stderr.is_empty() {
+    if !show_stderr {
+        msg.push_str(
+            " (its error output is not shown because it may contain the password; run the command in a terminal to see it)",
+        );
+    } else if !stderr.is_empty() {
         let shown: String = stderr.chars().take(MAX_STDERR_IN_ERROR).collect();
         msg.push_str(": ");
         msg.push_str(&shown);
     }
     Err(DbError::io(msg))
+}
+
+/// Kills the command's process group / tree when dropped while armed. A
+/// cancelled caller drops the future while the command runs, and
+/// `kill_on_drop` alone only kills the shell, not what it started. Declared
+/// after the child so it runs first, while the child is not yet reaped.
+struct TreeKill {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl Drop for TreeKill {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_process_group(self.pid);
+        }
+    }
 }
 
 fn shell_command(command: &str) -> Command {
@@ -131,6 +158,7 @@ async fn run_capture(command: &str, timeout: Duration) -> DbResult<CommandOutput
         .spawn()
         .map_err(|e| DbError::io(format!("Cannot start the shell command: {e}")))?;
     let pid = child.id();
+    let mut tree = TreeKill { pid, armed: true };
     let stdout_buf = Arc::new(Mutex::new(Zeroizing::new(Vec::new())));
     let stderr_buf = Arc::new(Mutex::new(Zeroizing::new(Vec::new())));
     // Read in tasks of their own that outlive this call: a helper the command
@@ -142,6 +170,8 @@ async fn run_capture(command: &str, timeout: Duration) -> DbResult<CommandOutput
     let result = tokio::time::timeout(timeout, async {
         // Done when the command exits, with what it printed until shortly after.
         let status = child.wait().await;
+        // Helpers it left running in the background are intentional.
+        tree.armed = false;
         let _ = tokio::time::timeout(Duration::from_millis(500), async {
             let _ = (&mut out_task).await;
             let _ = (&mut err_task).await;
@@ -164,6 +194,7 @@ async fn run_capture(command: &str, timeout: Duration) -> DbResult<CommandOutput
             "Waiting for the shell command failed: {e}"
         ))),
         Err(_) => {
+            tree.armed = false;
             kill_process_group(pid);
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
@@ -189,7 +220,24 @@ fn kill_process_group(pid: Option<u32>) {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows: `taskkill /T` ends the shell and its descendants (the shell is
+/// still running and its handle open, so the id is not reused).
+#[cfg(windows)]
+fn kill_process_group(pid: Option<u32>) {
+    use std::os::windows::process::CommandExt;
+    if let Some(pid) = pid {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // CREATE_NO_WINDOW
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_process_group(_pid: Option<u32>) {}
 
 #[cfg(all(test, unix))]
@@ -237,6 +285,54 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert!(!marker.exists(), "grandchild process was not killed");
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        // A cancelled task drops the future while the command runs.
+        let cmd = format!("(sleep 2; touch '{}') & sleep 30", marker.display());
+        let run = run_shell_command(&cmd, Duration::from_secs(60));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), run)
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!marker.exists(), "background child survived cancellation");
+    }
+
+    #[tokio::test]
+    async fn helpers_left_by_a_finished_command_keep_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("helper-ran");
+        let cmd = format!(
+            "(sleep 1; touch '{}') >/dev/null 2>&1 & echo started",
+            marker.display()
+        );
+        let out = run_shell_command(&cmd, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(out, "started");
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        assert!(
+            marker.exists(),
+            "an intentional background helper was killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_command_stderr_is_not_shown() {
+        let err = password_from_command(
+            "echo 'usage: helper --password hunter2' >&2; exit 2",
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Io);
+        assert!(err.message.contains("exit code 2"), "{}", err.message);
+        assert!(!err.full_text().contains("hunter2"), "{}", err.full_text());
     }
 
     #[tokio::test]

@@ -53,6 +53,8 @@ pub struct EditorTheme {
     pub gutter_separator: Color32,
     /// Background of the cursor line.
     pub current_line: Color32,
+    /// Background of a line with an error.
+    pub error_line: Color32,
     /// Background of the statement range set by
     /// [`crate::EditorState::set_statement_highlight`].
     pub statement_background: Color32,
@@ -92,27 +94,28 @@ impl EditorTheme {
     /// Light palette.
     pub fn light() -> Self {
         Self {
-            background: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-            text: Color32::from_rgb(0x1F, 0x1F, 0x1F),
-            keyword: Color32::from_rgb(0x00, 0x33, 0xB3),
-            identifier: Color32::from_rgb(0x1F, 0x1F, 0x1F),
-            quoted_identifier: Color32::from_rgb(0x00, 0x5C, 0x7A),
-            string: Color32::from_rgb(0x06, 0x7D, 0x17),
-            number: Color32::from_rgb(0x17, 0x50, 0xEB),
-            comment: Color32::from_rgb(0x8C, 0x8C, 0x8C),
-            operator: Color32::from_rgb(0x3A, 0x3A, 0x3A),
-            punctuation: Color32::from_rgb(0x3A, 0x3A, 0x3A),
+            background: Color32::from_rgb(0xff, 0xff, 0xff),
+            text: Color32::from_rgb(0x1a, 0x1a, 0x20),
+            keyword: Color32::from_rgb(0x25, 0x54, 0xc7),
+            identifier: Color32::from_rgb(0x1a, 0x1a, 0x20),
+            quoted_identifier: Color32::from_rgb(0x1a, 0x1a, 0x20),
+            string: Color32::from_rgb(0xa5, 0x53, 0x1a),
+            number: Color32::from_rgb(0x7a, 0x3f, 0xc4),
+            comment: Color32::from_rgb(0x85, 0x85, 0x8f),
+            operator: Color32::from_rgb(0x1a, 0x1a, 0x20),
+            punctuation: Color32::from_rgb(0x1a, 0x1a, 0x20),
             parameter: Color32::from_rgb(0x87, 0x10, 0x94),
             variable: Color32::from_rgb(0x87, 0x10, 0x94),
-            function: Color32::from_rgb(0x00, 0x62, 0x7A),
-            data_type: Color32::from_rgb(0x00, 0x7A, 0x6C),
+            function: Color32::from_rgb(0x25, 0x54, 0xc7),
+            data_type: Color32::from_rgb(0x25, 0x54, 0xc7),
             client_command: Color32::from_rgb(0x9E, 0x5A, 0x00),
             italic_comments: true,
-            gutter_background: Color32::from_rgb(0xF7, 0xF7, 0xF7),
-            gutter_text: Color32::from_rgb(0x86, 0x86, 0x86),
-            gutter_current_text: Color32::from_rgb(0x33, 0x33, 0x33),
-            gutter_separator: Color32::from_rgb(0xE6, 0xE6, 0xE6),
-            current_line: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 10),
+            gutter_background: Color32::from_rgb(0xff, 0xff, 0xff),
+            gutter_text: Color32::from_rgb(0x85, 0x85, 0x8f),
+            gutter_current_text: Color32::from_rgb(0x68, 0x68, 0x74),
+            gutter_separator: Color32::TRANSPARENT,
+            current_line: Color32::from_rgb(0xef, 0xef, 0xf3),
+            error_line: Color32::from_rgb(0xfd, 0xec, 0xea),
             statement_background: Color32::from_rgba_unmultiplied(0x2F, 0x6F, 0xDB, 18),
             statement_marker: Color32::from_rgb(0x2F, 0x6F, 0xDB),
             selection: Color32::from_rgb(0xB4, 0xD5, 0xFE),
@@ -135,27 +138,28 @@ impl EditorTheme {
     /// Dark palette.
     pub fn dark() -> Self {
         Self {
-            background: Color32::from_rgb(0x2B, 0x2D, 0x31),
-            text: Color32::from_rgb(0xD6, 0xD8, 0xDC),
-            keyword: Color32::from_rgb(0x6C, 0xA8, 0xF0),
-            identifier: Color32::from_rgb(0xD4, 0xD4, 0xD4),
-            quoted_identifier: Color32::from_rgb(0x9C, 0xDC, 0xFE),
-            string: Color32::from_rgb(0x8F, 0xC9, 0x7A),
-            number: Color32::from_rgb(0x2A, 0xAC, 0xB8),
-            comment: Color32::from_rgb(0x8C, 0x91, 0x9A),
-            operator: Color32::from_rgb(0xC8, 0xC8, 0xC8),
-            punctuation: Color32::from_rgb(0xB0, 0xB0, 0xB0),
+            background: Color32::from_rgb(0x29, 0x2b, 0x33),
+            text: Color32::from_rgb(0xe8, 0xe9, 0xed),
+            keyword: Color32::from_rgb(0x7a, 0xa7, 0xff),
+            identifier: Color32::from_rgb(0xe8, 0xe9, 0xed),
+            quoted_identifier: Color32::from_rgb(0xe8, 0xe9, 0xed),
+            string: Color32::from_rgb(0xe6, 0xa9, 0x6b),
+            number: Color32::from_rgb(0xc3, 0x9b, 0xf2),
+            comment: Color32::from_rgb(0x8d, 0x8f, 0x9b),
+            operator: Color32::from_rgb(0xe8, 0xe9, 0xed),
+            punctuation: Color32::from_rgb(0xe8, 0xe9, 0xed),
             parameter: Color32::from_rgb(0xC5, 0x86, 0xC0),
             variable: Color32::from_rgb(0xC5, 0x86, 0xC0),
-            function: Color32::from_rgb(0x56, 0xC1, 0xD6),
-            data_type: Color32::from_rgb(0x4E, 0xC9, 0xB0),
+            function: Color32::from_rgb(0x7a, 0xa7, 0xff),
+            data_type: Color32::from_rgb(0x7a, 0xa7, 0xff),
             client_command: Color32::from_rgb(0xE5, 0xB5, 0x67),
             italic_comments: true,
-            gutter_background: Color32::from_rgb(0x2B, 0x2D, 0x31),
-            gutter_text: Color32::from_rgb(0x83, 0x88, 0x91),
-            gutter_current_text: Color32::from_rgb(0xD0, 0xD2, 0xD6),
-            gutter_separator: Color32::from_rgb(0x3B, 0x3E, 0x44),
-            current_line: Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 10),
+            gutter_background: Color32::from_rgb(0x29, 0x2b, 0x33),
+            gutter_text: Color32::from_rgb(0x8d, 0x8f, 0x9b),
+            gutter_current_text: Color32::from_rgb(0xa6, 0xa8, 0xb3),
+            gutter_separator: Color32::TRANSPARENT,
+            current_line: Color32::from_rgb(0x30, 0x32, 0x3b),
+            error_line: Color32::from_rgb(0x3e, 0x2a, 0x2c),
             statement_background: Color32::from_rgba_unmultiplied(0x6C, 0xA8, 0xF0, 20),
             statement_marker: Color32::from_rgb(0x6C, 0xA8, 0xF0),
             selection: Color32::from_rgb(0x26, 0x4F, 0x78),
@@ -175,8 +179,10 @@ impl EditorTheme {
         }
     }
 
-    /// Palette matching `visuals` (dark or light), using its text-edit
-    /// background and selection colors so the editor blends into the app.
+    /// Palette matching `visuals` (dark or light), using its
+    /// `extreme_bg_color` as background (not `text_edit_bg_color`, which apps
+    /// may set to a distinct input-field color) and its selection color so
+    /// the editor blends into the app.
     pub fn from_visuals(visuals: &Visuals) -> Self {
         let mut theme = if visuals.dark_mode {
             Self::dark()
@@ -237,9 +243,13 @@ mod tests {
         let light = EditorTheme::light();
         let dark = EditorTheme::dark();
         assert_ne!(light.layout_key(), dark.layout_key());
-        let v = Visuals::dark();
+        let mut v = Visuals::dark();
+        // A distinct text-edit fill (as the app sets) must not leak into the editor.
+        v.text_edit_bg_color = Some(Color32::from_rgb(1, 2, 3));
         let t = EditorTheme::from_visuals(&v);
-        assert_eq!(t.background, v.text_edit_bg_color());
+        assert_eq!(t.background, v.extreme_bg_color);
+        assert_eq!(t.gutter_background, v.extreme_bg_color);
+        assert_eq!(t.selection, v.selection.bg_fill);
         assert_eq!(t.keyword, dark.keyword);
         let t = EditorTheme::from_visuals(&Visuals::light());
         assert_eq!(t.keyword, light.keyword);

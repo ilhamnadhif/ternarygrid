@@ -6,7 +6,7 @@
 //! when cancelled; the blocking thread stops at the next chunk).
 
 use crate::config::{AiConfig, AiProviderKind};
-use crate::protocol::{ApiError, Control, Flags, HttpRequest, SseParser, StreamState, build_request, parse_retry_after};
+use crate::protocol::{ApiError, Control, Flags, HttpRequest, MAX_SSE_EVENT, MAX_SSE_LINE, SseParser, StreamState, build_request, parse_retry_after};
 use crate::types::{ChatRequest, ChatResponse};
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
@@ -144,7 +144,28 @@ enum Streamed {
 }
 
 fn read_stream(provider: AiProviderKind, resp: ureq::http::Response<ureq::Body>, on_delta: &mut dyn FnMut(&str), cancel: &CancellationToken) -> DbResult<Streamed> {
-    let mut reader = BufReader::new(resp.into_body().into_reader());
+    let reader = BufReader::new(resp.into_body().into_reader());
+    read_events(provider, reader, on_delta, cancel, MAX_SSE_LINE, MAX_SSE_EVENT)
+}
+
+/// Read one line (terminator included) into `buf`, failing when it is longer
+/// than `max` bytes instead of buffering without limit.
+fn read_line_capped(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> DbResult<usize> {
+    let n = reader.by_ref().take(max as u64 + 1).read_until(b'\n', buf).map_err(|e| DbError::connection(trf("Reading the AI response failed: {}", &[&e])))?;
+    if n > max {
+        return Err(DbError::connection(trf("The AI response contains a line longer than {} bytes", &[&max])));
+    }
+    Ok(n)
+}
+
+fn read_events(
+    provider: AiProviderKind,
+    mut reader: impl BufRead,
+    on_delta: &mut dyn FnMut(&str),
+    cancel: &CancellationToken,
+    max_line: usize,
+    max_event: usize,
+) -> DbResult<Streamed> {
     let mut parser = SseParser::default();
     let mut state = StreamState::default();
     let mut emitted = false;
@@ -164,8 +185,11 @@ fn read_stream(provider: AiProviderKind, resp: ureq::http::Response<ureq::Body>,
             return Err(DbError::cancelled());
         }
         line.clear();
-        let n = reader.read_until(b'\n', &mut line).map_err(|e| DbError::connection(trf("Reading the AI response failed: {}", &[&e])))?;
+        let n = read_line_capped(&mut reader, &mut line, max_line)?;
         let ev = if n == 0 { parser.finish() } else { parser.push_line(&String::from_utf8_lossy(&line)) };
+        if parser.pending_bytes() > max_event {
+            return Err(DbError::connection(trf("The AI response contains an event larger than {} bytes", &[&max_event])));
+        }
         if let Some(ev) = ev {
             match handle(ev, &mut state, &mut emitted) {
                 Control::Continue => {}

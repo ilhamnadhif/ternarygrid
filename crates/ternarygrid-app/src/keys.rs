@@ -87,28 +87,13 @@ pub fn shortcuts_table(ui: &mut egui::Ui, cx: &mut AppContext) {
     });
 }
 
-/// Short label of an action on the main toolbar (its icon says "new", "open" …).
-pub fn toolbar_label(action: Action) -> &'static str {
-    match action {
-        Action::NewConnection => tr("Connection"),
-        Action::NewSqlEditor => tr("SQL editor"),
-        Action::AiAssistant => tr("AI"),
-        Action::Export => tr("Export"),
-        Action::Import => tr("Import"),
-        Action::OpenErDiagram => tr("ER diagram"),
-        Action::OpenSessionManager => tr("Sessions"),
-        Action::OpenHistory => tr("History"),
-        Action::PendingTransactions => tr("Transactions"),
-        Action::OpenTasks => tr("Tasks"),
-        Action::CommandPalette => tr("Commands"),
-        other => action_label(other),
-    }
-}
-
-/// Colour cue of an action's icon: green to run, red to stop.
+/// Colour cue of an action's icon: run in the accent (green with coloured
+/// icons), red to stop.
 pub fn action_color(action: Action, dark: bool) -> Option<egui::Color32> {
     match action {
-        Action::ExecuteStatement | Action::ExecuteScript | Action::ExecuteInNewTab => Some(crate::theme::success_color(dark)),
+        Action::ExecuteStatement | Action::ExecuteScript | Action::ExecuteInNewTab => {
+            Some(if ternarygrid_icons::colored() { crate::theme::success_color(dark) } else { ternarygrid_ui::palette(dark).accent_text })
+        }
         Action::CancelQuery => Some(crate::theme::error_color(dark)),
         _ => ternarygrid_icons::color(action_icon(action)),
     }

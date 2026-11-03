@@ -121,89 +121,110 @@ impl TabView for CatalogObjectTab {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
         let label = self.folder.as_ref().map(|f| tr(f.label)).unwrap_or_default();
-        ui.horizontal(|ui| {
-            ui.heading(format!("{} {}", self.icon(), self.name()));
-            ui.weak(label);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(ternarygrid_icons::ic(icon::ARROW_CLOCKWISE)).on_hover_text(tr("Refresh")).clicked() {
-                    self.started = false;
-                }
-            });
+        let name = self.name();
+        let mut refresh = false;
+        ternarygrid_ui::parts::page_header(ui, self.icon(), &[], name, Some(label), |ui| {
+            refresh = ternarygrid_ui::kit::icon_button(ui, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked();
         });
-        ui.separator();
+        if refresh {
+            self.started = false;
+        }
+        ternarygrid_ui::parts::hline(ui);
+        // 14 / 16 around; the properties, members and DDL at most 760 wide.
+        let pal = ternarygrid_ui::pal(ui);
+        let title = |ui: &mut Ui, text: &str| {
+            ui.label(RichText::new(text).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
+        };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.strong(tr("Properties"));
-            match &self.row {
-                Loadable::Loaded(Some(row)) => {
-                    egui::Grid::new(("catalog_props", &self.conn, self.folder_id)).num_columns(2).striped(true).spacing([16.0, 4.0]).show(ui, |ui| {
-                        for (k, v) in &row.values {
-                            if k.eq_ignore_ascii_case("detail") {
-                                continue;
-                            }
-                            ui.label(RichText::new(k.replace('_', " ")).weak());
-                            let text = if v.is_null() { "NULL".to_string() } else { v.to_text().into_owned() };
-                            ui.add(egui::Label::new(text).wrap());
-                            ui.end_row();
-                        }
-                    });
-                }
-                Loadable::Loaded(None) => {
-                    ui.weak(tr("The object no longer exists."));
-                }
-                Loadable::Failed(e) => {
-                    ui.colored_label(crate::theme::error_color(ui.visuals().dark_mode), e.full_text());
-                }
-                _ => {
-                    ui.spinner();
-                }
-            }
-            for (folder, items) in &self.children {
-                ui.add_space(8.0);
-                ui.strong(tr(folder.label));
-                match items {
-                    Loadable::Loaded(v) if v.is_empty() => {
-                        ui.weak(tr("(empty)"));
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 14)).show(ui, |ui| {
+                ui.set_max_width(760.0);
+                ui.spacing_mut().item_spacing.y = 12.0;
+                title(ui, tr("Properties"));
+                match &self.row {
+                    Loadable::Loaded(Some(row)) => {
+                        let props: Vec<ternarygrid_core::meta::Property> = row
+                            .values
+                            .iter()
+                            .filter(|(k, _)| !k.eq_ignore_ascii_case("detail") || row.values.len() <= 2)
+                            .map(|(k, v)| ternarygrid_core::meta::Property {
+                                name: k.replace('_', " "),
+                                value: if v.is_null() { "NULL".to_string() } else { v.to_text().into_owned() },
+                                group: None,
+                            })
+                            .collect();
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            crate::widgets::property_grid(ui, 200.0, &props);
+                        });
                     }
-                    Loadable::Loaded(v) => {
-                        for it in v {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{} {}", crate::nav::catalog_icon(folder.icon), it.name));
-                                if let Some(d) = &it.detail {
-                                    ui.weak(d);
+                    Loadable::Loaded(None) => {
+                        ui.weak(tr("The object no longer exists."));
+                    }
+                    Loadable::Failed(e) => {
+                        crate::widgets::error_box(ui, &e.full_text());
+                    }
+                    _ => {
+                        ternarygrid_ui::parts::spinner_label(ui, tr("Loading…"));
+                    }
+                }
+                for (folder, items) in &self.children {
+                    title(ui, tr(folder.label));
+                    match items {
+                        Loadable::Loaded(v) if v.is_empty() => {
+                            ui.label(RichText::new(tr("(empty)")).color(pal.text_faint));
+                        }
+                        Loadable::Loaded(v) => {
+                            ui.scope(|ui| {
+                                ui.spacing_mut().item_spacing.y = 6.0;
+                                for it in v {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        ui.label(RichText::new(crate::nav::catalog_icon(folder.icon)).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.text_muted));
+                                        ui.label(RichText::new(&it.name).color(pal.text));
+                                        if let Some(d) = &it.detail {
+                                            ui.label(RichText::new(d).size(12.0).color(pal.text_faint));
+                                        }
+                                    });
                                 }
                             });
                         }
+                        Loadable::Failed(e) => {
+                            crate::widgets::error_box(ui, &e.full_text());
+                        }
+                        _ => {
+                            ternarygrid_ui::parts::spinner_label(ui, tr("Loading…"));
+                        }
+                    }
+                }
+                match &self.ddl {
+                    Loadable::Loaded(Some(ddl)) => {
+                        ui.horizontal(|ui| {
+                            title(ui, "DDL");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                use ternarygrid_ui::kit;
+                                if kit::button_full(ui, kit::Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), true, false).clicked() {
+                                    let schema = self.ctx.database.clone().map(|d| SchemaRef { database: Some(d), schema: None });
+                                    cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema, text: Some(ddl.clone()) });
+                                }
+                                if kit::button_full(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), true, false).clicked() {
+                                    ui.ctx().copy_text(ddl.clone());
+                                }
+                            });
+                        });
+                        let tokens = cx
+                            .conns
+                            .live(&self.conn)
+                            .map(|l| ternarygrid_editor::EditorLanguage::highlight(&crate::sqllang::SqlLanguage::new(l.dialect.clone()), ddl))
+                            .unwrap_or_default();
+                        crate::widgets::code_block(ui, ("catalog_ddl", &self.conn, self.folder_id), ddl, &tokens, 400.0);
                     }
                     Loadable::Failed(e) => {
-                        ui.colored_label(crate::theme::error_color(ui.visuals().dark_mode), e.full_text());
+                        title(ui, "DDL");
+                        crate::widgets::error_box(ui, &e.full_text());
                     }
-                    _ => {
-                        ui.spinner();
-                    }
+                    _ => {}
                 }
-            }
-            match &self.ddl {
-                Loadable::Loaded(Some(ddl)) => {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.strong("DDL");
-                        if ui.small_button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).clicked() {
-                            ui.ctx().copy_text(ddl.clone());
-                        }
-                        if ui.small_button((ternarygrid_icons::ic(icon::FILE_SQL), tr("Open in SQL editor"))).clicked() {
-                            let schema = self.ctx.database.clone().map(|d| SchemaRef { database: Some(d), schema: None });
-                            cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema, text: Some(ddl.clone()) });
-                        }
-                    });
-                    crate::tabs::code(ui, cx, &self.conn, ("catalog_ddl", &self.conn, self.folder_id), ddl);
-                }
-                Loadable::Failed(e) => {
-                    ui.add_space(8.0);
-                    ui.strong("DDL");
-                    ui.colored_label(crate::theme::error_color(ui.visuals().dark_mode), e.full_text());
-                }
-                _ => {}
-            }
+            });
         });
     }
 

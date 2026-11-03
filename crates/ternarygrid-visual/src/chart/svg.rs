@@ -2,7 +2,7 @@
 
 use super::config::{ChartConfig, ChartKind};
 use super::data::{ChartData, XKind};
-use super::view::{pie_geometry, polar};
+use super::view::{bar_slot, pie_geometry, polar};
 use crate::common::colors;
 use crate::common::format::{compact, grouped};
 use crate::common::svg::{Anchor, SvgDoc, TextStyle, num};
@@ -311,27 +311,6 @@ pub fn export_chart_svg(data: &ChartData, config: &ChartConfig, size: Vec2) -> S
         );
     }
     doc.finish()
-}
-
-fn bar_slot(data: &ChartData) -> f64 {
-    match data.x_kind {
-        XKind::Categorical | XKind::Index => 1.0,
-        _ => {
-            let mut xs: Vec<f64> = data
-                .series
-                .iter()
-                .flat_map(|s| s.points.iter().map(|p| p[0]))
-                .collect();
-            xs.sort_by(f64::total_cmp);
-            xs.dedup();
-            let gap = xs
-                .windows(2)
-                .map(|w| w[1] - w[0])
-                .filter(|d| *d > 0.0)
-                .fold(f64::INFINITY, f64::min);
-            if gap.is_finite() { gap } else { 1.0 }
-        }
-    }
 }
 
 /// Bar from `y0` (baseline side) to `y1` (data end) with a 4 px rounded data end.

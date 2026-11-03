@@ -73,7 +73,9 @@ pub fn system_prompt(kind: DbKind, server_version: &str, schema_context: &str) -
     s.push_str("- Put every SQL statement in a fenced code block that starts with ```sql. Keep explanations short and outside the code blocks.\n");
     s.push_str("- Prefer read-only queries. Add a row limit when a query could return many rows, and qualify columns when several tables are joined.\n");
     s.push_str("- Before any statement that changes data or schema (INSERT, UPDATE, DELETE, MERGE, TRUNCATE, DROP, ALTER, CREATE, GRANT, REVOKE), warn clearly about its effect. Always include a WHERE clause in UPDATE and DELETE, and suggest running such statements in a transaction or after a backup.\n");
-    s.push_str("- You cannot see or execute anything: never claim results, and say when an answer depends on the data.\n");
+    // The same text with and without agent mode (whose tool is described after the
+    // schema): the cached prefix stays identical and nothing contradicts the tool.
+    s.push_str("- Never claim results you have not seen. Unless a tool for running queries is described below, you cannot see the data or execute anything, so say when an answer depends on the data.\n");
     s.push_str("- Answer in the language the user writes in. Keep SQL keywords, identifiers and code in their original form.\n\n");
     s.push_str("Database schema (structure only, no data):\n");
     if schema_context.trim().is_empty() {
@@ -708,6 +710,8 @@ mod tests {
         assert!(p.contains("Prefer read-only"));
         assert!(p.contains("warn clearly"));
         assert!(p.contains("Answer in the language the user writes in"));
+        // Does not contradict agent mode, which appends its tool after the schema.
+        assert!(p.contains("Unless a tool for running queries is described below") && !p.contains("You cannot see or execute anything"));
         assert!(p.ends_with("table public.users (id integer PK)\n"));
         let m = system_prompt(DbKind::MySql, "", "");
         assert!(m.contains("expert in MySQL and") && m.contains("backticks"));

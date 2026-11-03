@@ -237,6 +237,65 @@ fn null_safe_keys_and_key_updates() {
 }
 
 #[test]
+fn no_update_or_delete_without_a_key_that_identifies_the_row() {
+    let d = PgLike(GenericDialect::new());
+    // The store was replaced under the model (not synced yet): the rows' keys are
+    // unknown. Not `DELETE … WHERE id IS NULL`, nothing at all.
+    let mut m = model(3);
+    m.set_cell(0, 1, "x").unwrap();
+    m.delete_rows(&[2]).unwrap();
+    m.store().lock().clear();
+    let e = m.checked_change_set().unwrap_err();
+    assert!(e.contains("Row 3") && e.contains("disk cache"), "{e}");
+    assert!(m.change_set().is_none());
+    assert!(m.change_statements(&d).is_empty());
+    assert_eq!(m.change_preview_sql(&d), "");
+    assert!(matches!(crate::grid::save_action(&m), crate::grid::GridAction::Notify { error: true, .. }), "Save says why instead");
+    // A row without the key column's value.
+    let cols = vec![ColumnMeta::new("v", "int", DataKind::Int).with_source(src("v")), ColumnMeta::new("code", "text", DataKind::Text).with_source(src("code"))];
+    let mut m = ResultModel::from_rows(cols, vec![vec![Value::Int(1)], vec![Value::Int(2), Value::text("b")]]);
+    m.set_editability(determine_editability(m.columns(), |_| Some(vec!["code".into()]), false));
+    m.set_cell(0, 0, "10").unwrap();
+    assert!(m.checked_change_set().is_err());
+    m.undo();
+    m.set_cell(1, 0, "20").unwrap();
+    assert_eq!(m.change_statements(&d), vec![("UPDATE app.people SET v = $1 WHERE code = $2".to_string(), vec![Value::Int(20), Value::text("b")])]);
+    // A target without key columns, or with one that is no table column.
+    let mut m = model(3);
+    let mut target = m.editability().clone().unwrap();
+    target.key_columns.clear();
+    m.set_editability(Ok(target.clone()));
+    m.delete_rows(&[0]).unwrap();
+    assert!(m.checked_change_set().unwrap_err().contains("key"));
+    m.undo();
+    let r = m.add_row(None).unwrap();
+    m.set_cell(r, 1, "new").unwrap();
+    assert_eq!(m.checked_change_set().unwrap().inserts.len(), 1, "an insert needs no key");
+    m.discard_changes();
+    target.key_columns = vec![0, 4];
+    m.set_editability(Ok(target));
+    m.set_cell(1, 2, "50").unwrap();
+    assert!(m.checked_change_set().unwrap_err().contains("'label'"));
+    // A change set built by hand without a key: a condition no row meets.
+    let cs = ChangeSet {
+        table: ObjectRef::table(Some("app".into()), "people"),
+        deletes: vec![RowDelete { row: 0, key: vec![] }],
+        updates: vec![RowUpdate {
+            row: 1,
+            key: vec![],
+            changes: vec![ChangedValue { column: 1, name: "name".into(), type_name: "text".into(), value: CellValue::Value(Value::Null) }],
+        }],
+        inserts: vec![],
+        columns: vec![],
+        key_columns: vec![],
+    };
+    let stmts = cs.statements(&d);
+    assert_eq!(stmts[0].0, "DELETE FROM app.people WHERE 1 = 0");
+    assert_eq!(stmts[1].0, "UPDATE app.people SET name = $1 WHERE 1 = 0");
+    assert!(cs.preview_sql(&d).contains("WHERE 1 = 0"));
+}
+
+#[test]
 fn apply_saved_updates_store_and_view() {
     let mut m = model(5);
     m.set_cell(0, 2, "99").unwrap();
@@ -353,6 +412,23 @@ fn virtual_columns() {
 }
 
 #[test]
+fn removing_a_virtual_column_drops_views_that_use_it() {
+    let mut m = model(50);
+    m.add_virtual_column("v", "id * 2").unwrap();
+    // A view of it still being computed: its column index would point past the end.
+    m.start_client_view(ViewSpec { sort: vec![SortKey::desc(5)], filter: None }, Box::new(|| {}));
+    m.remove_virtual_column(0);
+    assert!(!m.is_view_job_running());
+    assert!(m.requested_view_spec().sort.is_empty());
+    // A view of result columns stays while one is removed.
+    m.add_virtual_column("v", "id * 2").unwrap();
+    m.start_client_view(ViewSpec { sort: vec![SortKey::desc(0)], filter: None }, Box::new(|| {}));
+    m.remove_virtual_column(0);
+    assert!(m.is_view_job_running());
+    assert_eq!(m.requested_view_spec().sort, vec![SortKey::desc(0)]);
+}
+
+#[test]
 fn paste_block_adds_rows_and_validates() {
     let mut m = model(2);
     let block = vec![vec!["Ann".to_string(), "30".into()], vec!["Ben".into(), "31".into()], vec!["Cy".into(), "32".into()]];
@@ -413,6 +489,34 @@ fn sync_handles_cleared_store_and_reset() {
     assert_eq!(m.row_count(), 2);
     assert_eq!(m.column_count(), 6, "virtual column kept for identical columns");
     assert!(m.is_editable());
+}
+
+#[test]
+fn reset_keeps_what_belongs_to_the_same_columns_only() {
+    let mut m = model(3);
+    m.add_virtual_column("v", "id + 1").unwrap();
+    m.set_dictionary(2, HashMap::from([("21".to_string(), "x".to_string())]));
+    m.set_enum_values(1, vec!["a".into()]);
+    m.set_view_index(ViewIndex { rows: vec![2, 1, 0], source_len: 3 }, ViewSpec { sort: vec![SortKey::desc(0)], filter: None });
+    m.fetch.has_more = true;
+    let store = || {
+        let s = RowStore::shared(1 << 20);
+        s.lock().extend(rows(2));
+        s
+    };
+    // A refresh: the same columns.
+    m.reset(columns(), store());
+    assert_eq!(m.column_count(), 6);
+    assert!(m.dictionary(2).is_some() && m.enum_values(1).is_none());
+    assert_eq!(m.client_view_spec().sort, vec![SortKey::desc(0)]);
+    assert!(m.is_editable() && m.fetch.has_more);
+    // Another column: the virtual column is dropped although "id" is still there.
+    let mut other = columns();
+    other.push(ColumnMeta::new("extra", "int4", DataKind::Int).with_source(src("extra")));
+    m.reset(other, store());
+    assert_eq!(m.column_count(), 6, "5 + extra, no virtual column");
+    assert!(m.virtual_columns().is_empty() && m.dictionary(2).is_none());
+    assert!(!m.has_client_view() && !m.is_editable());
 }
 
 #[test]

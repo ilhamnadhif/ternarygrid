@@ -198,6 +198,75 @@ async fn failures_and_cancellation() {
     assert_eq!(err.kind, ErrorKind::Cancelled);
 }
 
+#[tokio::test]
+async fn foreign_key_parent_spelled_in_another_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src_path, dst_path) = (dir.path().join("src.db"), dir.path().join("dst.db"));
+    // SQLite reports the referenced table as written in the REFERENCES clause.
+    rusqlite::Connection::open(&src_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE countries (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE cities (id INTEGER PRIMARY KEY, country_id INTEGER REFERENCES COUNTRIES(id));
+             INSERT INTO countries VALUES (1, 'x'); INSERT INTO cities VALUES (1, 1);",
+        )
+        .unwrap();
+    let source = SqliteFactory::new(&src_path, sqlite_dialect());
+    let target = SqliteFactory::new(&dst_path, sqlite_dialect());
+    let job = MigrationJob { tables: vec![ObjectRef::table(None, "countries"), ObjectRef::table(None, "cities")], ..Default::default() };
+    let s = run_migration(job, source, target.clone(), &Progress::new(), &CancellationToken::new()).await.unwrap();
+    assert!(!s.warnings.iter().any(|w| w.contains("not copied")), "{:?}", s.warnings);
+    // The foreign key is attempted (SQLite cannot add it to an existing table).
+    assert!(target.log.lock().iter().any(|q| q.contains("FOREIGN KEY (country_id) REFERENCES countries")), "{:?}", target.log.lock());
+}
+
+#[tokio::test]
+async fn source_time_zone_is_restored_when_a_table_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src_path, dst_path) = (dir.path().join("src.db"), dir.path().join("dst.db"));
+    rusqlite::Connection::open(&src_path)
+        .unwrap()
+        .execute_batch("CREATE TABLE events (id INTEGER PRIMARY KEY, at TIMESTAMP); INSERT INTO events VALUES (1, '2024-01-02 03:04:05');")
+        .unwrap();
+    // A MySQL source: TIMESTAMPs going into a time zone aware column are read in UTC.
+    let mut source = SqliteFactory::new(&src_path, dialect_of_kind(ternarygrid_core::DbKind::MySql));
+    std::sync::Arc::get_mut(&mut source).unwrap().fail_on = Some("FROM events".into());
+    let target = SqliteFactory::new(&dst_path, sqlite_dialect());
+    let job = MigrationJob {
+        tables: vec![ObjectRef::table(None, "events")],
+        column_types: BTreeMap::from([("events.at".to_string(), "TIMESTAMP WITH TIME ZONE".to_string())]),
+        continue_on_table_error: true,
+        ..Default::default()
+    };
+    let s = run_migration(job, source.clone(), target, &Progress::new(), &CancellationToken::new()).await.unwrap();
+    assert!(s.tables[0].error.as_deref().is_some_and(|e| e.contains("injected failure")), "{:?}", s.tables);
+    // The query failed after the session was switched to UTC: it is switched back.
+    let log = source.log.lock().clone();
+    let utc = log.iter().position(|q| q.contains("time_zone = '+00:00'")).expect("read in UTC");
+    let restored = log.iter().position(|q| q == "SET time_zone = @ternarygrid_time_zone").unwrap_or_else(|| panic!("time zone not restored: {log:?}"));
+    assert!(restored > utc);
+}
+
+#[tokio::test]
+async fn failed_migration_drops_the_table_it_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src_path, dst_path) = (dir.path().join("src.db"), dir.path().join("dst.db"));
+    source_db(&src_path);
+    let source = SqliteFactory::new(&src_path, sqlite_dialect());
+    let mut target = SqliteFactory::new(&dst_path, sqlite_dialect());
+    std::sync::Arc::get_mut(&mut target).unwrap().fail_on = Some("INSERT".into());
+    let job = MigrationJob { tables: vec![ObjectRef::table(None, "countries")], copy_foreign_keys: false, ..Default::default() };
+    let err = run_migration(job.clone(), source.clone(), target.clone(), &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(err.full_text().contains("injected failure"), "{}", err.full_text());
+    let dst = rusqlite::Connection::open(&dst_path).unwrap();
+    assert!(table_def(&dst, None, "countries").is_err(), "the table created by the failed migration is dropped");
+    // A table replacing a dropped one is kept (empty).
+    let job = MigrationJob { mode: MigrationMode::DropAndCreate, ..job };
+    run_migration(job, source, target, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(table_def(&dst, None, "countries").is_ok());
+    assert_eq!(count(&dst_path, "countries"), 0);
+}
+
 #[test]
 fn job_is_serialisable() {
     let job = MigrationJob {

@@ -21,6 +21,7 @@ default = []
 [dependencies]
 ternarygrid-core.workspace = true
 ternarygrid-icons.workspace = true
+ternarygrid-ui.workspace = true
 ternarygrid-config.workspace = true
 ternarygrid-net.workspace = true
 ternarygrid-visual.workspace = true

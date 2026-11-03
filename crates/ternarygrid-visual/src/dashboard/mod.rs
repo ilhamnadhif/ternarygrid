@@ -10,4 +10,6 @@ pub use custom::{
     show_custom_dashboard,
 };
 pub use history::{DEFAULT_CAPACITY, DashboardState, MetricHistory, WindowStats};
-pub use view::{DashboardLayout, DashboardResponse, WindowLength, show_dashboard};
+pub use view::{
+    DashboardLayout, DashboardResponse, WindowLength, show_dashboard, show_dashboard_with,
+};

@@ -5,12 +5,17 @@
 use crate::backend::{Backend, Job};
 use crate::conn::ConnectionManager;
 use crate::conn::session::SessionHandle;
+use crate::dialogs::{self, Column, W, table};
 use crate::tabs::Tab;
 use crate::toasts::Toasts;
 use egui::RichText;
 use egui_dock::DockState;
 use egui_phosphor::regular as icon;
+use std::cell::Cell;
 use ternarygrid_core::{DbResult, tr, trf};
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts::Dialog;
+use ternarygrid_ui::style;
 
 /// One session with uncommitted work.
 #[derive(Clone)]
@@ -95,56 +100,80 @@ impl PendingTxDialog {
             return;
         }
         let mut open = true;
-        let mut action: Option<(Option<usize>, bool)> = None;
-        egui::Window::new(format!("{} {}", icon::QUEUE, tr("Pending transactions")))
-            .id(egui::Id::new("pending_transactions"))
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(560.0)
-            .show(ctx, |ui| {
+        let action: Cell<Option<(Option<usize>, bool)>> = Cell::new(None);
+        let busy = self.busy();
+        let statements: usize = items.iter().map(|p| p.statements).sum();
+        let summary = match (statements, items.len()) {
+            (1, 1) => tr("1 statement in 1 transaction").to_string(),
+            (s, 1) => trf("{} statements in 1 transaction", &[&s]),
+            (s, n) => trf("{} statements in {} transactions", &[&s, &n]),
+        };
+        let (resp, _) = Dialog::new(tr("Pending transactions")).icon(icon::PAUSE).width(760.0).body_padding(egui::Margin::symmetric(20, 16)).show_window(
+            ctx,
+            egui::Id::new("pending_transactions"),
+            &mut open,
+            None,
+            |ui| {
+                let p = style::pal(ui);
                 if items.is_empty() {
-                    ui.weak(tr("No connection has uncommitted changes."));
+                    dialogs::muted(ui, tr("No connection has uncommitted changes."));
                     return;
                 }
-                egui::Grid::new("pending_tx_grid").num_columns(5).striped(true).spacing([12.0, 6.0]).show(ui, |ui| {
-                    for h in [tr("Connection"), tr("Opened by"), tr("Statements"), tr("Since"), ""] {
-                        ui.label(RichText::new(h).strong());
-                    }
-                    ui.end_row();
-                    for (i, p) in items.iter().enumerate() {
-                        ui.label(&p.conn_name);
-                        ui.label(&p.owner);
-                        ui.label(p.statements.to_string());
-                        ui.label(p.since.map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_else(|| "—".into()));
-                        ui.horizontal(|ui| {
-                            ui.add_enabled_ui(!self.busy(), |ui| {
-                                if ui.button((ternarygrid_icons::ic(icon::CHECK_CIRCLE), tr("Commit"))).clicked() {
-                                    action = Some((Some(i), true));
+                let cols = [
+                    Column::new(tr("Connection"), W::Fr(1.1)),
+                    Column::new(tr("Opened by"), W::Fr(1.5)),
+                    Column::new(tr("Statements"), W::Fr(0.8)).right(),
+                    Column::new(tr("Since"), W::Fr(0.8)),
+                    Column::new("", W::Px(200.0)),
+                ];
+                let max_h = (ui.ctx().content_rect().height() - 300.0).max(120.0);
+                table(ui, "pending_tx", &cols, items.len(), 40.0, max_h, |ui, row, col| {
+                    let Some(i) = row else { return };
+                    let tx = &items[i];
+                    match col {
+                        0 => {
+                            ui.label(RichText::new(&tx.conn_name).color(p.text));
+                        }
+                        1 => {
+                            ui.label(RichText::new(&tx.owner).color(p.text));
+                        }
+                        2 => {
+                            ui.label(RichText::new(tx.statements.to_string()).color(p.text));
+                        }
+                        3 => {
+                            ui.label(RichText::new(tx.since.map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_else(|| "—".into())).color(p.text));
+                        }
+                        _ => {
+                            ui.add_enabled_ui(!busy, |ui| {
+                                if kit::button_ex(ui, Kind::Secondary, Some(icon::CHECK_CIRCLE), tr("Commit"), true).clicked() {
+                                    action.set(Some((Some(i), true)));
                                 }
-                                if ui.button((ternarygrid_icons::ic(icon::ARROW_U_UP_LEFT), tr("Rollback"))).clicked() {
-                                    action = Some((Some(i), false));
+                                if kit::button_ex(ui, Kind::Ghost, Some(icon::ARROW_LEFT), tr("Rollback"), true).clicked() {
+                                    action.set(Some((Some(i), false)));
                                 }
                             });
-                        });
-                        ui.end_row();
+                        }
                     }
                 });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!self.busy(), |ui| {
-                        if ui.button(tr("Commit all")).clicked() {
-                            action = Some((None, true));
-                        }
-                        if ui.button(tr("Rollback all")).clicked() {
-                            action = Some((None, false));
-                        }
-                    });
-                    if self.busy() {
-                        ui.spinner();
+            },
+            Some(&mut |ui: &mut egui::Ui| {
+                ui.add_enabled_ui(!busy && !items.is_empty(), |ui| {
+                    if kit::secondary(ui, None, tr("Commit all")).clicked() {
+                        action.set(Some((None, true)));
+                    }
+                    if kit::button_ex(ui, Kind::Ghost, None, tr("Rollback all"), false).clicked() {
+                        action.set(Some((None, false)));
                     }
                 });
-            });
-        if let Some((which, commit)) = action {
+                if busy {
+                    ui.add(egui::Spinner::new().size(14.0));
+                }
+                if !items.is_empty() {
+                    dialogs::right(ui, |ui| ui.label(RichText::new(&summary).size(12.0).color(style::pal(ui).text_faint)));
+                }
+            }),
+        );
+        if let Some((which, commit)) = action.get() {
             match which {
                 Some(i) => self.end(backend, &items[i], commit),
                 None => {
@@ -157,6 +186,7 @@ impl PendingTxDialog {
         if !self.jobs.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
-        self.open = open;
+        dialogs::dim_behind(ctx, resp.layer);
+        self.open = open && !crate::widgets::escape_closes(ctx, resp.layer);
     }
 }

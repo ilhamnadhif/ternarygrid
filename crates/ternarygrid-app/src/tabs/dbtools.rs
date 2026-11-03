@@ -7,6 +7,7 @@
 mod backup;
 mod debugger;
 mod fdw;
+pub(crate) mod look;
 mod maintenance;
 mod password;
 
@@ -114,25 +115,23 @@ impl ToolSession {
         match self.state(cx, conn, label) {
             SessionState::Ready(s) => Some(s),
             SessionState::Opening => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak(tr("Opening a session…"));
-                });
+                ui.add_space(8.0);
+                ternarygrid_ui::parts::spinner_label(ui, tr("Opening a session…"));
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
                 None
             }
             SessionState::Closed => {
-                ui.horizontal(|ui| {
-                    ui.label(tr("The connection is closed."));
-                    if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
+                ui.add_space(8.0);
+                look::note_with(ui, ternarygrid_ui::parts::Tone::Info, None, tr("The connection is closed."), |ui| {
+                    if ternarygrid_ui::kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Connect")).clicked() {
                         cx.push(AppCommand::Connect(conn.to_string()));
                     }
                 });
                 None
             }
             SessionState::Failed(e) => {
-                crate::widgets::error_box(ui, &e);
-                if ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Retry"))).clicked() {
+                look::error(ui, &e);
+                if ternarygrid_ui::kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked() {
                     self.session = Loadable::NotLoaded;
                 }
                 None
@@ -309,15 +308,19 @@ pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash:
     let current =
         cx.conns.config(value).map(|c| c.name.clone()).unwrap_or_else(|| if value.is_empty() { tr("Choose…").to_string() } else { tr("(missing connection)").to_string() });
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).selected_text(current).width(width).show_ui(ui, |ui| {
-        for c in cx.conns.configs() {
-            let label = format!("{} {}", crate::nav::db_icon(c.kind), c.name);
-            if ui.selectable_label(*value == c.id, label).clicked() && *value != c.id {
-                *value = c.id.clone();
-                changed = true;
+    egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(width).show_ui(
+        ui,
+        |ui| {
+            ternarygrid_ui::kit::menu_look(ui, width);
+            for c in cx.conns.configs() {
+                let label = format!("{} {}", crate::nav::db_icon(c.kind), c.name);
+                if crate::tabs::transfer::wizard::choice(ui, *value == c.id, &label) && *value != c.id {
+                    *value = c.id.clone();
+                    changed = true;
+                }
             }
-        }
-    });
+        },
+    );
     changed
 }
 
@@ -328,13 +331,14 @@ pub(crate) fn schema_field(ui: &mut Ui, cx: &mut AppContext, id: impl std::hash:
         let backend = cx.backend;
         if let Some(live) = cx.conns.live_mut(conn) {
             let r = ui.menu_button(icon::CARET_DOWN, |ui| {
+                ternarygrid_ui::kit::menu_look(ui, 200.0);
                 let main = live.main.clone();
                 live.meta.request_schemas(backend, &main, None);
                 match live.meta.schemas_of(None).get() {
                     Some(list) => {
                         egui::ScrollArea::vertical().id_salt((id, "schemas")).max_height(280.0).show(ui, |ui| {
                             for s in list.iter().filter(|s| !s.is_system) {
-                                if ui.selectable_label(*value == s.name, &s.name).clicked() {
+                                if crate::tabs::transfer::wizard::choice(ui, *value == s.name, &s.name) {
                                     *value = s.name.clone();
                                     changed = true;
                                     ui.close();

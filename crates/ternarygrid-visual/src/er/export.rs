@@ -4,8 +4,8 @@
 
 use super::diagram::{ErDiagram, Notation};
 use super::geometry::{
-    COMMENT_FONT, COMMENT_HEIGHT, CORNER_RADIUS, HEADER_FONT, HEADER_HEIGHT, PAD_X, ROW_FONT,
-    ROW_HEIGHT, SCHEMA_FONT,
+    COMMENT_FONT, COMMENT_HEIGHT, CORNER_RADIUS, HEADER_FONT, HEADER_HEIGHT, HEADER_ICON_WIDTH,
+    PAD_X, ROW_FONT, ROW_HEIGHT, SCHEMA_FONT,
 };
 use super::model::{DiffStatus, ErRelation, ErTable, ErTableKind};
 use super::scene::{ErScene, Route};
@@ -22,7 +22,8 @@ const MARGIN: f32 = 24.0;
 const MAX_PIXELS: f32 = 64.0e6;
 const MAX_SIDE: f32 = 30_000.0;
 
-/// Fixed light palette of exported images (independent of the UI theme).
+/// Fixed light palette of exported images (independent of the UI theme): the light
+/// design tokens of the canvas, the relation lines a step darker so that they print.
 struct ExportColors {
     background: Color32,
     box_fill: Color32,
@@ -42,16 +43,16 @@ struct ExportColors {
 const EXPORT: ExportColors = ExportColors {
     background: Color32::WHITE,
     box_fill: Color32::WHITE,
-    box_stroke: Color32::from_rgb(0xb4, 0xb2, 0xa8),
-    header_table: Color32::from_rgb(0xe6, 0xee, 0xf9),
-    header_view: Color32::from_rgb(0xee, 0xeb, 0xfb),
-    text: Color32::from_rgb(0x0b, 0x0b, 0x0b),
-    weak: Color32::from_rgb(0x89, 0x87, 0x81),
-    type_text: Color32::from_rgb(0x52, 0x51, 0x4e),
-    pk: Color32::from_rgb(0xc9, 0x85, 0x00),
-    fk: Color32::from_rgb(0x2a, 0x78, 0xd6),
-    line: Color32::from_rgb(0x52, 0x51, 0x4e),
-    note_fill: Color32::from_rgb(0xff, 0xf6, 0xc8),
+    box_stroke: Color32::from_rgb(0xcf, 0xcf, 0xd8),
+    header_table: Color32::from_rgb(0xe3, 0xf2, 0xef),
+    header_view: Color32::from_rgb(0xed, 0xe7, 0xfb),
+    text: Color32::from_rgb(0x1a, 0x1a, 0x20),
+    weak: Color32::from_rgb(0x85, 0x85, 0x8f),
+    type_text: Color32::from_rgb(0x68, 0x68, 0x74),
+    pk: Color32::from_rgb(0x9a, 0x67, 0x00),
+    fk: Color32::from_rgb(0x25, 0x63, 0xdc),
+    line: Color32::from_rgb(0x85, 0x85, 0x8f),
+    note_fill: Color32::from_rgb(0xff, 0xf4, 0xc2),
     note_stroke: Color32::from_rgb(0xe3, 0xcd, 0x6c),
 };
 
@@ -284,7 +285,7 @@ fn table_box(
     } else {
         table_icon(doc, icon_c, EXPORT.type_text);
     }
-    let name_x = rect.left() + PAD_X + 18.0;
+    let name_x = rect.left() + PAD_X + HEADER_ICON_WIDTH;
     let schema_w = t
         .schema
         .as_deref()

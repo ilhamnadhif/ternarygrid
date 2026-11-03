@@ -7,6 +7,7 @@ use super::{SessionState, ToolSession};
 use crate::backend::{Job, Loadable};
 use crate::cx::AppContext;
 use crate::tabs::TabView;
+use crate::tabs::dbtools::look;
 use egui::{Align2, RichText, Ui};
 use egui_phosphor::regular as icon;
 use std::collections::BTreeSet;
@@ -18,6 +19,8 @@ use ternarygrid_core::ddl::RoutineDef;
 use ternarygrid_core::error::ErrorKind;
 use ternarygrid_core::meta::{ObjectKind, ObjectRef};
 use ternarygrid_core::{DbResult, Dialect, tr, trf};
+use ternarygrid_editor::TokenStyle;
+use ternarygrid_ui::{kit, parts};
 
 type Shared = Arc<tokio::sync::Mutex<Box<dyn DebugSession>>>;
 
@@ -204,6 +207,12 @@ pub struct DebuggerTab {
     scroll_to: Option<u32>,
     visible: Range<usize>,
     runtime: Option<tokio::runtime::Handle>,
+    /// Byte offset of each line of `source`.
+    line_starts: Vec<usize>,
+    /// Highlighting of `source` (the connection's dialect).
+    tokens: Vec<(Range<usize>, TokenStyle)>,
+    /// Length of the source `tokens` were made for.
+    tokens_for: Option<usize>,
 }
 
 impl DebuggerTab {
@@ -235,6 +244,9 @@ impl DebuggerTab {
             scroll_to: None,
             visible: 0..0,
             runtime: None,
+            line_starts: Vec::new(),
+            tokens: Vec::new(),
+            tokens_for: None,
         }
     }
 
@@ -275,8 +287,11 @@ impl DebuggerTab {
 
     fn set_source(&mut self, source: String, lines_ok: bool) {
         self.max_cols = source.lines().map(|l| l.chars().count() + l.matches('\t').count() * 3).max().unwrap_or(0);
+        self.line_starts = std::iter::once(0).chain(source.match_indices('\n').map(|(i, _)| i + 1)).collect();
         self.source = source;
         self.lines_ok = lines_ok;
+        self.tokens.clear();
+        self.tokens_for = None;
     }
 
     fn push_messages(&mut self, msgs: impl IntoIterator<Item = String>) {
@@ -538,41 +553,56 @@ impl DebuggerTab {
     fn toolbar(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let busy = self.is_busy();
         let stopped = self.stopped();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} {}", crate::nav::kind_icon(self.routine.kind), self.routine.display_path())).strong());
+        let p = ternarygrid_ui::pal(ui);
+        parts::toolbar(ui, |ui| {
+            ui.label(RichText::new(crate::nav::kind_icon(self.routine.kind)).font(ternarygrid_ui::style::icon_font(15.0)).color(p.text_muted));
+            // The signature as in the design: "public.recalc_order_total(bigint)".
+            let types: Vec<&str> = self.args.iter().filter(|a| !a.mode.eq_ignore_ascii_case("OUT")).map(|a| a.data_type.as_str()).collect();
+            let title = if types.is_empty() { self.routine.display_path() } else { format!("{}({})", self.routine.display_path(), types.join(", ")) };
+            ternarygrid_ui::kit::semibold_label(ui, &title, 13.0, p.text);
             if let Loadable::Loaded(d) = &self.def
                 && let Some(l) = &d.language
             {
-                ui.weak(l.as_str());
+                ui.label(RichText::new(l.as_str()).size(12.0).color(p.text_faint));
             }
-            ui.separator();
+            kit::vdivider(ui, 18.0);
             let can_start = self.dbg.is_none() && !busy && self.unsupported.is_none();
-            let start_label = if self.state.as_ref().is_some_and(|s| s.finished) { tr("Restart") } else { tr("Start") };
-            if ui.add_enabled(can_start, egui::Button::new(format!("{} {start_label}", icon::PLAY))).clicked() {
+            let clicked = ui
+                .add_enabled_ui(can_start, |ui| {
+                    if self.state.is_some() {
+                        look::small(ui, kit::Kind::Ghost, icon::ARROW_CLOCKWISE, tr("Restart"))
+                    } else {
+                        look::small(ui, kit::Kind::Primary, icon::PLAY, tr("Start"))
+                    }
+                })
+                .inner
+                .clicked();
+            if clicked {
                 self.start(cx);
             }
-            if ui.add_enabled(stopped, egui::Button::new((ternarygrid_icons::ic(icon::ARROW_ELBOW_DOWN_RIGHT), tr("Step into")))).on_hover_text("F11").clicked() {
-                self.command(cx, Command::StepInto);
-            }
-            if ui.add_enabled(stopped, egui::Button::new((ternarygrid_icons::ic(icon::ARROW_ARC_RIGHT), tr("Step over")))).on_hover_text("F10").clicked() {
-                self.command(cx, Command::StepOver);
-            }
-            if ui.add_enabled(stopped, egui::Button::new((ternarygrid_icons::ic(icon::FAST_FORWARD), tr("Resume")))).on_hover_text("F8").clicked() {
-                self.command(cx, Command::Resume);
-            }
-            if ui.add_enabled(self.dbg.is_some(), egui::Button::new((ternarygrid_icons::ic(icon::STOP), tr("Abort")))).clicked() {
+            ui.add_enabled_ui(stopped, |ui| {
+                if kit::icon_button(ui, icon::ARROW_ELBOW_DOWN_RIGHT, &format!("{} (F11)", tr("Step into"))).clicked() {
+                    self.command(cx, Command::StepInto);
+                }
+                if kit::icon_button(ui, icon::ARROW_ARC_RIGHT, &format!("{} (F10)", tr("Step over"))).clicked() {
+                    self.command(cx, Command::StepOver);
+                }
+                if look::small(ui, kit::Kind::Secondary, icon::FAST_FORWARD, tr("Resume")).on_hover_text("F8").clicked() {
+                    self.command(cx, Command::Resume);
+                }
+            });
+            if ui.add_enabled_ui(self.dbg.is_some(), |ui| look::small(ui, kit::Kind::Danger, icon::STOP, tr("Abort"))).inner.clicked() {
                 self.abort(cx);
             }
-            ui.separator();
+            kit::vdivider(ui, 18.0);
             if busy {
-                ui.spinner();
-                ui.weak(if self.start_job.is_some() || self.pending_start { tr("Waiting for the routine…") } else { tr("Running…") });
+                parts::spinner_label(ui, if self.start_job.is_some() || self.pending_start { tr("Waiting for the routine…") } else { tr("Running…") });
                 ui.ctx().request_repaint_after(Duration::from_millis(150));
             } else if let Some(s) = &self.state {
                 if s.finished {
-                    ui.weak(tr("Finished"));
+                    ui.label(RichText::new(tr("Finished")).color(p.text_muted));
                 } else if let Some(l) = s.line {
-                    ui.label(trf("Stopped at line {}", &[&l]));
+                    look::tone(ui, &trf("Stopped at line {}", &[&l]), p.warn, true);
                 }
             }
         });
@@ -589,100 +619,131 @@ impl DebuggerTab {
     }
 
     fn arguments_ui(&mut self, ui: &mut Ui) {
-        ui.strong(tr("Arguments"));
+        look::title(ui, tr("Arguments"));
         if self.args.is_empty() {
-            ui.weak(if self.definition_loaded() { tr("The routine has no arguments.") } else { tr("Loading…") });
+            look::faint(ui, if self.definition_loaded() { tr("The routine has no arguments.") } else { tr("Loading…") });
             return;
         }
         let editable = self.dbg.is_none() && !self.is_busy();
+        let p = ternarygrid_ui::pal(ui);
+        let id = ("dbg_args", self.conn.clone(), self.routine.name.clone());
+        let args = &mut self.args;
         ui.add_enabled_ui(editable, |ui| {
-            egui::Grid::new(("dbg_args", &self.conn, &self.routine.name)).num_columns(4).striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
-                ui.weak(tr("Name"));
-                ui.weak(tr("Value"));
-                ui.weak("NULL");
-                ui.weak(tr("Expression"));
-                ui.end_row();
-                for (i, a) in self.args.iter_mut().enumerate() {
-                    let mode = if a.mode == "IN" { String::new() } else { format!("{} ", a.mode) };
-                    let name = if a.name.is_empty() { format!("${}", i + 1) } else { a.name.clone() };
-                    ui.label(format!("{mode}{name}")).on_hover_text(a.data_type.as_str());
-                    ui.add_enabled(!a.null, egui::TextEdit::singleline(&mut a.value).desired_width(160.0).hint_text(a.data_type.as_str()));
-                    ui.checkbox(&mut a.null, "");
-                    ui.checkbox(&mut a.expression, "").on_hover_text(tr("Use the value as an SQL expression instead of a literal"));
-                    ui.end_row();
+            let n = args.len();
+            look::widget_table(ui, id, &[tr("Name"), tr("Value"), "NULL", tr("Expr.")], &[102.0, 102.0, 44.0, 44.0], n, 30.0, |ui, r, c| {
+                let a = &mut args[r];
+                match c {
+                    0 => {
+                        let mode = if a.mode == "IN" { String::new() } else { format!("{} ", a.mode) };
+                        let name = if a.name.is_empty() { format!("${}", r + 1) } else { a.name.clone() };
+                        ui.add(egui::Label::new(RichText::new(format!("{mode}{name}")).font(look::mono(12.0)).color(p.text)).truncate()).on_hover_text(a.data_type.as_str());
+                    }
+                    1 => {
+                        let w = (ui.available_width() - 8.0).max(40.0);
+                        ui.add_enabled(!a.null, egui::TextEdit::singleline(&mut a.value).desired_width(w).font(look::mono(12.0)).hint_text(a.data_type.as_str()));
+                    }
+                    2 => {
+                        look::checkbox(ui, &mut a.null, "").on_hover_text("NULL");
+                    }
+                    _ => {
+                        look::checkbox(ui, &mut a.expression, "").on_hover_text(tr("Use the value as an SQL expression instead of a literal"));
+                    }
                 }
             });
         });
+    }
+
+    /// The highlighted text of line `i` (`start..end` in the source).
+    fn line_job(&self, i: usize, theme: &ternarygrid_editor::EditorTheme, font: &egui::FontId) -> egui::text::LayoutJob {
+        let start = self.line_starts.get(i).copied().unwrap_or(0);
+        let end = self.line_starts.get(i + 1).map(|e| e.saturating_sub(1)).unwrap_or(self.source.len()).max(start);
+        let line = &self.source[start..end];
+        let mut job = egui::text::LayoutJob::default();
+        let fmt = |style| egui::TextFormat { font_id: font.clone(), color: theme.token_color(style), ..Default::default() };
+        let mut pos = start;
+        let push = |job: &mut egui::text::LayoutJob, from: usize, to: usize, style| {
+            if to > from {
+                job.append(&self.source[from..to].replace('\t', "    "), 0.0, fmt(style));
+            }
+        };
+        for (r, style) in self.tokens.iter().filter(|(r, _)| r.end > start && r.start < end) {
+            let (a, b) = (r.start.max(start), r.end.min(end));
+            if a < pos || !self.source.is_char_boundary(a) || !self.source.is_char_boundary(b) {
+                continue;
+            }
+            push(&mut job, pos, a, TokenStyle::Plain);
+            push(&mut job, a, b, *style);
+            pos = b;
+        }
+        push(&mut job, pos, end.max(pos), TokenStyle::Plain);
+        if line.is_empty() {
+            job.append(" ", 0.0, fmt(TokenStyle::Plain));
+        }
+        job
     }
 
     /// Source with line numbers; returns the line whose gutter was clicked.
     fn source_ui(&mut self, ui: &mut Ui) -> Option<u32> {
         if self.source.is_empty() {
             if !self.definition_loaded() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak(tr("Loading the routine…"));
-                });
+                egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| parts::spinner_label(ui, tr("Loading the routine…")));
             }
             return None;
         }
+        let p = ternarygrid_ui::pal(ui);
         if !self.lines_ok {
-            ui.weak(tr("Breakpoints can be set once the debugging session has started."));
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| look::faint(ui, tr("Breakpoints can be set once the debugging session has started.")));
         }
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let row_h = (ui.text_style_height(&egui::TextStyle::Monospace) + 3.0).round();
+        let font = look::mono(13.0);
+        let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
+        let row_h = 21.0;
         let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0')).max(1.0);
-        let lines: Vec<&str> = self.source.split('\n').collect();
-        let digits = lines.len().to_string().len().max(2);
-        let gutter_w = 22.0 + digits as f32 * char_w + 8.0;
-        let width = gutter_w + 8.0 + self.max_cols as f32 * char_w + 24.0;
+        let n = self.line_starts.len().max(1);
+        let digits = n.to_string().len().max(2);
+        let number_w = (digits as f32 * char_w).max(18.0) + 14.0;
+        let gutter_w = 18.0 + 18.0 + number_w;
+        let width = gutter_w + self.max_cols as f32 * char_w + 24.0;
         let current = self.state.as_ref().filter(|s| !s.finished).and_then(|s| s.line);
-        let dark = ui.visuals().dark_mode;
-        let highlight = crate::theme::tint(crate::theme::warning_color(dark), dark);
-        let bp_color = crate::theme::error_color(dark);
-        let arrow = crate::theme::warning_color(dark);
-        let gutter_bg = ui.visuals().faint_bg_color;
-        let weak = ui.visuals().weak_text_color();
-        let text = ui.visuals().text_color();
+        let current_bg = ternarygrid_ui::pal(ui).modified;
+        let bp_color = egui::Color32::from_rgb(0xf2, 0x66, 0x5a);
         let can_toggle = self.lines_ok;
         let mut toggled = None;
         let mut visible = 0..0;
-        let breakpoints = &self.breakpoints;
         let scroll_to = self.scroll_to.take();
+        let jobs: Vec<egui::text::LayoutJob> = (0..n).map(|i| self.line_job(i, &theme, &font)).collect();
+        let breakpoints = &self.breakpoints;
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut area = egui::ScrollArea::both().id_salt(("dbg_source", &self.conn, &self.routine.name)).auto_shrink([false, false]);
             if let Some(l) = scroll_to {
                 area = area.vertical_scroll_offset((l as f32 - 6.0).max(0.0) * row_h);
             }
-            area.show_rows(ui, row_h, lines.len(), |ui, range| {
+            ui.add_space(10.0);
+            area.show_rows(ui, row_h, n, |ui, range| {
                 visible = range.clone();
                 for i in range {
                     let line_no = i as u32 + 1;
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width.max(ui.available_width()), row_h), egui::Sense::click());
                     let painter = ui.painter();
                     if current == Some(line_no) {
-                        painter.rect_filled(rect, 0.0, highlight);
+                        painter.rect_filled(rect, 0.0, current_bg);
                     }
-                    let gutter = egui::Rect::from_min_size(rect.min, egui::vec2(gutter_w, row_h));
-                    painter.rect_filled(gutter, 0.0, gutter_bg);
                     let cy = rect.center().y;
-                    let marker = egui::pos2(gutter.left() + 11.0, cy);
                     if breakpoints.contains(&line_no) {
-                        painter.circle_filled(marker, (row_h * 0.3).min(5.5), bp_color);
+                        painter.circle_filled(egui::pos2(rect.left() + 9.0, cy), 4.5, bp_color);
                     }
                     if current == Some(line_no) {
-                        let s = (row_h * 0.3).min(5.0);
-                        let pts = vec![egui::pos2(marker.x - s, cy - s), egui::pos2(marker.x + s, cy), egui::pos2(marker.x - s, cy + s)];
-                        painter.add(egui::Shape::convex_polygon(pts, arrow, egui::Stroke::NONE));
+                        painter.text(egui::pos2(rect.left() + 27.0, cy), Align2::CENTER_CENTER, icon::ARROW_RIGHT, ternarygrid_ui::style::icon_font(13.0), p.warn);
                     }
-                    painter.text(egui::pos2(gutter.right() - 6.0, cy), Align2::RIGHT_CENTER, line_no.to_string(), font.clone(), weak);
-                    painter.text(egui::pos2(gutter.right() + 8.0, cy), Align2::LEFT_CENTER, lines[i].replace('\t', "    "), font.clone(), text);
-                    let in_gutter = resp.hover_pos().is_some_and(|p| p.x <= gutter.right());
+                    painter.text(egui::pos2(rect.left() + gutter_w - 14.0, cy), Align2::RIGHT_CENTER, line_no.to_string(), font.clone(), p.text_faint);
+                    let galley = ui.fonts_mut(|f| f.layout_job(jobs[i].clone()));
+                    ui.painter().galley(egui::pos2(rect.left() + gutter_w, cy - galley.size().y / 2.0), galley, p.text);
+                    let gutter = rect.left() + gutter_w;
+                    let in_gutter = resp.hover_pos().is_some_and(|pos| pos.x <= gutter);
                     if in_gutter && can_toggle {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    if can_toggle && resp.clicked() && resp.interact_pointer_pos().is_some_and(|p| p.x <= gutter.right()) {
+                    if can_toggle && resp.clicked() && resp.interact_pointer_pos().is_some_and(|pos| pos.x <= gutter) {
                         toggled = Some(line_no);
                     }
                 }
@@ -693,65 +754,79 @@ impl DebuggerTab {
     }
 
     fn frame_ui(&mut self, ui: &mut Ui, cx: &AppContext) {
-        ui.strong(tr("Variables"));
+        let p = ternarygrid_ui::pal(ui);
+        look::title(ui, tr("Variables"));
         let editable = self.stopped();
         let mut commit: Option<(String, String)> = None;
         let mut cancel_edit = false;
-        egui::ScrollArea::vertical().id_salt(("dbg_vars", &self.conn)).max_height(ui.available_height() * 0.6).show(ui, |ui| {
-            if self.variables.is_empty() {
-                ui.weak(if self.dbg.is_some() { tr("No variables in this frame.") } else { tr("Variables appear when the routine stops.") });
-            }
-            egui::Grid::new(("dbg_vars_grid", &self.conn)).num_columns(3).striped(true).spacing([8.0, 3.0]).show(ui, |ui| {
-                for v in &self.variables {
-                    let name = if v.is_argument { format!("{} {}", icon::ARROW_RIGHT, v.name) } else { v.name.clone() };
-                    ui.label(RichText::new(name).monospace());
-                    ui.weak(v.data_type.as_str());
-                    match self.editing.as_mut() {
-                        Some((n, text)) if *n == v.name => {
-                            let r = ui.add(egui::TextEdit::singleline(text).desired_width(140.0).font(egui::TextStyle::Monospace));
-                            if r.lost_focus() {
-                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                    commit = Some((n.clone(), text.clone()));
-                                } else {
-                                    cancel_edit = true;
+        let mut start_edit: Option<(String, String)> = None;
+        if self.variables.is_empty() {
+            look::faint(ui, if self.dbg.is_some() { tr("No variables in this frame.") } else { tr("Variables appear when the routine stops.") });
+        } else {
+            let vars = &self.variables;
+            let editing = &mut self.editing;
+            let id = ("dbg_vars", self.conn.clone());
+            egui::ScrollArea::vertical().id_salt(("dbg_vars_scroll", &self.conn)).max_height(ui.available_height() * 0.6).show(ui, |ui| {
+                look::widget_table(ui, id, &[tr("Name"), tr("Type"), tr("Value")], &[117.0, 78.0, 97.0], vars.len(), 30.0, |ui, r, c| {
+                    let v = &vars[r];
+                    match c {
+                        0 => {
+                            let name = if v.is_argument { format!("→ {}", v.name) } else { v.name.clone() };
+                            ui.add(egui::Label::new(RichText::new(name).font(look::mono(12.0)).color(p.text)).truncate());
+                        }
+                        1 => {
+                            ui.add(egui::Label::new(RichText::new(v.data_type.as_str()).size(12.0).color(p.text_faint)).truncate());
+                        }
+                        _ => match editing.as_mut() {
+                            Some((n, text)) if *n == v.name => {
+                                let r = ui.add(egui::TextEdit::singleline(text).desired_width(ui.available_width() - 8.0).font(look::mono(12.0)));
+                                if r.lost_focus() {
+                                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        commit = Some((n.clone(), text.clone()));
+                                    } else {
+                                        cancel_edit = true;
+                                    }
+                                } else if !r.has_focus() {
+                                    r.request_focus();
                                 }
-                            } else if !r.has_focus() {
-                                r.request_focus();
                             }
-                        }
-                        _ => {
-                            let r = ui.add(egui::Label::new(RichText::new(&v.value).monospace()).sense(egui::Sense::click()).truncate());
-                            let r = if editable { r.on_hover_text(tr("Double-click to change the value")) } else { r };
-                            if editable && r.double_clicked() {
-                                self.editing = Some((v.name.clone(), v.value.clone()));
+                            _ => {
+                                let color = if v.value.eq_ignore_ascii_case("null") { p.text_faint } else { p.text };
+                                let r = ui.add(egui::Label::new(RichText::new(&v.value).font(look::mono(12.0)).color(color)).sense(egui::Sense::click()).truncate());
+                                let r = if editable { r.on_hover_text(tr("Double-click to change the value")) } else { r };
+                                if editable && r.double_clicked() {
+                                    start_edit = Some((v.name.clone(), v.value.clone()));
+                                }
                             }
-                        }
+                        },
                     }
-                    ui.end_row();
-                }
+                });
             });
-        });
+        }
+        if let Some(e) = start_edit {
+            self.editing = Some(e);
+        }
         if let Some((name, value)) = commit {
             self.editing = None;
             self.set_variable(cx, name, value);
         } else if cancel_edit {
             self.editing = None;
         }
-        ui.add_space(6.0);
-        ui.strong(tr("Call stack"));
+        ui.add_space(4.0);
+        look::title(ui, tr("Call stack"));
         egui::ScrollArea::vertical().id_salt(("dbg_stack", &self.conn)).show(ui, |ui| {
             if self.stack.is_empty() {
-                ui.weak("—");
+                ui.label(RichText::new("—").color(p.text_faint));
             }
             for f in &self.stack {
                 ui.horizontal(|ui| {
-                    ui.weak(format!("#{}", f.level));
-                    ui.label(RichText::new(&f.routine).monospace());
-                    ui.weak(trf("line {}", &[&f.line]));
+                    ui.label(RichText::new(format!("#{}", f.level)).size(12.0).color(p.text_faint));
+                    ui.label(RichText::new(&f.routine).font(look::mono(12.0)).color(p.text));
+                    ui.label(RichText::new(trf("line {}", &[&f.line])).size(12.0).color(p.text_faint));
                 });
                 if !f.args.is_empty() {
                     ui.indent(("dbg_frame", f.level), |ui| {
-                        ui.add(egui::Label::new(RichText::new(&f.args).small()).wrap());
+                        ui.add(egui::Label::new(RichText::new(&f.args).size(11.5).color(p.text_muted)).wrap());
                     });
                 }
             }
@@ -759,52 +834,76 @@ impl DebuggerTab {
     }
 
     fn output_ui(&mut self, ui: &mut Ui, cx: &AppContext) {
-        if let Some(e) = &self.error {
-            crate::widgets::error_box(ui, e);
-        }
+        let p = ternarygrid_ui::pal(ui);
+        let rect = ui.max_rect();
+        ui.painter().vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, p.border));
         ui.columns(2, |cols| {
-            cols[0].strong(tr("Messages"));
-            egui::ScrollArea::both().id_salt(("dbg_msgs", &self.conn)).auto_shrink([false, false]).stick_to_bottom(true).show(&mut cols[0], |ui| {
-                let dark = ui.visuals().dark_mode;
+            let ui = &mut cols[0];
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                ternarygrid_ui::kit::semibold_label(ui, tr("Messages"), 12.5, p.text);
+            });
+            egui::ScrollArea::both().id_salt(("dbg_msgs", &self.conn)).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
                 for m in &self.messages {
-                    let t = RichText::new(m).monospace();
-                    let t = if m.starts_with("ERROR") {
-                        t.color(crate::theme::error_color(dark))
+                    let color = if m.starts_with("ERROR") {
+                        p.err
                     } else if m.starts_with("WARNING") {
-                        t.color(crate::theme::warning_color(dark))
+                        p.warn
                     } else {
-                        t
+                        p.text_muted
                     };
-                    ui.add(egui::Label::new(t).extend());
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.add(egui::Label::new(RichText::new(m).font(look::mono(11.5)).color(color)).extend());
+                    });
                 }
             });
-            cols[1].strong(tr("Result"));
-            match &self.result {
-                Some(data) if !data.columns.is_empty() => {
-                    let fmt = cx.settings.results.format.clone();
-                    let headers: Vec<&str> = data.columns.iter().map(String::as_str).collect();
-                    let rows: Vec<Vec<String>> = data.rows.iter().map(|r| r.iter().map(|v| v.display(&fmt).into_owned()).collect()).collect();
-                    crate::widgets::simple_table(&mut cols[1], ("dbg_result", &self.conn), &headers, &rows, None);
+            let ui = &mut cols[1];
+            ui.add_space(10.0);
+            egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 8 }).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ternarygrid_ui::kit::semibold_label(ui, tr("Result"), 12.5, p.text);
+                match &self.result {
+                    Some(data) if !data.columns.is_empty() => {
+                        let fmt = cx.settings.results.format.clone();
+                        let headers = look::headers(&data.columns.iter().map(String::as_str).collect::<Vec<_>>());
+                        let rows: Vec<Vec<look::Cell>> = data.rows.iter().map(|r| r.iter().map(|v| look::Cell::new(v.display(&fmt).into_owned())).collect()).collect();
+                        look::table(ui, ("dbg_result", &self.conn), &headers, &rows, None);
+                    }
+                    _ => {
+                        look::faint(ui, tr("The result appears when the routine finishes."));
+                    }
                 }
-                _ => {
-                    cols[1].weak(tr("The result appears when the routine finishes."));
-                }
-            }
+            });
         });
     }
-}
 
-fn info_box(ui: &mut Ui, text: &str) {
-    let color = ui.visuals().hyperlink_color;
-    egui::Frame::group(ui.style()).stroke(egui::Stroke::new(1.0, color)).show(ui, |ui| {
-        ui.horizontal_top(|ui| {
-            ui.label(RichText::new(icon::INFO).color(color).size(18.0));
-            ui.vertical(|ui| {
-                ui.strong(tr("The routine cannot be debugged"));
-                ui.add(egui::Label::new(text).wrap().selectable(true));
-            });
-        });
-    });
+    /// Show a debugging session stopped at `line` (for screenshots): the definition, the
+    /// breakpoints, the variables, the call stack and the messages, without a server.
+    #[doc(hidden)]
+    pub fn show_sample(&mut self, def: RoutineDef, line: u32, breakpoints: &[u32], variables: Vec<DebugVariable>, stack: Vec<StackFrame>, messages: Vec<String>) {
+        let mut args = parse_arguments(&def.arguments);
+        args.retain(|a| !a.is_out());
+        for a in &mut args {
+            a.value = "10423".into();
+        }
+        self.args = args;
+        let body = routine_body(&def.definition);
+        match body {
+            Some(b) => self.set_source(b, true),
+            None => self.set_source(def.definition.clone(), true),
+        }
+        self.def = Loadable::Loaded(def);
+        self.unsupported = None;
+        self.error = None;
+        self.breakpoints = breakpoints.iter().copied().collect();
+        self.state = Some(DebugState { line: Some(line), finished: false, result: None, messages: Vec::new() });
+        self.variables = variables;
+        self.stack = stack;
+        self.messages = messages;
+    }
 }
 
 impl TabView for DebuggerTab {
@@ -824,23 +923,51 @@ impl TabView for DebuggerTab {
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll(cx);
         let conn = self.conn.clone();
-        if self.session.ui(ui, cx, &conn, "debugger").is_none() && self.dbg.is_none() && self.def.is_not_loaded() {
+        let opened = egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 0)).show(ui, |ui| self.session.ui(ui, cx, &conn, "debugger").is_some()).inner;
+        if !opened && self.dbg.is_none() && self.def.is_not_loaded() {
             return;
         }
         self.load_definition(cx);
-        self.toolbar(ui, cx);
-        if let Some(msg) = self.unsupported.clone() {
-            info_box(ui, &msg);
+        if self.tokens_for != Some(self.source.len()) {
+            let dialect = cx.conns.live(&self.conn).map(|l| l.dialect.clone());
+            if let Some(d) = dialect {
+                let lang = crate::sqllang::SqlLanguage::new(d);
+                self.tokens = ternarygrid_editor::EditorLanguage::highlight(&lang, &self.source);
+                self.tokens_for = Some(self.source.len());
+            }
         }
-        ui.separator();
+        let p = ternarygrid_ui::pal(ui);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        self.toolbar(ui, cx);
+        if self.unsupported.is_some() || self.error.is_some() {
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 10)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                if let Some(msg) = &self.unsupported {
+                    look::note(ui, parts::Tone::Info, Some(tr("The routine cannot be debugged")), msg);
+                }
+                if let Some(e) = &self.error {
+                    look::error(ui, e);
+                }
+            });
+        }
         let base = egui::Id::new(("dbg", &self.conn, &self.routine.name));
-        egui::Panel::bottom(base.with("out")).resizable(true).default_size(170.0).size_range(80.0..=f32::INFINITY).show(ui, |ui| self.output_ui(ui, cx));
-        egui::Panel::right(base.with("frame")).resizable(true).default_size(300.0).show(ui, |ui| {
-            self.arguments_ui(ui);
-            ui.separator();
-            self.frame_ui(ui, cx);
-        });
-        let toggled = egui::CentralPanel::default().show(ui, |ui| self.source_ui(ui)).inner;
+        egui::Panel::bottom(base.with("out"))
+            .resizable(true)
+            .default_size(150.0)
+            .size_range(80.0..=f32::INFINITY)
+            .frame(egui::Frame::new().fill(p.canvas))
+            .show(ui, |ui| self.output_ui(ui, cx));
+        // The design's 320 wide content with its 14 × 12 padding (348 with the padding).
+        egui::Panel::right(base.with("frame")).resizable(true).default_size(347.0).frame(egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin::symmetric(14, 12))).show(
+            ui,
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
+                self.arguments_ui(ui);
+                ui.add_space(4.0);
+                self.frame_ui(ui, cx);
+            },
+        );
+        let toggled = egui::CentralPanel::default().frame(egui::Frame::new().fill(p.surface)).show(ui, |ui| self.source_ui(ui)).inner;
         if let Some(line) = toggled {
             self.toggle_breakpoint(cx, line);
         }

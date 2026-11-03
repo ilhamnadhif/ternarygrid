@@ -280,8 +280,51 @@ async fn xml_round_trip_text() {
     let names: Vec<String> = src.columns().iter().map(|c| c.name.clone()).collect();
     // The NULL-only last row does not change the set of columns.
     assert_eq!(names, cols.iter().map(|c| c.name.clone()).collect::<Vec<_>>());
-    let back = convert_rows(drain(&mut src).await, &cols, &ConvertOptions::default());
+    // Binary detection as `run_import` sets it up: the hex the export writes
+    // (`000102ff` is valid base64 too) must not be read as base64.
+    let convert = ConvertOptions { prefer_base64: src.binary_is_base64(), ..Default::default() };
+    let back = convert_rows(drain(&mut src).await, &cols, &convert);
     assert_same_rows(&rows, &back, &cols, "xml");
+}
+
+#[tokio::test]
+async fn xml_and_dbunit_binary_through_import() {
+    // Hex texts that are valid base64 (`abcd`, `000102ff`), base64 that is valid hex (`AAEC`).
+    let cols = vec![ColumnMeta::new("id", "int8", ternarygrid_core::DataKind::Int), ColumnMeta::new("data", "bytea", ternarygrid_core::DataKind::Binary)];
+    let rows: Vec<Row> = vec![
+        vec![Value::Int(1), Value::bytes(vec![0xab, 0xcd])],
+        vec![Value::Int(2), Value::bytes(vec![0u8, 1, 2, 255])],
+        vec![Value::Int(3), Value::bytes(vec![0u8, 1, 2])],
+        vec![Value::Int(4), Value::Null],
+    ];
+    for format in [ExportFormat::Xml, ExportFormat::DbUnit] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.xml");
+        export_to(format, &ExportOptions::default(), &path, cols.clone(), rows.clone(), None).await;
+        let mut session = SqliteSession::memory(sqlite_dialect());
+        session.exec_batch("CREATE TABLE t (id INTEGER, data BLOB)");
+        let mut src = XmlSource::open(&path, XmlReadOptions::default()).unwrap();
+        let mut mapping = ImportMapping::new(ternarygrid_core::ObjectRef::table(None, "t"));
+        mapping.columns =
+            vec![ColumnMapping::new(0, "id").typed("INTEGER", ternarygrid_core::DataKind::Int), ColumnMapping::new(1, "data").typed("BLOB", ternarygrid_core::DataKind::Binary)];
+        let summary = run_import(&mut src, &mut session, &mapping, &Progress::new(), &CancellationToken::new()).await.unwrap();
+        assert_eq!(summary.rows_written, 4, "{format:?}");
+        assert_eq!(select(&session.conn, "SELECT id, data FROM t ORDER BY id"), rows, "{format:?}");
+    }
+}
+
+#[tokio::test]
+async fn csv_numeric_null_marker() {
+    // With `0` as NULL marker, the integer 0 must be quoted to stay a number.
+    let cols = vec![ColumnMeta::new("n", "int8", ternarygrid_core::DataKind::Int)];
+    let rows: Vec<Row> = vec![vec![Value::Int(0)], vec![Value::Null], vec![Value::Int(-1)], vec![Value::UInt(0)]];
+    let mut o = ExportOptions::default();
+    o.csv.null_string = "0".into();
+    let text = export_string(ExportFormat::Csv, &o, cols.clone(), rows.clone(), None, None).await;
+    let read = CsvReadOptions { null_string: "0".into(), ..Default::default() };
+    let mut src = CsvSource::from_reader(std::io::Cursor::new(text.clone().into_bytes()), read).unwrap();
+    let back = convert_rows(drain(&mut src).await, &cols, &ConvertOptions::default());
+    assert_eq!(back, vec![vec![Value::Int(0)], vec![Value::Null], vec![Value::Int(-1)], vec![Value::Int(0)]], "{text}");
 }
 
 #[test]

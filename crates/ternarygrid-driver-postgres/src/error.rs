@@ -96,9 +96,7 @@ pub(crate) fn map_error(err: &tokio_postgres::Error) -> DbError {
         }
         return e;
     }
-    let kind = if text.starts_with("error performing TLS handshake") {
-        ErrorKind::Tls
-    } else if text.starts_with("authentication error") {
+    let kind = if text.starts_with("authentication error") {
         ErrorKind::Auth
     } else if text.starts_with("invalid configuration") || text.starts_with("invalid connection string") {
         if text.contains("password missing") { ErrorKind::Auth } else { ErrorKind::Config }

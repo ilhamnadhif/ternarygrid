@@ -85,7 +85,10 @@ impl CsvSink {
             opts.delimiter.clone()
         };
         let canonical = options.values.is_canonical();
-        let int_fast_path = canonical && opts.quote_mode != QuoteMode::Always && !delimiter.chars().any(|c| c.is_ascii_digit() || c == '-');
+        // Integers need no quoting check unless the delimiter or the NULL marker
+        // (`0`, `-1` ...) could be mistaken for one of them.
+        let numeric_null = !opts.null_string.is_empty() && opts.null_string.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '+');
+        let int_fast_path = canonical && opts.quote_mode != QuoteMode::Always && !numeric_null && !delimiter.chars().any(|c| c.is_ascii_digit() || c == '-');
         CsvSink {
             out,
             style: FieldStyle { delimiter, quote: opts.quote_char, mode: opts.quote_mode, escape: opts.escape, null_string: opts.null_string.clone() },

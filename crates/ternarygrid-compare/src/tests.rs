@@ -961,6 +961,35 @@ mod liquibase {
     }
 
     #[test]
+    fn whole_table_steps_keep_key_index_and_foreign_key_changes() {
+        let src = shop("app");
+        let tgt = drifted();
+        let d = schema_diff(&src, &tgt, &CompareOptions::default());
+        let whole = ScriptOptions { alter_mode: AlterMode::WholeTable, ..ScriptOptions::full_sync() };
+        let xml = liquibase_changelog(&d, &src, &tgt, &LiquibaseOptions { script: whole, ..Default::default() });
+        let (counts, _) = parse(&xml);
+        // orders: idx_orders_status replaced by idx_orders_user, fk_orders_user and the check changed
+        assert!(xml.contains("<dropIndex indexName=\"idx_orders_status\" tableName=\"orders\""), "{xml}");
+        assert!(xml.contains("<createIndex indexName=\"idx_orders_user\" tableName=\"orders\""), "{xml}");
+        assert_eq!(counts.get("dropIndex"), Some(&1), "{xml}");
+        assert_eq!(counts.get("createIndex").copied().unwrap_or(0), 2, "idx_orders_user and the new table's index: {xml}");
+        let at = |needle: &str| xml.find(needle).unwrap_or_else(|| panic!("{needle} in\n{xml}"));
+        assert!(
+            at("<dropForeignKeyConstraint baseTableName=\"orders\" baseTableSchemaName=\"prod\" constraintName=\"fk_orders_user\"")
+                < at("<addForeignKeyConstraint constraintName=\"fk_orders_user\"")
+        );
+        assert!(at("DROP CONSTRAINT orders_total_check") < at("ADD CONSTRAINT orders_total_check CHECK ((total >= (0)::numeric))"));
+        // drops come before the column changes of the table, adds after them
+        assert!(at("<dropIndex indexName=\"idx_orders_status\"") < at("<addDefaultValue tableName=\"orders\""));
+        assert!(at("<addDefaultValue tableName=\"orders\"") < at("<createIndex indexName=\"idx_orders_user\""));
+        // granular plans have their own steps: nothing is emitted twice
+        let granular = liquibase_changelog(&d, &src, &tgt, &LiquibaseOptions { script: ScriptOptions::full_sync(), ..Default::default() });
+        let (gc, _) = parse(&granular);
+        assert_eq!(gc.get("dropIndex"), Some(&1), "{granular}");
+        assert_eq!(gc.get("dropForeignKeyConstraint"), counts.get("dropForeignKeyConstraint"), "{granular}");
+    }
+
+    #[test]
     fn invalid_characters_are_replaced() {
         let mut src = shop("app");
         src.views[0].definition.push_str(" -- \u{1} ]]> end");
@@ -985,4 +1014,60 @@ fn write_samples() {
     std::fs::write(format!("{dir}/changelog.xml"), liquibase_changelog(&d, &src, &tgt, &opts)).unwrap();
     let st = migration_script(&d, &src, &tgt, &GenericDialect::new(), &ScriptOptions { wrap_in_transaction: true, ..ScriptOptions::full_sync() });
     std::fs::write(format!("{dir}/migration.sql"), st.join(";\n\n") + ";\n").unwrap();
+}
+
+#[test]
+fn simulation_resolves_table_names_like_the_analysis() {
+    // the target catalog spells referenced tables in another case than the tables
+    let src = shop("app");
+    let mut tgt = shop("prod");
+    table(&mut tgt, "orders").foreign_keys[0].ref_table = "USERS".into();
+    table(&mut tgt, "order_items").foreign_keys[0].ref_table = "Orders".into();
+    table(&mut tgt, "users").primary_key = Some(key("users_pk_old", &["id"]));
+    table(&mut tgt, "orders").columns.push(col("extra", "integer"));
+    let ci = CompareOptions { ignore_identifier_case: true, ..Default::default() };
+    // the foreign key on USERS is dropped and re-added around the primary key change
+    let plan = self_check(&src, &tgt, &ci, &ScriptOptions::full_sync(), &GenericDialect::new());
+    let st = plan.statements();
+    assert!(pos(&st, "DROP CONSTRAINT fk_orders_user") < pos(&st, "DROP CONSTRAINT users_pk_old"));
+    // and the simulation sees that the primary key is referenced through the other spelling
+    let mut unsafe_plan = plan.clone();
+    unsafe_plan.steps.retain(|s| !matches!(&s.op, MigrationOp::DropForeignKey { fk, .. } if fk.name.as_deref() == Some("fk_orders_user")));
+    let err = apply_plan(&unsafe_plan, &tgt).unwrap_err();
+    assert!(err.contains("primary key of users is referenced"), "{err}");
+}
+
+#[test]
+fn transaction_wrapping_per_dialect() {
+    use crate::plan::transaction_statements;
+    assert_eq!(transaction_statements(DbKind::Postgres), Some(("BEGIN", "COMMIT")));
+    assert_eq!(transaction_statements(DbKind::Sqlite), Some(("BEGIN", "COMMIT")));
+    assert_eq!(transaction_statements(DbKind::MySql), Some(("START TRANSACTION", "COMMIT")));
+    assert_eq!(transaction_statements(DbKind::SqlServer), Some(("BEGIN TRANSACTION", "COMMIT TRANSACTION")));
+    // a bare BEGIN opens a PL/SQL block in Oracle
+    assert_eq!(transaction_statements(DbKind::Oracle), None);
+    assert_eq!(transaction_statements(DbKind::ClickHouse), None);
+    assert_eq!(transaction_statements(DbKind::Cassandra), None);
+
+    struct Oracle(GenericDialect);
+    impl Dialect for Oracle {
+        fn kind(&self) -> DbKind {
+            DbKind::Oracle
+        }
+        fn syntax(&self) -> &ternarygrid_core::dialect::SqlSyntax {
+            self.0.syntax()
+        }
+        fn ddl(&self) -> &dyn DdlGenerator {
+            self.0.ddl()
+        }
+    }
+    let src = shop("app");
+    let tgt = drifted();
+    let d = schema_diff(&src, &tgt, &CompareOptions::default());
+    let opts = ScriptOptions { wrap_in_transaction: true, ..ScriptOptions::full_sync() };
+    let plan = migration_plan(&d, &src, &tgt, &Oracle(GenericDialect::new()), &opts);
+    assert!(plan.transaction.is_none());
+    assert!(plan.warnings.iter().any(|w| w.contains("Oracle commits DDL statements implicitly")), "{:?}", plan.warnings);
+    let st = migration_script(&d, &src, &tgt, &Oracle(GenericDialect::new()), &opts);
+    assert!(!st.iter().any(|s| s == "BEGIN" || s == "COMMIT"), "{st:?}");
 }

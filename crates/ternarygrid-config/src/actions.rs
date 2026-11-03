@@ -270,25 +270,6 @@ actions! {
 }
 
 impl Action {
-    /// Default toolbar items (action ids, in order).
-    pub fn default_toolbar() -> Vec<Action> {
-        vec![
-            Action::NewConnection,
-            Action::NewSqlEditor,
-            Action::SelectConnection,
-            Action::SelectSchema,
-            Action::ExecuteStatement,
-            Action::ExecuteScript,
-            Action::ExplainPlan,
-            Action::CancelQuery,
-            Action::Commit,
-            Action::Rollback,
-            Action::ToggleAutoCommit,
-            Action::FormatSql,
-            Action::OpenHistory,
-        ]
-    }
-
     /// Actions of one category.
     pub fn in_category(category: ActionCategory) -> impl Iterator<Item = Action> {
         Action::ALL
@@ -352,6 +333,5 @@ mod tests {
         assert_eq!(Action::SaveData.context(), ActionContext::ResultsGrid);
         assert_eq!(Action::Save.context(), ActionContext::SqlEditor);
         assert!(Action::in_category(ActionCategory::Transactions).count() == 4);
-        assert!(!Action::default_toolbar().is_empty());
     }
 }

@@ -8,8 +8,10 @@
 //!   handling and cancellation,
 //! * [`prompts`]: system prompt, task prompts, schema context, SQL extraction.
 //!
-//! Privacy: the only network connections are to the configured service; no
-//! data rows are ever sent, only schema structure and what the user types.
+//! Privacy: the only network connections are to the configured service. By
+//! default no data rows are sent, only schema structure and what the user
+//! types; in the application's opt-in agent mode the model may run read-only
+//! queries, and their results (limited rows) are sent to the service.
 //! The API key is a [`ternarygrid_core::Secret`]: never serialised or logged.
 
 // `DbError` (ternarygrid-core) is 144 bytes; every `DbResult` triggers this lint.

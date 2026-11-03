@@ -139,11 +139,7 @@ impl SqliteDriver {
     pub async fn connect_sqlite(&self, params: &ConnectParams) -> DbResult<SqliteSession> {
         let cfg = open_config(params)?;
         let mode = cfg.mode;
-        let dialect = if cfg.foreign_keys {
-            Arc::clone(&self.dialect)
-        } else {
-            Arc::new(SqliteDialect::with_foreign_keys(false))
-        };
+        let foreign_keys = cfg.foreign_keys;
         let path =
             (!cfg.is_memory() && !cfg.path.starts_with("file:")).then(|| PathBuf::from(&cfg.path));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -156,9 +152,15 @@ impl SqliteDriver {
             .map_err(|e| {
                 DbError::internal(format!("Cannot start the SQLite connection thread: {e}"))
             })?;
-        let (shared, info) = ready_rx.await.map_err(|_| {
+        let (shared, info, main_file) = ready_rx.await.map_err(|_| {
             DbError::internal("The SQLite connection thread ended while connecting")
         })??;
+        // Per connection: generated DDL depends on its foreign key enforcement and
+        // on where its main database is (new attached databases go next to it).
+        let dialect = Arc::new(SqliteDialect::for_connection(
+            foreign_keys,
+            Some(Path::new(&main_file)),
+        ));
         Ok(SqliteSession::new(tx, shared, info, dialect, mode, path))
     }
 }

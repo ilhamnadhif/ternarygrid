@@ -233,7 +233,47 @@ pub enum Node {
     Call(Func, Vec<Node>),
 }
 
+/// Dropped without recursion: a tree built by hand (or by combining filters)
+/// may be taller than the parser allows, and a recursive drop would overflow the stack.
+impl Drop for Node {
+    fn drop(&mut self) {
+        let mut stack = Vec::new();
+        self.take_children(&mut stack);
+        while let Some(mut n) = stack.pop() {
+            // `n` drops at the end of the iteration with leaves only below it.
+            n.take_children(&mut stack);
+        }
+    }
+}
+
 impl Node {
+    /// Move the children that have children of their own to `out`, leaving NULL leaves.
+    fn take_children(&mut self, out: &mut Vec<Node>) {
+        let mut take = |n: &mut Node| {
+            if !matches!(n, Node::Literal(_) | Node::Column(_)) {
+                out.push(std::mem::replace(n, Node::Literal(Value::Null)));
+            }
+        };
+        match self {
+            Node::Literal(_) | Node::Column(_) => {}
+            Node::Unary(_, e) | Node::IsNull { expr: e, .. } => take(e),
+            Node::Binary(_, l, r) | Node::Like { expr: l, pattern: r, .. } => {
+                take(l);
+                take(r);
+            }
+            Node::In { expr, list, .. } => {
+                take(expr);
+                list.iter_mut().for_each(take);
+            }
+            Node::Between { expr, low, high, .. } => {
+                take(expr);
+                take(low);
+                take(high);
+            }
+            Node::Call(_, args) => args.iter_mut().for_each(take),
+        }
+    }
+
     /// Indices of all referenced columns (sorted, unique).
     pub fn referenced_columns(&self) -> Vec<usize> {
         let mut out = Vec::new();
@@ -392,29 +432,34 @@ fn bind<S: AsRef<str>>(ast: Ast, columns: &[S]) -> Result<Node, ExprError> {
         Ast::Between { expr, low, high, negated } => {
             Node::Between { expr: Box::new(bind(*expr, columns)?), low: Box::new(bind(*low, columns)?), high: Box::new(bind(*high, columns)?), negated }
         }
-        Ast::Call { name, args, span } => {
-            let Some(func) = Func::lookup(&name) else {
-                let suggestion = closest_name(&name, Func::ALL.iter().map(|(_, n)| *n));
-                let msg = match suggestion {
-                    Some(s) => trf("Unknown function '{}' (did you mean '{}'?)", &[&name, &s]),
-                    None => trf("Unknown function '{}'", &[&name]),
-                };
-                return Err(ExprError::new(msg, span));
-            };
-            let (min, max) = func.arity();
-            if args.len() < min || args.len() > max {
-                let expected = if min == max {
-                    min.to_string()
-                } else if max == usize::MAX {
-                    trf("at least {}", &[&min])
-                } else {
-                    trf("{} to {}", &[&min, &max])
-                };
-                return Err(ExprError::new(trf("{}() takes {} argument(s), got {}", &[&func.name(), &expected, &args.len()]), span));
-            }
-            Node::Call(func, args.into_iter().map(|a| bind(a, columns)).collect::<Result<_, _>>()?)
-        }
+        Ast::Call { name, args, span } => Node::Call(check_call(&name, args.len(), span)?, args.into_iter().map(|a| bind(a, columns)).collect::<Result<_, _>>()?),
     })
+}
+
+/// The function `name` called with `args` arguments. Apart from [`bind`]: it
+/// recurses once per level of the tree, and these locals would make every
+/// level's stack frame bigger.
+fn check_call(name: &str, args: usize, span: Range<usize>) -> Result<Func, ExprError> {
+    let Some(func) = Func::lookup(name) else {
+        let suggestion = closest_name(name, Func::ALL.iter().map(|(_, n)| *n));
+        let msg = match suggestion {
+            Some(s) => trf("Unknown function '{}' (did you mean '{}'?)", &[&name, &s]),
+            None => trf("Unknown function '{}'", &[&name]),
+        };
+        return Err(ExprError::new(msg, span));
+    };
+    let (min, max) = func.arity();
+    if args < min || args > max {
+        let expected = if min == max {
+            min.to_string()
+        } else if max == usize::MAX {
+            trf("at least {}", &[&min])
+        } else {
+            trf("{} to {}", &[&min, &max])
+        };
+        return Err(ExprError::new(trf("{}() takes {} argument(s), got {}", &[&func.name(), &expected, &args]), span));
+    }
+    Ok(func)
 }
 
 /// Short reference of the language, shown as help text in the UI.
@@ -591,5 +636,61 @@ mod tests {
         // Deeply nested input is rejected by the parser instead of overflowing the stack.
         let deep = "not ".repeat(10_000) + "true";
         assert!(Expr::compile(&deep, &COLS).is_err());
+    }
+
+    #[test]
+    fn long_chains_are_bounded_and_tall_trees_never_overflow_the_stack() {
+        // A pasted chain: the parser loops over it, but binding and evaluating
+        // the tree recurse once per term.
+        for op in [" + ", " || ", " * ", " - "] {
+            let chain = vec!["id"; 200_000].join(op);
+            let e = Expr::compile(&chain, &COLS).unwrap_err();
+            assert!(e.message.contains("too deeply"), "{op}: {}", e.message);
+        }
+        let mixed = (0..200_000).map(|i| if i % 2 == 0 { "-id" } else { "(id)" }).collect::<Vec<_>>().join(" - ");
+        assert!(Expr::compile(&mixed, &COLS).is_err());
+        let r = row();
+        // AND / OR lists are balanced: long ones are fine and mean the same.
+        let any = (0..100_000).map(|i| format!("id = {}", 100_000 - i)).collect::<Vec<_>>().join(" OR ");
+        assert!(Expr::compile(&any, &COLS).unwrap().matches(&r[..]));
+        let all = (0..100_000).map(|i| format!("id > {}", -i)).collect::<Vec<_>>().join(" and ");
+        assert!(Expr::compile(&all, &COLS).unwrap().matches(&r[..]));
+        let t = |s: &str| Expr::compile(s, &COLS).unwrap().eval(&r[..]);
+        assert_eq!(t("null or false or null or true or name").unwrap(), Value::Bool(true), "stops at TRUE");
+        assert_eq!(t("null or false or null").unwrap(), Value::Null);
+        assert!(t("false or null or name or true").is_err(), "'Widget' is no boolean, before the TRUE");
+        assert_eq!(t("true and null and true and false and name").unwrap(), Value::Bool(false), "stops at FALSE");
+        assert_eq!(t("true and null and true").unwrap(), Value::Null);
+        assert!(t("true and null and name and false").is_err());
+        assert_eq!(t("id = 1 or id = 7 and qty = 4 or id = 3").unwrap(), Value::Bool(true));
+        // The tallest accepted trees bind and evaluate on a thread with the stack of a
+        // view worker (2 MiB), in a debug build too.
+        let tall = vec!["id"; parser::MAX_HEIGHT].join(" + ");
+        assert!(Expr::compile(&format!("{tall} + id"), &COLS).is_err(), "one more is too tall");
+        let calls = "abs(".repeat(99) + "id" + &")".repeat(99);
+        let worker = std::thread::Builder::new().stack_size(2 << 20).spawn(move || {
+            let r = row();
+            let e = Expr::compile(&tall, &COLS).expect("as tall as allowed");
+            assert_eq!(e.eval(&r[..]).unwrap(), Value::Int(7 * parser::MAX_HEIGHT as i64));
+            let copy = Expr::from_node(e.node().clone(), "copy");
+            assert_eq!(copy.node(), e.node());
+            assert_eq!(e.referenced_columns(), vec![0]);
+            drop((e, copy));
+            let e = Expr::compile(&calls, &COLS).expect("as deep as allowed");
+            assert_eq!(e.eval(&r[..]).unwrap(), Value::Int(7));
+            // A tree built by hand far taller than that (filters combined over and
+            // over) still drops without recursing.
+            let mut node = Node::Literal(Value::Int(0));
+            for _ in 0..1_000_000 {
+                node = Node::Binary(BinaryOp::Add, Box::new(node), Box::new(Node::Column(0)));
+            }
+            drop(node);
+            let mut node = Node::Literal(Value::Bool(true));
+            for _ in 0..1_000_000 {
+                node = Node::Call(Func::Coalesce, vec![Node::Unary(UnaryOp::Not, Box::new(node)), Node::Column(1)]);
+            }
+            drop(Expr::from_node(node, "deep"));
+        });
+        worker.unwrap().join().expect("no stack overflow");
     }
 }

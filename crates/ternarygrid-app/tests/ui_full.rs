@@ -38,6 +38,8 @@ fn harness_conns(dir: &std::path::Path, mut settings: Settings, conns: Connectio
     let backend = Arc::new(Backend::new().unwrap());
     let services = Services::ephemeral(&dir.join("home"));
     settings.general.restore_session = false;
+    // The walkthroughs start at the welcome page, not in the first-start setup.
+    settings.general.onboarding_done = true;
     let h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_max_steps(400).with_step_dt(1.0 / 60.0).build_eframe(move |cc| {
         ternarygrid_app::theme::setup_fonts(&cc.egui_ctx);
         backend.set_context(cc.egui_ctx.clone());
@@ -81,10 +83,21 @@ fn has(h: &H, label: &str) -> bool {
     h.query_all_by_label_contains(label).next().is_some()
 }
 
-/// Whether `n` is a button of the main toolbar (its icon and short label).
-fn on_toolbar(n: &egui_kittest::Node<'_>) -> bool {
-    let label = n.accesskit_node().label().unwrap_or_default();
-    n.rect().top() < 60.0 && Action::ALL.iter().any(|&a| label == format!("{} {}", ternarygrid_app::keys::action_icon(a), ternarygrid_app::keys::toolbar_label(a)))
+/// Whether `n` lies in the chrome at the top of the window (menu bar, toolbar),
+/// as drawn in the last frame.
+fn in_top_chrome(h: &H, n: &egui_kittest::Node<'_>) -> bool {
+    n.rect().center().y < h.state().chrome.top_bottom()
+}
+
+/// Whether `n` is in the window's chrome: the top bar or the icon rail (their
+/// buttons repeat items found elsewhere: Settings, AI assistant …).
+fn on_toolbar(h: &H, n: &egui_kittest::Node<'_>) -> bool {
+    in_top_chrome(h, n) || h.state().chrome.rail.is_some_and(|r| r.contains(n.rect().center()))
+}
+
+/// Whether `n` lies in the navigator panel.
+fn in_nav(h: &H, n: &egui_kittest::Node<'_>) -> bool {
+    h.state().chrome.nav.is_some_and(|r| r.contains(n.rect().center()))
 }
 
 /// Click the first widget whose label contains `label`, one outside the
@@ -92,7 +105,7 @@ fn on_toolbar(n: &egui_kittest::Node<'_>) -> bool {
 fn click(h: &mut H, label: &str) {
     pause(h);
     {
-        let Some(n) = h.query_all_by_label_contains(label).find(|n| !on_toolbar(n)).or_else(|| h.query_all_by_label_contains(label).next()) else {
+        let Some(n) = h.query_all_by_label_contains(label).find(|n| !on_toolbar(h, n)).or_else(|| h.query_all_by_label_contains(label).next()) else {
             panic!("no widget labelled {label:?}; labels: {:?}", labels(h));
         };
         n.click();
@@ -220,9 +233,7 @@ fn editor_execute_sort_and_edit() {
 
 /// A navigator row (the navigator is the left panel).
 fn nav_row<'a>(h: &'a H, label: &'a str) -> Option<egui_kittest::Node<'a>> {
-    // Not the status bar's breadcrumb at the bottom.
-    let status_top = h.ctx.content_rect().bottom() - 30.0;
-    h.query_all_by_label(label).find(|n| n.rect().left() < 120.0 && n.rect().top() > 60.0 && n.rect().top() < status_top)
+    h.query_all_by_label(label).find(|n| in_nav(h, n))
 }
 
 fn nav_double_click(h: &mut H, label: &str) {
@@ -270,7 +281,7 @@ fn sweep_menu(h: &mut H, name: &str, open: &dyn Fn(&mut H), skip: &[&str]) -> us
         frames(h, 3);
         // A sub-menu: new items appeared and the menu is still open.
         let sub: Vec<String> = labels(h).into_iter().filter(|l| !before.contains(l) && !l.trim().is_empty()).collect();
-        let is_submenu = item.contains('⏵');
+        let is_submenu = item.contains('⏵') || item.contains(egui_phosphor::regular::CARET_RIGHT);
         if is_submenu && !sub.is_empty() {
             h.key_press(Key::Escape);
             frames(h, 2);
@@ -370,6 +381,12 @@ fn navigator_data_editing_and_context_menus() {
     wait(&mut h, "saved", |h| !h.state().dock.iter_all_tabs().any(|(_, t)| t.view.is_dirty()));
     no_errors(&mut h, "save data");
     assert_eq!(query_one(&db, "SELECT COUNT(*) FROM customer WHERE name = 'Zedka'"), "1");
+    // Keys typed in the grid (clicked last) are the grid's, not the navigator's.
+    let selected = h.state().nav.selected.clone();
+    assert!(selected.is_some());
+    h.key_press(Key::ArrowDown);
+    frames(&mut h, 2);
+    assert_eq!(h.state().nav.selected, selected, "the navigator's selection stays");
 
     // Every navigator context menu, on every kind of node.
     let skip = ["Delete", "Drop", "Disconnect", "Duplicate", "Copy name", "Connect", "Hide in navigator"];
@@ -682,6 +699,7 @@ fn menus_actions_commands_and_dialogs() {
 }
 
 /// Click the combo box on the row of `label`, then the option `option`.
+#[allow(dead_code)]
 fn combo_pick(h: &mut H, label: &str, option: &str) {
     pause(h);
     {
@@ -712,24 +730,26 @@ fn settings_grid_menu_and_editor_helpers() {
         "Query history",
         "Navigator",
         "Keyboard shortcuts",
-        "Toolbar",
         "Connection types",
         "Network profiles",
-        "AI",
+        "AI assistant",
         "Security",
         "Accessibility",
         "General",
     ] {
         pause(&mut h);
-        let key = format!(" {section}");
-        let Some(n) = h.query_all_by_label_contains(&key).find(|n| !on_toolbar(n)) else {
+        // The section's own row (the rail and the top bar have some of the same names).
+        let Some(n) = h.query_all_by_label(section).find(|n| !on_toolbar(&h, n)) else {
             panic!("settings section {section:?}; labels: {:?}", labels(&h));
         };
         n.click();
         frames(&mut h, 3);
         no_errors(&mut h, section);
     }
-    combo_pick(&mut h, "Theme", "Dark");
+    // The theme is a segmented control.
+    pause(&mut h);
+    h.query_all_by_label("Dark").find(|n| !on_toolbar(&h, n)).expect("the Dark theme segment").click();
+    frames(&mut h, 3);
     assert_eq!(h.ctx.theme(), egui::Theme::Dark, "dark theme applied");
     assert!(!has(&h, "Language"), "English only, no language choice: {:?}", labels(&h));
     no_errors(&mut h, "settings");
@@ -741,6 +761,17 @@ fn settings_grid_menu_and_editor_helpers() {
         page: ternarygrid_app::command::ObjectPage::Data,
     });
     wait(&mut h, "product data", |h| has(h, "Data grid,") && !has(h, "Data grid, 0 rows"));
+    // Its keys are read in the background: the footer's row buttons show once it is editable.
+    // (Add row and the other row actions are in the footer's ⋯ menu.)
+    wait(&mut h, "product editable", |h| {
+        let (_, tab) = h.state_mut().dock.find_active_focused().expect("a focused tab");
+        tab.view
+            .as_any_mut()
+            .downcast_mut::<ternarygrid_app::tabs::object::ObjectEditorTab>()
+            .and_then(|o| o.data.as_mut())
+            .and_then(|d| d.panel.as_ref())
+            .is_some_and(|p| p.model.is_editable())
+    });
     let body = h.query_all_by_label_contains("Data grid,").next().unwrap().rect();
     let cell = egui::pos2(body.left() + 40.0, body.top() + 30.0);
     let open = move |h: &mut H| {
@@ -758,7 +789,10 @@ fn settings_grid_menu_and_editor_helpers() {
     pause(&mut h);
     open(&mut h);
     frames(&mut h, 2);
-    click(&mut h, "Columns");
+    // The menu's Columns (the object's page tabs have a "Columns" too).
+    pause(&mut h);
+    h.query_all_by_label_contains("Columns").last().expect("the menu's Columns").click();
+    frames(&mut h, 2);
     click(&mut h, "Show all");
     assert!(rows_label(&h).contains("5 columns"), "{}", rows_label(&h));
     // Filter by value, then clear filter and order from the grid toolbar.
@@ -767,7 +801,7 @@ fn settings_grid_menu_and_editor_helpers() {
     open(&mut h);
     frames(&mut h, 2);
     click(&mut h, "Filter by value");
-    let eq = labels(&h).into_iter().find(|l| l.starts_with("id = ")).unwrap_or_else(|| panic!("{:?}", labels(&h)));
+    let eq = labels(&h).into_iter().find(|l| l.trim_start_matches(egui_phosphor::regular::SQUARE).trim_start().starts_with("id = ")).unwrap_or_else(|| panic!("{:?}", labels(&h)));
     click(&mut h, &eq);
     // The menu sweep left pending edits: reloading asks first, and discarding them
     // drops the new row the filter may name.
@@ -778,7 +812,9 @@ fn settings_grid_menu_and_editor_helpers() {
     }
     wait(&mut h, "filtered", |h| rows_label(h).starts_with("Data grid, 1 rows") || (discarded && rows_label(h).starts_with("Data grid, 0 rows")));
     no_errors(&mut h, "filter by value");
-    click(&mut h, egui_phosphor::regular::X);
+    // The filter bar's ⋯ menu has Clear filter and order.
+    click(&mut h, "Filter options");
+    click(&mut h, "Clear filter and order");
     wait(&mut h, "filter cleared", |h| {
         let n = rows_label(h).split(',').nth(1).unwrap_or_default().to_string();
         if discarded { n.trim().split(' ').next().and_then(|c| c.parse::<usize>().ok()).is_some_and(|c| c > 1) } else { n == all }
@@ -821,7 +857,10 @@ fn settings_grid_menu_and_editor_helpers() {
     click(&mut h, "Disable order by id");
     wait(&mut h, "order removed", |h| first_id(h) == ascending);
     column_menu(&mut h);
-    let eq = labels(&h).into_iter().find(|l| l.starts_with("id = '")).unwrap_or_else(|| panic!("cell value filters: {:?}", labels(&h)));
+    let eq = labels(&h)
+        .into_iter()
+        .find(|l| l.trim_start_matches(egui_phosphor::regular::SQUARE).trim_start().starts_with("id = '"))
+        .unwrap_or_else(|| panic!("cell value filters: {:?}", labels(&h)));
     click(&mut h, &eq);
     wait(&mut h, "filtered by the cell value", |h| rows_label(h).starts_with("Data grid, 1 rows"));
     column_menu(&mut h);
@@ -898,7 +937,7 @@ fn settings_grid_menu_and_editor_helpers() {
     h.event(egui::Event::Text("select * from cust".into()));
     frames(&mut h, 2);
     h.key_press_modifiers(Modifiers::CTRL, Key::Space);
-    wait(&mut h, "completion popup", |h| h.query_all_by_label("customer").any(|n| n.rect().left() > 300.0));
+    wait(&mut h, "completion popup", |h| h.query_all_by_label("customer").any(|n| !in_nav(h, &n)));
     h.key_press(Key::Enter);
     frames(&mut h, 3);
     assert!(focused_editor(&mut h).text().contains("customer"), "{}", focused_editor(&mut h).text());
@@ -955,6 +994,9 @@ fn wait_file(h: &mut H, dir: &std::path::Path, what: &str, pred: impl Fn(&str) -
     found.unwrap()
 }
 
+/// The label of the navigator menu's Tools submenu (its text and the chevron after it).
+const TOOLS: &str = concat!("Tools ", "\u{E13A}");
+
 fn nav_menu(h: &mut H, row: &str, items: &[&str]) {
     pause(h);
     nav_row(h, row).unwrap_or_else(|| panic!("no navigator row {row:?}")).click_secondary();
@@ -984,11 +1026,18 @@ fn tool_tabs_run() {
     assert_eq!(popup_rect(&h), r0, "the pop-up keeps its size");
     let screen = h.ctx.content_rect();
     assert!(screen.contains_rect(r0), "{r0:?} inside {screen:?}");
-    // The window's close button closes it; opening export again shows a new one.
-    click(&mut h, "Close window");
+    // The window's close button (× in its header) closes it; opening export again shows a new one.
+    pause(&mut h);
+    h.query_all_by_label("Close").find(|n| r0.contains(n.rect().center())).expect("the pop-up's ×").click();
+    frames(&mut h, 2);
     assert!(h.state().popups.is_empty());
     nav_menu(&mut h, "customer", &["Export data"]);
     assert_eq!(h.state().popups.len(), 1);
+    // The defaults: Next to the last page, which runs it.
+    assert!(!has(&h, "Run export"), "run on the last page only");
+    for _ in 0..3 {
+        click(&mut h, "Next");
+    }
     click(&mut h, "Run export");
     // Named database (SQLite: the file) _ table _ date _ time.
     let date = chrono::Local::now().format("%Y%m%d").to_string();
@@ -1003,7 +1052,7 @@ fn tool_tabs_run() {
 
     // Backup of the SQLite database (with the sqlite3 tool, which Windows lacks).
     if std::process::Command::new("sqlite3").arg("-version").output().is_ok() {
-        nav_menu(&mut h, "ternarygrid-sample.db", &["Tools ⏵", "Backup"]);
+        nav_menu(&mut h, "ternarygrid-sample.db", &[TOOLS, "Backup"]);
         click(&mut h, "Start backup");
         let backup = wait_file(&mut h, &dir.0, "backup file", |n| n.starts_with("ternarygrid-sample") && n.ends_with(".sql"));
         let dump = std::fs::read_to_string(&backup).unwrap();
@@ -1030,7 +1079,7 @@ fn tool_tabs_run() {
     settle(&mut h, "mock data");
 
     // Metadata search.
-    nav_menu(&mut h, "ternarygrid-sample.db", &["Tools ⏵", "Search metadata"]);
+    nav_menu(&mut h, "ternarygrid-sample.db", &[TOOLS, "Search metadata"]);
     field_with_hint(&mut h, "Name or pattern", "cust*");
     click(&mut h, "Search");
     wait(&mut h, "search results", |h| h.query_all_by_label_contains("customer").count() > 2);
@@ -1117,9 +1166,9 @@ fn themes_whats_new_and_updates() {
     pause(&mut h);
     h.key_press(Key::Escape);
     frames(&mut h, 2);
-    click(&mut h, egui_phosphor::regular::SUN);
+    click(&mut h, "Switch to the light theme");
     assert_eq!(h.ctx.theme(), egui::Theme::Light);
-    click(&mut h, egui_phosphor::regular::MOON);
+    click(&mut h, "Switch to the dark theme");
     assert_eq!(h.ctx.theme(), egui::Theme::Dark);
     pause(&mut h);
     h.key_press_modifiers(CMD | Modifiers::SHIFT, Key::P);
@@ -1226,10 +1275,10 @@ fn catalog_folders_in_the_navigator() {
     wait(&mut h, "Roles folder", |h| nav_row(h, "Roles").is_some());
     nav_double_click(&mut h, "Roles");
     // The role (the database has the same name: the role row is the last one).
-    wait(&mut h, "role row", |h| h.query_all_by_label(&user).filter(|n| n.rect().left() < 120.0).count() >= 2);
+    wait(&mut h, "role row", |h| h.query_all_by_label(&user).filter(|n| in_nav(h, n)).count() >= 2);
     pause(&mut h);
     {
-        let n = h.query_all_by_label(&user).rfind(|n| n.rect().left() < 120.0).unwrap();
+        let n = h.query_all_by_label(&user).rfind(|n| in_nav(&h, n)).unwrap();
         n.click();
         n.click();
     }
@@ -1532,30 +1581,32 @@ fn workspace_from_dbeaver() {
     settle(&mut h, "tip of the day");
     assert!(h.state().tip.is_none());
 
-    // Main toolbar: SQL editor actions are disabled without an editor.
-    let toolbar_enabled = |h: &H, icon: &str| -> bool {
-        // Icon and short label, or the icon alone.
-        let n = h.query_all_by_label_contains(icon).find(|n| n.rect().top() < 70.0).unwrap_or_else(|| panic!("toolbar {icon:?}: {:?}", labels(h)));
-        !n.accesskit_node().is_disabled()
-    };
+    // The top bar and the rail.
     // No tab is open: the start page fills the editor area.
     assert_eq!(h.state().dock.iter_all_tabs().count(), 0);
     assert!(has(&h, "Create sample database"));
-    // The default toolbar has global actions only (run, commit … are in the editor).
-    assert!(h.query_all_by_label_contains(egui_phosphor::regular::PLAY).all(|n| n.rect().top() >= 70.0), "no Run in the main toolbar by default");
-    // A customised toolbar with editor actions: disabled without an editor.
-    h.state_mut().settings.toolbar.items = ["sql.new_editor", "sql.execute_statement", "tx.commit"].map(String::from).to_vec();
-    frames(&mut h, 2);
-    assert!(!toolbar_enabled(&h, egui_phosphor::regular::PLAY), "Run needs a SQL editor");
-    assert!(toolbar_enabled(&h, egui_phosphor::regular::FILE_SQL), "New SQL editor is always available");
-    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: None });
+    // Running, explaining, transactions are the SQL editor's own commands.
+    assert!(h.query_all_by_label_contains(egui_phosphor::regular::PLAY).all(|n| !in_top_chrome(&h, &n)), "no Run in the top bar");
+    // The search box opens the command palette.
+    click(&mut h, "Search or run a command");
+    assert!(h.state().dialogs.palette_open, "the search box opens the command palette");
+    settle(&mut h, "search box");
+    // The rail shows the projects, then the navigator again.
+    click(&mut h, "Projects and scripts");
+    assert!(has(&h, "Scripts"), "the projects view: {:?}", labels(&h));
+    click(&mut h, "Database Navigator");
+    wait(&mut h, "the navigator", |h| nav_row(h, "Tables").is_some() || has(h, "Database Navigator"));
+    // A SQL editor: its connection in the top bar, its transaction mode and result in the status bar.
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: Some("select * from customer".into()) });
     frames(&mut h, 3);
     wait(&mut h, "editor session", |h| focused_editor(h).session_ready());
+    let ctx = h.ctx.clone();
+    h.state_mut().dispatch_action(&ctx, Action::ExecuteStatement);
+    wait(&mut h, "the result", |h| !focused_editor(h).is_running() && focused_editor(h).result_count() > 0);
     frames(&mut h, 2);
-    assert!(toolbar_enabled(&h, egui_phosphor::regular::PLAY), "Run in a SQL editor");
-    assert!(!toolbar_enabled(&h, egui_phosphor::regular::CHECK_CIRCLE), "nothing to commit in auto-commit mode");
-    h.state_mut().settings.toolbar = Default::default();
-    settle(&mut h, "toolbar states");
+    assert!(has(&h, "Auto-commit"), "transaction mode in the status bar: {:?}", labels(&h));
+    assert!(labels(&h).iter().any(|l| l.contains(" rows")), "the result in the status bar: {:?}", labels(&h));
+    settle(&mut h, "top bar, rail and status bar");
 
     // Production: reading runs without a question, changing data asks.
     {
@@ -1797,7 +1848,7 @@ fn boolean_check_boxes_in_the_record_view() {
     h.query_all_by_role(egui::accesskit::Role::CheckBox).find(|n| n.accesskit_node().label().as_deref() == Some("false")).unwrap().click();
     frames(&mut h, 3);
     assert!(boxes(&h).iter().any(|l| l == "true"), "toggled: {:?}", boxes(&h));
-    assert!(has(&h, "Save (1)"), "one pending change: {:?}", labels(&h));
+    assert!(has(&h, "1 change"), "one pending change: {:?}", labels(&h));
     assert!(h.query_all_by_role(egui::accesskit::Role::TextInput).all(|n| n.accesskit_node().value().as_deref() != Some("false")), "no text field for a boolean");
 }
 
@@ -1845,7 +1896,7 @@ fn filter_box_suggests_columns() {
     // The only field with text (its hint is gone once something is typed).
     let where_box = |h: &H| -> Option<String> { h.query_all_by_role(egui::accesskit::Role::TextInput).filter_map(|n| n.accesskit_node().value()).find(|v| !v.is_empty()) };
     // "na" offers the column "name"; Tab takes it.
-    field_with_hint(&mut h, "WHERE condition", "na");
+    field_with_hint(&mut h, "status = 'open'", "na");
     frames(&mut h, 2);
     assert!(has(&h, " name"), "the column is offered: {:?}", labels(&h));
     h.key_press(Key::Tab);
@@ -1890,6 +1941,8 @@ fn ai_assistant_is_a_side_panel() {
     });
     frames(&mut h, 3);
     assert!(has(&h, "Ran a query · 1 rows"), "{:?}", labels(&h));
+    // Folded, its SQL's Run goes away: the Run left is the answer's.
+    click(&mut h, "Ran a query · 1 rows");
     click(&mut h, "Run");
     wait(&mut h, "the query run in a new editor", |h| tab_titles(h).iter().any(|t| t.starts_with("Script-")) && has(h, "Data grid, 1 rows"));
     no_errors(&mut h, "Run from the assistant");
@@ -1897,7 +1950,7 @@ fn ai_assistant_is_a_side_panel() {
     h.state_mut().ai_panel.as_mut().unwrap().reset();
     frames(&mut h, 2);
     assert!(h.state().ai_panel.as_ref().unwrap().turns().is_empty());
-    let history = egui_phosphor::regular::CLOCK_COUNTER_CLOCKWISE;
+    let history = "Conversation history";
     {
         let button = h.query_all_by_label(history).max_by(|a, b| a.rect().left().total_cmp(&b.rect().left())).expect("history button");
         button.click();

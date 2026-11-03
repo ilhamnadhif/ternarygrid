@@ -202,3 +202,127 @@ async fn big_values_are_paged() {
     );
     run(s.as_mut(), "DEL big:h big:l big:z big:s").await;
 }
+
+#[tokio::test]
+async fn counts_match_the_rows() {
+    let Some(mut s) = connect().await else { return };
+    // Database 7: the other tests use 8 and 9.
+    run(s.as_mut(), "SELECT 7").await;
+    run(s.as_mut(), "FLUSHDB").await;
+    let items: Vec<String> = (0..50).map(|i| format!("v{i}")).collect();
+    run(s.as_mut(), &format!("RPUSH l {}", items.join(" "))).await;
+    for i in 0..30 {
+        run(s.as_mut(), &format!("SET user:{i} x")).await;
+    }
+    run(s.as_mut(), "SET other y").await;
+    run(s.as_mut(), "HSET h f1 1 f2 2 g1 3").await;
+    // More stream entries than one page, with ids sharing a millisecond.
+    for chunk in 0..3 {
+        let entries: Vec<String> = (0..700)
+            .map(|i| format!("XADD st 1-{} n {i}", chunk * 700 + i + 1))
+            .collect();
+        for e in entries {
+            run(s.as_mut(), &e).await;
+        }
+    }
+    let d = s.dialect();
+    for (cmd, n) in [
+        ("SCAN 0 MATCH user:*", 30),
+        ("SCAN 0 MATCH user:* COUNT 5", 30),
+        ("SCAN 0", 34),
+        ("KEYS user:1*", 11),
+        ("LRANGE l 10 20", 11),
+        ("LRANGE l 45 100", 5),
+        ("LRANGE l 0 -1", 50),
+        ("HSCAN h 0 MATCH f*", 2),
+        ("GET other", 1),
+        ("GET missing", 1),
+        ("XRANGE st - +", 2100),
+        ("XRANGE st 1-1000 +", 1101),
+    ] {
+        let (_, r) = rows(s.as_mut(), cmd, 333).await;
+        assert_eq!(r.len(), n, "{cmd}");
+        let count = query_scalar(s.as_mut(), &d.count_query(cmd), &[])
+            .await
+            .unwrap_or_else(|e| panic!("{cmd}: {}", e.full_text()));
+        assert_eq!(count, Value::Int(n as i64), "{cmd}");
+    }
+    // The stream pages continue after the last id read, without repeats.
+    let (_, r) = rows(s.as_mut(), "XRANGE st - +", 1000).await;
+    assert_eq!(r[999][0], Value::Text("1-1000".into()));
+    assert_eq!(r[1000][0], Value::Text("1-1001".into()));
+    // A count never runs a command that writes again.
+    let e = query_all(s.as_mut(), &d.count_query("SPOP l 3"), &[])
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind, ternarygrid_core::ErrorKind::Unsupported, "{e:?}");
+    // GET's column is the one the key's definition names.
+    let (cols, _) = rows(s.as_mut(), "GET other", 10).await;
+    let keys = s
+        .list_objects(&SchemaRef::schema("db7"), ObjectKind::Table)
+        .await
+        .unwrap();
+    let other = keys.iter().find(|k| k.obj.name == "other").unwrap();
+    let t = s.table_definition(&other.obj).await.unwrap();
+    assert_eq!(
+        cols,
+        t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+    );
+    run(s.as_mut(), "FLUSHDB").await;
+}
+
+#[tokio::test]
+async fn read_only_connections_refuse_writes() {
+    let Some(mut p) = params() else { return };
+    // Database 6: the other tests use 7, 8 and 9.
+    p.database = Some("6".into());
+    let mut rw = RedisDriver::new().connect(&p).await.unwrap();
+    run(rw.as_mut(), "FLUSHDB").await;
+    run(rw.as_mut(), "SET k v").await;
+    run(rw.as_mut(), "SADD s a b c").await;
+    p.read_only = true;
+    let mut s = RedisDriver::new().connect(&p).await.unwrap();
+    assert_eq!(
+        query_scalar(s.as_mut(), "GET k", &[]).await.unwrap(),
+        Value::Text("v".into())
+    );
+    rows(s.as_mut(), "SCAN 0", 10).await;
+    rows(s.as_mut(), "INFO keyspace", 100).await;
+    let d = s.dialect();
+    assert_eq!(
+        query_scalar(s.as_mut(), &d.count_query("SSCAN s 0 MATCH a*"), &[])
+            .await
+            .unwrap(),
+        Value::Int(1)
+    );
+    let keys = s
+        .list_objects(&SchemaRef::schema("db6"), ObjectKind::Table)
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 2);
+    s.object_ddl(&keys[0].obj).await.unwrap();
+    s.object_properties(&keys[0].obj).await.unwrap();
+    for write in [
+        "SET k w",
+        "DEL k",
+        "SPOP s",
+        "FLUSHDB",
+        "EVAL \"return 1\" 0",
+    ] {
+        let e = query_all(s.as_mut(), write, &[]).await.unwrap_err();
+        assert_eq!(
+            e.kind,
+            ternarygrid_core::ErrorKind::ReadOnly,
+            "{write}: {e:?}"
+        );
+    }
+    assert_eq!(
+        query_scalar(rw.as_mut(), "GET k", &[]).await.unwrap(),
+        Value::Text("v".into())
+    );
+    assert_eq!(
+        query_scalar(rw.as_mut(), "SCARD s", &[]).await.unwrap(),
+        Value::Int(3)
+    );
+    run(rw.as_mut(), "FLUSHDB").await;
+}

@@ -85,6 +85,24 @@ $$"
         assert!(st.finished);
         assert!(st.messages.iter().any(|m| m.starts_with("ERROR")), "{st:?}");
         dbg.abort().await.unwrap();
+
+        // on a read-only connection the debugged routine cannot write either
+        exec(&mut s, &format!("CREATE TABLE {schema}.dbg_t (a int)")).await;
+        exec(&mut s, &format!("CREATE FUNCTION {schema}.dbg_ins() RETURNS int LANGUAGE plpgsql AS $$\nbegin\n  insert into {schema}.dbg_t values (1);\n  return 1;\nend;\n$$"))
+            .await;
+        let mut ro_params = params.clone();
+        ro_params.read_only = true;
+        let mut ro = connect(&ro_params).await;
+        let g = ObjectRef::new(ObjectKind::Function, Some(schema.clone()), "dbg_ins").with_signature("()");
+        let mut dbg = ro.debug_routine(&g, &[]).await.unwrap();
+        let st = tokio::time::timeout(Duration::from_secs(20), dbg.wait()).await.expect("no hang").unwrap();
+        if !st.finished {
+            let st = tokio::time::timeout(Duration::from_secs(20), dbg.resume()).await.expect("no hang").unwrap();
+            assert!(st.finished, "{st:?}");
+        }
+        dbg.abort().await.unwrap();
+        assert_eq!(scalar(&mut s, &format!("SELECT count(*) FROM {schema}.dbg_t")).await, Value::Int(0));
+        ro.close().await.ok();
         s.close().await.ok();
     })
     .await;

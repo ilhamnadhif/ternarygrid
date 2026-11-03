@@ -220,3 +220,142 @@ async fn large_results_stream_in_batches() {
     assert_eq!(total, 3000);
     run(s.as_mut(), "db.dropDatabase()").await;
 }
+
+#[tokio::test]
+async fn aggregate_counts_views_and_explain() {
+    let Some(mut s) = connect("ternarygrid_agg").await else {
+        return;
+    };
+    run(s.as_mut(), "db.dropDatabase()").await;
+    run(
+        s.as_mut(),
+        "db.items.insertMany([{k: 'a', n: 1}, {k: 'b', n: 2}, {k: 'a', n: 3}, {k: 'c', n: 4}])",
+    )
+    .await;
+    // `.count()` (the data tab's row count) counts the pipeline's documents.
+    let pipeline = "db.items.aggregate([{$match: {n: {$gt: 1}}}, {$project: {k: 1}}])";
+    let d = s.dialect();
+    assert_eq!(
+        query_scalar(s.as_mut(), &d.count_query(pipeline), &[])
+            .await
+            .unwrap(),
+        Value::Int(3)
+    );
+    assert_eq!(
+        query_scalar(
+            s.as_mut(),
+            "db.items.aggregate({$match: {k: 'a'}}, {$group: {_id: '$k'}}).count()",
+            &[]
+        )
+        .await
+        .unwrap(),
+        Value::Int(1)
+    );
+    assert_eq!(
+        query_scalar(
+            s.as_mut(),
+            "db.items.aggregate([{$match: {k: 'zzz'}}]).count()",
+            &[]
+        )
+        .await
+        .unwrap(),
+        Value::Int(0)
+    );
+    // Explain of stages given as separate arguments sees every stage.
+    let plan = s
+        .explain(
+            "db.items.aggregate({$match: {k: 'a'}}, {$group: {_id: '$k', t: {$sum: '$n'}}})",
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(plan.text.contains("$group"), "{}", plan.text);
+    // A view's DDL creates the view, and runs.
+    run(
+        s.as_mut(),
+        "db.createView('big_items', 'items', [{$match: {n: {$gte: 3}}}])",
+    )
+    .await;
+    let views = s
+        .list_objects(&SchemaRef::schema("ternarygrid_agg"), ObjectKind::View)
+        .await
+        .unwrap();
+    assert_eq!(views.len(), 1);
+    let ddl = s.object_ddl(&views[0].obj).await.unwrap();
+    assert_eq!(
+        ddl,
+        "db.getSiblingDB(\"ternarygrid_agg\").createView(\"big_items\", \"items\", [{$match: {n: {$gte: 3}}}])"
+    );
+    run(s.as_mut(), "db.big_items.drop()").await;
+    run(s.as_mut(), &ddl).await;
+    assert_eq!(
+        query_scalar(s.as_mut(), "db.big_items.countDocuments({})", &[])
+            .await
+            .unwrap(),
+        Value::Int(2)
+    );
+    run(s.as_mut(), "db.dropDatabase()").await;
+}
+
+#[tokio::test]
+async fn read_only_connections_refuse_writes() {
+    let Some(mut rw) = connect("ternarygrid_ro").await else {
+        return;
+    };
+    run(rw.as_mut(), "db.dropDatabase()").await;
+    run(rw.as_mut(), "db.users.insertOne({_id: 1, name: 'Ayu'})").await;
+    let mut p = params("ternarygrid_ro").unwrap();
+    p.read_only = true;
+    let mut s = MongoDriver::new().connect(&p).await.unwrap();
+    // Reads, and the navigator, work.
+    assert_eq!(
+        query_scalar(s.as_mut(), "db.users.countDocuments({})", &[])
+            .await
+            .unwrap(),
+        Value::Int(1)
+    );
+    query_all(s.as_mut(), "db.users.find({})", &[])
+        .await
+        .unwrap();
+    query_all(s.as_mut(), "db.runCommand({ping: 1})", &[])
+        .await
+        .unwrap();
+    query_all(s.as_mut(), "show collections", &[])
+        .await
+        .unwrap();
+    let colls = s
+        .list_objects(&SchemaRef::schema("ternarygrid_ro"), ObjectKind::Table)
+        .await
+        .unwrap();
+    s.table_definition(&colls[0].obj).await.unwrap();
+    s.object_ddl(&colls[0].obj).await.unwrap();
+    s.explain("db.users.find({})", false).await.unwrap();
+    for write in [
+        "db.users.insertOne({_id: 2})",
+        "db.users.deleteMany({})",
+        "db.users.aggregate([{$match: {}}, {$out: 'copy'}])",
+        "db.users.aggregate([{$merge: {into: 'copy'}}])",
+        "db.runCommand({drop: 'users'})",
+        "db.dropDatabase()",
+    ] {
+        let e = query_all(s.as_mut(), write, &[]).await.unwrap_err();
+        assert_eq!(
+            e.kind,
+            ternarygrid_core::ErrorKind::ReadOnly,
+            "{write}: {e:?}"
+        );
+    }
+    let names = query_all(rw.as_mut(), "show collections", &[])
+        .await
+        .unwrap()
+        .1;
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0][0], Value::Text("users".into()));
+    assert_eq!(
+        query_scalar(rw.as_mut(), "db.users.countDocuments({})", &[])
+            .await
+            .unwrap(),
+        Value::Int(1)
+    );
+    run(rw.as_mut(), "db.dropDatabase()").await;
+}

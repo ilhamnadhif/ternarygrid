@@ -71,15 +71,15 @@ pub fn kind_label(kind: &TaskKind) -> &'static str {
 /// Icon of a task type.
 pub fn kind_icon(kind: &TaskKind) -> &'static str {
     match kind {
-        TaskKind::SqlScript { .. } => icon::FILE_SQL,
+        TaskKind::SqlScript { .. } => icon::FILE_CODE,
         TaskKind::Export { .. } => icon::EXPORT,
         TaskKind::Import { .. } => icon::DOWNLOAD_SIMPLE,
-        TaskKind::Backup { .. } => icon::ARCHIVE,
+        TaskKind::Backup { .. } => icon::CUBE,
         TaskKind::Restore { .. } => icon::ARROW_COUNTER_CLOCKWISE,
         TaskKind::Migration { .. } => icon::ARROWS_LEFT_RIGHT,
-        TaskKind::SchemaCompare { .. } => icon::GIT_DIFF,
-        TaskKind::Shell { .. } => icon::TERMINAL,
-        TaskKind::Composite { .. } => icon::STACK,
+        TaskKind::SchemaCompare { .. } => icon::ARROWS_DOWN_UP,
+        TaskKind::Shell { .. } => icon::TERMINAL_WINDOW,
+        TaskKind::Composite { .. } => icon::LIST_CHECKS,
     }
 }
 

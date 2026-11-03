@@ -165,7 +165,7 @@ Legend: ✅ implemented and tested · 🟡 implemented, partially tested ·
 | --- | --- | --- | --- |
 | Themes (light, dark, system), high contrast | ✅ | `theme.rs` | `ternarygrid-app::tabs_smoke` |
 | Keyboard shortcuts (customisable, TernaryGrid / DBeaver presets) | ✅ | `ternarygrid-config::keymap`, `keys.rs` | `ternarygrid-config::keymap` tests, `ternarygrid-app::keys::tests` |
-| Toolbar customisation | ✅ | settings → Toolbar | `ternarygrid-config::settings` tests |
+| Top bar (connection › schema, search), icon rail, status bar (transaction mode, rows, time) | ✅ | `app/shell.rs` | `ternarygrid-app::ui_full` (top bar, rail and status bar) |
 | Accessibility | 🟡 | AccessKit tree (egui), editor text runs, keyboard navigation everywhere; screen reader support per grid cell is not implemented (one node per grid) | `ternarygrid-editor` AccessKit test |
 
 ## AI assistant

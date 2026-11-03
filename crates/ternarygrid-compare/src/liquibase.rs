@@ -6,7 +6,7 @@
 //! `<sql>` change (rendered by the target dialect) otherwise.
 
 use crate::model::SchemaDiff;
-use crate::plan::{MigrationOp, MigrationStep, ScriptOptions, migration_plan};
+use crate::plan::{AlterMode, MigrationOp, MigrationStep, Phase, ScriptOptions, migration_plan};
 use crate::util::{xml_cdata, xml_escape};
 use std::fmt;
 use std::sync::Arc;
@@ -148,6 +148,64 @@ fn column(x: &mut Xml, c: &ColumnDef, pk: Option<&KeyDef>) {
     }
 }
 
+/// Key, check, index and foreign key differences between the two sides of an
+/// `AlterTable` step, comparing `from` with its columns renamed.
+#[derive(Default)]
+struct KeyChanges {
+    pk_drop: Option<KeyDef>,
+    pk_add: Option<KeyDef>,
+    uq_drop: Vec<KeyDef>,
+    uq_add: Vec<KeyDef>,
+    ck_drop: Vec<CheckDef>,
+    ck_add: Vec<CheckDef>,
+    idx_drop: Vec<IndexDef>,
+    idx_add: Vec<IndexDef>,
+    fk_drop: Vec<ForeignKeyDef>,
+    fk_add: Vec<ForeignKeyDef>,
+}
+
+impl KeyChanges {
+    fn new(from: &TableDef, to: &TableDef, rn: &dyn Fn(&str) -> String) -> Self {
+        use ternarygrid_core::dialect::ansi::{same_index, secondary_indexes};
+        let key = |k: &KeyDef| KeyDef { columns: k.columns.iter().map(|c| rn(c)).collect(), ..k.clone() };
+        let index = |i: &IndexDef| {
+            let mut i = i.clone();
+            for c in i.columns.iter_mut().filter(|c| !c.is_expression) {
+                c.name = rn(&c.name);
+            }
+            i.include = i.include.iter().map(|c| rn(c)).collect();
+            i
+        };
+        // a self reference may keep or rename its referenced columns
+        let fk_kept = |f: &ForeignKeyDef| {
+            let mut own = f.clone();
+            own.columns = f.columns.iter().map(|c| rn(c)).collect();
+            let mut both = own.clone();
+            both.ref_columns = f.ref_columns.iter().map(|c| rn(c)).collect();
+            [own, both]
+        };
+        let mut k = KeyChanges::default();
+        let from_pk = from.primary_key.as_ref().map(key);
+        if from_pk != to.primary_key {
+            k.pk_drop = from.primary_key.clone();
+            k.pk_add = to.primary_key.clone();
+        }
+        let from_uq: Vec<KeyDef> = from.unique_keys.iter().map(key).collect();
+        k.uq_drop = from.unique_keys.iter().zip(&from_uq).filter(|(_, r)| !to.unique_keys.contains(r)).map(|(u, _)| u.clone()).collect();
+        k.uq_add = to.unique_keys.iter().filter(|u| !from_uq.contains(u)).cloned().collect();
+        k.ck_drop = from.checks.iter().filter(|c| !to.checks.contains(c)).cloned().collect();
+        k.ck_add = to.checks.iter().filter(|c| !from.checks.contains(c)).cloned().collect();
+        let from_idx: Vec<(&IndexDef, IndexDef)> = secondary_indexes(from).map(|i| (i, index(i))).collect();
+        let to_idx: Vec<&IndexDef> = secondary_indexes(to).collect();
+        k.idx_drop = from_idx.iter().filter(|(_, r)| !to_idx.iter().any(|t| same_index(t, r))).map(|(i, _)| (*i).clone()).collect();
+        k.idx_add = to_idx.iter().filter(|t| !from_idx.iter().any(|(_, r)| same_index(t, r))).map(|t| (*t).clone()).collect();
+        let from_fk: Vec<[ForeignKeyDef; 2]> = from.foreign_keys.iter().map(fk_kept).collect();
+        k.fk_drop = from.foreign_keys.iter().zip(&from_fk).filter(|(_, r)| !r.iter().any(|r| to.foreign_keys.contains(r))).map(|(f, _)| f.clone()).collect();
+        k.fk_add = to.foreign_keys.iter().filter(|f| !from_fk.iter().any(|r| r.contains(f))).cloned().collect();
+        k
+    }
+}
+
 struct Gen<'a> {
     xml: Xml,
     n: usize,
@@ -283,10 +341,56 @@ impl Gen<'_> {
         });
     }
 
+    /// Run `op` through [`Gen::step`] (native change type, else `statements`).
+    fn sub_step(&mut self, description: String, op: MigrationOp, statements: Vec<String>) {
+        self.step(&MigrationStep { phase: Phase::AlterTables, object: String::new(), description, op, statements });
+    }
+
     fn alter_table(&mut self, from: &TableDef, to: &TableDef, renamed: &[(String, String)]) {
         let table = to.name.clone();
         let schema = self.schema_attr();
         let new_name = |old: &str| renamed.iter().find(|(o, _)| o == old).map(|(_, n)| n.clone()).unwrap_or_else(|| old.to_string());
+        // Keys, checks, indexes and foreign keys only differ in whole-table steps
+        // (granular plans have their own steps for them): the old ones are
+        // dropped before the column changes, the new ones added after them.
+        let k = if self.opts.script.alter_mode == AlterMode::WholeTable {
+            // renamed like the planner does (case-insensitively with ignore_identifier_case)
+            let rn = |c: &str| {
+                renamed.iter().find(|(o, _)| o == c).or_else(|| renamed.iter().find(|(o, _)| o.eq_ignore_ascii_case(c))).map(|(_, n)| n.clone()).unwrap_or_else(|| c.to_string())
+            };
+            KeyChanges::new(from, to, &rn)
+        } else {
+            KeyChanges::default()
+        };
+        let dialect = self.dialect;
+        let ddl = dialect.ddl();
+        for f in &k.fk_drop {
+            self.sub_step(
+                format!("Drop foreign key {} on {table}", f.name.clone().unwrap_or_default()),
+                MigrationOp::DropForeignKey { table: table.clone(), fk: f.clone() },
+                vec![ddl.drop_foreign_key(from, f)],
+            );
+        }
+        for i in &k.idx_drop {
+            self.sub_step(format!("Drop index {} on {table}", i.name), MigrationOp::DropIndex { table: table.clone(), index: i.clone() }, vec![ddl.drop_index(from, i)]);
+        }
+        for c in &k.ck_drop {
+            self.sub_step(
+                format!("Drop check {} on {table}", c.name.clone().unwrap_or_default()),
+                MigrationOp::DropCheck { table: table.clone(), check: c.clone() },
+                vec![ddl.drop_check(from, c)],
+            );
+        }
+        for u in &k.uq_drop {
+            self.sub_step(
+                format!("Drop unique key {} on {table}", u.name.clone().unwrap_or_default()),
+                MigrationOp::DropUniqueKey { table: table.clone(), key: u.clone() },
+                vec![ddl.drop_unique_key(from, u)],
+            );
+        }
+        if let Some(pk) = &k.pk_drop {
+            self.sub_step(format!("Drop primary key on {table}"), MigrationOp::DropPrimaryKey { table: table.clone(), key: pk.clone() }, vec![ddl.drop_primary_key(from, pk)]);
+        }
         for (old, new) in renamed {
             let ty = to.column(new).map(|c| c.data_type.clone());
             self.change_set(&format!("Rename column {table}.{old} to {new}"), |x| {
@@ -369,6 +473,22 @@ impl Gen<'_> {
         if mid != *to {
             let sql = self.dialect.ddl().alter_table(&mid, to, &[]);
             self.sql(&format!("Alter table {table}"), &sql);
+        }
+        if let Some(pk) = &k.pk_add {
+            self.add_pk(&table, pk);
+        }
+        for u in &k.uq_add {
+            self.add_unique(&table, u);
+        }
+        for c in &k.ck_add {
+            let sql = vec![self.dialect.ddl().add_check(to, c)];
+            self.sql(&format!("Add check on {table}"), &sql);
+        }
+        for i in &k.idx_add {
+            self.create_index(&table, i, to);
+        }
+        for f in &k.fk_add {
+            self.add_fk(&table, f);
         }
     }
 

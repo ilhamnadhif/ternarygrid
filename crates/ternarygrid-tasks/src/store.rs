@@ -127,18 +127,31 @@ impl TaskStore {
         let mut out = data.clone();
         out.version = VERSION;
         let text = serde_json::to_string_pretty(&out).map_err(|e| DbError::internal(e.to_string()))?;
-        let tmp = self.path.with_extension("json.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp).map_err(|e| io_err("Cannot write", &tmp, e))?;
-            f.write_all(text.as_bytes()).map_err(|e| io_err("Cannot write", &tmp, e))?;
-            f.sync_all().map_err(|e| io_err("Cannot write", &tmp, e))?;
+        // One temporary file per process (the GUI and `--run-task` may save at
+        // the same time), created with mode 0600: the content is never readable
+        // by others, not even until a later chmod.
+        let tmp = self.path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let written = (|| -> std::io::Result<()> {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io_err("Cannot write", &tmp, e));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, &self.path).map_err(|e| io_err("Cannot write", &self.path, e))
+        std::fs::rename(&tmp, &self.path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            io_err("Cannot write", &self.path, e)
+        })
     }
 
     /// Apply `f` to a copy of the data, validate, persist and publish it.
@@ -400,6 +413,11 @@ impl TaskStore {
     /// Import task definitions exported by [`TaskStore::export_json`] (or a
     /// plain JSON array of tasks). Tasks whose id already exists get a new id;
     /// composite steps are remapped. Returns the imported tasks.
+    ///
+    /// Imported tasks with a schedule arrive *disabled* (whatever the file
+    /// says): a file from someone else must not start shell commands, SQL or
+    /// restores on its own while TernaryGrid is open. The schedule is kept; the
+    /// user enables the task after reviewing it. Manual runs are unaffected.
     pub fn import_json(&self, json: &str) -> DbResult<Vec<TaskDef>> {
         let tasks: Vec<TaskDef> = match serde_json::from_str::<ExportFile>(json) {
             Ok(f) => {
@@ -436,6 +454,9 @@ impl TaskStore {
                 }
                 n.updated = now;
                 n.os_scheduler = false;
+                if n.schedule.is_some() {
+                    n.enabled = false;
+                }
                 n.folder = n.folder.as_deref().map(norm_folder).filter(|f| !f.is_empty());
                 n.validate()?;
                 imported.push(n);
@@ -565,6 +586,52 @@ mod tests {
         assert!(other.import_json("{\"format\":\"other\",\"version\":1,\"tasks\":[]}").is_err());
         assert!(other.import_json("not json").is_err());
         assert!(store.export_json(&["missing".to_string()]).is_err());
+    }
+
+    #[test]
+    fn imported_scheduled_tasks_are_disabled() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = TaskStore::open(src_dir.path()).unwrap();
+        let every = Schedule::Interval { every_secs: 60 };
+        let sh = src.create(TaskDef::new("rm", TaskKind::Shell { command: "rm -rf ~/x".into() }).with_schedule(every.clone())).unwrap();
+        let manual = src.create(shell("manual")).unwrap();
+        let comp =
+            src.create(TaskDef::new("c", TaskKind::Composite { steps: vec![manual.id.clone()], stop_on_error: true, parallel: false }).with_schedule(every.clone())).unwrap();
+        assert!(sh.enabled && comp.enabled);
+        let json = src.export_json(&[sh.id.clone(), comp.id.clone()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let imported = store.import_json(&json).unwrap();
+        assert_eq!(imported.len(), 3);
+        for t in &imported {
+            let stored = store.get(&t.id).unwrap();
+            assert_eq!(stored.enabled, t.enabled);
+            if t.schedule.is_some() {
+                assert!(!t.enabled, "{} would run on its own", t.name);
+                assert_eq!(t.schedule.as_ref(), Some(&every), "the schedule is kept for review");
+            } else {
+                assert!(t.enabled, "unscheduled tasks only run when started by hand");
+            }
+        }
+        // A plain array with an explicitly enabled scheduled task too.
+        let arr = serde_json::to_string(&vec![shell("x").with_schedule(every)]).unwrap();
+        assert!(!store.import_json(&arr).unwrap()[0].enabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_file_is_private_and_no_temporary_file_is_left() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        // A stale world-readable temporary file of an earlier crash is not reused as is.
+        let stale = store.path().with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&stale, "old").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+        store.create(shell("a")).unwrap();
+        assert_eq!(std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o777, 0o600);
+        let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![TaskStore::FILE_NAME.to_string()]);
     }
 
     #[test]

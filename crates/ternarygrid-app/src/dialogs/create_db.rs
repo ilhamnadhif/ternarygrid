@@ -3,13 +3,16 @@
 //! mode (PostgreSQL refuses `CREATE DATABASE` inside a transaction) and a
 //! navigator refresh.
 
+use super::{add_field, opt_field, text_field};
 use crate::backend::Job;
 use crate::command::AppCommand;
 use crate::cx::AppContext;
-use egui::RichText;
 use egui_phosphor::regular as icon;
+use std::cell::Cell;
 use ternarygrid_core::driver::TransactionMode;
 use ternarygrid_core::{DbKind, DbResult, NewDatabase, tr, trf};
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts::Dialog;
 
 pub struct CreateDatabaseDialog {
     conn: String,
@@ -79,32 +82,27 @@ impl CreateDatabaseDialog {
         let offer_show_all = !schema && !live.config.init.show_all_databases && live.driver.info().capabilities.multiple_databases;
         let (driver, params, cfg) = (live.driver.clone(), live.params().clone(), live.config.clone());
         let sql = self.sql(live.dialect.as_ref());
+        let dialect = live.dialect.clone();
         let busy = self.job.is_some();
-        let mut keep = true;
-        let mut create = false;
+        let enter = Cell::new(false);
+        let (create, editor, cancel) = (Cell::new(false), Cell::new(false), Cell::new(false));
         let title = if schema { tr("New schema") } else { tr("New database") };
-        let modal = egui::Modal::new(egui::Id::new(("create_database", &self.conn))).show(ctx, |ui| {
-            ui.set_width(520.0);
-            ui.heading(format!("{} {title}", icon::DATABASE));
-            ui.weak(trf("On {}", &[&conn_name]));
-            ui.add_space(6.0);
-            egui::Grid::new("create_db_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label(tr("Name"));
-                let r = ui.add(egui::TextEdit::singleline(&mut self.db.name).desired_width(280.0));
+        let subtitle = trf("On {}", &[&conn_name]);
+        let error = self.error.clone();
+        let (resp, _) = Dialog::new(title).icon(icon::DATABASE).subtitle(&subtitle).width(560.0).body_padding(super::BODY).show_modal(
+            ctx,
+            egui::Id::new(("create_database", &self.conn)),
+            |ui| {
+                super::form_spacing(ui, 12.0);
+                let r = super::form_row(ui, tr("Name"), |ui| add_field(ui, text_field(&mut self.db.name, f32::INFINITY)));
                 if std::mem::take(&mut self.focus) {
                     r.request_focus();
                 }
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    create = true;
+                    enter.set(true);
                 }
-                ui.end_row();
                 let field = |ui: &mut egui::Ui, label: &str, v: &mut Option<String>, hint: &str| {
-                    ui.label(label);
-                    let mut text = v.clone().unwrap_or_default();
-                    if ui.add(egui::TextEdit::singleline(&mut text).hint_text(hint).desired_width(280.0)).changed() {
-                        *v = Some(text).filter(|t| !t.trim().is_empty());
-                    }
-                    ui.end_row();
+                    super::form_row(ui, label, |ui| opt_field(ui, v, hint, f32::INFINITY, false));
                 };
                 match (schema, kind) {
                     (true, DbKind::Postgres | DbKind::CockroachDb | DbKind::SqlServer) => field(ui, tr("Owner"), &mut self.db.owner, tr("(current user)")),
@@ -120,56 +118,55 @@ impl CreateDatabaseDialog {
                     (false, DbKind::SqlServer) => field(ui, tr("Collation"), &mut self.db.collation, tr("(server default)")),
                     _ => {}
                 }
-            });
-            if offer_show_all {
-                ui.checkbox(&mut self.show_all, tr("Show all databases in the navigator"))
-                    .on_hover_text(tr("The navigator lists only the connection's database; the new one appears when all databases are shown."));
-            }
-            ui.add_space(6.0);
-            match &sql {
-                // A bounded preview: a view that fills the available space
-                // would make the dialog grow every frame (and move its buttons).
-                Some(s) => {
-                    egui::ScrollArea::vertical().id_salt(("create_db_sql", &self.conn)).max_height(120.0).show(ui, |ui| {
-                        let text = format!("{s};");
-                        let mut t = text.as_str();
-                        ui.add(egui::TextEdit::multiline(&mut t).code_editor().desired_rows(2).desired_width(f32::INFINITY));
+                if offer_show_all {
+                    super::form_row(ui, "", |ui| {
+                        ternarygrid_ui::kit::checkbox(ui, &mut self.show_all, tr("Show all databases in the navigator"))
+                            .on_hover_text(tr("The navigator lists only the connection's database; the new one appears when all databases are shown."))
                     });
                 }
-                None if self.db.name.trim().is_empty() => {
-                    ui.weak(tr("Enter a name."));
+                match &sql {
+                    // A bounded preview: a view that fills the available space
+                    // would make the dialog grow every frame (and move its buttons).
+                    Some(s) => super::sql_preview(ui, ("create_db_sql", &self.conn), Some(dialect.clone()), &format!("{s};"), 120.0, false),
+                    None if self.db.name.trim().is_empty() => {
+                        super::muted(ui, tr("Enter a name."));
+                    }
+                    None => {
+                        super::muted(ui, tr("This database type cannot create it with SQL."));
+                    }
                 }
-                None => {
-                    ui.weak(tr("This database type cannot create it with SQL."));
+                if read_only {
+                    crate::dialogs::error_note(ui, tr("The connection is read-only."));
                 }
-            }
-            if read_only {
-                crate::widgets::error_box(ui, tr("The connection is read-only."));
-            }
-            if let Some(e) = &self.error {
-                crate::widgets::error_box(ui, e);
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let can = sql.is_some() && !busy && !read_only;
-                if ui.add_enabled(can, egui::Button::new(RichText::new(format!("{} {}", icon::PLUS, tr("Create"))).strong())).clicked() {
-                    create = true;
+                if let Some(e) = &error {
+                    crate::dialogs::error_note(ui, e);
                 }
-                if ui.add_enabled(sql.is_some(), egui::Button::new(tr("Open in SQL editor"))).clicked()
-                    && let Some(s) = &sql
-                {
-                    cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: None, text: Some(format!("{s};\n")) });
-                    keep = false;
+            },
+            |ui| {
+                if ui.add_enabled_ui(sql.is_some(), |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::FILE_CODE), tr("Open in SQL editor"), false)).inner.clicked() {
+                    editor.set(true);
                 }
-                if ui.add_enabled(!busy, egui::Button::new(tr("Cancel"))).clicked() {
-                    keep = false;
-                }
-                if busy {
-                    ui.spinner();
-                }
-            });
-        });
-        if create
+                super::right(ui, |ui| {
+                    if ui.add_enabled_ui(sql.is_some() && !busy && !read_only, |ui| kit::primary_icon(ui, icon::PLUS, tr("Create"))).inner.clicked() {
+                        create.set(true);
+                    }
+                    if ui.add_enabled_ui(!busy, super::cancel_button).inner.clicked() {
+                        cancel.set(true);
+                    }
+                    if busy {
+                        ui.add(egui::Spinner::new().size(14.0));
+                    }
+                });
+            },
+        );
+        let mut keep = !(cancel.get() || (resp.close && !busy));
+        if editor.get()
+            && let Some(s) = &sql
+        {
+            cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: None, text: Some(format!("{s};\n")) });
+            keep = false;
+        }
+        if (create.get() || enter.get())
             && !busy
             && !read_only
             && let Some(stmt) = sql
@@ -192,9 +189,6 @@ impl CreateDatabaseDialog {
                 let _ = s.close().await;
                 r
             }));
-        }
-        if modal.should_close() && !busy {
-            keep = false;
         }
         keep
     }

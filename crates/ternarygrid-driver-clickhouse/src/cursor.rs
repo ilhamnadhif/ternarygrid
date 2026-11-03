@@ -26,6 +26,10 @@ const BATCH_ROWS: usize = 256;
 const CHANNEL_CAPACITY: usize = 8;
 /// Read buffer for the response body.
 const READ_BUFFER: usize = 64 * 1024;
+/// How long [`ChannelCursor::close`] waits for the reader to end after killing the
+/// statement. A server that keeps the response open (the KILL failed, the connection
+/// hangs) would otherwise block the session forever.
+pub(crate) const CLOSE_WAIT: Duration = Duration::from_secs(15);
 
 /// Message from the reader thread to the cursor.
 #[derive(Debug)]
@@ -92,6 +96,10 @@ pub(crate) struct Job {
     pub timeout: Option<Duration>,
     /// Released when the thread is done, unblocking the next statement.
     pub permit: Option<OwnedSemaphorePermit>,
+    /// How long closing the cursor waits for the reader thread.
+    pub close_wait: Duration,
+    /// Set when the reader did not end in time: the session is unusable.
+    pub broken: Arc<AtomicBool>,
 }
 
 /// Start `job` on its own thread and return the cursor reading its results.
@@ -137,6 +145,7 @@ pub(crate) fn start(job: Job, open_flag: Arc<AtomicU64>) -> DbResult<ChannelCurs
 
     let thread_state = state.clone();
     let transport = job.transport.clone();
+    let (close_wait, broken) = (job.close_wait, job.broken.clone());
     std::thread::Builder::new()
         .name("ternarygrid-ch-query".into())
         .spawn(move || {
@@ -170,7 +179,10 @@ pub(crate) fn start(job: Job, open_flag: Arc<AtomicU64>) -> DbResult<ChannelCurs
             });
         }
     });
-    Ok(ChannelCursor::new(rx, Some(on_close), open_flag))
+    let mut cursor = ChannelCursor::new(rx, Some(on_close), open_flag);
+    cursor.close_wait = close_wait;
+    cursor.broken = Some(broken);
+    Ok(cursor)
 }
 
 /// Send helper: false when the cursor is gone or reading was aborted.
@@ -203,7 +215,7 @@ fn run(mut job: Job, tx: &mpsc::Sender<Event>, state: &JobState) -> Option<Owned
     let sent = loop {
         match job.transport.send(&job.request) {
             // The previous (killed) statement may still hold the session lock.
-            Err(e) if e.code.as_deref().is_some_and(|c| c.starts_with("373")) && attempts < 40 => {
+            Err(e) if crate::error::error_code(&e) == Some(373) && attempts < 40 => {
                 attempts += 1;
                 if state.abort.load(Ordering::SeqCst) {
                     state.finished.store(true, Ordering::SeqCst);
@@ -422,12 +434,34 @@ pub(crate) struct ChannelCursor {
     /// The session's open cursor id, and this cursor's: cleared only while it is still this one.
     open_flag: Arc<AtomicU64>,
     id: u64,
+    /// Bound of [`close`](QueryCursor::close)'s wait for the reader thread.
+    close_wait: Duration,
+    /// The session's flag, set when the reader did not end within `close_wait`.
+    broken: Option<Arc<AtomicBool>>,
 }
 
 impl ChannelCursor {
     pub(crate) fn new(rx: mpsc::Receiver<Event>, on_close: Option<Box<dyn FnOnce() + Send>>, open_flag: Arc<AtomicU64>) -> Self {
         let id = open_flag.load(Ordering::SeqCst);
-        ChannelCursor { rx, in_rows: false, buffer: VecDeque::new(), pending_header: None, pending_error: None, finished: false, messages: Vec::new(), on_close, open_flag, id }
+        ChannelCursor {
+            rx,
+            in_rows: false,
+            buffer: VecDeque::new(),
+            pending_header: None,
+            pending_error: None,
+            finished: false,
+            messages: Vec::new(),
+            on_close,
+            open_flag,
+            id,
+            close_wait: CLOSE_WAIT,
+            broken: None,
+        }
+    }
+
+    /// Messages delivered with this cursor's (connection warnings).
+    pub(crate) fn add_messages(&mut self, messages: Vec<ServerMessage>) {
+        self.messages.extend(messages);
     }
 
     fn clear_open_flag(&self) {
@@ -527,7 +561,23 @@ impl QueryCursor for ChannelCursor {
         self.in_rows = false;
         self.pending_header = None;
         self.pending_error = None;
-        while self.recv().await.is_some() {}
+        // The reader ends once the killed statement's response ends. Bounded: a server
+        // that keeps it open (the KILL failed, the connection hangs) must not block the
+        // session forever. The reader thread is left behind and the session is unusable.
+        let wait = self.close_wait;
+        let drained = tokio::time::timeout(wait, async { while self.recv().await.is_some() {} }).await;
+        if drained.is_err() {
+            self.finished = true;
+            self.clear_open_flag();
+            if let Some(b) = &self.broken {
+                b.store(true, Ordering::SeqCst);
+            }
+            tracing::warn!("ClickHouse: the statement did not end within {wait:?} after its cursor was closed; the session is closed");
+            return Err(DbError::connection(format!(
+                "The server did not end the statement within {} s after it was cancelled; the session was closed, reconnect to continue",
+                wait.as_secs()
+            )));
+        }
         Ok(())
     }
 
@@ -618,6 +668,43 @@ mod tests {
         c.close().await.unwrap();
         assert!(called.load(Ordering::SeqCst));
         assert_eq!(flag.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn close_gives_up_on_a_reader_that_never_ends() {
+        let flag = Arc::new(AtomicU64::new(3));
+        let broken = Arc::new(AtomicBool::new(false));
+        // The reader holds its sender and never sends (server keeps the response open).
+        let (tx, rx) = mpsc::channel::<Event>(4);
+        tx.try_send(Event::Header(ResultHeader::Rows(vec![]))).unwrap();
+        let mut c = ChannelCursor::new(rx, Some(Box::new(|| {})), flag.clone());
+        c.close_wait = Duration::from_millis(50);
+        c.broken = Some(broken.clone());
+        assert!(c.next_result().await.unwrap().is_some());
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(5), c.close()).await.expect("close must not hang").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Connection);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(broken.load(Ordering::SeqCst));
+        assert_eq!(flag.load(Ordering::SeqCst), 0);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_a_reader_that_ends() {
+        let broken = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<Event>(4);
+        let mut c = ChannelCursor::new(rx, None, Arc::new(AtomicU64::new(1)));
+        c.close_wait = Duration::from_secs(5);
+        c.broken = Some(broken.clone());
+        // The killed statement ends a little later (blocked send unblocks, thread exits).
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = tx.blocking_send(Event::Rows(rows(1)));
+            drop(tx);
+        });
+        c.close().await.unwrap();
+        assert!(!broken.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

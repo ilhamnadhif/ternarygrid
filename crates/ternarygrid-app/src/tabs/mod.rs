@@ -76,6 +76,11 @@ pub trait TabView: Any {
         None
     }
 
+    /// The result the tab shows, for the status bar ("1,204 rows · 42 ms").
+    fn status_summary(&self) -> Option<String> {
+        None
+    }
+
     /// Unsaved changes (editor text, pending data edits).
     fn is_dirty(&self) -> bool {
         false
@@ -96,9 +101,16 @@ pub trait TabView: Any {
         crate::keys::ActionContext::Global
     }
 
-    /// Opens in a pop-up window of this size instead of a tab: wizards and
-    /// one-off actions (export, import, backup …).
+    /// Opens in a pop-up window instead of a tab (wizards and one-off actions: export,
+    /// import, backup …) of this size: the design's window inside its 1-point border (the
+    /// modal's CSS width × height, header included); the window adds the border.
     fn popup_size(&self) -> Option<egui::Vec2> {
+        None
+    }
+
+    /// The connection a pop-up writes to, when it is not its own (a migration's target): the
+    /// header then reads "source → target".
+    fn popup_target(&self) -> Option<&str> {
         None
     }
 
@@ -167,7 +179,16 @@ pub struct DockViewer<'a, 'b> {
     pub style: std::sync::Arc<egui::Style>,
     /// Titles that several tabs share, with what tells them apart (see [`tab_suffixes`]).
     pub suffixes: std::collections::HashMap<u64, String>,
+    /// Where each tab's button was drawn (filled while the tabs are shown).
+    pub tab_rects: std::collections::HashMap<u64, egui::Rect>,
+    /// The tabs shown in their leaf (each leaf's open tab).
+    pub open_tabs: std::collections::HashSet<u64>,
 }
+
+/// Height of the tab bar: 37 points and the hairline under it.
+pub const TAB_BAR_H: f32 = 38.0;
+/// Room kept at the right of the open tab's title for its × (8, the 20-point button, 10).
+const TAB_CLOSE_ROOM: f32 = 30.0;
 
 /// Tabs with the same title ("product" of two connections) get what tells them
 /// apart after it: the connection's name, or schema@database within one connection.
@@ -248,46 +269,34 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         Id::new(("ternarygrid_tab", tab.id))
     }
 
+    /// The tab's icon and title as in the design: 14 points from the tab's left edge, the
+    /// icon (muted on the open tab, faint on the others), 8 points, the title (the medium
+    /// weight on the open tab); the open tab keeps room for its × at the right.
     fn title(&mut self, tab: &mut Tab) -> WidgetText {
         let dirty = if tab.view.is_dirty() { "● " } else { "" };
-        let mut title = format!(" {dirty}{}", tab.view.title());
+        let mut title = format!("{dirty}{}", tab.view.title());
         if let Some(s) = self.suffixes.get(&tab.id) {
             title = format!("{title} · {s}");
         }
         if title.chars().count() > 46 {
             title = title.chars().take(44).collect::<String>() + "…";
         }
-        // Tabs of a coloured connection type (Production …) are tinted, see `tab_style_override`.
-        let text = egui::RichText::new(title);
+        let p = ternarygrid_ui::palette(self.style.visuals.dark_mode);
+        let open = self.open_tabs.contains(&tab.id);
+        let size = self.style.text_styles.get(&egui::TextStyle::Body).map_or(13.0, |f| f.size);
+        let format = |font: egui::FontId, color: egui::Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
         let mut job = egui::text::LayoutJob::default();
-        let font = egui::FontSelection::Default;
-        ternarygrid_icons::ic(tab.view.icon()).append_to(&mut job, &self.style, font.clone(), egui::Align::Center);
-        text.append_to(&mut job, &self.style, font, egui::Align::Center);
+        // egui_dock pads the title by 8 points: 6 more on the left (7 inside the open tab's
+        // hairline), the icon in a 14-point slot, 8 points, the title, then the × room.
+        job.append(tab.view.icon(), if open { 7.0 } else { 6.0 }, format(ternarygrid_ui::style::icon_font(14.0), if open { p.text_muted } else { p.text_faint }));
+        let font = if open { egui::FontId::new(size, egui::FontFamily::Name(ternarygrid_ui::style::MEDIUM.into())) } else { egui::FontId::proportional(size) };
+        job.append(&title, 8.0 + 14.0 * (1.0 - ternarygrid_ui::style::ICON_SCALE), format(font, egui::Color32::PLACEHOLDER));
+        job.append("\u{200b}", if open { TAB_CLOSE_ROOM + 1.0 } else { 4.0 }, format(egui::FontId::proportional(size), egui::Color32::PLACEHOLDER));
         job.into()
     }
 
     /// A tab of a connection whose type has a colour (Production: red) is
     /// tinted in it, as in DBeaver: work on that server stands out.
-    fn tab_style_override(&self, tab: &Tab, global: &egui_dock::TabStyle) -> Option<egui_dock::TabStyle> {
-        let color = tab.view.connection_id().and_then(|c| self.cx.conns.color_of(c)).and_then(crate::theme::connection_marker)?;
-        let dark = self.style.visuals.dark_mode;
-        let mut s = global.clone();
-        let tint = |base: egui::Color32, t: f32| ternarygrid_grid::theme::mix(base, color, t);
-        for (style, t) in [
-            (&mut s.active, if dark { 0.45 } else { 0.35 }),
-            (&mut s.focused, if dark { 0.45 } else { 0.35 }),
-            (&mut s.active_with_kb_focus, if dark { 0.45 } else { 0.35 }),
-            (&mut s.focused_with_kb_focus, if dark { 0.45 } else { 0.35 }),
-            (&mut s.inactive, if dark { 0.3 } else { 0.22 }),
-            (&mut s.inactive_with_kb_focus, if dark { 0.3 } else { 0.22 }),
-            (&mut s.hovered, if dark { 0.4 } else { 0.3 }),
-        ] {
-            style.bg_fill = tint(style.bg_fill, t);
-            style.outline_color = color;
-        }
-        Some(s)
-    }
-
     fn ui(&mut self, ui: &mut Ui, tab: &mut Tab) {
         self.cx.tab_active = self.active_tab == Some(tab.id);
         self.cx.current_tab = Some(tab.id);
@@ -308,19 +317,48 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         if response.middle_clicked() {
             self.cx.commands.push(crate::command::AppCommand::CloseTab(tab.id));
         }
+        self.tab_rects.insert(tab.id, response.rect);
+        let p = ternarygrid_ui::palette(self.style.visuals.dark_mode);
+        let open = self.open_tabs.contains(&tab.id);
+        let r = response.rect;
+        // The tab reaches up to the top bar's hairline: what it paints starts a point below.
+        let painter = response.ctx.layer_painter(response.layer_id).with_clip_rect(r.with_min_y(r.top() + 1.0));
+        // A line along the top: the connection type's colour on every tab of a marked
+        // connection (Production stays visible), else the accent on the focused tab.
+        let marker = tab.view.connection_id().and_then(|c| self.cx.conns.color_of(c)).and_then(|c| crate::theme::marker(c, self.style.visuals.dark_mode));
+        let focused = self.active_tab == Some(tab.id);
+        if let Some(color) = marker.or_else(|| focused.then_some(p.accent)) {
+            let (top, thick) = if open { (r.top() + 1.0, 3.0) } else { (r.top() + 2.0, 2.0) };
+            let line = egui::Rect::from_min_max(egui::pos2(r.left() + 8.0, top), egui::pos2(r.right() - 8.0, top + thick));
+            painter.rect_filled(line, egui::CornerRadius { nw: 0, ne: 0, sw: 2, se: 2 }, color);
+        }
+        // The open tab's ×: 20 points, 10 from its right hairline.
+        if open {
+            let x = egui::Rect::from_center_size(egui::pos2(r.right() - 21.0, r.center().y + 0.5), egui::vec2(20.0, 20.0));
+            let hover = response.ctx.input(|i| i.pointer.hover_pos()).is_some_and(|q| x.contains(q)) && response.hovered();
+            if hover {
+                painter.rect_filled(x, ternarygrid_ui::style::RADIUS, p.hover);
+            }
+            painter.text(x.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::X, ternarygrid_ui::style::icon_font(12.0), if hover { p.text } else { p.text_muted });
+            if response.clicked() && response.interact_pointer_pos().is_some_and(|q| x.contains(q)) {
+                self.cx.commands.push(crate::command::AppCommand::CloseTab(tab.id));
+            }
+        }
     }
 
     fn context_menu(&mut self, ui: &mut Ui, tab: &mut Tab, _path: egui_dock::NodePath) {
         use crate::command::AppCommand;
-        if ui.button(ternarygrid_core::tr("Close")).clicked() {
+        use ternarygrid_core::tr;
+        ternarygrid_ui::kit::menu_look(ui, 180.0);
+        if ternarygrid_ui::kit::menu_item(ui, Some(egui_phosphor::regular::X), tr("Close"), "").clicked() {
             self.cx.commands.push(AppCommand::CloseTab(tab.id));
             ui.close();
         }
-        if ui.button(ternarygrid_core::tr("Close others")).clicked() {
+        if ternarygrid_ui::kit::menu_item(ui, None, tr("Close others"), "").clicked() {
             self.cx.commands.push(AppCommand::CloseOtherTabs(tab.id));
             ui.close();
         }
-        if ui.button(ternarygrid_core::tr("Close all")).clicked() {
+        if ternarygrid_ui::kit::menu_item(ui, None, tr("Close all"), "").clicked() {
             self.cx.commands.push(AppCommand::CloseAllTabs);
             ui.close();
         }
@@ -378,12 +416,6 @@ pub trait EmbeddedView {
     fn header_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let _ = (ui, cx);
     }
-}
-
-/// Data editor for a table or view (filled in by the results module).
-pub fn make_table_data_view(cx: &mut AppContext, conn: &str, obj: &ternarygrid_core::ObjectRef) -> Option<Box<dyn EmbeddedView>> {
-    let _ = cx;
-    Some(Box::new(crate::results::data_tab::TableDataView::new(conn.to_string(), obj.clone(), None)))
 }
 
 /// Read-only SQL (DDL, generated scripts), highlighted in the dialect of `conn`.

@@ -104,6 +104,11 @@ pub fn kind_for_code(code: u32) -> ErrorKind {
     }
 }
 
+/// Numeric ClickHouse error code of `e` (its `code` reads `47 UNKNOWN_IDENTIFIER` or `47`).
+pub fn error_code(e: &DbError) -> Option<u32> {
+    e.code.as_deref()?.split(' ').next()?.parse().ok()
+}
+
 /// Convert an exception text (from a response body) into a [`DbError`].
 /// `header_code` is the `X-ClickHouse-Exception-Code` header when present.
 pub fn exception_to_error(text: &str, header_code: Option<&str>) -> DbError {
@@ -194,6 +199,16 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Timeout);
         assert_eq!(err.code.as_deref(), Some("159"));
         assert_eq!(err.message, "something odd");
+    }
+
+    #[test]
+    fn error_codes_match_exactly() {
+        let code = |text: &str| error_code(&exception_to_error(text, None));
+        assert_eq!(code("Code: 47. DB::Exception: Unknown identifier: x. (UNKNOWN_IDENTIFIER)"), Some(47));
+        assert_eq!(code("Code: 473. DB::Exception: Deadlock avoided. (DEADLOCK_AVOIDED)"), Some(473));
+        assert_eq!(code("Code: 160. DB::Exception: Too slow. (TOO_SLOW)"), Some(160));
+        assert_eq!(error_code(&exception_to_error("odd", Some("16"))), Some(16));
+        assert_eq!(error_code(&DbError::query("no code")), None);
     }
 
     #[test]

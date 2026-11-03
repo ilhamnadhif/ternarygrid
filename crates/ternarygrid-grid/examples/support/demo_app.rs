@@ -194,7 +194,8 @@ impl DemoApp {
             GridAction::SelectionChanged => {}
             other => {
                 let s = format!("{other:?}");
-                let s = if s.len() > 160 { format!("{}…", &s[..160]) } else { s };
+                // Cut by characters: a byte index may fall inside a non-ASCII character.
+                let s = if s.chars().count() > 160 { format!("{}…", s.chars().take(160).collect::<String>()) } else { s };
                 self.log(s);
             }
         }

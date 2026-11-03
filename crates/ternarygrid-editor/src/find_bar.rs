@@ -133,6 +133,9 @@ pub(crate) fn find_step(st: &mut EditorState, lang: &dyn EditorLanguage, forward
 
 /// Replace the current match (if selected) and move to the next one.
 pub(crate) fn replace_one(st: &mut EditorState, lang: &dyn EditorLanguage) {
+    // Rescan now: large documents defer rescans while typing and their
+    // matches may only have been shifted through the edits.
+    st.find.dirty = true;
     refresh(st, lang);
     let sel = st.sel.range();
     let Some(searcher) = st.find.searcher.clone() else {
@@ -153,6 +156,8 @@ pub(crate) fn replace_one(st: &mut EditorState, lang: &dyn EditorLanguage) {
 
 /// Replace every match as a single undo step. Returns the number replaced.
 pub(crate) fn replace_all(st: &mut EditorState, lang: &dyn EditorLanguage) -> usize {
+    // Never replace shifted (possibly stale) matches: rescan first.
+    st.find.dirty = true;
     refresh(st, lang);
     let Some(searcher) = st.find.searcher.clone() else {
         return 0;
@@ -437,6 +442,48 @@ mod tests {
         assert!(st.find.matches.is_empty());
         st.undo(&ctx);
         assert_eq!(st.text(), "select a, A, b from xyz");
+    }
+
+    #[test]
+    fn replace_never_uses_matches_shifted_through_recent_edits() {
+        let ctx = Context::default();
+        let filler = "-- filler line\n".repeat(RESCAN_DEBOUNCE_BYTES / 10);
+        let mut st = EditorState::new(1, format!("foo fo\n{filler}"));
+        st.find.open = true;
+        st.find.query = "foo".into();
+        st.find.replacement = "bar".into();
+        refresh(&mut st, &PlainText);
+        assert_eq!(st.find.matches, vec![0..3]);
+        // Typing right after the scan: the large document defers rescans,
+        // the stored match is only shifted ("foxo") and "foo" appears anew.
+        st.now = 10.0;
+        st.replace_range(&ctx, 2..2, "x");
+        st.replace_range(&ctx, 7..7, "o");
+        assert!(st.text().starts_with("foxo foo\n"));
+        refresh(&mut st, &PlainText);
+        assert_eq!(st.find.matches, vec![0..4], "shifted, not rescanned");
+        assert_eq!(replace_all(&mut st, &PlainText), 1);
+        assert!(
+            st.text().starts_with("foxo bar\n"),
+            "{:?}",
+            &st.text()[..10]
+        );
+        // Replace (one) moves on to a match of the current text.
+        st.undo(&ctx);
+        assert!(st.text().starts_with("foxo foo\n"));
+        st.now = 20.0;
+        st.find.dirty = true;
+        refresh(&mut st, &PlainText);
+        assert_eq!(st.find.matches, vec![5..8]);
+        st.replace_range(&ctx, 2..3, "");
+        st.set_selection(Selection::caret(0));
+        replace_one(&mut st, &PlainText);
+        assert!(st.text().starts_with("foo foo\n"));
+        assert_eq!(
+            st.selection(),
+            Some(0..3),
+            "the new match, found by a rescan"
+        );
     }
 
     #[test]

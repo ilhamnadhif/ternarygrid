@@ -466,3 +466,58 @@ async fn explain_sessions_metrics() {
     assert!(metrics.iter().any(|m| m.key == "server.uptime"));
     assert!(s.list_locks().await.is_err());
 }
+
+/// First result's rows and messages of `sql`.
+async fn rows_and_messages(s: &mut dyn Session, sql: &str) -> (Vec<ternarygrid_core::Row>, Vec<ternarygrid_core::ServerMessage>) {
+    let mut cur = s.execute(sql, &[], &ExecOptions::default()).await.unwrap();
+    assert!(matches!(cur.next_result().await.unwrap(), Some(ResultHeader::Rows(_))));
+    let mut messages = cur.take_messages();
+    let rows = cur.fetch(100).await.unwrap();
+    messages.extend(cur.take_messages());
+    cur.close().await.unwrap();
+    (rows, messages)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_settings_keep_read_only_and_warn() {
+    let Some(mut p) = params() else { return };
+    // The server refuses an unknown setting: the session falls back to fewer settings.
+    p.properties.insert("setting.ternarygrid_no_such_setting".into(), "1".into());
+    p.read_only = true;
+    let mut s = ClickHouseDriver::new().connect(&p).await.expect("connect");
+    let (rows, messages) = rows_and_messages(s.as_mut(), "SELECT getSetting('readonly')").await;
+    // still read-only on the server
+    assert_eq!(rows[0][0].as_i64(), Some(2));
+    let warning = messages.iter().find(|m| m.severity == "WARNING").unwrap_or_else(|| panic!("no warning in {messages:?}"));
+    let dropped = warning.message.rsplit("runs without:").next().unwrap();
+    assert!(dropped.contains("ternarygrid_no_such_setting") && dropped.contains("http_send_timeout"), "{warning:?}");
+    assert!(!dropped.contains("readonly"), "{warning:?}");
+    let db = unique("ternarygrid_ro");
+    let err = ternarygrid_core::driver::execute_update(s.as_mut(), &format!("CREATE DATABASE {db}"), &[]).await.err();
+    if err.is_none() {
+        exec(s.as_mut(), &format!("DROP DATABASE {db}")).await;
+    }
+    assert_eq!(err.expect("write must be refused").kind, ErrorKind::ReadOnly);
+    // The warning comes once.
+    let (_, messages) = rows_and_messages(s.as_mut(), "SELECT 1").await;
+    assert!(!messages.iter().any(|m| m.severity == "WARNING"), "{messages:?}");
+    s.close().await.unwrap();
+
+    // Not read-only: every setting is dropped, and the warning says so.
+    p.read_only = false;
+    let mut s = ClickHouseDriver::new().connect(&p).await.expect("connect");
+    let (rows, messages) = rows_and_messages(s.as_mut(), "SELECT getSetting('readonly')").await;
+    assert_eq!(rows[0][0].as_i64(), Some(0));
+    assert!(messages.iter().any(|m| m.severity == "WARNING" && m.message.contains("ternarygrid_no_such_setting")), "{messages:?}");
+    s.close().await.unwrap();
+
+    // A `setting.readonly` property does not undo the read-only option.
+    let Some(mut p) = params() else { return };
+    p.read_only = true;
+    p.properties.insert("setting.readonly".into(), "0".into());
+    let mut s = ClickHouseDriver::new().connect(&p).await.expect("connect");
+    let (rows, messages) = rows_and_messages(s.as_mut(), "SELECT getSetting('readonly')").await;
+    assert_eq!(rows[0][0].as_i64(), Some(2));
+    assert!(!messages.iter().any(|m| m.severity == "WARNING"), "{messages:?}");
+    s.close().await.unwrap();
+}

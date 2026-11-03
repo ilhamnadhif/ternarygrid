@@ -13,7 +13,8 @@ use ternarygrid_core::driver::{execute_update, query_all};
 use ternarygrid_core::value::{ColumnSource, DataKind};
 use ternarygrid_core::{ErrorKind, ExecOptions, ResultHeader, Session, TransactionMode, Value};
 use ternarygrid_driver_sqlite::{
-    BackupProgress, SqliteDriver, online_backup, online_backup_with_progress, vacuum_into_sql,
+    BackupProgress, ProgressFn, SqliteDriver, online_backup, online_backup_with_progress,
+    vacuum_into_sql,
 };
 
 const COUNT_TO_A_BILLION: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000) SELECT count(*) FROM c";
@@ -676,6 +677,109 @@ async fn cancels_a_long_query() {
     assert_eq!(int(&mut s, "SELECT 3").await, 3);
 }
 
+/// A cancel that arrives while no statement runs (the worker waits for the
+/// client to ask for the next result) stops the rest of the batch: it used to be
+/// lost (`sqlite3_interrupt` is a no-op then, and the flag was reset).
+#[tokio::test]
+async fn a_cancel_between_statements_stops_the_batch() {
+    let mut s = memory().await;
+    exec(&mut s, "CREATE TABLE t(x)").await;
+    let mut c = s
+        .execute(
+            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+            &[],
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        c.next_result().await.unwrap(),
+        Some(ResultHeader::Update {
+            rows_affected: Some(1),
+            ..
+        })
+    ));
+    s.cancel_handle().unwrap().cancel().await.unwrap();
+    let err = c.next_result().await.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Cancelled, "{err:?}");
+    assert!(c.next_result().await.unwrap().is_none());
+    drop(c);
+    assert_eq!(int(&mut s, "SELECT count(*) FROM t").await, 1);
+
+    // after a row result read to its end as well
+    let mut c = s
+        .execute("SELECT 1; INSERT INTO t VALUES (3)", &[], &opts())
+        .await
+        .unwrap();
+    c.next_result().await.unwrap();
+    assert_eq!(c.fetch(10).await.unwrap(), vec![vec![Value::Int(1)]]);
+    s.cancel_handle().unwrap().cancel().await.unwrap();
+    assert!(
+        c.fetch(10).await.unwrap().is_empty(),
+        "nothing left to cancel"
+    );
+    let err = c.next_result().await.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Cancelled, "{err:?}");
+    drop(c);
+    assert_eq!(int(&mut s, "SELECT count(*) FROM t").await, 1);
+    // the next request is not affected
+    assert_eq!(int(&mut s, "SELECT 9").await, 9);
+}
+
+/// Overflows at x = 5, after four rows.
+const FAILS_AT_ROW_5: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 10) \
+     SELECT CASE WHEN x < 5 THEN x ELSE abs(-9223372036854775803 - x) END FROM c";
+
+/// An error while fetching ends the batch, like an error of its first step,
+/// and is not lost when the client moves on with `next_result`.
+#[tokio::test]
+async fn an_error_while_fetching_ends_the_batch() {
+    let mut s = memory().await;
+    exec(&mut s, "CREATE TABLE t(x)").await;
+    let sql = format!("{FAILS_AT_ROW_5}; INSERT INTO t VALUES (1)");
+
+    // reported by the fetch, then the batch ends
+    let mut c = s.execute(&sql, &[], &opts()).await.unwrap();
+    assert!(matches!(
+        c.next_result().await.unwrap(),
+        Some(ResultHeader::Rows(_))
+    ));
+    assert_eq!(c.fetch(2).await.unwrap().len(), 2);
+    assert_eq!(c.fetch(10).await.unwrap().len(), 2, "rows before the error");
+    let err = c.fetch(10).await.unwrap_err();
+    assert!(err.message.contains("overflow"), "{err:?}");
+    assert!(c.next_result().await.unwrap().is_none());
+    drop(c);
+    assert_eq!(int(&mut s, "SELECT count(*) FROM t").await, 0);
+
+    // held back with the rows before it, then reported by next_result
+    let mut c = s.execute(&sql, &[], &opts()).await.unwrap();
+    c.next_result().await.unwrap();
+    assert_eq!(c.fetch(2).await.unwrap().len(), 2);
+    assert_eq!(c.fetch(10).await.unwrap().len(), 2);
+    let err = c.next_result().await.unwrap_err();
+    assert!(err.message.contains("overflow"), "{err:?}");
+    assert!(c.next_result().await.unwrap().is_none());
+    drop(c);
+    assert_eq!(int(&mut s, "SELECT count(*) FROM t").await, 0);
+
+    // a statement whose rows were all read does not stop the batch
+    let mut c = s
+        .execute("SELECT 1; INSERT INTO t VALUES (1)", &[], &opts())
+        .await
+        .unwrap();
+    c.next_result().await.unwrap();
+    assert!(matches!(
+        c.next_result().await.unwrap(),
+        Some(ResultHeader::Update {
+            rows_affected: Some(1),
+            ..
+        })
+    ));
+    drop(c);
+    assert_eq!(int(&mut s, "SELECT count(*) FROM t").await, 1);
+}
+
 #[tokio::test]
 async fn statement_timeout_interrupts() {
     let mut s = memory().await;
@@ -983,6 +1087,81 @@ async fn online_backup_and_vacuum_into() {
     exec(&mut s, &vacuum_into_sql(None, &dest4)).await;
     let mut copy = connect(&dest4.to_string_lossy()).await;
     assert_eq!(int(&mut copy, "SELECT count(*) FROM t").await, 5000);
+}
+
+/// A backup that fails leaves no destination file behind (it used to leave an
+/// empty one), and an existing destination unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_backup_leaves_the_destination_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = file_in(dir.path(), "src.db");
+    let mut s = connect_with(&path, &[("busy_timeout", "50")]).await;
+    // small pages: more than one backup step
+    exec(&mut s, "PRAGMA page_size = 512; CREATE TABLE t(x); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000) INSERT INTO t SELECT randomblob(400) FROM c").await;
+    assert!(int(&mut s, "PRAGMA page_count").await > 2048);
+    // cancelled after the first step
+    let cancel = s.cancel_handle().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let cancel_on_progress: ProgressFn = Arc::new(move |_| {
+        rt.block_on(cancel.cancel()).unwrap();
+    });
+
+    let dest = dir.path().join("new.db");
+    let err = online_backup_with_progress(&mut s, &dest, Some(cancel_on_progress.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Cancelled, "{err:?}");
+    assert!(!dest.exists(), "the destination was created");
+
+    let existing = dir.path().join("existing.db");
+    let mut e = connect(&existing.to_string_lossy()).await;
+    exec(
+        &mut e,
+        "CREATE TABLE keep(y); INSERT INTO keep VALUES ('old')",
+    )
+    .await;
+    close(e).await;
+    let err = online_backup_with_progress(&mut s, &existing, Some(cancel_on_progress))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Cancelled, "{err:?}");
+    let mut e = connect(&existing.to_string_lossy()).await;
+    assert_eq!(
+        scalar(&mut e, "SELECT y FROM keep").await,
+        Value::text("old")
+    );
+    close(e).await;
+
+    // a locked source is reported as such (it was "Unknown database 'main'")
+    let mut locker = connect(&path).await;
+    exec(&mut locker, "BEGIN EXCLUSIVE; INSERT INTO t VALUES (2)").await;
+    let err = online_backup(&mut s, &dest).await.unwrap_err();
+    assert!(err.message.contains("locked"), "{err:?}");
+    assert!(!dest.exists());
+    exec(&mut locker, "ROLLBACK").await;
+
+    online_backup(&mut s, &dest).await.unwrap();
+    let mut copy = connect(&dest.to_string_lossy()).await;
+    assert_eq!(int(&mut copy, "SELECT count(*) FROM t").await, 3000);
+}
+
+/// `create_schema` attaches a new file next to the main database, not in the
+/// process working directory.
+#[tokio::test]
+async fn created_schemas_are_next_to_the_main_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = connect(&file_in(dir.path(), "main.db")).await;
+    let sql = s.dialect().ddl().create_schema("extra");
+    exec(&mut s, &sql).await;
+    exec(&mut s, "CREATE TABLE extra.t(x)").await;
+    assert!(dir.path().join("extra.db").exists(), "{sql}");
+
+    // in memory: an in-memory database
+    let mut m = memory().await;
+    let sql = m.dialect().ddl().create_schema("extra");
+    assert!(sql.contains("':memory:'"), "{sql}");
+    exec(&mut m, &sql).await;
+    exec(&mut m, "CREATE TABLE extra.t(x)").await;
 }
 
 #[tokio::test]

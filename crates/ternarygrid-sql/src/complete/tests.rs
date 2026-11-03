@@ -476,6 +476,26 @@ fn s30_variables() {
     assert_eq!(r.items[0].kind, CompletionKind::Variable);
     let r = run("SELECT * FROM users WHERE id = :uid AND name = :u‸");
     assert!(r.items.iter().any(|i| i.insert == ":uid"));
+    // The word being typed is no proposal.
+    assert!(
+        !r.items.iter().any(|i| i.insert == ":u"),
+        "{:?}",
+        labels(&r)
+    );
+    let r = run("SELECT * FROM users WHERE id = :abc‸");
+    assert!(r.items.is_empty(), "{:?}", labels(&r));
+    let r = run_with(
+        "SET @total = 1;\nSELECT @tot‸",
+        &TestDialect::mysql(),
+        &CompletionOptions::default(),
+    );
+    assert_eq!(
+        r.items
+            .iter()
+            .map(|i| i.insert.as_str())
+            .collect::<Vec<_>>(),
+        ["@total"]
+    );
 }
 
 #[test]

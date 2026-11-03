@@ -20,6 +20,22 @@ use std::collections::BTreeSet;
 use ternarygrid_core::plan::QueryPlan;
 use ternarygrid_core::{tr, trf};
 
+/// "Color by": the metric of the plan's colours, a drop-down in the kit's menu look.
+pub(super) fn metric_combo(ui: &mut Ui, metric: &mut PlanMetric, salt: &str) {
+    egui::ComboBox::from_id_salt(salt)
+        .icon(ternarygrid_ui::kit::combo_caret)
+        .selected_text(tr(metric.label()))
+        .show_ui(ui, |ui| {
+            ternarygrid_ui::kit::menu_look(ui, 120.0);
+            for m in [PlanMetric::Auto, PlanMetric::Time, PlanMetric::Cost] {
+                if ternarygrid_ui::kit::menu_check(ui, &mut (*metric == m), tr(m.label())).clicked()
+                {
+                    *metric = m;
+                }
+            }
+        });
+}
+
 /// Direction of the plan tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -309,7 +325,14 @@ pub fn show_plan_diagram(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewStat
         }
         let mut view = ViewTransform::new(state.zoom, state.pan);
         match bounds {
-            Some(b) => view.fit(rect.size(), b, 24.0, 0.1, 1.0),
+            // Readable boxes (at least 75 %): a plan taller than the area starts at its top
+            // (the rest is a scroll away), as the mockups show it.
+            Some(b) => {
+                view.fit(rect.size(), b, 24.0, 0.75, 1.0);
+                if b.height() * view.zoom > rect.height() - 48.0 {
+                    view.pan.y = 20.0 - b.top() * view.zoom;
+                }
+            }
             None => view = ViewTransform::default(),
         }
         state.zoom = view.zoom;
@@ -451,42 +474,53 @@ pub fn show_plan_diagram(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewStat
 }
 
 fn plan_toolbar(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) {
+    use ternarygrid_ui::kit;
     ui.horizontal(|ui| {
-        ui.selectable_value(
-            &mut state.orientation,
-            PlanOrientation::TopDown,
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if kit::icon_button_ex(
+            ui,
             icon::ARROW_DOWN,
+            tr("Top down"),
+            state.orientation == PlanOrientation::TopDown,
+            26.0,
         )
-        .on_hover_text(tr("Top down"));
-        ui.selectable_value(
-            &mut state.orientation,
-            PlanOrientation::LeftRight,
-            icon::ARROW_RIGHT,
-        )
-        .on_hover_text(tr("Left to right"));
-        ui.separator();
-        ui.label(tr("Color by"));
-        egui::ComboBox::from_id_salt("ternarygrid_plan_metric")
-            .selected_text(tr(state.metric.label()))
-            .show_ui(ui, |ui| {
-                for m in [PlanMetric::Auto, PlanMetric::Time, PlanMetric::Cost] {
-                    ui.selectable_value(&mut state.metric, m, tr(m.label()));
-                }
-            });
-        if ui
-            .button(ternarygrid_icons::ic(icon::CORNERS_OUT))
-            .on_hover_text(tr("Zoom to fit"))
-            .clicked()
+        .clicked()
         {
+            state.orientation = PlanOrientation::TopDown;
+        }
+        if kit::icon_button_ex(
+            ui,
+            icon::ARROW_RIGHT,
+            tr("Left to right"),
+            state.orientation == PlanOrientation::LeftRight,
+            26.0,
+        )
+        .clicked()
+        {
+            state.orientation = PlanOrientation::LeftRight;
+        }
+        kit::vdivider(ui, 16.0);
+        ui.label(egui::RichText::new(tr("Color by")).color(ternarygrid_ui::pal(ui).text_muted));
+        metric_combo(ui, &mut state.metric, "ternarygrid_plan_metric");
+        if kit::icon_button_ex(ui, icon::CORNERS_OUT, tr("Zoom to fit"), false, 26.0).clicked() {
             state.fit_pending = true;
         }
-        ui.toggle_value(
-            &mut state.show_details,
-            ternarygrid_icons::ic(icon::SIDEBAR_SIMPLE),
+        if kit::icon_button_ex(
+            ui,
+            icon::SIDEBAR_SIMPLE,
+            tr("Show node details"),
+            state.show_details,
+            26.0,
         )
-        .on_hover_text(tr("Show node details"));
-        ui.separator();
-        ui.weak(summary_line(&plan_summary(plan)));
+        .clicked()
+        {
+            state.show_details = !state.show_details;
+        }
+        kit::vdivider(ui, 16.0);
+        ui.label(
+            egui::RichText::new(summary_line(&plan_summary(plan)))
+                .color(ternarygrid_ui::pal(ui).text_faint),
+        );
     });
 }
 
@@ -504,12 +538,10 @@ fn paint_box(
 ) {
     let share = f.share(metric);
     let heat = colors::heat(share.map(|s| (s * 2.0) as f32).unwrap_or(0.0));
-    let radius = (5.0 * zoom).clamp(0.0, 10.0);
-    let fill = match share {
-        Some(s) if s >= 0.02 => colors::tint(v, heat, if v.dark_mode { 0.16 } else { 0.12 }),
-        _ => v.window_fill,
-    };
-    painter.rect_filled(srect, radius, fill);
+    // As the mockups' nodes: a card on the surface, the heat in its left bar and its share.
+    let p = ternarygrid_ui::style::palette(v.dark_mode);
+    let radius = (8.0 * zoom).clamp(0.0, 10.0);
+    painter.rect_filled(srect, radius, p.surface);
     let r8 = radius.round() as u8;
     let accent = Rect::from_min_size(srect.min, vec2((ACCENT_W * zoom).max(2.0), srect.height()));
     painter.rect_filled(
@@ -527,11 +559,11 @@ fn paint_box(
         },
     );
     let stroke = if selected {
-        Stroke::new(2.0, v.selection.stroke.color)
+        Stroke::new(2.0, p.accent)
     } else if hover {
-        Stroke::new(1.5, v.selection.stroke.color.gamma_multiply(0.7))
+        Stroke::new(1.5, p.accent.gamma_multiply(0.7))
     } else {
-        v.widgets.noninteractive.bg_stroke
+        Stroke::new(1.0, p.border)
     };
     painter.rect_stroke(srect, radius, stroke, StrokeKind::Inside);
 
@@ -550,8 +582,8 @@ fn paint_box(
                 ),
                 galley.size() + vec2(10.0, 2.0),
             );
-            painter.rect_filled(pill, pill.height() * 0.5, heat);
-            painter.galley(pill.min + vec2(5.0, 1.0), galley, colors::text_on(heat));
+            painter.rect_filled(pill, pill.height() * 0.5, p.subtle);
+            painter.galley_with_override_text_color(pill.min + vec2(5.0, 1.0), galley, heat);
             right = pill.left() - 4.0;
         }
         paint::text(

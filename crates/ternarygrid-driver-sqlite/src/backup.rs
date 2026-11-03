@@ -172,13 +172,17 @@ fn run_backup(
     if dest.is_dir() {
         return Err(DbError::io(format!("'{}' is a directory", dest.display())));
     }
-    let source_file: Option<String> = src
-        .query_row(
-            "SELECT file FROM pragma_database_list WHERE name = ?1",
-            [schema],
-            |r| r.get(0),
-        )
-        .map_err(|_| DbError::query(format!("Unknown database '{schema}'")))?;
+    // Only a missing row means an unknown database (a locked source is not one).
+    let source_file: Option<String> = match src.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = ?1",
+        [schema],
+        |r| r.get(0),
+    ) {
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err(DbError::query(format!("Unknown database '{schema}'")));
+        }
+        r => r.db()?,
+    };
     if let Some(f) = source_file.filter(|f| !f.is_empty())
         && same_file(Path::new(&f), dest)
     {
@@ -193,6 +197,35 @@ fn run_backup(
             |r| r.get(0),
         )
         .db()?;
+    // An existing destination is left unchanged when the copy fails or is
+    // cancelled (its write transaction is rolled back); one created here is removed.
+    let existed = dest.exists();
+    let result = copy_pages(src, schema, dest, progress, cancel, busy_timeout);
+    if result.is_err() && !existed {
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let mut p = dest.as_os_str().to_owned();
+            p.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(p));
+        }
+    }
+    let pages = result?;
+    Ok(BackupReport {
+        pages,
+        bytes: pages * page_size,
+        elapsed: started.elapsed(),
+    })
+}
+
+/// The copy itself; returns the number of pages copied. The destination
+/// connection is closed when it returns.
+fn copy_pages(
+    src: &Connection,
+    schema: &str,
+    dest: &Path,
+    progress: Option<ProgressFn>,
+    cancel: Option<&AtomicBool>,
+    busy_timeout: Duration,
+) -> DbResult<i64> {
     let mut dst = Connection::open(dest).map_err(|e| {
         DbError::io(format!(
             "Cannot open '{}': {}",
@@ -237,11 +270,7 @@ fn run_backup(
             total: pages,
         });
     }
-    Ok(BackupReport {
-        pages,
-        bytes: pages * page_size,
-        elapsed: started.elapsed(),
-    })
+    Ok(pages)
 }
 
 #[cfg(test)]

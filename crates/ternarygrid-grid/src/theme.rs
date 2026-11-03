@@ -19,6 +19,8 @@ pub struct GridTheme {
     pub stripe: Color32,
     /// Grid lines.
     pub line: Color32,
+    /// The line under the header and over the grid.
+    pub border: Color32,
     /// Header / row number background.
     pub header_bg: Color32,
     /// Header text.
@@ -27,12 +29,12 @@ pub struct GridTheme {
     pub header_selected_bg: Color32,
     /// Row numbers.
     pub rownum_text: Color32,
-    /// Values of the record view (one colour, no stripes).
-    pub record_bg: Color32,
     /// Normal text.
     pub text: Color32,
-    /// Weak text (NULL, defaults, descriptions).
+    /// Weak text (defaults, descriptions, binary values).
     pub weak: Color32,
+    /// NULL (in italics).
+    pub null: Color32,
     /// Selected cells overlay.
     pub selection: Color32,
     /// Active cell border.
@@ -58,38 +60,41 @@ pub struct GridTheme {
 }
 
 impl GridTheme {
-    /// Theme for `visuals`.
+    /// Theme for `visuals`: the design's colours (the palette of `ternarygrid_ui`, and the
+    /// grid's own tints: stripes, lines, the selection, changed, new and deleted rows).
     pub fn from_visuals(v: &Visuals) -> Self {
-        let bg = v.extreme_bg_color;
-        let text = v.text_color();
         let dark = v.dark_mode;
-        let green = if dark { Color32::from_rgb(0x3f, 0xb9, 0x50) } else { Color32::from_rgb(0x1a, 0x7f, 0x37) };
-        let header_base = v.widgets.noninteractive.weak_bg_fill;
+        let p = ternarygrid_ui::style::palette(dark);
+        let rgb = |d: u32, l: u32| {
+            let c = if dark { d } else { l };
+            Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+        };
+        let bg = p.surface;
+        let sel = p.sel;
         GridTheme {
             bg,
-            stripe: mix(bg, text, if dark { 0.053 } else { 0.03 }),
-            // Darker than the rows in the dark theme (as in DBeaver), else darker than white.
-            line: if dark { mix(bg, Color32::BLACK, 0.17) } else { mix(bg, text, 0.12) },
-            header_bg: mix(header_base, bg, 0.25),
-            header_text: v.strong_text_color(),
-            // DBeaver's grey-violet in the dark theme (selected headers, the record view's field).
-            header_selected_bg: if dark { Color32::from_rgb(0x5F, 0x5F, 0x6F) } else { mix(header_base, v.selection.bg_fill, 0.45) },
-            // White on the dark blue-grey header (as in DBeaver), grey on the light one.
-            rownum_text: if dark { v.strong_text_color() } else { v.weak_text_color() },
-            record_bg: if dark { mix(bg, text, 0.053) } else { bg },
-            text,
-            weak: v.weak_text_color(),
-            selection: v.selection.bg_fill.gamma_multiply(if dark { 0.55 } else { 0.45 }),
-            active_border: v.selection.stroke.color,
-            modified: mix(bg, v.warn_fg_color, if dark { 0.28 } else { 0.30 }),
-            inserted: mix(bg, green, if dark { 0.26 } else { 0.20 }),
-            deleted: mix(bg, v.error_fg_color, if dark { 0.26 } else { 0.18 }),
-            link: v.hyperlink_color,
-            badge_bg: mix(bg, text, 0.13),
-            badge_text: mix(text, bg, 0.25),
-            error: v.error_fg_color,
-            warn: v.warn_fg_color,
-            bool_true: green,
+            stripe: p.stripe,
+            line: p.line,
+            border: p.border,
+            header_bg: p.header,
+            header_text: p.text,
+            // Selected headers and the record view's field: the header tinted with the selection.
+            header_selected_bg: mix(p.header, sel, 0.7),
+            rownum_text: p.text_faint,
+            text: p.text,
+            weak: p.text_faint,
+            null: p.text_faint,
+            selection: sel,
+            active_border: p.accent,
+            modified: p.modified,
+            inserted: rgb(0x1f3a2b, 0xe6f4ea),
+            deleted: rgb(0x43282b, 0xfbe9e7),
+            link: p.accent_text,
+            badge_bg: mix(bg, p.text, 0.13),
+            badge_text: mix(p.text, bg, 0.25),
+            error: p.err,
+            warn: p.warn,
+            bool_true: p.ok,
         }
     }
 }

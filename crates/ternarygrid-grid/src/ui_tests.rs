@@ -54,6 +54,24 @@ impl Viewer {
         })
     }
 
+    /// Centres of the accessibility nodes labelled exactly `text`, top to bottom.
+    fn find_all_exact(&self, text: &str) -> Vec<Pos2> {
+        let Some(update) = self.output.accesskit_update.as_ref() else { return Vec::new() };
+        let mut found: Vec<Pos2> = update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.label().is_some_and(|l| l == text))
+            .filter_map(|(_, n)| n.bounds().map(|b| Pos2::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)))
+            .collect();
+        found.sort_by(|a, b| a.y.total_cmp(&b.y));
+        found
+    }
+
+    /// The filter bar's Apply (the topmost: a panel can have an Apply of its own).
+    fn filter_apply(&self) -> Option<Pos2> {
+        self.find_all_exact("Apply").first().copied()
+    }
+
     /// Centre of the first text input holding `text`.
     fn find_input(&self, text: &str) -> Option<Pos2> {
         let update = self.output.accesskit_update.as_ref()?;
@@ -152,8 +170,8 @@ fn client_filter_from_filter_bar() {
     let mut v = Viewer::new(editable_model(100));
     v.state.toolbar.filter_text = "id >= 90 and flag".into();
     v.state.toolbar.order_text = "id desc".into();
-    // Press Enter in the filter field: simulate by clicking the apply button (labelled ▶ icon).
-    let apply = v.find(egui_phosphor::regular::PLAY).expect("apply button");
+    // Press Enter in the filter field: simulate by clicking the filter bar's Apply.
+    let apply = v.filter_apply().expect("apply button");
     v.click(apply);
     v.wait_jobs();
     assert_eq!(v.model.row_count(), 5);
@@ -191,7 +209,7 @@ fn server_mode_filter_bar_emits_query_change() {
     let mut v = Viewer::new(editable_model(10));
     v.state.grid.mode = crate::grid::DataMode::Server;
     v.state.toolbar.filter_text = "status = 'open'".into();
-    let apply = v.find(egui_phosphor::regular::PLAY).expect("apply button");
+    let apply = v.filter_apply().expect("apply button");
     v.frame(vec![Event::PointerMoved(apply)]);
     v.frame(vec![press(apply, PointerButton::Primary, Modifiers::NONE)]);
     v.frame(vec![release(apply, PointerButton::Primary, Modifiers::NONE)]);
@@ -211,7 +229,8 @@ fn value_panel_edits_active_cell() {
     v.click(editor);
     v.frame(vec![crate::test_support::key(egui::Key::End, Modifiers::NONE)]);
     v.frame(vec![Event::Text("!".into())]);
-    let apply = v.find("Apply").expect("apply button");
+    // The value panel's Apply: below the filter bar's.
+    let apply = v.find_all_exact("Apply").last().copied().expect("apply button");
     v.click(apply);
     assert_eq!(v.model.cell(2, 1), Some(Value::text("name 2!")));
 }
@@ -634,13 +653,14 @@ fn record_view_has_the_grids_menu_and_keys() {
 }
 
 #[test]
-fn cancel_discards_pending_changes_at_once() {
+fn discard_drops_pending_changes_at_once() {
     let mut v = Viewer::new(editable_model(3));
     v.model.set_value(1, 1, ternarygrid_core::Value::text("changed")).unwrap();
     v.frame(vec![]);
     assert!(v.model.has_changes());
-    let cancel = v.find("Cancel").expect("Cancel button");
-    v.click(cancel);
+    assert!(v.find("1 change").is_some(), "the footer counts the pending change");
+    let discard = v.find("Discard").expect("Discard button");
+    v.click(discard);
     assert!(!v.model.has_changes(), "no Discard / Keep question first");
     assert!(v.actions.iter().any(|a| matches!(a, GridAction::ChangesDiscarded)));
     v.frame(vec![]);
@@ -653,7 +673,7 @@ fn a_long_fetch_shows_a_spinner_then_cancel() {
     v.model.fetch.fetching = true;
     v.frame(vec![]);
     assert!(v.find("Fetching…").is_some(), "the spinner's text");
-    // Not the Cancel of Save / Cancel in the toolbar: the one over the grid's body.
+    // The Cancel over the grid's body (not a button of the footer).
     let cancel_in_body = |v: &Viewer| {
         let (body, ..) = v.state.grid.rt.last_geometry.unwrap();
         let update = v.output.accesskit_update.as_ref()?;
@@ -685,7 +705,7 @@ fn the_panel_tab_x_closes_it() {
         .nodes
         .iter()
         .filter_map(|(_, n)| {
-            let b = n.bounds().filter(|_| n.label().is_some_and(|l| l == egui_phosphor::regular::X))?;
+            let b = n.bounds().filter(|_| n.label().is_some_and(|l| l == "Close panel"))?;
             Some(egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
         })
         .filter(|p| p.x > tab.x && (p.y - tab.y).abs() < 10.0)
@@ -694,4 +714,106 @@ fn the_panel_tab_x_closes_it() {
     v.click(x);
     v.frame(vec![]);
     assert!(!v.state.toolbar.is_panel_open(PanelKind::Grouping), "× closes the panel");
+}
+
+#[test]
+fn filter_by_value_runs_the_filter_the_box_shows() {
+    // Server mode: the action carries the whole WHERE, the one before included,
+    // and the filter box shows exactly that (the application runs it as it is).
+    let mut v = Viewer::new(editable_model(10));
+    v.state.grid.mode = crate::grid::DataMode::Server;
+    v.state.toolbar.filter_text = "id > 1".into();
+    let by_value = |v: &mut Viewer, value: &str| {
+        v.state.grid.select_cell(2, 1);
+        v.state.grid.rt.header_popup = Some((1, egui::Rect::from_min_size(egui::pos2(300.0, 40.0), egui::vec2(16.0, 20.0)), true));
+        v.frame(vec![]);
+        v.frame(vec![]);
+        let item = v.find(&format!("name = '{value}'")).expect("the column menu's filter by the cell value");
+        v.click(item);
+    };
+    by_value(&mut v, "name 2");
+    let sent: Vec<Option<String>> = v
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            GridAction::ServerQueryChanged { where_clause, .. } => Some(where_clause.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent.len(), 1, "{:?}", v.actions);
+    let sent = sent[0].clone().unwrap();
+    assert!(sent.starts_with("(id > 1) AND (") && sent.contains("name") && sent.ends_with("'name 2')"), "{sent}");
+    assert_eq!(v.state.toolbar.filter_text, sent, "the box shows what runs");
+    // Applied again from the box: the same condition, not doubled.
+    v.frame(vec![]);
+    assert_eq!(v.state.toolbar.filter_text, sent);
+    // Client mode combines the same way: (filter before) AND (new condition).
+    let mut v = Viewer::new(editable_model(10));
+    v.state.toolbar.filter_text = "id > 1".into();
+    let apply = v.filter_apply().expect("apply button");
+    v.click(apply);
+    v.wait_jobs();
+    assert_eq!(v.model.row_count(), 8);
+    by_value(&mut v, "name 4");
+    v.wait_jobs();
+    assert_eq!(v.state.toolbar.filter_text, "(id > 1) AND (name = 'name 4')");
+    assert_eq!(v.model.row_count(), 1);
+}
+
+#[test]
+fn nothing_to_copy_is_a_note_not_an_error_pop_up() {
+    let mut v = Viewer::new(editable_model(5));
+    v.state.grid.request_focus();
+    v.frame(vec![]);
+    v.state.grid.selection_mut().clear();
+    v.frame(vec![Event::Copy]);
+    v.frame(vec![]);
+    assert_eq!(v.state.toolbar.notice, Some(("Nothing is selected".to_string(), false)));
+    assert!(v.state.toolbar.error_popup.is_none(), "no modal for it");
+    // Typing while editing is disabled (a save runs) says so, without a pop-up per key.
+    v.options.allow_editing = false;
+    v.state.grid.select_cell(1, 1);
+    v.frame(vec![]);
+    v.frame(vec![Event::Text("x".into())]);
+    v.frame(vec![]);
+    assert!(!v.state.grid.is_editing());
+    assert_eq!(v.state.toolbar.notice, Some(("Editing is disabled".to_string(), false)));
+    assert!(v.state.toolbar.error_popup.is_none());
+    // A real error still pops up.
+    v.options.allow_editing = true;
+    v.model.set_editability(Err(crate::model::ReadOnlyReason::ConnectionReadOnly));
+    v.frame(vec![Event::Text("x".into())]);
+    v.frame(vec![]);
+    assert!(v.state.toolbar.error_popup.is_some());
+}
+
+#[test]
+fn record_view_keeps_its_values_while_the_store_is_busy() {
+    let mut v = Viewer::new(editable_model(5));
+    v.state.grid.select_cell(2, 1);
+    v.state.toolbar.view = ResultViewKind::Record;
+    v.frame(vec![]);
+    v.frame(vec![]);
+    // The check box of `flag` (true in row 3) says what it shows.
+    let flag = |v: &Viewer| {
+        let update = v.output.accesskit_update.as_ref()?;
+        update.nodes.iter().filter(|(_, n)| n.role() == egui::accesskit::Role::CheckBox).find_map(|(_, n)| n.label().filter(|l| *l != "Hide empty").map(str::to_string))
+    };
+    assert_eq!(flag(&v).as_deref(), Some("true"));
+    let store = v.model.store().clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let guard = store.lock();
+        let _ = locked_tx.send(());
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+    });
+    locked_rx.recv().unwrap();
+    v.frame(vec![]);
+    v.frame(vec![]);
+    let busy = flag(&v);
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    assert_eq!(busy.as_deref(), Some("true"), "the values read before, not NULL, while the fetch task holds the store");
 }

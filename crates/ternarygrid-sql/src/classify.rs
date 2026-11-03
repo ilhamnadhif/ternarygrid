@@ -323,48 +323,44 @@ pub fn classify_command(
             }
         }
         L::Mongo => {
-            let lower = text.to_ascii_lowercase();
-            let method = |m: &str| lower.contains(&format!(".{}(", m.to_ascii_lowercase()));
-            let writes = [
-                "insertOne",
-                "insertMany",
-                "updateOne",
-                "updateMany",
-                "replaceOne",
-                "deleteOne",
-                "deleteMany",
-                "remove",
-                "drop",
-                "dropDatabase",
-                "createIndex",
-                "dropIndex",
-                "createCollection",
-                "renameCollection",
-                "findOneAndUpdate",
-                "findOneAndDelete",
-                "findOneAndReplace",
-                "bulkWrite",
-                "runCommand",
-                "adminCommand",
-            ];
-            info.is_write = writes.iter().any(|w| method(w)) || lower.starts_with("use ");
+            let t = js_tokens(text);
+            let calls = js_calls(&t);
+            // Only methods known to read are reads: anything else (`insert`, `save`,
+            // `findAndModify`, `mapReduce`, `createView`, `createUser`, …) writes.
+            let unknown_call = calls.iter().any(|c| {
+                let known = if c.member {
+                    MONGO_READ_METHODS
+                } else {
+                    MONGO_GLOBAL_CALLS
+                };
+                !known.contains(&c.name.as_str())
+            });
+            // An aggregation `$out` / `$merge` stage writes its result.
+            let write_stage = t.iter().any(
+                |x| matches!(x, JsTok::Ident(s) | JsTok::Str(s) if s == "$out" || s == "$merge"),
+            );
+            let use_db = matches!(t.first(), Some(JsTok::Ident(w)) if w.eq_ignore_ascii_case("use"))
+                && t.len() > 1;
+            info.is_write = unknown_call || write_stage || use_db;
             info.returns_rows = !info.is_write;
             info.kind = if info.is_write {
                 StatementKind::Other
             } else {
                 StatementKind::Select
             };
+            let called = |m: &str| calls.iter().any(|c| c.member && c.name == m);
             let empty_filter = |m: &str| {
-                let pat = format!(".{}(", m.to_ascii_lowercase());
-                lower.find(&pat).is_some_and(|i| {
-                    let rest: String = lower[i + pat.len()..]
-                        .chars()
-                        .filter(|c| !c.is_whitespace())
-                        .collect();
-                    rest.starts_with(')') || rest.starts_with("{})") || rest.starts_with("{},")
+                calls.iter().any(|c| {
+                    c.member && c.name == m && {
+                        let a = c.open + 1;
+                        t.get(a) == Some(&JsTok::Punct(')'))
+                            || (t.get(a) == Some(&JsTok::Punct('{'))
+                                && t.get(a + 1) == Some(&JsTok::Punct('}'))
+                                && matches!(t.get(a + 2), Some(JsTok::Punct(')' | ','))))
+                    }
                 })
             };
-            if method("drop") || method("dropDatabase") {
+            if called("drop") || called("dropDatabase") {
                 info.danger = Some(Danger::Drop);
             } else if empty_filter("deleteMany") || empty_filter("remove") {
                 info.danger = Some(Danger::DeleteWithoutWhere);
@@ -374,29 +370,76 @@ pub fn classify_command(
         }
         L::Search => {
             let method = first.as_str();
-            let path = text.split_whitespace().nth(1).unwrap_or("");
+            // Like the driver: `METHOD target`, where `target` is not SQL's FROM.
+            let next = text.split_whitespace().nth(1).unwrap_or("");
             let rest = matches!(method, "GET" | "POST" | "PUT" | "DELETE" | "HEAD")
-                && !path.eq_ignore_ascii_case("FROM");
+                && !next.is_empty()
+                && !next.eq_ignore_ascii_case("FROM");
             if !rest {
                 return None;
             }
+            // The driver takes the path from the request line (`/` when it has none).
+            let (line, body) = text.split_once('\n').unwrap_or((text, ""));
+            let mut words = line.split_whitespace().skip(1);
+            let target = words.next().unwrap_or("/");
+            let path = target.split(['?', '#']).next().unwrap_or("");
+            let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            // The endpoint is the first `_` segment (index names cannot start with `_`):
+            // `/product_catalog/_doc` is `_doc`, `/logs/_search/scroll` is `_search`.
+            let api = segments
+                .iter()
+                .copied()
+                .find(|s| s.starts_with('_') && !matches!(*s, "_plugins" | "_opendistro"))
+                .unwrap_or("");
+            // Encoded or relative paths may reach another endpoint.
+            let plain = !path.contains('%') && !segments.iter().any(|s| matches!(*s, "." | ".."));
             let reads = [
                 "_search",
-                "_count",
                 "_msearch",
+                "_count",
                 "_sql",
-                "_mapping",
-                "_cat",
-                "_stats",
+                "_ppl",
+                "_query",
+                "_eql",
                 "_explain",
                 "_field_caps",
                 "_validate",
+                "_mget",
+                "_termvectors",
+                "_mtermvectors",
+                "_analyze",
+                "_rank_eval",
+                "_search_shards",
+                "_async_search",
+                "_knn_search",
+                "_terms_enum",
+                "_render",
             ];
-            info.is_write = match method {
-                "GET" | "HEAD" => false,
-                "POST" => !reads.iter().any(|r| path.contains(r)),
-                _ => true,
+            // GET requests that still change the index.
+            let side_effects = ["_refresh", "_flush", "_forcemerge", "_cache"];
+            // OpenSearch SQL / PPL can delete documents.
+            let dml = matches!(api, "_sql" | "_ppl") && {
+                let request: String = words
+                    .chain(body.split_whitespace())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                request
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .any(|w| {
+                        [
+                            "DELETE", "INSERT", "UPDATE", "REPLACE", "UPSERT", "MERGE", "CREATE",
+                            "ALTER", "DROP", "TRUNCATE",
+                        ]
+                        .iter()
+                        .any(|k| w.eq_ignore_ascii_case(k))
+                    })
             };
+            info.is_write = dml
+                || match method {
+                    "GET" | "HEAD" => segments.iter().any(|s| side_effects.contains(s)),
+                    "POST" => !(plain && reads.contains(&api)),
+                    _ => true,
+                };
             info.returns_rows = !info.is_write;
             info.kind = if info.is_write {
                 StatementKind::Other
@@ -405,13 +448,255 @@ pub fn classify_command(
             };
             if method == "DELETE" {
                 info.danger = Some(Danger::Drop);
-            } else if path.contains("_delete_by_query") {
+            } else if segments.contains(&"_delete_by_query") {
                 info.danger = Some(Danger::DeleteWithoutWhere);
             }
         }
         _ => return None,
     }
     Some(info)
+}
+
+/// MongoDB collection, cursor and database methods that only read.
+const MONGO_READ_METHODS: &[&str] = &[
+    "find",
+    "findOne",
+    "aggregate",
+    "count",
+    "countDocuments",
+    "estimatedDocumentCount",
+    "distinct",
+    "getIndexes",
+    "getIndexKeys",
+    "getIndexSpecs",
+    "stats",
+    "dataSize",
+    "storageSize",
+    "totalSize",
+    "totalIndexSize",
+    "isCapped",
+    "latencyStats",
+    "sort",
+    "limit",
+    "skip",
+    "projection",
+    "pretty",
+    "toArray",
+    "batchSize",
+    "maxTimeMS",
+    "allowDiskUse",
+    "comment",
+    "hint",
+    "collation",
+    "min",
+    "max",
+    "readConcern",
+    "readPref",
+    "returnKey",
+    "showRecordId",
+    "size",
+    "itcount",
+    "explain",
+    "hasNext",
+    "next",
+    "getCollection",
+    "getSiblingDB",
+    "getCollectionNames",
+    "getCollectionInfos",
+    "getName",
+    "serverStatus",
+    "version",
+    "hostInfo",
+    "getUsers",
+    "getUser",
+    "getRoles",
+    "getRole",
+    "currentOp",
+    "getProfilingStatus",
+    "getProfilingLevel",
+    "hello",
+    "isMaster",
+];
+
+/// Calls without a receiver that only build values (`ObjectId("…")`, `new Date()`),
+/// and keywords followed by `(`.
+const MONGO_GLOBAL_CALLS: &[&str] = &[
+    "ObjectId",
+    "ISODate",
+    "Date",
+    "NumberLong",
+    "Long",
+    "NumberInt",
+    "Int32",
+    "NumberDecimal",
+    "Decimal128",
+    "Double",
+    "UUID",
+    "BinData",
+    "Timestamp",
+    "RegExp",
+    "MinKey",
+    "MaxKey",
+    "print",
+    "printjson",
+    "tojson",
+    "function",
+    "if",
+    "for",
+    "while",
+    "switch",
+    "return",
+    "typeof",
+    "catch",
+];
+
+/// Token of a MongoDB shell statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JsTok {
+    /// Name or number (`db`, `$out`, `5`).
+    Ident(String),
+    /// String (unescaped like the driver does) or regular expression literal.
+    Str(String),
+    Punct(char),
+}
+
+/// Tokens of a shell statement: white space and comments dropped, strings
+/// unescaped, read the way the TernaryGrid MongoDB driver reads them.
+fn js_tokens(src: &str) -> Vec<JsTok> {
+    let c: Vec<char> = src.chars().collect();
+    let mut out: Vec<JsTok> = Vec::new();
+    let mut i = 0;
+    let ident_char = |ch: char| {
+        ch.is_ascii_alphanumeric()
+            || ch == '_'
+            || ch == '$'
+            || !(ch.is_ascii() || ch.is_whitespace())
+    };
+    while i < c.len() {
+        let ch = c[i];
+        if ch.is_whitespace() {
+            i += 1;
+        } else if ch == '/' && c.get(i + 1) == Some(&'/') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+        } else if ch == '/' && c.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if ch == '"' || ch == '\'' {
+            let mut s = String::new();
+            i += 1;
+            while i < c.len() && c[i] != ch {
+                if c[i] == '\\' {
+                    i += 1;
+                    match c.get(i) {
+                        Some('n') => s.push('\n'),
+                        Some('t') => s.push('\t'),
+                        Some('r') => s.push('\r'),
+                        Some('b') => s.push('\u{8}'),
+                        Some('f') => s.push('\u{c}'),
+                        Some('0') => s.push('\0'),
+                        Some('u') => {
+                            let hex: String = c.iter().skip(i + 1).take(4).collect();
+                            if let Some(u) =
+                                u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                            {
+                                s.push(u);
+                                i += 4;
+                            }
+                        }
+                        Some(&e) => s.push(e),
+                        None => {}
+                    }
+                } else {
+                    s.push(c[i]);
+                }
+                i += 1;
+            }
+            i += 1;
+            out.push(JsTok::Str(s));
+        } else if ch == '/'
+            && !matches!(
+                out.last(),
+                Some(JsTok::Ident(_) | JsTok::Str(_) | JsTok::Punct(')' | ']'))
+            )
+        {
+            // Regular expression literal (where a value is expected).
+            let mut s = String::new();
+            let mut class = false;
+            i += 1;
+            while i < c.len() {
+                match c[i] {
+                    '\\' => {
+                        s.push('\\');
+                        i += 1;
+                    }
+                    '[' => class = true,
+                    ']' => class = false,
+                    '/' if !class => break,
+                    _ => {}
+                }
+                if let Some(&x) = c.get(i) {
+                    s.push(x);
+                }
+                i += 1;
+            }
+            i += 1;
+            while i < c.len() && c[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            out.push(JsTok::Str(s));
+        } else if ident_char(ch) {
+            let start = i;
+            while i < c.len() && ident_char(c[i]) {
+                i += 1;
+            }
+            out.push(JsTok::Ident(c[start..i].iter().collect()));
+        } else {
+            out.push(JsTok::Punct(ch));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A call in a shell statement.
+struct JsCall {
+    /// Function name; empty when it is computed (`f()()`, `x[k]()`).
+    name: String,
+    /// Called on an object (`.name(`, `["name"](`).
+    member: bool,
+    /// Index of the `(` (or `` ` `` of a tagged template).
+    open: usize,
+}
+
+/// Every call in `t`: `.name(`, `.name?.(`, `["name"](`, `name(` …
+fn js_calls(t: &[JsTok]) -> Vec<JsCall> {
+    let p = |k: usize, ch: char| t.get(k) == Some(&JsTok::Punct(ch));
+    let mut calls = Vec::new();
+    for k in 0..t.len() {
+        let open = if p(k + 1, '(') || p(k + 1, '`') {
+            k + 1
+        } else if p(k + 1, '?') && p(k + 2, '.') && p(k + 3, '(') {
+            k + 3
+        } else {
+            continue;
+        };
+        let (name, member) = match &t[k] {
+            JsTok::Ident(n) => (n.clone(), k > 0 && p(k - 1, '.')),
+            JsTok::Punct(']') => match (k >= 2 && p(k - 2, '['), &t[k.saturating_sub(1)]) {
+                (true, JsTok::Str(s)) => (s.clone(), true),
+                _ => (String::new(), true),
+            },
+            JsTok::Punct(')') => (String::new(), false),
+            _ => continue,
+        };
+        calls.push(JsCall { name, member, open });
+    }
+    calls
 }
 
 /// Classify one statement.
@@ -440,23 +725,135 @@ pub fn split_and_classify(
 /// Classify the statement made of `tokens` (offsets into `src`).
 pub(crate) fn classify_tokens(src: &str, tokens: &[Token], syntax: &SqlSyntax) -> StatementInfo {
     let sig: Vec<Token> = tokens.iter().filter(|t| !t.is_trivia()).copied().collect();
+    // MySQL runs the text of `/*! … */` comments as part of the statement.
+    let expanded = expand_exec_comments(src, tokens);
     if sig.is_empty() {
-        if let Some(c) = tokens
-            .iter()
-            .find(|t| t.kind == TokenKind::BlockComment && t.text(src).starts_with("/*!"))
-        {
+        return match expanded {
+            Some(text) => classify_text(&text, syntax),
+            None => StatementInfo::new(StatementKind::Other, String::new()),
+        };
+    }
+    let mut info = classify_sig(src, &sig, syntax);
+    // MySQL runs `/*! … */` comments: `SELECT * FROM t /*!INTO OUTFILE '/tmp/x'*/` writes.
+    if syntax.delimiter_command && !info.is_write {
+        for c in tokens.iter().filter(|t| is_exec_comment(t, src)) {
             let inner = exec_comment_body(c.text(src));
             let toks = tokenize(inner, syntax);
             let sig: Vec<Token> = toks.iter().filter(|t| !t.is_trivia()).copied().collect();
-            return Sig {
-                src: inner,
-                t: &sig,
+            let words: Vec<String> = sig
+                .iter()
+                .map(|t| t.text(inner).to_ascii_uppercase())
+                .collect();
+            let into_file = words
+                .windows(2)
+                .any(|w| w[0] == "INTO" && (w[1] == "OUTFILE" || w[1] == "DUMPFILE"));
+            // A fragment (`, 2`, `PARTITION BY …`) is no statement: only a writing statement word counts.
+            let writes = words.first().is_some_and(|w| {
+                LATER_WRITE_STARTS.contains(&w.as_str())
+                    || ["REPLACE", "RENAME", "LOAD"].contains(&w.as_str())
+            });
+            if into_file || writes {
+                info.is_write = true;
+                break;
             }
-            .classify(0, 0);
         }
-        return StatementInfo::new(StatementKind::Other, String::new());
+        // Clauses spread over several comments and the text around them
+        // (`SELECT * FROM t /*!INTO*/ /*!OUTFILE '/tmp/x'*/`).
+        if !info.is_write
+            && let Some(text) = &expanded
+        {
+            let e = classify_text(text, syntax);
+            info.is_write = e.is_write;
+            info.danger = info.danger.or(e.danger);
+        }
     }
-    let mut info = Sig { src, t: &sig }.classify(0, 0);
+    info
+}
+
+/// `/*! … */` (MySQL) or `/*M! … */` (MariaDB) executable comment.
+fn is_exec_comment(t: &Token, src: &str) -> bool {
+    t.kind == TokenKind::BlockComment && {
+        let text = t.text(src);
+        text.starts_with("/*!") || text.starts_with("/*M!")
+    }
+}
+
+/// The statement as MySQL runs it: executable comments replaced by their
+/// text; `None` without such comments.
+fn expand_exec_comments(src: &str, tokens: &[Token]) -> Option<String> {
+    if !tokens.iter().any(|t| is_exec_comment(t, src)) {
+        return None;
+    }
+    let mut text = String::new();
+    for t in tokens {
+        if is_exec_comment(t, src) {
+            text.push(' ');
+            text.push_str(exec_comment_body(t.text(src)));
+            text.push(' ');
+        } else {
+            text.push_str(t.text(src));
+        }
+    }
+    Some(text)
+}
+
+/// Classify `text` (an expanded statement).
+fn classify_text(text: &str, syntax: &SqlSyntax) -> StatementInfo {
+    let toks = tokenize(text, syntax);
+    let sig: Vec<Token> = toks.iter().filter(|t| !t.is_trivia()).copied().collect();
+    let mut info = classify_sig(text, &sig, syntax);
+    // An executable comment left inside one is not looked into.
+    if toks.iter().any(|t| is_exec_comment(t, text)) {
+        info.is_write = true;
+    }
+    info
+}
+
+/// Classify the significant tokens `sig`. Statements separated by `;` at the
+/// top level (`SELECT 1; DELETE FROM t` given to [`classify`] as one, a MySQL
+/// custom delimiter) all count: any write makes the whole a write.
+fn classify_sig(src: &str, sig: &[Token], syntax: &SqlSyntax) -> StatementInfo {
+    let mut pieces = Vec::new();
+    let (mut depth, mut from) = (0i32, 0usize);
+    for (k, t) in sig.iter().enumerate() {
+        match t.kind {
+            TokenKind::LParen => depth += 1,
+            TokenKind::RParen => depth -= 1,
+            TokenKind::Semicolon if depth <= 0 => {
+                if k > from {
+                    pieces.push(from..k);
+                }
+                from = k + 1;
+            }
+            _ => {}
+        }
+    }
+    if from < sig.len() {
+        pieces.push(from..sig.len());
+    }
+    let Some(first) = pieces.first() else {
+        return classify_run(src, sig, syntax);
+    };
+    let mut info = classify_run(src, &sig[first.clone()], syntax);
+    // Procedure bodies and blocks hold statements of their own: their dangers are not the statement's.
+    let holds_body = info.is_write
+        && matches!(
+            info.kind,
+            StatementKind::Create | StatementKind::Alter | StatementKind::Other
+        );
+    for r in &pieces[1..] {
+        let piece = classify_run(src, &sig[r.clone()], syntax);
+        info.is_write |= piece.is_write;
+        if !holds_body {
+            info.danger = info.danger.or(piece.danger);
+        }
+    }
+    info
+}
+
+/// Classify one statement (or a T-SQL run of statements without `;`).
+fn classify_run(src: &str, sig: &[Token], syntax: &SqlSyntax) -> StatementInfo {
+    let mut info = Sig { src, t: sig }.classify(0, 0);
     // T-SQL runs statements one after another without `;` (`SELECT 1 DELETE FROM t`,
     // `UPDATE t SET a = 1 DELETE FROM u WHERE id = 5`): one span may hold several.
     // Each is classified on its own tokens, so a later WHERE does not count for an
@@ -466,7 +863,7 @@ pub(crate) fn classify_tokens(src: &str, tokens: &[Token], syntax: &SqlSyntax) -
         let mut several = false;
         let mut danger = None;
         loop {
-            let next = next_batch_statement(src, &sig, from, kind, is_write);
+            let next = next_batch_statement(src, sig, from, kind, is_write);
             if next.is_none() && !several {
                 break;
             }
@@ -489,33 +886,6 @@ pub(crate) fn classify_tokens(src: &str, tokens: &[Token], syntax: &SqlSyntax) -
         }
         if several {
             info.danger = danger;
-        }
-    }
-    // MySQL runs `/*! … */` comments: `SELECT * FROM t /*!INTO OUTFILE '/tmp/x'*/` writes.
-    if syntax.delimiter_command && !info.is_write {
-        for c in tokens
-            .iter()
-            .filter(|t| t.kind == TokenKind::BlockComment && t.text(src).starts_with("/*!"))
-        {
-            let inner = exec_comment_body(c.text(src));
-            let toks = tokenize(inner, syntax);
-            let sig: Vec<Token> = toks.iter().filter(|t| !t.is_trivia()).copied().collect();
-            let words: Vec<String> = sig
-                .iter()
-                .map(|t| t.text(inner).to_ascii_uppercase())
-                .collect();
-            let into_file = words
-                .windows(2)
-                .any(|w| w[0] == "INTO" && (w[1] == "OUTFILE" || w[1] == "DUMPFILE"));
-            // A fragment (`, 2`, `PARTITION BY …`) is no statement: only a writing statement word counts.
-            let writes = words.first().is_some_and(|w| {
-                LATER_WRITE_STARTS.contains(&w.as_str())
-                    || ["REPLACE", "RENAME", "LOAD"].contains(&w.as_str())
-            });
-            if into_file || writes {
-                info.is_write = true;
-                break;
-            }
         }
     }
     info
@@ -554,9 +924,14 @@ fn next_batch_statement(
                     && !(is("MERGE") && sig.get(k + 1).is_some_and(|n| n.text(src).eq_ignore_ascii_case("JOIN")))
                     // `INSERT … EXEC p` fills the insert.
                     && !(kind == K::Insert && (is("EXEC") || is("EXECUTE")));
+                // `DISABLE TRIGGER trg ON t`
+                let trigger = (is("ENABLE") || is("DISABLE"))
+                    && sig
+                        .get(k + 1)
+                        .is_some_and(|n| n.text(src).eq_ignore_ascii_case("TRIGGER"));
                 // After UPDATE / DELETE a SELECT is the next statement (`INSERT … SELECT` fills the insert).
                 let read = is("SELECT") && matches!(kind, K::Update | K::Delete);
-                if write || read {
+                if write || trigger || read {
                     return Some(k);
                 }
             }
@@ -587,11 +962,43 @@ const LATER_WRITE_STARTS: &[&str] = &[
     "RECONFIGURE",
     "KILL",
     "SHUTDOWN",
+    "CHECKPOINT",
+    "WRITETEXT",
+    "UPDATETEXT",
+    "SETUSER",
 ];
 
-/// Body of a MySQL executable comment: `/*!40101 SET x */` → `SET x`.
+/// Settings that make a session read-only: turning one off or resetting it
+/// lifts the read-only mode of a read-only connection.
+const READ_ONLY_SETTINGS: &[&str] = &[
+    "default_transaction_read_only",
+    "transaction_read_only",
+    "tx_read_only",
+    "read_only",
+    "super_read_only",
+    // ClickHouse
+    "readonly",
+];
+
+/// `name` (possibly quoted or qualified: `@@session.transaction_read_only`) is
+/// one of [`READ_ONLY_SETTINGS`].
+fn is_read_only_setting(name: &str) -> bool {
+    let name = name.trim_matches(['`', '"']).to_ascii_lowercase();
+    let name = name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('@');
+    READ_ONLY_SETTINGS.contains(&name)
+}
+
+/// Body of a MySQL executable comment: `/*!40101 SET x */` → `SET x`
+/// (MariaDB: `/*M!100100 SET x */`).
 fn exec_comment_body(text: &str) -> &str {
-    let inner = text.strip_prefix("/*!").unwrap_or(text);
+    let inner = text
+        .strip_prefix("/*!")
+        .or_else(|| text.strip_prefix("/*M!"))
+        .unwrap_or(text);
     let inner = inner.strip_suffix("*/").unwrap_or(inner);
     inner
         .trim_start_matches(|c: char| c.is_ascii_digit())
@@ -768,6 +1175,15 @@ impl<'a> Sig<'a> {
         }
         let first = self.upper(p);
         if self.kind(p) == Some(TokenKind::ClientCommand) {
+            // Without client command splitting SQL may follow on the next lines
+            // (`@set x = 1` / `DELETE FROM t`): that is what the statement does.
+            let mut q = p + 1;
+            while self.kind(q) == Some(TokenKind::ClientCommand) {
+                q += 1;
+            }
+            if q < self.t.len() {
+                return self.classify(q, depth + 1);
+            }
             let text = self.text(p);
             let name: String = text.chars().take_while(|c| !c.is_whitespace()).collect();
             return StatementInfo::new(StatementKind::ClientCommand, name.to_uppercase());
@@ -780,7 +1196,11 @@ impl<'a> Sig<'a> {
         match first.as_str() {
             "SELECT" => self.select(p, first),
             "WITH" => self.with(p, depth),
-            "VALUES" | "SUMMARIZE" => info(K::Select, first).rows(),
+            "VALUES" | "SUMMARIZE" => {
+                let mut i = info(K::Select, first).rows();
+                i.is_write = self.lifts_read_only(p + 1);
+                i
+            }
             "TABLE" => {
                 let mut i = info(K::Select, first).rows();
                 i.target = self.name_at(p + 1);
@@ -905,14 +1325,16 @@ impl<'a> Sig<'a> {
             "RELEASE" => info(K::Transaction(TxCommand::Release), first),
             "SET" => self.set(p, first),
             "RESET" => {
-                if self.any(
+                let mut i = info(K::Set, first);
+                // `RESET ALL` and `RESET default_transaction_read_only` lift the read-only
+                // session of a read-only connection.
+                i.is_write = self.any(
                     p + 1,
-                    &["MASTER", "SLAVE", "REPLICA", "QUERY", "BINARY", "PERSIST"],
-                ) {
-                    info(K::Set, first).write()
-                } else {
-                    info(K::Set, first)
-                }
+                    &[
+                        "MASTER", "SLAVE", "REPLICA", "QUERY", "BINARY", "PERSIST", "ALL",
+                    ],
+                ) || is_read_only_setting(self.text(p + 1));
+                i
             }
             "SHOW" => info(K::Show, first).rows(),
             "DESCRIBE" | "DESC" => {
@@ -936,6 +1358,13 @@ impl<'a> Sig<'a> {
                 i.is_write = !to_stdout;
                 if self.kind(p + 1) != Some(TokenKind::LParen) {
                     i.target = self.name_at(p + 1);
+                } else {
+                    // `COPY (DELETE FROM t RETURNING *) TO STDOUT` runs the statement.
+                    let inner = self
+                        .sub(p + 2, self.close_paren(p + 1))
+                        .classify(0, depth + 1);
+                    i.is_write |= inner.is_write;
+                    i.danger = inner.danger;
                 }
                 i
             }
@@ -976,8 +1405,21 @@ impl<'a> Sig<'a> {
                 }
             }
             "FETCH" | "MOVE" => info(K::Other, first).rows(),
-            "CLOSE" | "DEALLOCATE" | "DISCARD" | "LISTEN" | "UNLISTEN" | "PRINT" | "WAITFOR"
-            | "RAISERROR" | "THROW" => info(K::Other, first),
+            // `DISCARD ALL` runs `RESET ALL`.
+            "DISCARD" => {
+                let mut i = info(K::Other, first);
+                i.is_write = !self.any(p + 1, &["PLANS", "SEQUENCES", "TEMP", "TEMPORARY"]);
+                i
+            }
+            // `WAITFOR (RECEIVE … FROM queue)` takes messages off a queue.
+            "WAITFOR" => {
+                let mut i = info(K::Other, first);
+                i.is_write = self.kind(p + 1) == Some(TokenKind::LParen);
+                i
+            }
+            "CLOSE" | "DEALLOCATE" | "LISTEN" | "UNLISTEN" | "PRINT" | "RAISERROR" | "THROW" => {
+                info(K::Other, first)
+            }
             _ => info(K::Other, first).write(),
         }
     }
@@ -986,8 +1428,10 @@ impl<'a> Sig<'a> {
         let mut i = StatementInfo::new(StatementKind::Select, first).rows();
         if let Some(into) = self.find_top(p + 1, |j| self.w(j, "INTO")) {
             i.returns_rows = false;
-            let target = self.kind(into + 1);
-            let to_variable = matches!(target, Some(TokenKind::Variable | TokenKind::Parameter));
+            // `INTO @v` (MySQL / T-SQL variables) only reads; `${name}` and `:name` are
+            // replaced by any text before the statement runs.
+            let to_variable = self.kind(into + 1) == Some(TokenKind::Variable)
+                && !self.text(into + 1).starts_with("${");
             if !to_variable {
                 // PostgreSQL / T-SQL `SELECT ... INTO new_table`, MySQL `INTO OUTFILE`.
                 i.is_write = true;
@@ -1002,7 +1446,7 @@ impl<'a> Sig<'a> {
                 && (self.any(j + 1, &["UPDATE", "SHARE"]) || (self.any(j + 1, &["NO", "KEY"]))))
                 || (self.w(j, "LOCK") && self.w(j + 1, "IN"))
         });
-        if locking.is_some() {
+        if locking.is_some() || self.lifts_read_only(p + 1) {
             i.is_write = true;
         }
         if i.target.is_none() {
@@ -1084,21 +1528,8 @@ impl<'a> Sig<'a> {
             || self.text(n).to_ascii_lowercase().starts_with("@@persist");
         // `SET default_transaction_read_only = off`, `SET SESSION transaction_read_only = 0`:
         // turning a read-only setting off (a value that is not plainly "on" counts as off).
-        const READ_ONLY: [&str; 5] = [
-            "default_transaction_read_only",
-            "transaction_read_only",
-            "tx_read_only",
-            "read_only",
-            "super_read_only",
-        ];
         let read_only_setting = (n..self.t.len()).any(|k| {
-            let name = self.text(k).trim_matches(['`', '"']).to_ascii_lowercase();
-            let name = name
-                .rsplit('.')
-                .next()
-                .unwrap_or("")
-                .trim_start_matches('@');
-            if !READ_ONLY.contains(&name) {
+            if !is_read_only_setting(self.text(k)) {
                 return false;
             }
             let v = if self.text(k + 1) == "=" || self.w(k + 1, "TO") {
@@ -1117,6 +1548,28 @@ impl<'a> Sig<'a> {
     /// `READ WRITE` from token `from` on.
     fn read_write(&self, from: usize) -> bool {
         (from..self.t.len()).any(|k| self.w(k, "READ") && self.w(k + 1, "WRITE"))
+    }
+
+    /// A `set_config('default_transaction_read_only', …)` call from token `from` on
+    /// (or one whose setting is not a plain string): it lifts the read-only session
+    /// of a read-only connection like `SET` does.
+    fn lifts_read_only(&self, from: usize) -> bool {
+        (from..self.t.len()).any(|k| {
+            if self.kind(k + 1) != Some(TokenKind::LParen)
+                || !self
+                    .ident_text(k)
+                    .is_some_and(|n| n.eq_ignore_ascii_case("set_config"))
+            {
+                return false;
+            }
+            let name = self.text(k + 2);
+            let plain = self.kind(k + 2) == Some(TokenKind::String)
+                && self.kind(k + 3) == Some(TokenKind::Comma)
+                && name.len() >= 2
+                && name.starts_with('\'')
+                && name.ends_with('\'');
+            !plain || is_read_only_setting(&name[1..name.len() - 1])
+        })
     }
 
     fn explain(&self, p: usize, first: String, depth: u32) -> StatementInfo {
@@ -1202,7 +1655,9 @@ impl<'a> Sig<'a> {
         }
         let name = self.text(n).to_ascii_lowercase();
         let has_arg = self.kind(n + 1) == Some(TokenKind::LParen);
-        if assigns || (has_arg && !QUERY_PRAGMAS.contains(&name.as_str())) {
+        // Without an argument these still change the database file.
+        let writes = ["optimize", "incremental_vacuum", "wal_checkpoint"].contains(&name.as_str());
+        if assigns || writes || (has_arg && !QUERY_PRAGMAS.contains(&name.as_str())) {
             i.is_write = true;
         } else {
             i.returns_rows = true;
@@ -1507,8 +1962,128 @@ mod tests {
         assert!(cm("SET PASSWORD = 'x'").is_write);
         let i = cm("USE shop");
         assert_eq!((i.kind, i.is_write), (K::Use, false));
-        assert!(!c("RESET ALL").is_write);
+        // `RESET ALL` lifts a read-only session (it used to count as no write).
+        assert!(c("RESET ALL").is_write);
+        assert!(!c("RESET search_path").is_write);
         assert!(cm("RESET MASTER").is_write);
+    }
+
+    #[test]
+    fn lifting_read_only_is_a_write() {
+        for q in [
+            "RESET ALL",
+            "reset default_transaction_read_only",
+            "RESET transaction_read_only",
+            "DISCARD ALL",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE",
+            "SET default_transaction_read_only = off",
+            "SET LOCAL transaction_read_only TO false",
+            "SET default_transaction_read_only TO DEFAULT",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE, READ WRITE",
+            "SELECT set_config('default_transaction_read_only', 'off', false)",
+            "SELECT pg_catalog.set_config('transaction_read_only', 'off', true)",
+            "SELECT \"set_config\"('default_transaction_read_only', 'off', false)",
+            "SELECT set_config(current_setting('app.name'), 'off', false)",
+            "SELECT set_config('default_transaction_' || 'read_only', 'off', false)",
+            "VALUES (set_config('default_transaction_read_only', 'off', false))",
+            "WITH x AS (SELECT set_config('default_transaction_read_only', 'off', false)) SELECT * FROM x",
+            // ClickHouse
+            "SET readonly = 0",
+        ] {
+            assert!(c(q).is_write, "{q}");
+        }
+        for q in [
+            "RESET search_path",
+            "RESET ROLE",
+            "DISCARD PLANS",
+            "DISCARD TEMP",
+            "SELECT set_config('app.user_id', '5', false)",
+            "SET default_transaction_read_only = on",
+            "SET readonly = 1",
+        ] {
+            assert!(!c(q).is_write, "{q}");
+        }
+        for q in [
+            "SET SESSION TRANSACTION READ WRITE",
+            "SET TRANSACTION READ WRITE",
+            "SET transaction_read_only=0",
+            "SET @@session.transaction_read_only = OFF",
+            "SET @@transaction_read_only = 0",
+            "SET SESSION tx_read_only = 0",
+            "START TRANSACTION READ WRITE",
+        ] {
+            assert!(cm(q).is_write, "{q}");
+        }
+        assert!(!cm("SET SESSION TRANSACTION READ ONLY").is_write);
+        assert!(!cm("SET transaction_read_only = 1").is_write);
+        let s = sqlite();
+        for q in [
+            "PRAGMA query_only = 0",
+            "PRAGMA query_only = OFF",
+            "PRAGMA query_only(false)",
+            "PRAGMA main.query_only = 0",
+            "PRAGMA optimize",
+            "PRAGMA incremental_vacuum",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ] {
+            assert!(classify(q, &s).is_write, "{q}");
+        }
+        assert!(!classify("PRAGMA query_only", &s).is_write);
+    }
+
+    #[test]
+    fn hidden_writes() {
+        // Several statements given as one: any write counts.
+        let i = c("SELECT 1; DELETE FROM t");
+        assert_eq!(
+            (i.kind, i.is_write, i.danger),
+            (K::Select, true, Some(Danger::DeleteWithoutWhere))
+        );
+        assert!(!c("SELECT 1; SELECT 2;").is_write);
+        assert_eq!(
+            classify("PRINT 'x'; DELETE FROM t", &tsql()).danger,
+            Some(Danger::DeleteWithoutWhere)
+        );
+        assert_eq!(c("DELETE FROM t WHERE a = 1;").danger, None);
+        // A body's statements are not the statement's dangers.
+        let i = cm("CREATE PROCEDURE p() BEGIN UPDATE t SET a = 1; DELETE FROM u; END");
+        assert_eq!((i.kind, i.is_write, i.danger), (K::Create, true, None));
+        // COPY of a data-modifying query runs it.
+        let i = c("COPY (DELETE FROM t RETURNING *) TO STDOUT");
+        assert_eq!(
+            (i.is_write, i.danger),
+            (true, Some(Danger::DeleteWithoutWhere))
+        );
+        assert!(
+            c("COPY (WITH d AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM d) TO STDOUT")
+                .is_write
+        );
+        assert!(!c("COPY (SELECT * FROM t) TO STDOUT").is_write);
+        assert!(c("COPY t FROM PROGRAM 'curl x'").is_write);
+        assert!(c("COPY t TO PROGRAM 'cat > /tmp/x'").is_write);
+        // INTO a template variable or parameter: replaced by any text before running.
+        assert!(c("SELECT * INTO ${target} FROM t").is_write);
+        assert!(c("SELECT * INTO :target FROM t").is_write);
+        assert!(!cm("SELECT a INTO @v FROM t").is_write);
+        // MySQL / MariaDB executable comments, also spread over several.
+        assert!(cm("SELECT * FROM t /*!INTO*/ /*!OUTFILE '/tmp/x'*/").is_write);
+        assert!(cm("SELECT * FROM t /*!INTO*/ OUTFILE '/tmp/x'").is_write);
+        assert!(cm("/*!SELECT 1*/ /*!INTO OUTFILE '/tmp/x'*/").is_write);
+        assert!(cm("SELECT * FROM t /*M!INTO OUTFILE '/tmp/x'*/").is_write);
+        assert!(cm("/*M!100100 DROP TABLE t */").is_write);
+        assert!(!cm("/*!40101 SET NAMES utf8 */ /*!40103 SET TIME_ZONE='+00:00' */").is_write);
+        // T-SQL
+        let t = |sql: &str| classify(sql, &tsql());
+        assert!(t("WAITFOR (RECEIVE TOP (1) * FROM q)").is_write);
+        assert!(!t("WAITFOR DELAY '00:00:01'").is_write);
+        assert!(t("SELECT 1\nDISABLE TRIGGER trg ON t").is_write);
+        assert!(t("SELECT 1\nCHECKPOINT").is_write);
+        assert!(!t("SELECT enable, disable FROM t").is_write);
+        // Unknown statements stay writes.
+        assert!(cm("HANDLER t OPEN").is_write);
+        assert!(t("sp_who").is_write);
+        assert!(c("NOTIFY ch").is_write);
     }
 
     #[test]
@@ -1620,6 +2195,17 @@ mod tests {
         assert!(!classify("DECLARE @x INT", &tsql()).is_write);
         let i = c("FETCH 10 FROM c");
         assert!(i.returns_rows && !i.is_write);
+        // SQL after a client command line in the same statement (client commands not split).
+        let i = c("@set x = 1\nDELETE FROM t");
+        assert_eq!((i.kind, i.is_write), (K::Delete, true));
+        let off = SplitOptions {
+            client_commands: false,
+            ..Default::default()
+        };
+        let r = split_and_classify("@set x = 1\nDROP TABLE t;", &pg(), &off);
+        assert!(r[0].1.is_write, "{r:?}");
+        let i = c("@set a = 1\n@set b = 2");
+        assert_eq!((i.kind, i.is_write), (K::ClientCommand, false));
     }
 
     #[test]
@@ -1642,6 +2228,13 @@ mod tests {
             let src = random_sql(&mut rng, 30);
             for syn in all_syntaxes() {
                 let _ = classify(&src, &syn);
+            }
+            for l in [
+                ternarygrid_core::QueryLanguage::Mongo,
+                ternarygrid_core::QueryLanguage::Search,
+            ] {
+                let _ = classify_command(&src, l);
+                let _ = classify_command(&format!("POST /{src}"), l);
             }
         }
     }
@@ -1671,5 +2264,121 @@ mod tests {
         assert_eq!(c("DELETE /logs", L::Search).danger, Some(Danger::Drop));
         assert!(classify_command("SELECT 1", L::Search).is_none());
         assert!(classify_command("SELECT 1", L::Sql).is_none());
+    }
+
+    #[test]
+    fn mongo_writes() {
+        use ternarygrid_core::QueryLanguage as L;
+        let w = |s: &str| classify_command(s, L::Mongo).unwrap().is_write;
+        for s in [
+            "db.orders.aggregate([{$match: {a: 1}}, {$out: \"copy\"}])",
+            "db.orders.aggregate([{\"$merge\": {into: \"copy\"}}])",
+            "db.orders.aggregate([{'$out': 'copy'}])",
+            "db.orders.aggregate([{'\\u0024out': 'copy'}])",
+            "db.x.insert({a: 1})",
+            "db.x.update({}, {$set: {a: 1}})",
+            "db.x.save({a: 1})",
+            "db.x.findAndModify({query: {}, remove: true})",
+            "db.x.mapReduce(m, r, {out: 'y'})",
+            "db.createView('v', 'x', [])",
+            "db.x.dropIndexes()",
+            "db.x.createIndexes([{a: 1}])",
+            "db.createUser({user: 'u', pwd: 'p', roles: []})",
+            "db.dropUser('u')",
+            "db.grantRolesToUser('u', ['root'])",
+            "db.runCommand({ping: 1})",
+            "db.x.deleteMany  ({})",
+            "db.x.deleteMany /* ( */ ({})",
+            "db.x // c\n  .deleteMany({})",
+            "db.x . deleteMany({})",
+            "db[\"x\"].drop()",
+            "db.x[\"drop\"]()",
+            "db.x['drop']()",
+            "db.x.drop?.()",
+            "db.x.drop.call(db.x)",
+            "db.x.drop\u{a0}()",
+            "db.getCollection(\"x\").drop()",
+            "db.getSiblingDB('a').x.updateMany({}, {$set: {a: 1}})",
+            "db.x.find({a: \"b\"}).forEach(d => db.y.insertOne(d))",
+            "db.x.find({a: /\"/}).drop()",
+            "sh.enableSharding('a')",
+            "use shop",
+        ] {
+            assert!(w(s), "{s}");
+        }
+        for s in [
+            "db.users.find({name: /a.drop(/i, n: 'x.drop()'}).sort({a: -1}).limit(5)",
+            "db.orders.aggregate([{$match: {a: 1}}, {$group: {_id: '$a', n: {$sum: 1}}}, {$project: {m: {$mergeObjects: ['$a', '$b']}}}])",
+            "db.x.countDocuments({at: {$gt: ISODate('2024-01-01')}, _id: ObjectId('65f0a1b2c3d4e5f6a7b8c9d0')})",
+            "db.x.find().count()",
+            "db.x.find({d: new Date()})",
+            "db.getCollectionNames()",
+            "db.getSiblingDB('a').getCollection('b').find() // .drop()",
+            "show dbs",
+        ] {
+            assert!(!w(s), "{s}");
+        }
+        let d = |s: &str| classify_command(s, L::Mongo).unwrap().danger;
+        assert_eq!(
+            d("db.x.deleteMany  ( { } )"),
+            Some(Danger::DeleteWithoutWhere)
+        );
+        assert_eq!(d("db.x.remove()"), Some(Danger::DeleteWithoutWhere));
+        assert_eq!(
+            d("db.x.updateMany({}, {$set: {a: 1}})"),
+            Some(Danger::UpdateWithoutWhere)
+        );
+        assert_eq!(d("db[\"x\"].drop()"), Some(Danger::Drop));
+        assert_eq!(d("db.x.updateMany({a: 1}, {$set: {a: 1}})"), None);
+    }
+
+    #[test]
+    fn search_requests_match_whole_path_segments() {
+        use ternarygrid_core::QueryLanguage as L;
+        let w = |s: &str| classify_command(s, L::Search).unwrap().is_write;
+        for s in [
+            "POST /product_catalog/_doc\n{\"a\": 1}",
+            "POST /my_stats/_doc",
+            "POST /item_count/_doc",
+            "POST /my_sql_logs/_doc",
+            "POST /web_search/_doc",
+            "POST /logs/_doc/_search",
+            "POST /logs/_mapping\n{\"properties\": {}}",
+            "PUT /logs/_mapping\n{}",
+            "POST /logs/_delete_by_query\n{\"query\": {\"match_all\": {}}}",
+            "POST /logs/_update_by_query",
+            "POST /_bulk\n{}",
+            "POST /_reindex\n{}",
+            "POST /logs/%5Fdoc",
+            "POST /logs/_search/../_doc",
+            "POST /_cat/indices",
+            "GET /logs/_refresh",
+            "POST\n/logs/_search",
+            "POST /_plugins/_sql\n{\"query\": \"DELETE FROM logs WHERE a = 1\"}",
+        ] {
+            assert!(w(s), "{s}");
+        }
+        for s in [
+            "POST /logs/_search?q=_doc",
+            "post /logs/_count",
+            "POST /_search/scroll\n{}",
+            "POST /_sql?format=txt\n{\"query\": \"SELECT * FROM logs\"}",
+            "POST /_plugins/_sql\n{\"query\": \"SELECT 1\"}",
+            "POST /_mget\n{}",
+            "POST /.kibana/_search",
+            "GET /product_catalog/_doc/1",
+            "GET /logs/_mapping",
+            "GET /_cat/indices?v",
+            "HEAD /logs",
+        ] {
+            assert!(!w(s), "{s}");
+        }
+        assert_eq!(
+            classify_command("POST /logs/_delete_by_query", L::Search)
+                .unwrap()
+                .danger,
+            Some(Danger::DeleteWithoutWhere)
+        );
+        assert!(classify_command("GET", L::Search).is_none());
     }
 }

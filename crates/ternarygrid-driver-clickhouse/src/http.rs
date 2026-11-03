@@ -25,6 +25,10 @@ pub const DEFAULT_SESSION_TIMEOUT: u32 = 3600;
 /// Maximum number of bytes read from an error response body.
 const MAX_ERROR_BODY: u64 = 1024 * 1024;
 
+/// Bound of a `KILL QUERY … ASYNC` request (it returns at once on a healthy server;
+/// one that does not answer must not hang cancelling or disconnecting).
+const KILL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Static per-session HTTP configuration.
 pub struct Transport {
     agent: Agent,
@@ -63,6 +67,8 @@ pub struct QueryRequest {
     pub extra_settings: Vec<(String, String)>,
     /// Skip the per-connection settings (used while probing).
     pub skip_default_settings: bool,
+    /// End-to-end bound of the request (none: statements may run as long as they need).
+    pub timeout: Option<Duration>,
 }
 
 /// Interesting response headers.
@@ -285,6 +291,9 @@ impl Transport {
         for (k, v) in &req.extra_settings {
             rb = rb.query(k, v);
         }
+        if let Some(t) = req.timeout {
+            rb = rb.config().timeout_global(Some(t)).build();
+        }
         let response = rb.send(req.sql.as_bytes()).map_err(|e| transport_error(e, &self.display_url))?;
         let header = |name: &str| -> Option<String> { response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string) };
         let head = ResponseHead {
@@ -326,7 +335,9 @@ impl Transport {
     /// `KILL QUERY` for `query_id` (separate request, outside the session).
     pub fn kill_query(&self, query_id: &str, sync: bool) -> DbResult<()> {
         let sql = format!("KILL QUERY WHERE query_id = {} {}", sql_string(query_id), if sync { "SYNC" } else { "ASYNC" });
-        let req = QueryRequest { sql, use_session: false, skip_default_settings: true, ..Default::default() };
+        // SYNC waits for the query to end, which may legitimately take long.
+        let timeout = (!sync).then_some(KILL_TIMEOUT);
+        let req = QueryRequest { sql, use_session: false, skip_default_settings: true, timeout, ..Default::default() };
         let (_, text) = self.send_text(&req, 1 << 20)?;
         if let Some(i) = crate::error::find_exception_start(&text) {
             return Err(exception_to_error(&text[i..], None));

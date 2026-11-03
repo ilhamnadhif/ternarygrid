@@ -3,9 +3,10 @@
 //! preparation, indexes and foreign keys; runs with per-table progress and
 //! can be saved as a task.
 
+use super::wizard::{self, Clicked, W, col, line};
 use super::{
-    MessageLog, Running, TaskSaver, combo, connection_combo, connection_name, current_schema, error_text, next_uid, not_connected, on_error_options, progress_ui, schema_combo,
-    schema_tables, section, steps_ui, table_def_of,
+    MessageLog, Running, TaskSaver, combo_w, connection_combo, connection_name, current_schema, error_text, next_uid, not_connected, on_error_options, progress_ui, schema_combo,
+    schema_tables, section, table_def_of,
 };
 use crate::cx::AppContext;
 use crate::tabs::TabView;
@@ -18,6 +19,8 @@ use ternarygrid_core::meta::{ObjectRef, SchemaRef};
 use ternarygrid_core::{DbError, DbKind, DbResult, tr, trf};
 use ternarygrid_tasks::TaskKind;
 use ternarygrid_transfer::{MessageLevel, MigrationJob, MigrationMode, MigrationSummary, NameCase, SessionFactory, run_migration};
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts::{self, Tone};
 
 const PAGE_SOURCE: usize = 0;
 const PAGE_TARGET: usize = 1;
@@ -165,18 +168,31 @@ impl MigrationTab {
         let enabled: Vec<&TableEntry> = self.tables.iter().filter(|t| t.enabled).collect();
         job.tables = enabled.iter().map(|t| t.source.clone()).collect();
         job.target_schema = self.target_schema.as_ref().and_then(|s| s.schema.clone());
-        job.table_names = enabled.iter().filter(|t| !t.target_name.trim().is_empty()).map(|t| (t.source.name.clone(), t.target_name.trim().to_string())).collect();
+        // Keyed by the schema-qualified source name: tables of the same name in two
+        // schemas keep their own names. A name only one table has is also given
+        // alone (the key of saved tasks and of readers that know no schema).
+        let keys = |t: &TableEntry| {
+            let mut keys = vec![table_key(&t.source)];
+            if keys[0] != t.source.name && enabled.iter().filter(|o| o.source.name == t.source.name).count() == 1 {
+                keys.push(t.source.name.clone());
+            }
+            keys
+        };
+        job.table_names = enabled.iter().filter(|t| !t.target_name.trim().is_empty()).flat_map(|t| keys(t).into_iter().map(|k| (k, t.target_name.trim().to_string()))).collect();
         job.column_names = enabled
             .iter()
-            .map(|t| {
+            .flat_map(|t| {
                 let names: BTreeMap<String, String> = t.column_names.iter().filter(|(_, v)| !v.trim().is_empty()).map(|(k, v)| (k.clone(), v.trim().to_string())).collect();
-                (t.source.name.clone(), names)
+                keys(t).into_iter().map(move |k| (k, names.clone()))
             })
             .filter(|(_, m)| !m.is_empty())
             .collect();
         job.column_types = enabled
             .iter()
-            .flat_map(|t| t.column_types.iter().filter(|(_, v)| !v.trim().is_empty()).map(|(c, v)| (format!("{}.{c}", t.source.name), v.trim().to_string())))
+            .flat_map(|t| {
+                let types: Vec<(&String, &String)> = t.column_types.iter().filter(|(_, v)| !v.trim().is_empty()).collect();
+                keys(t).into_iter().flat_map(move |k| types.clone().into_iter().map(move |(c, v)| (format!("{k}.{c}"), v.trim().to_string())))
+            })
             .collect();
         job
     }
@@ -386,74 +402,105 @@ impl MigrationTab {
     // ------------------------------------------------------------------ pages
 
     fn source_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
         section(ui, tr("Tables to migrate"));
         if self.tables.is_empty() {
-            ui.weak(tr("No table selected yet: add tables below."));
-        }
-        let mut remove = None;
-        egui::Grid::new(("mig_tables", self.uid)).num_columns(3).spacing([8.0, 4.0]).striped(true).show(ui, |ui| {
-            for (i, t) in self.tables.iter_mut().enumerate() {
-                ui.checkbox(&mut t.enabled, "");
-                ui.label(format!("{} {}", icon::TABLE, t.source.display_path()));
-                if ui.small_button(ternarygrid_icons::ic(icon::TRASH)).on_hover_text(tr("Remove")).clicked() {
-                    remove = Some(i);
-                }
-                ui.end_row();
+            wizard::faint(ui, tr("No table selected yet: add tables below."));
+        } else {
+            let mut remove = None;
+            let mut set_all = None;
+            let states: Vec<bool> = self.tables.iter().map(|t| t.enabled).collect();
+            let cols = [col("", W::Px(32.0)), col(tr("Table"), W::Fr(1.0)), col("", W::Px(44.0))];
+            let tables = &mut self.tables;
+            wizard::table(
+                ui,
+                ("mig_tables", self.uid),
+                &cols,
+                34.0,
+                None,
+                tables.len(),
+                |ui, c| {
+                    if c == 0
+                        && let Some(on) = wizard::check_all(ui, &states)
+                    {
+                        set_all = Some(on);
+                    }
+                },
+                |ui, i, c| {
+                    let t = &mut tables[i];
+                    match c {
+                        0 => {
+                            wizard::check(ui, &mut t.enabled, "");
+                        }
+                        1 => {
+                            ui.label(RichText::new(icon::TABLE).font(ternarygrid_ui::style::icon_font(14.0)).color(p.text_muted));
+                            ui.add(egui::Label::new(t.source.display_path()).truncate());
+                        }
+                        _ => {
+                            if wizard::icon_button(ui, icon::TRASH, tr("Remove"), 24.0).clicked() {
+                                remove = Some(i);
+                            }
+                        }
+                    }
+                },
+            );
+            if let Some(on) = set_all {
+                self.tables.iter_mut().for_each(|t| t.enabled = on);
             }
-        });
-        if let Some(i) = remove {
-            self.tables.remove(i);
+            if let Some(i) = remove {
+                self.tables.remove(i);
+            }
         }
         section(ui, tr("Add tables"));
         let conn = self.conn.clone();
         if cx.conns.live(&conn).is_none() {
             ui.horizontal(|ui| {
-                ui.weak(tr("Connect to list the tables."));
-                if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
+                wizard::faint(ui, tr("Connect to list the tables."));
+                if kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Connect")).clicked() {
                     cx.push(crate::command::AppCommand::Connect(conn.clone()));
                 }
             });
             return;
         }
-        ui.horizontal(|ui| {
-            ui.label(tr("Schema"));
-            schema_combo(ui, cx, &conn, ("mig_schema", self.uid), &mut self.picker_schema);
-            ui.add(egui::TextEdit::singleline(&mut self.picker_filter).hint_text(tr("Filter…")).desired_width(160.0));
-        });
-        let Some(schema) = self.picker_schema.clone().or_else(|| current_schema(cx, &conn)) else { return };
-        match schema_tables(cx, &conn, &schema, false) {
-            None => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak(tr("Loading…"));
-                });
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        let schema = self.picker_schema.clone().or_else(|| current_schema(cx, &conn));
+        let list = schema.as_ref().map(|s| schema_tables(cx, &conn, s, false));
+        let filter = self.picker_filter.to_lowercase();
+        let shown: Option<Vec<ObjectRef>> = match &list {
+            Some(Some(Ok(list))) => {
+                Some(list.iter().filter(|o| !o.is_system && (filter.is_empty() || o.obj.name.to_lowercase().contains(&filter))).map(|o| o.obj.clone()).collect())
             }
-            Some(Err(e)) => crate::widgets::error_box(ui, &e.full_text()),
-            Some(Ok(list)) => {
-                let filter = self.picker_filter.to_lowercase();
-                let shown: Vec<ObjectRef> =
-                    list.iter().filter(|o| !o.is_system && (filter.is_empty() || o.obj.name.to_lowercase().contains(&filter))).map(|o| o.obj.clone()).collect();
-                ui.horizontal(|ui| {
-                    ui.weak(trf("{} tables", &[&shown.len()]));
-                    if !shown.is_empty() && ui.button(tr("Add all shown")).clicked() {
-                        for o in &shown {
+            _ => None,
+        };
+        ui.horizontal(|ui| {
+            wizard::muted(ui, tr("Schema"));
+            schema_combo(ui, cx, &conn, ("mig_schema", self.uid), &mut self.picker_schema, 160.0);
+            kit::search_field(ui, egui::Id::new(("mig_filter", self.uid)), &mut self.picker_filter, tr("Filter…"), 220.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(shown) = &shown {
+                    if !shown.is_empty() && wizard::ghost(ui, None, tr("Add all shown")).clicked() {
+                        for o in shown {
                             self.add_table(o.clone());
                         }
                     }
-                });
-                egui::ScrollArea::vertical().id_salt(("mig_pick", self.uid)).max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for o in &shown {
-                        let already = self.tables.iter().any(|t| t.source == *o);
-                        ui.horizontal(|ui| {
-                            if ui.add_enabled(!already, egui::Button::new(ternarygrid_icons::ic(icon::PLUS)).small()).clicked() {
-                                self.add_table(o.clone());
-                            }
-                            let text = RichText::new(format!("{} {}", icon::TABLE, o.name));
-                            ui.label(if already { text.weak() } else { text });
-                        });
-                    }
-                });
+                    wizard::faint(ui, &trf("{} tables", &[&shown.len()]));
+                }
+            });
+        });
+        match list {
+            None => {}
+            Some(None) => {
+                parts::spinner_label(ui, tr("Loading…"));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Some(Some(Err(e))) => crate::widgets::error_box(ui, &e.full_text()),
+            Some(Some(Ok(_))) => {
+                let shown = shown.unwrap_or_default();
+                let mut add = None;
+                let tables = &self.tables;
+                super::export::picker_list(ui, ("mig_pick", self.uid), &shown, |o| tables.iter().any(|t| t.source == *o), |o| add = Some(o));
+                if let Some(o) = add {
+                    self.add_table(o);
+                }
             }
         }
     }
@@ -461,46 +508,50 @@ impl MigrationTab {
     fn target_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         section(ui, tr("Target"));
         let id = self.uid;
-        egui::Grid::new(("mig_target", id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Connection"));
-            ui.horizontal(|ui| {
-                if connection_combo(ui, cx, ("mig_conn", id), &mut self.target_conn) {
+        wizard::form(ui, ("mig_target", id), 1, 120.0, |f| {
+            f.row(tr("Connection"), |ui| {
+                let kind = self.target_conn.as_ref().and_then(|t| cx.conns.config(t)).map(|c| c.kind);
+                if let Some(k) = kind {
+                    crate::tabs::dbtools::look::logo(ui, k, 15.0);
+                }
+                if connection_combo(ui, cx, ("mig_conn", id), &mut self.target_conn, 260.0) {
                     self.target_schema = None;
                 }
                 if let Some(t) = self.target_conn.clone()
                     && !cx.conns.is_connected(&t)
-                    && ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked()
+                    && kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Connect")).clicked()
                 {
                     cx.push(crate::command::AppCommand::Connect(t));
                 }
             });
-            ui.end_row();
             if let Some(t) = self.target_conn.clone()
                 && cx.conns.is_connected(&t)
             {
-                ui.label(tr("Schema"));
-                schema_combo(ui, cx, &t, ("mig_tschema", id), &mut self.target_schema);
-                ui.end_row();
+                f.row(tr("Schema"), |ui| schema_combo(ui, cx, &t, ("mig_tschema", id), &mut self.target_schema, 200.0));
             }
-            ui.label(tr("Names"));
-            combo(
-                ui,
-                ("mig_case", id),
-                &mut self.options.name_case,
-                &[(NameCase::Keep, tr("Keep them as they are").to_string()), (NameCase::Lower, tr("lower case").to_string()), (NameCase::Upper, tr("UPPER CASE").to_string())],
-            );
-            ui.end_row();
+            f.seg_row(tr("Names"), |ui| {
+                parts::segmented(
+                    ui,
+                    &mut self.options.name_case,
+                    &[(NameCase::Keep, tr("Keep them as they are")), (NameCase::Lower, tr("lower case")), (NameCase::Upper, tr("UPPER CASE"))],
+                )
+            });
         });
         if let (Some(t), Some(src)) = (&self.target_conn, cx.conns.config(&self.conn).map(|c| c.kind)) {
             let dst = cx.conns.config(t).map(|c| c.kind);
             if let Some(dst) = dst
                 && dst != src
             {
-                ui.weak(trf("Column types are converted from {} to {}; check them on the next page.", &[&src.display_name(), &dst.display_name()]));
+                parts::callout(
+                    ui,
+                    Tone::Info,
+                    None,
+                    &trf("Column types are converted from {} to {}; check them on the next page.", &[&src.display_name(), &dst.display_name()]),
+                    |_| {},
+                );
             }
         }
         if let Some(e) = self.target_error(cx) {
-            ui.add_space(4.0);
             crate::widgets::error_box(ui, &e);
         }
     }
@@ -514,7 +565,9 @@ impl MigrationTab {
         let same = src_kind == dst.kind() && src_kind != DbKind::Generic;
         let case = self.options.name_case;
         let conn = self.conn.clone();
-        ui.weak(tr("Leave a field empty to keep the default shown in grey."));
+        let p = ternarygrid_ui::pal(ui);
+        wizard::faint(ui, tr("Leave a field empty to keep the default shown in grey."));
+        let mut first = true;
         for (i, t) in self.tables.iter_mut().enumerate().filter(|(_, t)| t.enabled) {
             let default_name = apply_case(case, &t.source.name);
             let title = if t.target_name.trim().is_empty() {
@@ -522,117 +575,149 @@ impl MigrationTab {
             } else {
                 format!("{} → {}", t.source.display_path(), t.target_name.trim())
             };
-            egui::CollapsingHeader::new(title).id_salt(("mig_map", id, i)).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(tr("Target table"));
-                    ui.add(egui::TextEdit::singleline(&mut t.target_name).hint_text(default_name.clone()).desired_width(220.0));
+            let key = egui::Id::new(("mig_map", id, table_key(&t.source)));
+            let mut open = wizard::remembered_open(ui, key, first);
+            first = false;
+            let toggled = wizard::fold_card(ui, key, &mut open, &title, None, true, |ui| {
+                wizard::form(ui, ("mig_map_name", id, i), 1, 110.0, |f| {
+                    f.row(tr("Target table"), |ui| ui.add(line(&mut t.target_name).hint_text(default_name.clone()).desired_width(260.0)));
                 });
                 match table_def_of(cx, &conn, &t.source) {
                     None => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak(tr("Loading…"));
-                        });
+                        parts::spinner_label(ui, tr("Loading…"));
                         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                     }
                     Some(Err(e)) => crate::widgets::error_box(ui, &e.full_text()),
                     Some(Ok(def)) => {
-                        egui::Grid::new(("mig_cols", id, i)).num_columns(4).spacing([10.0, 4.0]).striped(true).show(ui, |ui| {
-                            ui.strong(tr("Column"));
-                            ui.strong(tr("Source type"));
-                            ui.strong(tr("Target column"));
-                            ui.strong(tr("Target type"));
-                            ui.end_row();
-                            for c in &def.columns {
-                                ui.label(&c.name);
-                                ui.weak(&c.data_type);
-                                let name = t.column_names.entry(c.name.clone()).or_default();
-                                ui.add(egui::TextEdit::singleline(name).hint_text(apply_case(case, &c.name)).desired_width(160.0));
-                                let mapped = if same { c.data_type.clone() } else { dst.ddl().map_type(src_kind, &c.data_type, c.kind) };
-                                let ty = t.column_types.entry(c.name.clone()).or_default();
-                                ui.add(egui::TextEdit::singleline(ty).hint_text(mapped).desired_width(180.0));
-                                ui.end_row();
-                            }
-                        });
+                        let cols = [col(tr("Column"), W::Fr(1.0)), col(tr("Source type"), W::Fr(1.0)), col(tr("Target column"), W::Fr(1.0)), col(tr("Target type"), W::Fr(1.0))];
+                        let (names, types) = (&mut t.column_names, &mut t.column_types);
+                        wizard::table(
+                            ui,
+                            ("mig_cols", id, i),
+                            &cols,
+                            36.0,
+                            None,
+                            def.columns.len(),
+                            |_, _| {},
+                            |ui, r, k| {
+                                let c = &def.columns[r];
+                                match k {
+                                    0 => {
+                                        wizard::mono(ui, &c.name, p.text, 12.0);
+                                    }
+                                    1 => {
+                                        wizard::mono(ui, &c.data_type, p.text_muted, 12.0);
+                                    }
+                                    2 => {
+                                        let name = names.entry(c.name.clone()).or_default();
+                                        ui.add(line(name).hint_text(apply_case(case, &c.name)).desired_width(f32::INFINITY));
+                                    }
+                                    _ => {
+                                        let mapped = if same { c.data_type.clone() } else { dst.ddl().map_type(src_kind, &c.data_type, c.kind) };
+                                        let ty = types.entry(c.name.clone()).or_default();
+                                        ui.add(wizard::mono_line(ty, f32::INFINITY).hint_text(RichText::new(mapped).monospace()));
+                                    }
+                                }
+                            },
+                        );
                     }
                 }
             });
+            if toggled {
+                wizard::remember_open(ui, key, open);
+            }
+        }
+        if !same && src_kind != DbKind::Generic && dst_kind != DbKind::Generic {
+            parts::callout(
+                ui,
+                Tone::Info,
+                None,
+                &trf("Column types are converted from {} to {}; check them on this page.", &[&src_kind.display_name(), &dst_kind.display_name()]),
+                |_| {},
+            );
         }
     }
 
-    fn options_page(&mut self, ui: &mut Ui) {
+    fn options_page(&mut self, ui: &mut Ui, transactions: bool) {
         section(ui, tr("Options"));
         let id = self.uid;
         let o = &mut self.options;
-        egui::Grid::new(("mig_opts", id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Target tables"));
-            ui.checkbox(&mut o.create_tables, tr("Create the tables that do not exist"));
-            ui.end_row();
-            ui.label(tr("Existing rows"));
-            combo(
-                ui,
-                ("mig_mode", id),
-                &mut o.mode,
-                &[
-                    (MigrationMode::Append, tr("Keep them and add the new rows").to_string()),
-                    (MigrationMode::Truncate, tr("Delete them first").to_string()),
-                    (MigrationMode::Replace, tr("Insert or replace rows by primary key").to_string()),
-                    (MigrationMode::DropAndCreate, tr("Drop and create the tables again").to_string()),
-                ],
-            );
-            ui.end_row();
-            ui.label(tr("Rows per batch"));
-            ui.add(egui::DragValue::new(&mut o.batch_size).range(1..=100_000));
-            ui.end_row();
-            ui.label(tr("Copy"));
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut o.copy_indexes, tr("Indexes"));
-                ui.checkbox(&mut o.copy_foreign_keys, tr("Foreign keys"));
+        wizard::form(ui, ("mig_opts", id), 1, 150.0, |f| {
+            f.check_row(tr("Target tables"), |ui| wizard::check(ui, &mut o.create_tables, tr("Create the tables that do not exist")));
+            f.row(tr("Existing rows"), |ui| {
+                combo_w(
+                    ui,
+                    ("mig_mode", id),
+                    &mut o.mode,
+                    &[
+                        (MigrationMode::Append, tr("Keep them and add the new rows").to_string()),
+                        (MigrationMode::Truncate, tr("Delete them first").to_string()),
+                        (MigrationMode::Replace, tr("Insert or replace rows by primary key").to_string()),
+                        (MigrationMode::DropAndCreate, tr("Drop and create the tables again").to_string()),
+                    ],
+                    320.0,
+                )
             });
-            ui.end_row();
-            ui.label(tr("Transactions"));
-            ui.checkbox(&mut o.transaction_per_table, tr("Load every table in one transaction"));
-            ui.end_row();
-            ui.label(tr("On error"));
-            combo(ui, ("mig_err", id), &mut o.on_error, &on_error_options());
-            ui.end_row();
-            ui.label(tr("Failed tables"));
-            ui.checkbox(&mut o.continue_on_table_error, tr("Continue with the next table"));
-            ui.end_row();
+            if o.mode == MigrationMode::Replace && !transactions {
+                super::replace_without_transactions_ui(f);
+            }
+            f.row(tr("Rows per batch"), |ui| wizard::number(ui, &mut o.batch_size, 1..=100_000, 120.0));
+            f.check_row(tr("Copy"), |ui| {
+                ui.spacing_mut().item_spacing.x = 16.0;
+                wizard::check(ui, &mut o.copy_indexes, tr("Indexes"));
+                wizard::check(ui, &mut o.copy_foreign_keys, tr("Foreign keys"));
+            });
+            f.check_row(tr("Transactions"), |ui| wizard::check(ui, &mut o.transaction_per_table, tr("Load every table in one transaction")));
+            f.row(tr("On error"), |ui| combo_w(ui, ("mig_err", id), &mut o.on_error, &on_error_options(), 260.0));
+            f.check_row(tr("Failed tables"), |ui| wizard::check(ui, &mut o.continue_on_table_error, tr("Continue with the next table")));
         });
     }
 
     fn run_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        let dark = ui.visuals().dark_mode;
+        let p = ternarygrid_ui::pal(ui);
         if let Some(run) = &self.run {
-            section(ui, tr("Migrating…"));
+            wizard::title(ui, tr("Migrating…"));
             if progress_ui(ui, &run.progress, run.is_cancelling()) {
                 run.cancel();
             }
-            egui::Grid::new(("mig_live", self.uid)).num_columns(3).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
-                ui.strong(tr("Table"));
-                ui.strong(tr("Status"));
-                ui.strong(tr("Rows"));
-                ui.end_row();
-                for t in &self.table_runs {
-                    ui.label(&t.name);
-                    match t.state {
-                        TableState::Pending => ui.weak(tr("waiting")),
-                        TableState::Running => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(tr("copying"))
-                            })
-                            .inner
+            let cols = [col(tr("Table"), W::Fr(1.4)), col(tr("Status"), W::Fr(1.0)), col(tr("Rows"), W::Fr(0.6)).right()];
+            let runs = &self.table_runs;
+            wizard::table(
+                ui,
+                ("mig_live", self.uid),
+                &cols,
+                30.0,
+                Some(260.0),
+                runs.len(),
+                |_, _| {},
+                |ui, r, c| {
+                    let t = &runs[r];
+                    match c {
+                        0 => {
+                            ui.add(egui::Label::new(&t.name).truncate());
                         }
-                        TableState::Done => ui.label(RichText::new(tr("done")).color(crate::theme::success_color(dark))),
-                        TableState::Failed => ui.label(RichText::new(tr("failed")).color(crate::theme::error_color(dark))),
-                    };
-                    ui.label(t.rows.to_string());
-                    ui.end_row();
-                }
-            });
-            ui.add_space(6.0);
+                        1 => match t.state {
+                            TableState::Pending => {
+                                wizard::faint(ui, tr("waiting"));
+                            }
+                            TableState::Running => {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.label(RichText::new(icon::CLOCK_COUNTER_CLOCKWISE).font(ternarygrid_ui::style::icon_font(13.0)).color(p.accent_text));
+                                ui.label(RichText::new(tr("copying")).size(12.5).color(p.accent_text));
+                            }
+                            TableState::Done => {
+                                wizard::tone_text(ui, Tone::Success, tr("done"));
+                            }
+                            TableState::Failed => {
+                                wizard::tone_text(ui, Tone::Error, tr("failed"));
+                            }
+                        },
+                        _ => {
+                            ui.label(if t.state == TableState::Pending { "—".to_string() } else { super::group(t.rows) });
+                        }
+                    }
+                },
+            );
             self.log.ui(ui, ("mig_log", self.uid), 220.0);
             return;
         }
@@ -642,9 +727,9 @@ impl MigrationTab {
                 self.result_ui(ui, &summary);
             }
             Some(Err(e)) => {
-                section(ui, tr("The migration failed"));
+                wizard::outcome(ui, Tone::Error, tr("The migration failed"), None);
                 crate::widgets::error_box(ui, e);
-                if ui.button((ternarygrid_icons::ic(icon::ARROW_COUNTER_CLOCKWISE), tr("Change settings"))).clicked() {
+                if kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked() {
                     self.result = None;
                     self.page = PAGE_SOURCE;
                 }
@@ -652,7 +737,6 @@ impl MigrationTab {
             None => self.summary_ui(ui, cx),
         }
         if self.result.is_some() {
-            ui.add_space(6.0);
             self.log.ui(ui, ("mig_log", self.uid), 220.0);
         }
     }
@@ -660,63 +744,83 @@ impl MigrationTab {
     fn summary_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         section(ui, tr("Summary"));
         let job = self.job();
-        egui::Grid::new(("mig_sum", self.uid)).num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            ui.weak(tr("Source"));
-            ui.label(connection_name(cx, &self.conn));
-            ui.end_row();
-            ui.weak(tr("Target"));
-            let target = self.target_conn.as_ref().map(|t| connection_name(cx, t)).unwrap_or_else(|| "—".into());
-            let schema = job.target_schema.clone().unwrap_or_else(|| tr("(default)").to_string());
-            ui.label(format!("{target} / {schema}"));
-            ui.end_row();
-            ui.weak(tr("Tables"));
-            ui.label(job.tables.iter().map(|t| t.display_path()).collect::<Vec<_>>().join(", "));
-            ui.end_row();
-        });
+        let target = self.target_conn.as_ref().map(|t| connection_name(cx, t)).unwrap_or_else(|| "—".into());
+        let schema = job.target_schema.clone().unwrap_or_else(|| tr("(default)").to_string());
+        wizard::facts(
+            ui,
+            ("mig_sum", self.uid),
+            120.0,
+            8.0,
+            &[
+                (tr("Source"), connection_name(cx, &self.conn), None),
+                (tr("Target"), format!("{target} / {schema}"), None),
+                (tr("Tables"), job.tables.iter().map(|t| t.display_path()).collect::<Vec<_>>().join(", "), None),
+            ],
+        );
         if let Err(e) = self.validate(cx) {
-            ui.add_space(4.0);
             crate::widgets::error_box(ui, &e);
         }
     }
 
     fn result_ui(&mut self, ui: &mut Ui, s: &MigrationSummary) {
-        let dark = ui.visuals().dark_mode;
-        section(ui, &describe(s));
-        egui::Grid::new(("mig_res", self.uid)).num_columns(6).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
-            ui.strong(tr("Table"));
-            ui.strong(tr("Target"));
-            ui.strong(tr("Rows"));
-            ui.strong(tr("Failed"));
-            ui.strong(tr("Time"));
-            ui.strong(tr("Status"));
-            ui.end_row();
-            for t in &s.tables {
-                ui.label(t.source.as_ref().map(ObjectRef::display_path).unwrap_or_default());
-                let mut target = t.target.as_ref().map(ObjectRef::display_path).unwrap_or_default();
-                if t.created {
-                    target = trf("{} (created)", &[&target]);
-                }
-                ui.label(target);
-                ui.label(t.rows_written.to_string());
-                ui.label(t.rows_failed.to_string());
-                ui.label(crate::widgets::format_duration(std::time::Duration::from_millis(t.duration_ms)));
-                match &t.error {
-                    Some(e) => {
-                        ui.add(egui::Label::new(RichText::new(e).color(crate::theme::error_color(dark))).wrap());
+        let p = ternarygrid_ui::pal(ui);
+        let failed = s.tables.iter().any(|t| t.error.is_some());
+        wizard::outcome(ui, if failed { Tone::Warning } else { Tone::Success }, &describe(s), None);
+        let cols = [
+            col(tr("Table"), W::Fr(1.2)),
+            col(tr("Target"), W::Fr(1.3)),
+            col(tr("Rows"), W::Fr(0.8)).right(),
+            col(tr("Failed"), W::Fr(0.6)).right(),
+            col(tr("Time"), W::Fr(0.6)).right(),
+            col(tr("Status"), W::Fr(1.0)),
+        ];
+        wizard::table(
+            ui,
+            ("mig_res", self.uid),
+            &cols,
+            30.0,
+            Some(320.0),
+            s.tables.len(),
+            |_, _| {},
+            |ui, r, c| {
+                let t = &s.tables[r];
+                match c {
+                    0 => {
+                        ui.add(egui::Label::new(t.source.as_ref().map(ObjectRef::display_path).unwrap_or_default()).truncate());
                     }
-                    None => {
-                        let text = if t.indexes_created > 0 { trf("OK, {} index(es)", &[&t.indexes_created]) } else { tr("OK").to_string() };
-                        ui.label(RichText::new(text).color(crate::theme::success_color(dark)));
+                    1 => {
+                        let mut target = t.target.as_ref().map(|o| o.name.clone()).unwrap_or_default();
+                        if t.created {
+                            target = trf("{} (created)", &[&target]);
+                        }
+                        ui.add(egui::Label::new(target).truncate());
                     }
+                    2 => {
+                        ui.label(super::group(t.rows_written));
+                    }
+                    3 => {
+                        ui.label(super::group(t.rows_failed));
+                    }
+                    4 => {
+                        ui.label(crate::widgets::format_duration(std::time::Duration::from_millis(t.duration_ms)));
+                    }
+                    _ => match &t.error {
+                        Some(e) => {
+                            wizard::tone_text(ui, Tone::Error, e).on_hover_text(e);
+                        }
+                        None => {
+                            let text = if t.indexes_created > 0 { trf("OK, {} index(es)", &[&t.indexes_created]) } else { tr("OK").to_string() };
+                            wizard::tone_text(ui, Tone::Success, &text);
+                        }
+                    },
                 }
-                ui.end_row();
-            }
-        });
+            },
+        );
         if s.foreign_keys_created > 0 {
-            ui.label(trf("{} foreign key(s) created", &[&s.foreign_keys_created]));
+            wizard::muted(ui, &trf("{} foreign key(s) created", &[&s.foreign_keys_created]));
         }
         for w in &s.warnings {
-            ui.label(RichText::new(format!("{} {w}", icon::WARNING)).color(crate::theme::warning_color(dark)));
+            ui.label(RichText::new(format!("{} {w}", icon::WARNING)).color(p.warn));
         }
         let failed_rows: Vec<String> = s
             .tables
@@ -728,72 +832,80 @@ impl MigrationTab {
             .collect();
         if !failed_rows.is_empty() {
             section(ui, tr("Failed rows"));
-            for f in failed_rows {
-                ui.label(RichText::new(f).small());
-            }
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for f in failed_rows {
+                    ui.add(egui::Label::new(RichText::new(f).monospace().size(11.5).color(p.err)).wrap());
+                }
+            });
         }
-        if ui.button((ternarygrid_icons::ic(icon::ARROW_COUNTER_CLOCKWISE), tr("Change settings"))).clicked() {
+        if kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked() {
             self.result = None;
             self.page = PAGE_SOURCE;
         }
     }
 
     fn footer(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let running = self.run.is_some();
-            if ui.add_enabled(self.page > PAGE_SOURCE && !running, egui::Button::new((ternarygrid_icons::ic(icon::CARET_LEFT), tr("Back")))).clicked() {
-                self.page -= 1;
-            }
-            let reachable = self.reachable(cx);
-            if self.page < PAGE_RUN && ui.add_enabled(self.page < reachable && !running, egui::Button::new(format!("{} {}", tr("Next"), icon::CARET_RIGHT))).clicked() {
-                self.page += 1;
-            }
-            ui.separator();
-            let ok = reachable == PAGE_RUN && !running;
-            if ui.add_enabled(ok, crate::widgets::primary_button(ui, icon::PLAY, tr("Run migration"))).clicked() {
+        let running = self.run.is_some();
+        let reachable = self.reachable(cx);
+        let ok = reachable == PAGE_RUN && !running;
+        let footer = wizard::Footer {
+            back: (self.page > PAGE_SOURCE).then_some(!running),
+            next: (self.page < PAGE_RUN).then_some(self.page < reachable && !running),
+            run: (tr("Run migration"), ok),
+            save: Some((ok && !self.saver.is_saving(), None)),
+            error: self.error.as_deref(),
+        };
+        match wizard::footer(ui, &footer) {
+            Some(Clicked::Back) => self.page -= 1,
+            Some(Clicked::Next) => self.page += 1,
+            Some(Clicked::Run) => {
                 if self.destructive() {
                     self.confirm = true;
                 } else {
                     self.start(cx);
                 }
             }
-            if ui.add_enabled(ok && !self.saver.is_saving(), egui::Button::new((ternarygrid_icons::ic(icon::FLOPPY_DISK), tr("Save as task…")))).clicked() {
+            Some(Clicked::Save) => {
                 let target = self.target_conn.as_ref().map(|t| connection_name(cx, t)).unwrap_or_default();
                 self.saver.open(trf("Migrate to {}", &[&target]));
             }
-            if let Some(e) = &self.error {
-                ui.label(RichText::new(e).color(crate::theme::error_color(ui.visuals().dark_mode)));
-            }
-        });
-        ui.add_space(2.0);
+            None => {}
+        }
     }
 
     fn confirm_ui(&mut self, ctx: &egui::Context, cx: &mut AppContext) {
         if !self.confirm {
             return;
         }
-        let mut close = false;
         let target = self.target_conn.as_ref().map(|t| connection_name(cx, t)).unwrap_or_default();
-        let modal = egui::Modal::new(egui::Id::new(("mig_confirm", self.uid))).show(ctx, |ui| {
-            ui.heading(tr("Replace the target data?"));
-            let text = if self.options.mode == MigrationMode::DropAndCreate {
-                trf("Existing target tables on \"{}\" are dropped and created again.", &[&target])
-            } else {
-                trf("All rows of the existing target tables on \"{}\" are deleted first.", &[&target])
-            };
-            ui.label(text);
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new(tr("Run")).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                    self.start(cx);
-                    close = true;
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    close = true;
-                }
-            });
-        });
-        if close || modal.should_close() {
+        let text = if self.options.mode == MigrationMode::DropAndCreate {
+            trf("Existing target tables on \"{}\" are dropped and created again.", &[&target])
+        } else {
+            trf("All rows of the existing target tables on \"{}\" are deleted first.", &[&target])
+        };
+        let (mut run, mut cancel) = (false, false);
+        let (resp, _) = parts::Dialog::new(tr("Replace the target data?")).icon(icon::WARNING).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
+            ctx,
+            egui::Id::new(("mig_confirm", self.uid)),
+            |ui| {
+                ui.add(egui::Label::new(RichText::new(&text).size(13.5)).wrap());
+            },
+            |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if kit::button_ex(ui, Kind::DangerFilled, Some(icon::PLAY), tr("Run"), false).clicked() {
+                        run = true;
+                    }
+                    if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                        cancel = true;
+                    }
+                });
+            },
+        );
+        if run {
+            self.start(cx);
+        }
+        if run || cancel || resp.close {
             self.confirm = false;
         }
     }
@@ -802,9 +914,9 @@ impl MigrationTab {
 fn describe(s: &MigrationSummary) -> String {
     let failed = s.tables.iter().filter(|t| t.error.is_some()).count();
     if failed > 0 {
-        trf("{} rows copied, {} of {} table(s) failed", &[&s.rows, &failed, &s.tables.len()])
+        trf("{} rows copied, {} of {} table(s) failed", &[&super::group(s.rows), &failed, &s.tables.len()])
     } else {
-        trf("{} rows copied into {} table(s)", &[&s.rows, &s.tables.len()])
+        trf("{} rows copied into {} table(s)", &[&super::group(s.rows), &s.tables.len()])
     }
 }
 
@@ -813,8 +925,11 @@ impl TabView for MigrationTab {
         std::mem::take(&mut self.done)
     }
 
+    fn popup_target(&self) -> Option<&str> {
+        self.target_conn.as_deref()
+    }
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(820.0, 600.0))
+        Some(wizard::WINDOW)
     }
 
     fn title(&self) -> String {
@@ -827,7 +942,7 @@ impl TabView for MigrationTab {
     }
 
     fn icon(&self) -> &'static str {
-        icon::ARROWS_LEFT_RIGHT
+        icon::ARROWS_DOWN_UP
     }
 
     fn connection_id(&self) -> Option<&str> {
@@ -837,33 +952,30 @@ impl TabView for MigrationTab {
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll(cx);
         let uid = self.uid;
-        egui::Panel::top(egui::Id::new(("mig_top", uid))).show(ui, |ui| {
-            ui.add_space(4.0);
+        wizard::top_panel(ui, egui::Id::new(("mig_top", uid)), |ui| {
             // In a pop-up its title bar names the wizard and the connection.
             if !cx.popup {
                 ui.horizontal(|ui| {
-                    crate::widgets::icon_heading(ui, icon::ARROWS_LEFT_RIGHT, tr("Migrate tables"));
+                    crate::widgets::icon_heading(ui, icon::ARROWS_DOWN_UP, tr("Migrate tables"));
                     ui.weak(connection_name(cx, &self.conn));
                 });
             }
             let steps = [tr("Source"), tr("Target"), tr("Mapping"), tr("Options"), tr("Run")];
             let reachable = if self.run.is_some() { self.page } else { self.reachable(cx) };
-            if let Some(p) = steps_ui(ui, &steps, self.page, reachable.max(self.page))
+            let finished = self.page == PAGE_RUN && matches!(self.result, Some(Ok(_)));
+            if let Some(p) = wizard::steps(ui, &steps, self.page, reachable.max(self.page), finished)
                 && self.run.is_none()
             {
                 self.page = p;
             }
-            ui.add_space(2.0);
         });
-        egui::Panel::bottom(egui::Id::new(("mig_bottom", uid))).show(ui, |ui| self.footer(ui, cx));
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt(("mig_body", uid)).auto_shrink([false, false]).show(ui, |ui| match self.page {
-                PAGE_SOURCE => self.source_page(ui, cx),
-                PAGE_TARGET => self.target_page(ui, cx),
-                PAGE_MAPPING => self.mapping_page(ui, cx),
-                PAGE_OPTIONS => self.options_page(ui),
-                _ => self.run_page(ui, cx),
-            });
+        wizard::bottom_panel(ui, egui::Id::new(("mig_bottom", uid)), |ui| self.footer(ui, cx));
+        wizard::body(ui, egui::Id::new(("mig_body", uid)), |ui| match self.page {
+            PAGE_SOURCE => self.source_page(ui, cx),
+            PAGE_TARGET => self.target_page(ui, cx),
+            PAGE_MAPPING => self.mapping_page(ui, cx),
+            PAGE_OPTIONS => self.options_page(ui, self.target_conn.as_deref().is_none_or(|c| super::has_transactions(cx, c))),
+            _ => self.run_page(ui, cx),
         });
         let ctx = ui.ctx().clone();
         self.confirm_ui(&ctx, cx);
@@ -882,6 +994,14 @@ impl TabView for MigrationTab {
     crate::impl_tab_any!();
 }
 
+/// Key of a source table in the job's name maps: `schema.table` (`table` without a schema).
+pub fn table_key(o: &ObjectRef) -> String {
+    match o.schema.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => format!("{s}.{}", o.name),
+        None => o.name.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,8 +1018,27 @@ mod tests {
         assert_eq!(job.target_schema.as_deref(), Some("archive"));
         assert_eq!(job.table_names.get("users").map(String::as_str), Some("app_users"));
         assert!(!job.table_names.contains_key("orders"));
+        assert_eq!(job.table_names.get("public.users").map(String::as_str), Some("app_users"));
+        assert!(!job.table_names.contains_key("orders"));
         assert_eq!(job.column_types.get("users.id").map(String::as_str), Some("BIGINT"));
-        assert_eq!(job.column_types.len(), 1);
+        assert_eq!(job.column_types.get("public.users.id").map(String::as_str), Some("BIGINT"));
+        assert_eq!(job.column_types.len(), 2);
         assert_eq!(apply_case(NameCase::Upper, "ab"), "AB");
+    }
+
+    #[test]
+    fn same_table_names_in_two_schemas_keep_their_own_mapping() {
+        let mut tab = MigrationTab::new("src".into(), vec![ObjectRef::table(Some("sales".into()), "orders"), ObjectRef::table(Some("archive".into()), "orders")]);
+        tab.tables[1].target_name = "old_orders".into();
+        tab.tables[1].column_names.insert("id".into(), "order_id".into());
+        tab.tables[1].column_types.insert("id".into(), "BIGINT".into());
+        tab.tables[0].column_types.insert("id".into(), "INT".into());
+        let job = tab.job();
+        // Only the archive table is renamed; no unqualified key could tell them apart.
+        assert_eq!(job.table_names, BTreeMap::from([("archive.orders".to_string(), "old_orders".to_string())]));
+        assert_eq!(job.column_names.keys().collect::<Vec<_>>(), vec!["archive.orders"]);
+        assert_eq!(job.column_types.get("archive.orders.id").map(String::as_str), Some("BIGINT"));
+        assert_eq!(job.column_types.get("sales.orders.id").map(String::as_str), Some("INT"));
+        assert!(!job.column_types.contains_key("orders.id"));
     }
 }

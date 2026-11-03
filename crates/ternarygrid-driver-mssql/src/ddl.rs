@@ -140,9 +140,14 @@ fn unique_clause(t: &TableDef, k: &KeyDef) -> String {
     format!("CONSTRAINT {} UNIQUE{} ({})", quote(&name), key_kind(t, k, false), col_list(&k.columns))
 }
 
+/// Name of a check constraint; an unnamed one gets one from its expression
+/// (`CK_<table>` alone collides as soon as a table has two).
+fn check_name(t: &TableDef, c: &CheckDef) -> String {
+    c.name.clone().unwrap_or_else(|| format!("CK_{}_{}", t.name, var_suffix(&[strip_outer_parens(&c.expression).as_str()])))
+}
+
 fn check_clause(t: &TableDef, c: &CheckDef) -> String {
-    let name = c.name.clone().unwrap_or_else(|| format!("CK_{}", t.name));
-    format!("CONSTRAINT {} CHECK ({})", quote(&name), strip_outer_parens(&c.expression))
+    format!("CONSTRAINT {} CHECK ({})", quote(&check_name(t, c)), strip_outer_parens(&c.expression))
 }
 
 fn fk_action(a: FkAction) -> Option<&'static str> {
@@ -154,8 +159,14 @@ fn fk_action(a: FkAction) -> Option<&'static str> {
     }
 }
 
+/// Name of a foreign key; an unnamed one is named after its columns too
+/// (`FK_<table>_<referenced>` alone collides for two keys to the same table).
+fn fk_name(t: &TableDef, fk: &ForeignKeyDef) -> String {
+    fk.name.clone().unwrap_or_else(|| format!("FK_{}_{}_{}", t.name, fk.ref_table, fk.columns.join("_")))
+}
+
 fn fk_clause(t: &TableDef, fk: &ForeignKeyDef) -> String {
-    let name = fk.name.clone().unwrap_or_else(|| format!("FK_{}_{}", t.name, fk.ref_table));
+    let name = fk_name(t, fk);
     let mut s = format!(
         "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
         quote(&name),
@@ -435,6 +446,15 @@ impl DdlGenerator for MsSqlDdl {
             let msg = format!("Foreign keys of other tables reference a key this change removes or changes the type of: {}. Drop or change them first.", lost.join(", "));
             out.insert(0, format!("THROW 50000, {}, 1", nstring(&msg)));
         }
+        // IDENTITY cannot be added to or removed from an existing column: skipping it would
+        // apply the rest of the change and silently leave the column as it was.
+        // (A column becoming or ceasing to be computed is dropped and re-added: that works.)
+        let identity: Vec<String> =
+            pairs.iter().filter(|(f, tc)| f.auto_increment != tc.auto_increment && f.generated.is_none() && tc.generated.is_none()).map(|(_, tc)| tc.name.clone()).collect();
+        if !identity.is_empty() {
+            let msg = format!("SQL Server cannot add or remove IDENTITY on an existing column ({}). Recreate the table, or add a new column instead.", identity.join(", "));
+            out.insert(0, format!("THROW 50000, {}, 1", nstring(&msg)));
+        }
         for fk in &referencing {
             out.push(self.drop_foreign_key(&child(fk), fk));
         }
@@ -522,9 +542,6 @@ impl DdlGenerator for MsSqlDdl {
                 out.push(format!("ALTER TABLE {t} DROP COLUMN {}", ident(&tc.name)));
                 out.push(format!("ALTER TABLE {t} ADD {}", column_definition(to, tc)));
                 continue;
-            }
-            if f.auto_increment != tc.auto_increment {
-                out.push(format!("-- SQL Server cannot add or remove IDENTITY on the existing column {}; recreate the table", ident(&tc.name)));
             }
             if f.data_type != tc.data_type || f.nullable != tc.nullable || f.collation != tc.collation {
                 let mut s = format!("ALTER TABLE {t} ALTER COLUMN {} {}", ident(&tc.name), tc.data_type);
@@ -662,8 +679,7 @@ impl DdlGenerator for MsSqlDdl {
     }
 
     fn drop_check(&self, table: &TableDef, check: &CheckDef) -> String {
-        let name = check.name.clone().unwrap_or_else(|| format!("CK_{}", table.name));
-        format!("ALTER TABLE {} DROP CONSTRAINT {}", tname(table), quote(&name))
+        format!("ALTER TABLE {} DROP CONSTRAINT {}", tname(table), quote(&check_name(table, check)))
     }
 
     fn add_foreign_key(&self, table: &TableDef, fk: &ForeignKeyDef) -> String {
@@ -671,8 +687,7 @@ impl DdlGenerator for MsSqlDdl {
     }
 
     fn drop_foreign_key(&self, table: &TableDef, fk: &ForeignKeyDef) -> String {
-        let name = fk.name.clone().unwrap_or_else(|| format!("FK_{}_{}", table.name, fk.ref_table));
-        format!("ALTER TABLE {} DROP CONSTRAINT {}", tname(table), quote(&name))
+        format!("ALTER TABLE {} DROP CONSTRAINT {}", tname(table), quote(&fk_name(table, fk)))
     }
 
     fn create_trigger(&self, _table: &TableDef, trigger: &TriggerDef) -> Vec<String> {
@@ -1141,6 +1156,49 @@ mod tests {
         // the unique key changed because of the rename: dropped and re-added
         assert!(pos("DROP CONSTRAINT [UQ_orders_name]") < pos("ADD CONSTRAINT [UQ_orders_name] UNIQUE (title)"));
         assert!(!stmts.iter().any(|s| s.contains("CREATE NONCLUSTERED INDEX")));
+    }
+
+    #[test]
+    fn unnamed_constraints_get_distinct_names() {
+        let d = MsSqlDdl::new();
+        let mut t = TableDef::new(Some("dbo".into()), "orders");
+        t.columns = vec![ColumnDef::new("qty", "int"), ColumnDef::new("created_by", "int"), ColumnDef::new("updated_by", "int")];
+        t.checks = vec![CheckDef { name: None, expression: "qty > 0".into() }, CheckDef { name: None, expression: "(qty < 100)".into() }];
+        let fk = |col: &str| ForeignKeyDef { columns: vec![col.into()], ref_table: "users".into(), ref_columns: vec!["id".into()], ..Default::default() };
+        t.foreign_keys = vec![fk("created_by"), fk("updated_by")];
+        let s = &d.create_table(&t, true)[0];
+        let names: Vec<&str> = s.split("CONSTRAINT [").skip(1).map(|r| &r[..r.find(']').unwrap()]).collect();
+        assert_eq!(names.len(), 4, "{s}");
+        for (i, n) in names.iter().enumerate() {
+            assert!(!names[..i].contains(n), "duplicate constraint name {n}: {s}");
+        }
+        assert!(names[0].starts_with("CK_orders_") && names[2] == "FK_orders_users_created_by", "{names:?}");
+        // the generated name is stable: a drop finds what create made
+        assert!(s.contains(&format!("CONSTRAINT [{}] CHECK (qty > 0)", names[0])), "{s}");
+        assert_eq!(d.drop_check(&t, &t.checks[0]), format!("ALTER TABLE dbo.orders DROP CONSTRAINT [{}]", names[0]));
+        assert_eq!(d.add_check(&t, &t.checks[1]), format!("ALTER TABLE dbo.orders ADD CONSTRAINT [{}] CHECK (qty < 100)", names[1]));
+        assert_eq!(d.drop_foreign_key(&t, &t.foreign_keys[1]), "ALTER TABLE dbo.orders DROP CONSTRAINT [FK_orders_users_updated_by]");
+    }
+
+    #[test]
+    fn identity_changes_are_refused() {
+        let d = MsSqlDdl::new();
+        let from = sample();
+        let mut to = from.clone();
+        to.columns[0].auto_increment = false;
+        to.columns[3].auto_increment = true;
+        to.comment = Some("changed".into());
+        let sql = d.alter_table(&from, &to, &[]);
+        assert!(sql[0].starts_with("THROW 50000, N'SQL Server cannot add or remove IDENTITY on an existing column (id, price)"), "{sql:#?}");
+        assert!(!sql.iter().any(|s| s.starts_with("--")), "{sql:#?}");
+        // a new identity column is fine
+        let mut added = from.clone();
+        added.columns[0].auto_increment = false;
+        let mut back = added.clone();
+        back.columns.push(ColumnDef::new("seq", "int").not_null().auto_increment());
+        let sql = d.alter_table(&added, &back, &[]);
+        assert!(!sql.iter().any(|s| s.starts_with("THROW")), "{sql:#?}");
+        assert!(sql.iter().any(|s| s.contains("ADD seq int IDENTITY(1,1) NOT NULL")), "{sql:#?}");
     }
 
     #[test]

@@ -154,6 +154,8 @@ pub enum AppCommand {
     OpenSettings,
     /// Preferences were edited: apply and save them.
     SettingsChanged,
+    /// Ask for the master password of the encrypted vault (it locked itself).
+    UnlockVault,
     OpenHistory,
     OpenTasks,
     OpenErDiagram {
@@ -185,6 +187,13 @@ pub enum AppCommand {
     },
     OpenAiAssistant {
         connection: Option<String>,
+    },
+    /// Open the AI assistant on a new conversation about `sql`: "Fix error" with `error`,
+    /// "Explain query" without (sent at once).
+    AskAi {
+        connection: Option<String>,
+        sql: String,
+        error: Option<String>,
     },
     OpenExport {
         connection: String,

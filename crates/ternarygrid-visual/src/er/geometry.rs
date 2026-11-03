@@ -14,7 +14,7 @@ pub(crate) const HEADER_FONT: f32 = 13.0;
 /// Font size of the schema name in the header.
 pub(crate) const SCHEMA_FONT: f32 = 10.5;
 /// Font size of column rows.
-pub(crate) const ROW_FONT: f32 = 12.0;
+pub(crate) const ROW_FONT: f32 = 11.5;
 /// Font size of the comment line.
 pub(crate) const COMMENT_FONT: f32 = 11.0;
 /// Height of the header band.
@@ -24,17 +24,21 @@ pub(crate) const COMMENT_HEIGHT: f32 = 18.0;
 /// Height of one column row.
 pub(crate) const ROW_HEIGHT: f32 = 20.0;
 /// Horizontal padding inside the box.
-pub(crate) const PAD_X: f32 = 10.0;
-/// Width reserved for the key icon of a row and the kind icon of the header.
-pub(crate) const ICON_WIDTH: f32 = 18.0;
+pub(crate) const PAD_X: f32 = 8.0;
+/// Width reserved for the key icon of a row (11) and the gap after it (6).
+pub(crate) const ICON_WIDTH: f32 = 17.0;
+/// Width reserved for the kind icon of the header (13) and the gap after it (6).
+pub(crate) const HEADER_ICON_WIDTH: f32 = 19.0;
 /// Gap between the name and type columns.
 pub(crate) const TYPE_GAP: f32 = 14.0;
+/// Padding above the first row.
+pub(crate) const TOP_PAD: f32 = 3.0;
 /// Padding below the last row.
-pub(crate) const BOTTOM_PAD: f32 = 5.0;
+pub(crate) const BOTTOM_PAD: f32 = 3.0;
 /// Corner radius of boxes.
 pub(crate) const CORNER_RADIUS: f32 = 6.0;
 /// Minimum and maximum box width.
-pub(crate) const MIN_WIDTH: f32 = 140.0;
+pub(crate) const MIN_WIDTH: f32 = 210.0;
 pub(crate) const MAX_WIDTH: f32 = 460.0;
 /// Maximum characters of the comment line.
 const COMMENT_MAX_CHARS: usize = 80;
@@ -117,7 +121,7 @@ pub fn table_geometry(table: &ErTable, settings: &ErSettings) -> TableGeometry {
     };
 
     let mut header_w =
-        PAD_X + ICON_WIDTH + text_width(&table.name, HEADER_FONT, true) * UI_SAFETY + PAD_X;
+        PAD_X + HEADER_ICON_WIDTH + text_width(&table.name, HEADER_FONT, true) * UI_SAFETY + PAD_X;
     if let Some(schema) = table.schema.as_deref().filter(|s| !s.is_empty()) {
         header_w += 10.0 + text_width(schema, SCHEMA_FONT, false) * UI_SAFETY;
     }
@@ -159,7 +163,8 @@ pub fn table_geometry(table: &ErTable, settings: &ErSettings) -> TableGeometry {
             COMMENT_HEIGHT
         } else {
             0.0
-        };
+        }
+        + if rows.is_empty() { 0.0 } else { TOP_PAD };
     let height =
         body_top + rows.len() as f32 * ROW_HEIGHT + if rows.is_empty() { 0.0 } else { BOTTOM_PAD };
     TableGeometry {
@@ -190,7 +195,10 @@ mod tests {
         let t = table();
         let all = table_geometry(&t, &ErSettings::default());
         assert_eq!(all.rows, vec![0, 1, 2]);
-        assert_eq!(all.size.y, HEADER_HEIGHT + 3.0 * ROW_HEIGHT + BOTTOM_PAD);
+        assert_eq!(
+            all.size.y,
+            HEADER_HEIGHT + TOP_PAD + 3.0 * ROW_HEIGHT + BOTTOM_PAD
+        );
         let keys = table_geometry(
             &t,
             &ErSettings {
@@ -224,13 +232,16 @@ mod tests {
         let g = table_geometry(&t, &ErSettings::default());
         assert_eq!(
             g.anchor_y(&t, Some("customer_id")),
-            HEADER_HEIGHT + ROW_HEIGHT * 1.5
+            HEADER_HEIGHT + TOP_PAD + ROW_HEIGHT * 1.5
         );
         assert_eq!(g.anchor_y(&t, Some("missing")), HEADER_HEIGHT / 2.0);
-        assert_eq!(g.row_at(HEADER_HEIGHT + 1.0), Some(0));
+        assert_eq!(g.row_at(HEADER_HEIGHT + TOP_PAD + 1.0), Some(0));
         assert_eq!(g.row_at(5.0), None);
-        assert_eq!(g.row_at(HEADER_HEIGHT + 2.5 * ROW_HEIGHT), Some(2));
-        assert_eq!(g.row_at(HEADER_HEIGHT + 3.5 * ROW_HEIGHT), None);
+        assert_eq!(
+            g.row_at(HEADER_HEIGHT + TOP_PAD + 2.5 * ROW_HEIGHT),
+            Some(2)
+        );
+        assert_eq!(g.row_at(HEADER_HEIGHT + TOP_PAD + 3.5 * ROW_HEIGHT), None);
     }
 
     #[test]
@@ -245,6 +256,6 @@ mod tests {
             },
         );
         assert_eq!(g.comment.as_deref(), Some("Orders placed by customers"));
-        assert_eq!(g.body_top, HEADER_HEIGHT + COMMENT_HEIGHT);
+        assert_eq!(g.body_top, HEADER_HEIGHT + COMMENT_HEIGHT + TOP_PAD);
     }
 }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use ternarygrid_core::ddl::{ForeignKeyDef, SchemaSnapshot, TableDef};
 use ternarygrid_core::meta::{ObjectKind, ObjectRef, SchemaRef};
 use ternarygrid_core::{tr, trf};
+use ternarygrid_ui::kit;
 use ternarygrid_visual::er::{ErDiagram, ErEvent, ErModel, ErViewState, export_png, export_svg, show_er};
 
 pub struct ErTab {
@@ -84,6 +85,12 @@ impl ErTab {
 
     pub fn key(conn: &str, schema: &SchemaRef, tables: &[String]) -> String {
         format!("er:{conn}:{}:{}:{}", schema.database.as_deref().unwrap_or(""), schema.schema.as_deref().unwrap_or(""), tables.join(","))
+    }
+
+    /// Where table `key` (`schema.name`) was drawn on screen in the last frame (tests click on it).
+    #[doc(hidden)]
+    pub fn table_screen_rect(&self, key: &str) -> Option<egui::Rect> {
+        self.state.screen_rect(self.diagram.as_ref()?, key)
     }
 
     fn object_of(&self, key: &str) -> ObjectRef {
@@ -297,10 +304,8 @@ impl TabView for ErTab {
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let backend = cx.backend;
         let Some(live) = cx.conns.live_mut(&self.conn) else {
-            ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.label(tr("The connection is closed."));
-                if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
+            kit::empty_state(ui, icon::GRAPH, tr("The connection is closed."), "", |ui| {
+                if kit::primary_icon(ui, icon::PLUGS_CONNECTED, tr("Connect")).clicked() {
                     cx.commands.push(AppCommand::Connect(self.conn.clone()));
                 }
             });
@@ -338,18 +343,17 @@ impl TabView for ErTab {
             }
             Some(crate::backend::Loadable::Failed(e)) => {
                 let text = e.full_text();
-                crate::widgets::error_box(ui, &text);
-                if ui.button(tr("Retry")).clicked() {
-                    live.meta.clear_schema(&self.schema);
-                }
+                egui::Frame::new().inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                    crate::widgets::error_box(ui, &text);
+                    if kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked() {
+                        live.meta.clear_schema(&self.schema);
+                    }
+                });
                 return;
             }
             _ => {
                 if self.diagram.is_none() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.weak(tr("Reading the schema…"));
-                    });
+                    egui::Frame::new().inner_margin(egui::Margin::same(16)).show(ui, |ui| ternarygrid_ui::parts::spinner_label(ui, tr("Reading the schema…")));
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                     return;
                 }
@@ -373,16 +377,34 @@ impl TabView for ErTab {
 impl ErTab {
     /// Name, Save and Refresh of a diagram tab.
     fn name_row(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.name_edit).desired_width(200.0));
-            if ui.button((ternarygrid_icons::ic(icon::FLOPPY_DISK), tr("Save"))).on_hover_text(tr("Save the diagram in the project")).clicked() {
-                self.save(cx);
-            }
-            if ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Refresh"))).clicked() {
-                self.reload(cx);
-            }
-            // Layout, edit mode and export are in the diagram's own toolbar.
+        let p = ternarygrid_ui::pal(ui);
+        egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 8, bottom: 8 }).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.set_min_height(ternarygrid_ui::style::CONTROL_H);
+                let name = ui
+                    .scope(|ui| {
+                        ui.visuals_mut().widgets.inactive.bg_stroke.color = p.border;
+                        let edit = egui::TextEdit::singleline(&mut self.name_edit)
+                            .desired_width(200.0)
+                            .min_size(egui::vec2(0.0, ternarygrid_ui::style::CONTROL_H))
+                            .vertical_align(egui::Align::Center)
+                            .margin(egui::Margin::symmetric(10, 2));
+                        ui.add(edit)
+                    })
+                    .inner;
+                if name.has_focus() {
+                    ternarygrid_ui::style::focus_halo(ui, name.rect, ternarygrid_ui::style::RADIUS);
+                }
+                if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::FLOPPY_DISK), tr("Save"), true).on_hover_text(tr("Save the diagram in the project")).clicked() {
+                    self.save(cx);
+                }
+                if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::ARROW_CLOCKWISE), tr("Refresh"), true).clicked() {
+                    self.reload(cx);
+                }
+                // Layout, edit mode and export are in the diagram's own toolbar.
+            });
         });
-        ui.separator();
+        ternarygrid_ui::parts::hline(ui);
     }
 }

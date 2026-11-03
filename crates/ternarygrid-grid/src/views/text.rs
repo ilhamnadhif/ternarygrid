@@ -14,10 +14,12 @@ const MAX_CELL_CHARS: usize = 60;
 /// Cached rendering of the text view.
 #[derive(Debug, Clone, Default)]
 pub struct TextViewState {
+    /// Content generation, columns and rows rendered.
     key: Option<(u64, Vec<usize>, usize)>,
+    /// When it was rendered (`ui` time).
+    built_at: f64,
     lines: Arc<Vec<String>>,
     max_chars: usize,
-    truncated: bool,
 }
 
 fn cell_text(v: &Value, null_text: &str) -> String {
@@ -94,26 +96,29 @@ impl<'a> TextView<'a> {
     pub fn show(self, ui: &mut Ui) {
         let TextView { model, grid, options, state } = self;
         let columns = grid.visible_columns();
-        let key = (model.generation(), columns.clone(), model.row_count());
-        if state.key.as_ref() != Some(&key) {
+        // Rows fetched past the first MAX_TEXT_ROWS change nothing shown; before,
+        // a streaming fetch re-renders at most every half second.
+        let key = (model.content_generation(), columns.clone(), model.row_count().min(MAX_TEXT_ROWS));
+        let more_rows_only = state.key.as_ref().is_some_and(|(g, c, _)| *g == key.0 && *c == key.1);
+        if state.key.as_ref() != Some(&key) && super::rebuild_due(ui.ctx(), more_rows_only, state.built_at) {
             let (lines, max) = render_text_table(model, &columns, MAX_TEXT_ROWS, &options.format.null_text);
             state.lines = Arc::new(lines);
             state.max_chars = max;
-            state.truncated = model.row_count() > MAX_TEXT_ROWS;
             state.key = Some(key);
+            state.built_at = ui.input(|i| i.time);
         }
-        ui.horizontal(|ui| {
-            if ui.button(format!("{}  {}", egui_phosphor::regular::COPY, tr("Copy text"))).clicked() {
+        super::view_bar(ui, &mut |ui| {
+            if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy text"), true, false).clicked() {
                 ui.ctx().copy_text(state.lines.join("\n"));
             }
-            if state.truncated {
+            if model.row_count() > MAX_TEXT_ROWS {
                 ui.weak(trf(
                     "Showing the first {} of {} rows",
                     &[&crate::format::group_thousands(&MAX_TEXT_ROWS.to_string()), &crate::format::group_thousands(&model.row_count().to_string())],
                 ));
             }
         });
-        super::show_lines(ui, "ternarygrid_text_view", &state.lines, state.max_chars);
+        super::show_lines(ui, "ternarygrid_text_view", &state.lines, state.max_chars, false);
     }
 }
 
@@ -133,5 +138,51 @@ mod tests {
         assert_eq!(max, 11);
         let (lines, _) = render_text_table(&m, &[1], 1, "");
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn a_streaming_fetch_does_not_render_every_frame() {
+        let row = |i: i64| vec![Value::Int(i), Value::text(format!("n{i}"))];
+        let mut model = ResultModel::from_rows(vec![ColumnMeta::new("id", "int", DataKind::Int), ColumnMeta::new("name", "text", DataKind::Text)], (0..10).map(row).collect());
+        let grid = DataGridState::for_model(&model);
+        let options = GridOptions::default();
+        let mut state = TextViewState::default();
+        let mut ui = crate::test_support::Ui::new();
+        let mut frame = |model: &mut ResultModel, state: &mut TextViewState| {
+            model.try_sync();
+            ui.run(vec![], egui::Modifiers::NONE, |ui| TextView::new(model, &grid, &options, state).show(ui));
+        };
+        frame(&mut model, &mut state);
+        let built = state.built_at;
+        assert_eq!(state.lines.len(), 12);
+        // A batch every frame: not rendered again each time ...
+        for i in 10..20 {
+            model.store().lock().push(row(i));
+            frame(&mut model, &mut state);
+        }
+        assert_eq!(state.built_at, built);
+        assert_eq!(state.lines.len(), 12);
+        // ... but within half a second, with all of them.
+        for _ in 0..30 {
+            frame(&mut model, &mut state);
+        }
+        assert_eq!(state.lines.len(), 22);
+        // Anything else at once.
+        let built = state.built_at;
+        model.add_virtual_column("twice", "id * 2").unwrap();
+        frame(&mut model, &mut state);
+        assert!(state.built_at > built);
+        // Rows past the ones shown change nothing.
+        model.store().lock().extend((20..MAX_TEXT_ROWS as i64 + 5).map(row));
+        for _ in 0..40 {
+            frame(&mut model, &mut state);
+        }
+        let built = state.built_at;
+        model.store().lock().push(row(-1));
+        for _ in 0..40 {
+            frame(&mut model, &mut state);
+        }
+        assert_eq!(state.built_at, built);
+        assert_eq!(state.lines.len(), MAX_TEXT_ROWS + 2);
     }
 }

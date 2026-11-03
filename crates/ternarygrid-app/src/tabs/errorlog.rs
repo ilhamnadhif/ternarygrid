@@ -32,7 +32,11 @@ impl ErrorLogTab {
     /// The entries shown with the current filter, newest first.
     pub fn visible(&self) -> Vec<&LogEntry> {
         let needle = self.search.to_lowercase();
-        self.entries.iter().rev().filter(|e| e.level <= self.level && (needle.is_empty() || e.message.to_lowercase().contains(&needle) || e.target.contains(&needle))).collect()
+        self.entries
+            .iter()
+            .rev()
+            .filter(|e| e.level <= self.level && (needle.is_empty() || e.message.to_lowercase().contains(&needle) || e.target.to_lowercase().contains(&needle)))
+            .collect()
     }
 
     pub fn set_level(&mut self, level: Level) {
@@ -40,11 +44,11 @@ impl ErrorLogTab {
     }
 }
 
-fn level_color(level: Level, dark: bool) -> Color32 {
+fn level_color(level: Level, p: &ternarygrid_ui::Palette) -> Color32 {
     match level {
-        Level::ERROR => crate::theme::error_color(dark),
-        Level::WARN => Color32::from_rgb(214, 152, 32),
-        _ => Color32::GRAY,
+        Level::ERROR => p.err,
+        Level::WARN => p.warn,
+        _ => p.text_muted,
     }
 }
 
@@ -78,45 +82,84 @@ impl TabView for ErrorLogTab {
         }
         // new entries appear while the tab is open
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("error_log_level").selected_text(tr(level_label(self.level))).show_ui(ui, |ui| {
-                for l in [Level::ERROR, Level::WARN, Level::INFO] {
-                    ui.selectable_value(&mut self.level, l, tr(level_label(l)));
-                }
-            });
-            ui.add(egui::TextEdit::singleline(&mut self.search).hint_text(format!("{} {}", icon::MAGNIFYING_GLASS, tr("Search"))).desired_width(220.0));
-            if ui.button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).on_hover_text(tr("Copy the shown entries")).clicked() {
+        let pal = ternarygrid_ui::pal(ui);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ternarygrid_ui::parts::toolbar(ui, |ui| {
+            // The select at the height of the design's fields, its text 11 points in.
+            ui.spacing_mut().interact_size.y = 30.0;
+            ui.spacing_mut().button_padding = egui::vec2(11.0, 5.0);
+            egui::ComboBox::from_id_salt("error_log_level")
+                .icon(ternarygrid_ui::kit::combo_caret)
+                .popup_style(egui::containers::menu::menu_style.into())
+                .width(190.0)
+                .selected_text(tr(level_label(self.level)))
+                .show_ui(ui, |ui| {
+                    ternarygrid_ui::kit::menu_look(ui, 190.0);
+                    for l in [Level::ERROR, Level::WARN, Level::INFO] {
+                        let mut on = self.level == l;
+                        if ternarygrid_ui::kit::menu_check(ui, &mut on, tr(level_label(l))).clicked() {
+                            self.level = l;
+                        }
+                    }
+                });
+            ternarygrid_ui::kit::search_field(ui, egui::Id::new("error_log_search"), &mut self.search, tr("Search"), 260.0);
+            if ternarygrid_ui::kit::ghost(ui, Some(icon::COPY), tr("Copy")).on_hover_text(tr("Copy the shown entries")).clicked() {
                 let text: Vec<String> = self.visible().iter().rev().map(|e| e.line()).collect();
                 ui.ctx().copy_text(text.join("\n"));
             }
-            if ui.button((ternarygrid_icons::ic(icon::TRASH), tr("Clear"))).clicked() {
+            if ternarygrid_ui::kit::ghost(ui, Some(icon::TRASH), tr("Clear")).clicked() {
                 applog::clear();
             }
             if let Some(file) = applog::log_file()
-                && ui.button((ternarygrid_icons::ic(icon::FOLDER_OPEN), tr("Show log file"))).on_hover_text(file.display().to_string()).clicked()
+                && ternarygrid_ui::kit::ghost(ui, Some(icon::FOLDER_OPEN), tr("Show log file")).on_hover_text(file.display().to_string()).clicked()
             {
                 let _ = open::that_detached(file.parent().unwrap_or(&file));
             }
         });
-        ui.separator();
-        let dark = ui.visuals().dark_mode;
         let shown = self.visible();
         if shown.is_empty() {
-            ui.weak(tr("No entries."));
+            ternarygrid_ui::kit::empty_state(ui, icon::CHECK_CIRCLE, tr("No entries."), tr("Errors and warnings of this session appear here."), |_| {});
             return;
         }
-        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-        egui::ScrollArea::both().auto_shrink([false, false]).show_rows(ui, row_h, shown.len(), |ui, range| {
+        // Rows of 30 and their hairline on the surface colour (the space under them stays the
+        // canvas).
+        let row_h = 31.0;
+        let mono = egui::FontId::monospace(12.0);
+        let room = ui.available_rect_before_wrap();
+        let rows_h = (row_h * shown.len() as f32).min(room.height());
+        ui.painter().rect_filled(egui::Rect::from_min_size(room.min, egui::vec2(room.width(), rows_h)), 0.0, pal.surface);
+        ternarygrid_ui::kit::show_rows(egui::ScrollArea::both().auto_shrink([false, false]), ui, row_h, shown.len(), |ui, range| {
             for e in &shown[range] {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(e.time.format("%H:%M:%S").to_string()).monospace().weak()).on_hover_text(e.time.format("%Y-%m-%d %H:%M:%S%.3f").to_string());
-                    ui.label(RichText::new(format!("{:<5}", e.level)).monospace().color(level_color(e.level, dark)));
-                    let first = e.message.lines().next().unwrap_or("");
-                    let resp = ui.add(egui::Label::new(first).truncate());
-                    if e.message.contains('\n') || first.len() > 120 {
-                        resp.on_hover_text(format!("{}\n\n{}", e.target, e.message));
-                    }
-                });
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, pal.line));
+                let cy = rect.center().y;
+                let t = painter.text(egui::pos2(rect.left() + 16.0, cy), egui::Align2::LEFT_CENTER, e.time.format("%H:%M:%S").to_string(), mono.clone(), pal.text_faint);
+                // The level in a bold monospace (drawn twice, half a pixel apart: the
+                // monospace font has no bold face).
+                let level_font = egui::FontId::new(12.0, egui::FontFamily::Monospace);
+                for dx in [0.0, 0.35] {
+                    painter.text(egui::pos2(t.right() + 14.0 + dx, cy), egui::Align2::LEFT_CENTER, format!("{}", e.level), level_font.clone(), level_color(e.level, &pal));
+                }
+                let x = t.right() + 14.0 + 62.0;
+                let first = e.message.lines().next().unwrap_or("");
+                let size = ternarygrid_ui::style::body_size(ui.ctx());
+                let g = egui::WidgetText::from(RichText::new(first).size(size).color(pal.text)).into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Truncate),
+                    (rect.right() - x - 16.0).max(40.0),
+                    egui::TextStyle::Body,
+                );
+                let truncated = g.elided;
+                ui.painter().galley(egui::pos2(x, cy - g.size().y / 2.0), g, pal.text);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, first));
+                // The full time, and for long entries where they come from and the whole message.
+                let when = e.time.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                if e.message.contains('\n') || truncated {
+                    resp.on_hover_text(format!("{when}  {}\n\n{}", e.target, e.message));
+                } else {
+                    resp.on_hover_text(when);
+                }
             }
         });
     }

@@ -187,43 +187,136 @@ impl KnownHosts {
     }
 
     /// Records `key` for `host:port` in the writable file (atomic rewrite, mode 0600).
+    ///
+    /// The read-modify-write is serialized ([`WriteLock`]): two connections
+    /// learning keys at the same time must not lose one of them. An entry that
+    /// is already there is not added twice; a file that cannot be read is an
+    /// error (rewriting it would drop its entries).
     pub fn learn(&self, host: &str, port: u16, key: &PublicKey) -> DbResult<()> {
-        let mut content = std::fs::read_to_string(&self.own).unwrap_or_default();
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
         let key_text = key
             .to_openssh()
             .map_err(|e| DbError::internal(format!("Cannot encode host key: {e}")))?;
-        content.push_str(&lookup_name(host, port));
-        content.push(' ');
-        content.push_str(key_text.trim());
-        content.push('\n');
-        write_private_file(&self.own, content.as_bytes())
+        let name = lookup_name(host, port);
+        let _lock = WriteLock::acquire(&self.own);
+        let mut content = match std::fs::read(&self.own) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(DbError::io(format!(
+                    "Cannot read {}: {e}",
+                    self.own.display()
+                )));
+            }
+        };
+        let recorded = String::from_utf8_lossy(&content)
+            .lines()
+            .filter_map(|l| parse_line(l, 0))
+            .any(|e| {
+                e.marker == Marker::None
+                    && host_matches(&name, &e.patterns)
+                    && e.key.key_data() == key.key_data()
+            });
+        if recorded {
+            return Ok(());
+        }
+        if !content.is_empty() && !content.ends_with(b"\n") {
+            content.push(b'\n');
+        }
+        content.extend_from_slice(name.as_bytes());
+        content.push(b' ');
+        content.extend_from_slice(key_text.trim().as_bytes());
+        content.push(b'\n');
+        write_private_file(&self.own, &content)
     }
 
     /// Removes every entry for `host:port` from the writable file; returns the number removed.
     pub fn forget(&self, host: &str, port: u16) -> DbResult<usize> {
-        let Ok(content) = std::fs::read_to_string(&self.own) else {
+        let _lock = WriteLock::acquire(&self.own);
+        let Ok(content) = std::fs::read(&self.own) else {
             return Ok(0);
         };
         let name = lookup_name(host, port);
         let mut removed = 0;
-        let mut out = String::with_capacity(content.len());
-        for line in content.lines() {
-            let matches = parse_line(line, 0)
+        let mut out = Vec::with_capacity(content.len());
+        // Byte lines: other lines are kept exactly as they are.
+        for line in content.split_inclusive(|b| *b == b'\n') {
+            let matches = parse_line(&String::from_utf8_lossy(line), 0)
                 .is_some_and(|e| e.marker == Marker::None && host_matches(&name, &e.patterns));
             if matches {
                 removed += 1;
             } else {
-                out.push_str(line);
-                out.push('\n');
+                out.extend_from_slice(line);
             }
         }
         if removed > 0 {
-            write_private_file(&self.own, out.as_bytes())?;
+            if !out.is_empty() && !out.ends_with(b"\n") {
+                out.push(b'\n');
+            }
+            write_private_file(&self.own, &out)?;
         }
         Ok(removed)
+    }
+}
+
+/// Serializes rewrites of a known_hosts file: a process-wide mutex
+/// (connections verify host keys concurrently, each with its own
+/// [`KnownHosts`]) plus, on Unix, an advisory `flock` on `<file>.lock`
+/// against other TernaryGrid processes. Released when dropped.
+struct WriteLock {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    #[cfg(unix)]
+    _file: Option<std::fs::File>,
+}
+
+static WRITE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl WriteLock {
+    fn acquire(path: &Path) -> WriteLock {
+        let guard = WRITE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(unix)]
+        {
+            WriteLock {
+                _guard: guard,
+                _file: lock_file(path),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            WriteLock { _guard: guard }
+        }
+    }
+}
+
+/// Exclusive `flock` on `<path>.lock`; `None` (no cross-process lock) when
+/// the file cannot be created or the file system does not support locks.
+#[cfg(unix)]
+fn lock_file(path: &Path) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(dir) = dir {
+        create_private_dir(dir).ok()?;
+    }
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(PathBuf::from(name))
+        .ok()?;
+    loop {
+        // SAFETY: `flock` only takes the descriptor of `file`, open for the
+        // duration of the call; the lock is released when `file` is closed.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Some(file);
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
     }
 }
 
@@ -243,8 +336,9 @@ pub fn lookup_name(host: &str, port: u16) -> String {
 }
 
 fn read_entries(path: &Path) -> Vec<Entry> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => text
+    // Lossy: a comment in another encoding must not hide every entry.
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes)
             .lines()
             .enumerate()
             .filter_map(|(i, l)| parse_line(l, i + 1))
@@ -493,6 +587,70 @@ mod tests {
         }
         assert_eq!(kh.forget("bastion", 2022).unwrap(), 1);
         assert_eq!(kh.check("bastion", 2022, &k1), HostKeyStatus::Unknown);
+    }
+
+    #[test]
+    fn concurrent_learns_keep_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("known_hosts");
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let own = own.clone();
+                std::thread::spawn(move || {
+                    // A KnownHosts of its own, like every SSH connection.
+                    let kh = KnownHosts::own_only(&own);
+                    let k = key();
+                    kh.learn(&format!("host{i}"), 22, &k).unwrap();
+                    (i, k)
+                })
+            })
+            .collect();
+        let kh = KnownHosts::own_only(&own);
+        for t in threads {
+            let (i, k) = t.join().unwrap();
+            assert!(
+                matches!(
+                    kh.check(&format!("host{i}"), 22, &k),
+                    HostKeyStatus::Known { .. }
+                ),
+                "host{i} was lost"
+            );
+        }
+        // Learning a recorded key again adds nothing.
+        let k = key();
+        kh.learn("again", 22, &k).unwrap();
+        kh.learn("again", 22, &k).unwrap();
+        let text = std::fs::read_to_string(&own).unwrap();
+        assert_eq!(text.lines().count(), 17);
+    }
+
+    #[test]
+    fn learn_keeps_a_file_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("known_hosts");
+        let k1 = key();
+        let mut bytes = b"# caf\xe9 (latin-1 comment)\n".to_vec();
+        bytes.extend_from_slice(line_for("old-host", &k1).as_bytes());
+        std::fs::write(&own, &bytes).unwrap();
+        let kh = KnownHosts::own_only(&own);
+        let k2 = key();
+        kh.learn("new-host", 22, &k2).unwrap();
+        let after = std::fs::read(&own).unwrap();
+        assert!(after.starts_with(&bytes), "existing entries were dropped");
+        assert!(matches!(
+            kh.check("new-host", 22, &k2),
+            HostKeyStatus::Known { .. }
+        ));
+        assert!(matches!(
+            kh.check("old-host", 22, &k1),
+            HostKeyStatus::Known { line: 2, .. }
+        ));
+        assert_eq!(kh.forget("new-host", 22).unwrap(), 1);
+        assert_eq!(
+            std::fs::read(&own).unwrap(),
+            bytes,
+            "other lines kept byte for byte"
+        );
     }
 
     #[test]

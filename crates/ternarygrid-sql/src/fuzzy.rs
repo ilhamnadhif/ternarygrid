@@ -1,4 +1,4 @@
-//! Fuzzy matching for the command palette and autocomplete.
+//! Fuzzy matching for autocomplete.
 //!
 //! The pattern must appear in the candidate as a case-insensitive
 //! subsequence. Among all alignments the best one is chosen (dynamic

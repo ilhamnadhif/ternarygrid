@@ -132,7 +132,8 @@ pub fn capabilities(flavor: Flavor) -> Capabilities {
         restore: true,
         debugger: false,
         cancel: true,
-        returning: false,
+        // MariaDB 10.5+; the session's dialect (`supports_returning`) knows the version.
+        returning: flavor == Flavor::MariaDb,
         schema_object_kinds,
         table_child_kinds: vec![
             ObjectKind::Column,
@@ -299,6 +300,7 @@ mod tests {
                 && caps.cancel
         );
         assert!(!caps.schema_object_kinds.contains(&ObjectKind::Sequence));
+        assert!(!caps.returning && MariaDbDriver::new().info().capabilities.returning);
         let ma = MariaDbDriver::new();
         assert_eq!(ma.kind(), DbKind::MariaDb);
         assert!(

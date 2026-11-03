@@ -89,7 +89,7 @@ fn is_keyword(s: &str) -> bool {
 
 pub(crate) fn parse(src: &str) -> Result<Ast, ExprError> {
     let tokens = tokenize(src)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser { tokens, pos: 0, height: 0 };
     if matches!(p.peek().kind, Tok::Eof) {
         return Err(ExprError::new(tr("Expression is empty"), 0..0));
     }
@@ -104,9 +104,21 @@ pub(crate) fn parse(src: &str) -> Result<Ast, ExprError> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Height of the tree the last parse function returned (a leaf is 1).
+    /// Kept here, not returned: the parser recurses per nesting level and
+    /// bigger frames would limit how deep it can go on a small stack.
+    height: usize,
 }
 
 const MAX_DEPTH: usize = 200;
+
+/// Height of the tallest tree [`parse`] builds. Binding and evaluating a tree
+/// recurse once per level, and a chain such as `a + a + a …` is as tall as it
+/// is long (the parser itself loops over it): a pasted expression must not
+/// overflow the stack of the thread evaluating it (2 MiB for the view
+/// workers, a debug build included). AND / OR lists are built balanced, so
+/// `x = 1 OR x = 2 OR …` stays far below it.
+pub(crate) const MAX_HEIGHT: usize = 256;
 
 impl Parser {
     fn peek(&self) -> &Token {
@@ -154,7 +166,27 @@ impl Parser {
     }
 
     fn check_depth(&self, depth: usize) -> Result<(), ExprError> {
-        if depth > MAX_DEPTH { Err(ExprError::new(tr("Expression is nested too deeply"), self.peek().span.clone())) } else { Ok(()) }
+        if depth > MAX_DEPTH { Err(self.too_deep()) } else { Ok(()) }
+    }
+
+    fn too_deep(&self) -> ExprError {
+        ExprError::new(tr("Expression is nested too deeply"), self.peek().span.clone())
+    }
+
+    /// A leaf was parsed.
+    fn leaf(&mut self, ast: Ast) -> Result<Ast, ExprError> {
+        self.height = 1;
+        Ok(ast)
+    }
+
+    /// A node over children of heights `children` was built: its height
+    /// becomes [`Parser::height`]; an error past [`MAX_HEIGHT`].
+    fn node(&mut self, ast: Ast, children: usize) -> Result<Ast, ExprError> {
+        if children >= MAX_HEIGHT {
+            return Err(self.too_deep());
+        }
+        self.height = children + 1;
+        Ok(ast)
     }
 
     fn expr(&mut self, depth: usize) -> Result<Ast, ExprError> {
@@ -163,34 +195,68 @@ impl Parser {
     }
 
     fn or(&mut self, depth: usize) -> Result<Ast, ExprError> {
-        let mut left = self.and(depth)?;
-        while self.eat_kw("OR") {
-            let right = self.and(depth)?;
-            left = Ast::Binary(BinaryOp::Or, Box::new(left), Box::new(right));
+        let first = self.and(depth)?;
+        if !self.is_kw("OR") {
+            return Ok(first);
         }
-        Ok(left)
+        let mut terms = vec![(first, self.height)];
+        while self.eat_kw("OR") {
+            let term = self.and(depth)?;
+            terms.push((term, self.height));
+        }
+        self.balanced(BinaryOp::Or, terms)
     }
 
     fn and(&mut self, depth: usize) -> Result<Ast, ExprError> {
-        let mut left = self.not(depth)?;
-        while self.eat_kw("AND") {
-            let right = self.not(depth)?;
-            left = Ast::Binary(BinaryOp::And, Box::new(left), Box::new(right));
+        let first = self.not(depth)?;
+        if !self.is_kw("AND") {
+            return Ok(first);
         }
-        Ok(left)
+        let mut terms = vec![(first, self.height)];
+        while self.eat_kw("AND") {
+            let term = self.not(depth)?;
+            terms.push((term, self.height));
+        }
+        self.balanced(BinaryOp::And, terms)
+    }
+
+    /// `a OP b OP c …` for AND / OR as a balanced tree. It evaluates the terms
+    /// in the same order, stops at the same one and gives the same result
+    /// (NULLs and errors included) as the left-deep tree: both operators are
+    /// associative and short-circuit left to right. A long list
+    /// (`x = 1 OR x = 2 OR …`) is only log2(n) levels taller than its terms.
+    fn balanced(&mut self, op: BinaryOp, mut terms: Vec<(Ast, usize)>) -> Result<Ast, ExprError> {
+        while terms.len() > 1 {
+            let mut pairs = Vec::with_capacity(terms.len().div_ceil(2));
+            let mut it = terms.into_iter();
+            while let Some((left, lh)) = it.next() {
+                match it.next() {
+                    Some((right, rh)) => {
+                        let node = self.node(Ast::Binary(op, Box::new(left), Box::new(right)), lh.max(rh))?;
+                        pairs.push((node, self.height));
+                    }
+                    None => pairs.push((left, lh)),
+                }
+            }
+            terms = pairs;
+        }
+        let (ast, height) = terms.pop().expect("at least one term");
+        self.height = height;
+        Ok(ast)
     }
 
     fn not(&mut self, depth: usize) -> Result<Ast, ExprError> {
         self.check_depth(depth)?;
         if self.eat_kw("NOT") {
             let inner = self.not(depth + 1)?;
-            return Ok(Ast::Unary(UnaryOp::Not, Box::new(inner)));
+            return self.node(Ast::Unary(UnaryOp::Not, Box::new(inner)), self.height);
         }
         self.cmp(depth)
     }
 
     fn cmp(&mut self, depth: usize) -> Result<Ast, ExprError> {
         let left = self.concat(depth)?;
+        let lh = self.height;
         let op = match self.peek().kind {
             Tok::Eq => Some(BinaryOp::Eq),
             Tok::NotEq => Some(BinaryOp::NotEq),
@@ -203,7 +269,7 @@ impl Parser {
         if let Some(op) = op {
             self.next();
             let right = self.concat(depth)?;
-            return Ok(Ast::Binary(op, Box::new(left), Box::new(right)));
+            return self.node(Ast::Binary(op, Box::new(left), Box::new(right)), lh.max(self.height));
         }
         if self.is_kw("IS") {
             self.next();
@@ -212,7 +278,7 @@ impl Parser {
                 let t = self.peek().clone();
                 return Err(ExprError::new(trf("Expected NULL after IS but found '{}'", &[&t.kind.describe()]), t.span));
             }
-            return Ok(Ast::IsNull { expr: Box::new(left), negated });
+            return self.node(Ast::IsNull { expr: Box::new(left), negated }, lh);
         }
         let negated = if self.is_kw("NOT") && (self.is_kw_at(1, "LIKE") || self.is_kw_at(1, "ILIKE") || self.is_kw_at(1, "IN") || self.is_kw_at(1, "BETWEEN")) {
             self.next();
@@ -224,32 +290,36 @@ impl Parser {
             let case_insensitive = self.is_kw("ILIKE");
             self.next();
             let pattern = self.concat(depth)?;
-            return Ok(Ast::Like { expr: Box::new(left), pattern: Box::new(pattern), negated, case_insensitive });
+            return self.node(Ast::Like { expr: Box::new(left), pattern: Box::new(pattern), negated, case_insensitive }, lh.max(self.height));
         }
         if self.eat_kw("IN") {
             self.expect(Tok::LParen, "'('")?;
             let mut list = vec![self.expr(depth + 1)?];
+            let mut h = lh.max(self.height);
             while matches!(self.peek().kind, Tok::Comma) {
                 self.next();
                 list.push(self.expr(depth + 1)?);
+                h = h.max(self.height);
             }
             self.expect(Tok::RParen, "')'")?;
-            return Ok(Ast::In { expr: Box::new(left), list, negated });
+            return self.node(Ast::In { expr: Box::new(left), list, negated }, h);
         }
         if self.eat_kw("BETWEEN") {
             let low = self.concat(depth)?;
+            let h = lh.max(self.height);
             if !self.eat_kw("AND") {
                 let t = self.peek().clone();
                 return Err(ExprError::new(trf("Expected AND in BETWEEN but found '{}'", &[&t.kind.describe()]), t.span));
             }
             let high = self.concat(depth)?;
-            return Ok(Ast::Between { expr: Box::new(left), low: Box::new(low), high: Box::new(high), negated });
+            return self.node(Ast::Between { expr: Box::new(left), low: Box::new(low), high: Box::new(high), negated }, h.max(self.height));
         }
         if negated {
             // Unreachable: `negated` is only set when one of the keywords follows.
             let t = self.peek().clone();
             return Err(ExprError::new(tr("Unexpected NOT"), t.span));
         }
+        self.height = lh;
         Ok(left)
     }
 
@@ -257,8 +327,9 @@ impl Parser {
         let mut left = self.add(depth)?;
         while matches!(self.peek().kind, Tok::Concat) {
             self.next();
+            let h = self.height;
             let right = self.add(depth)?;
-            left = Ast::Binary(BinaryOp::Concat, Box::new(left), Box::new(right));
+            left = self.node(Ast::Binary(BinaryOp::Concat, Box::new(left), Box::new(right)), h.max(self.height))?;
         }
         Ok(left)
     }
@@ -272,8 +343,9 @@ impl Parser {
                 _ => break,
             };
             self.next();
+            let h = self.height;
             let right = self.mul(depth)?;
-            left = Ast::Binary(op, Box::new(left), Box::new(right));
+            left = self.node(Ast::Binary(op, Box::new(left), Box::new(right)), h.max(self.height))?;
         }
         Ok(left)
     }
@@ -288,8 +360,9 @@ impl Parser {
                 _ => break,
             };
             self.next();
+            let h = self.height;
             let right = self.unary(depth)?;
-            left = Ast::Binary(op, Box::new(left), Box::new(right));
+            left = self.node(Ast::Binary(op, Box::new(left), Box::new(right)), h.max(self.height))?;
         }
         Ok(left)
     }
@@ -301,14 +374,14 @@ impl Parser {
                 self.next();
                 let inner = self.unary(depth + 1)?;
                 // Fold negative numeric literals so `-9223372036854775808` style values work.
-                Ok(match inner {
-                    Ast::Literal(Value::Int(i)) => Ast::Literal(match i.checked_neg() {
+                match inner {
+                    Ast::Literal(Value::Int(i)) => self.leaf(Ast::Literal(match i.checked_neg() {
                         Some(n) => Value::Int(n),
                         None => Value::Float(-(i as f64)),
-                    }),
-                    Ast::Literal(Value::Float(f)) => Ast::Literal(Value::Float(-f)),
-                    other => Ast::Unary(UnaryOp::Neg, Box::new(other)),
-                })
+                    })),
+                    Ast::Literal(Value::Float(f)) => self.leaf(Ast::Literal(Value::Float(-f))),
+                    other => self.node(Ast::Unary(UnaryOp::Neg, Box::new(other)), self.height),
+                }
             }
             Tok::Plus => {
                 self.next();
@@ -321,10 +394,10 @@ impl Parser {
     fn primary(&mut self, depth: usize) -> Result<Ast, ExprError> {
         let t = self.next();
         match t.kind {
-            Tok::Int(i) => Ok(Ast::Literal(Value::Int(i))),
-            Tok::Float(f) => Ok(Ast::Literal(Value::Float(f))),
-            Tok::Str(s) => Ok(Ast::Literal(Value::text(s))),
-            Tok::QuotedIdent(name) => Ok(Ast::Column { name, span: t.span }),
+            Tok::Int(i) => self.leaf(Ast::Literal(Value::Int(i))),
+            Tok::Float(f) => self.leaf(Ast::Literal(Value::Float(f))),
+            Tok::Str(s) => self.leaf(Ast::Literal(Value::text(s))),
+            Tok::QuotedIdent(name) => self.leaf(Ast::Column { name, span: t.span }),
             Tok::LParen => {
                 let inner = self.expr(depth + 1)?;
                 self.expect(Tok::RParen, "')'")?;
@@ -332,31 +405,34 @@ impl Parser {
             }
             Tok::Ident(word) => {
                 if word.eq_ignore_ascii_case("NULL") {
-                    return Ok(Ast::Literal(Value::Null));
+                    return self.leaf(Ast::Literal(Value::Null));
                 }
                 if word.eq_ignore_ascii_case("TRUE") {
-                    return Ok(Ast::Literal(Value::Bool(true)));
+                    return self.leaf(Ast::Literal(Value::Bool(true)));
                 }
                 if word.eq_ignore_ascii_case("FALSE") {
-                    return Ok(Ast::Literal(Value::Bool(false)));
+                    return self.leaf(Ast::Literal(Value::Bool(false)));
                 }
                 if matches!(self.peek().kind, Tok::LParen) {
                     self.next();
                     let mut args = Vec::new();
+                    let mut h = 0;
                     if !matches!(self.peek().kind, Tok::RParen) {
                         args.push(self.expr(depth + 1)?);
+                        h = self.height;
                         while matches!(self.peek().kind, Tok::Comma) {
                             self.next();
                             args.push(self.expr(depth + 1)?);
+                            h = h.max(self.height);
                         }
                     }
                     let close = self.expect(Tok::RParen, "')'")?;
-                    return Ok(Ast::Call { name: word, args, span: t.span.start..close.span.end });
+                    return self.node(Ast::Call { name: word, args, span: t.span.start..close.span.end }, h);
                 }
                 if is_keyword(&word) {
                     return Err(ExprError::new(trf("'{}' is a keyword; write [{}] to refer to a column with that name", &[&word, &word]), t.span));
                 }
-                Ok(Ast::Column { name: word, span: t.span })
+                self.leaf(Ast::Column { name: word, span: t.span })
             }
             Tok::Eof => Err(ExprError::new(tr("Unexpected end of expression"), t.span)),
             other => Err(ExprError::new(trf("Unexpected '{}'", &[&other.describe()]), t.span)),

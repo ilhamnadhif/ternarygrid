@@ -7,9 +7,13 @@ use crate::conn::session::SessionHandle;
 use crate::cx::AppContext;
 use egui::RichText;
 use egui_phosphor::regular as icon;
+use std::cell::Cell;
 use ternarygrid_core::ddl::{CheckDef, ForeignKeyDef, IndexDef, KeyDef, RoutineDef, SequenceDef, TableDef, TriggerDef, ViewDef};
 use ternarygrid_core::meta::{ObjectKind, ObjectRef};
 use ternarygrid_core::{DbResult, Dialect, tr, trf};
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts::{self, Dialog};
+use ternarygrid_ui::style;
 
 pub struct DropDialog {
     conn: String,
@@ -83,6 +87,7 @@ impl DropDialog {
                         return false;
                     }
                     let mut schemas: Vec<_> = self.objects.iter().map(|o| o.schema_ref()).collect();
+                    schemas.sort();
                     schemas.dedup();
                     for s in schemas {
                         cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: None, schema: Some(s) });
@@ -106,81 +111,92 @@ impl DropDialog {
         let own: Vec<SessionHandle> =
             self.objects.iter().filter(|o| o.kind == ObjectKind::Database).filter_map(|o| live.db_sessions.get(&o.name).and_then(|l| l.get()).cloned()).collect();
         let read_only = live.config.read_only;
-        let statements: Vec<String> = self.objects.iter().map(|o| drop_sql(dialect.as_ref(), o, self.cascade)).collect();
-        let mut keep = true;
-        let busy = self.job.is_some();
-        let modal = egui::Modal::new(egui::Id::new(("drop_objects", &self.conn))).show(ctx, |ui| {
-            ui.set_width(560.0);
-            crate::widgets::icon_heading(ui, icon::TRASH, tr("Drop objects"));
-            ui.label(trf("Drop {} object(s)? This cannot be undone.", &[&self.objects.len()]));
-            ui.checkbox(&mut self.cascade, tr("Cascade (also drop dependent objects)"));
-            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                let text = statements.iter().map(|s| format!("{s};\n")).collect::<String>();
-                let mut t = text.as_str();
-                ui.add(egui::TextEdit::multiline(&mut t).code_editor().desired_width(f32::INFINITY));
-            });
-            if read_only {
-                crate::widgets::error_box(ui, tr("The connection is read-only."));
-            }
-            if let Some(e) = &session_error {
-                crate::widgets::error_box(ui, e);
-            } else if opening {
-                ui.weak(tr("Opening a session…"));
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-            }
-            if let Some(e) = &self.error {
-                crate::widgets::error_box(ui, e);
-            }
-            ui.horizontal(|ui| {
-                let danger = crate::theme::error_color(ui.visuals().dark_mode);
-                if ui.add_enabled(!busy && !read_only && !opening, egui::Button::new(RichText::new(tr("Drop")).color(danger))).clicked() {
-                    let work: Vec<(String, SessionHandle)> = statements.iter().cloned().zip(sessions.iter().flatten().cloned()).collect();
-                    let own = own.clone();
-                    self.error = None;
-                    self.job = Some(backend.spawn(async move {
-                        // The sessions are shared: other uncommitted work would be committed with the drop.
-                        if work.iter().map(|(_, s)| s).chain(&own).any(|s| s.has_uncommitted_writes()) {
-                            return Err(ternarygrid_core::DbError::config(tr(
-                                "The session has uncommitted changes (another tab, the data editor): commit or roll them back before dropping objects.",
-                            )));
-                        }
-                        for s in &own {
-                            s.close().await;
-                        }
-                        let mut n = 0;
-                        for (sql, s) in &work {
-                            s.execute_update(sql, &[]).await.map_err(|e| e.with_context(sql.clone()))?;
-                            n += 1;
-                        }
-                        // In manual commit mode the drop would stay in an open transaction (holding its locks).
-                        let mut done: Vec<&SessionHandle> = Vec::new();
-                        for (_, s) in &work {
-                            if !done.iter().any(|d| d.same(s)) {
-                                done.push(s);
-                                if s.tx_state().in_transaction {
-                                    s.commit().await?;
-                                }
-                            }
-                        }
-                        Ok(n)
-                    }));
-                }
-                if ui.button(tr("Open in SQL editor")).clicked() {
-                    let text = statements.iter().map(|s| format!("{s};\n")).collect::<String>();
-                    cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: self.objects.first().map(|o| o.schema_ref()), text: Some(text) });
-                    keep = false;
-                }
-                if ui.add_enabled(!busy, egui::Button::new(tr("Cancel"))).clicked() {
-                    keep = false;
-                }
-                if busy {
-                    ui.spinner();
-                }
-            });
-        });
-        if modal.should_close() && !busy {
-            keep = false;
+        // The subtitle: the connection, and the schema when every object is in the same one.
+        let mut place = live.config.name.clone();
+        if let Some(s) = self.objects.first().and_then(|o| o.schema.clone()).filter(|s| self.objects.iter().all(|o| o.schema.as_deref() == Some(s.as_str()))) {
+            place = format!("{place} · {s}");
         }
-        keep
+        let statements: Vec<String> = self.objects.iter().map(|o| drop_sql(dialect.as_ref(), o, self.cascade)).collect();
+        let script = statements.iter().map(|s| format!("{s};\n")).collect::<String>();
+        let busy = self.job.is_some();
+        let (drop, editor, cancel) = (Cell::new(false), Cell::new(false), Cell::new(false));
+        let error = self.error.clone();
+        let count = self.objects.len();
+        let cascade = &mut self.cascade;
+        let (resp, _) = Dialog::new(tr("Drop objects")).icon(icon::TRASH).subtitle(&place).width(580.0).body_padding(super::BODY).show_modal(
+            ctx,
+            egui::Id::new(("drop_objects", &self.conn)),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 12.0;
+                let question = if count == 1 { tr("Drop 1 object? This cannot be undone.").to_string() } else { trf("Drop {} objects? This cannot be undone.", &[&count]) };
+                ui.add(egui::Label::new(RichText::new(question).font(style::medium(ui.ctx(), 13.5))).wrap());
+                ternarygrid_ui::kit::checkbox(ui, cascade, tr("Cascade (also drop dependent objects)"));
+                super::sql_preview(ui, "drop_sql", Some(dialect.clone()), script.trim_end(), 240.0, true);
+                if read_only {
+                    crate::dialogs::error_note(ui, tr("The connection is read-only."));
+                }
+                if let Some(e) = &session_error {
+                    crate::dialogs::error_note(ui, e);
+                } else if opening {
+                    parts::spinner_label(ui, tr("Opening a session…"));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                }
+                if let Some(e) = &error {
+                    crate::dialogs::error_note(ui, e);
+                }
+            },
+            |ui| {
+                if kit::button_ex(ui, Kind::Ghost, Some(icon::FILE_CODE), tr("Open in SQL editor"), false).clicked() {
+                    editor.set(true);
+                }
+                super::right(ui, |ui| {
+                    if ui.add_enabled_ui(!busy && !read_only && !opening, |ui| kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Drop"), false)).inner.clicked() {
+                        drop.set(true);
+                    }
+                    if ui.add_enabled_ui(!busy, super::cancel_button).inner.clicked() {
+                        cancel.set(true);
+                    }
+                    if busy {
+                        ui.add(egui::Spinner::new().size(14.0));
+                    }
+                });
+            },
+        );
+        if drop.get() && !busy && !read_only && !opening {
+            let work: Vec<(String, SessionHandle)> = statements.iter().cloned().zip(sessions.iter().flatten().cloned()).collect();
+            self.error = None;
+            self.job = Some(backend.spawn(async move {
+                // The sessions are shared: other uncommitted work would be committed with the drop.
+                if work.iter().map(|(_, s)| s).chain(&own).any(|s| s.has_uncommitted_writes()) {
+                    return Err(ternarygrid_core::DbError::config(tr(
+                        "The session has uncommitted changes (another tab, the data editor): commit or roll them back before dropping objects.",
+                    )));
+                }
+                for s in &own {
+                    s.close().await;
+                }
+                let mut n = 0;
+                for (sql, s) in &work {
+                    s.execute_update(sql, &[]).await.map_err(|e| e.with_context(sql.clone()))?;
+                    n += 1;
+                }
+                // In manual commit mode the drop would stay in an open transaction (holding its locks).
+                let mut done: Vec<&SessionHandle> = Vec::new();
+                for (_, s) in &work {
+                    if !done.iter().any(|d| d.same(s)) {
+                        done.push(s);
+                        if s.tx_state().in_transaction {
+                            s.commit().await?;
+                        }
+                    }
+                }
+                Ok(n)
+            }));
+        }
+        if editor.get() {
+            cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: self.objects.first().map(|o| o.schema_ref()), text: Some(script) });
+            return false;
+        }
+        !(cancel.get() || (resp.close && !busy))
     }
 }

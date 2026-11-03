@@ -39,6 +39,7 @@ const METHODS: &[&str] = &[
     "adminCommand",
     "getCollectionNames",
     "createCollection",
+    "createView",
     "dropDatabase",
     "stats",
     "show",

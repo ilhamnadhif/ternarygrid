@@ -34,6 +34,8 @@ pub fn font_definitions(theme: Theme) -> FontDefinitions {
         fonts.font_data.insert(name.into(), Arc::new(data));
     };
     add("Inter", FontData::from_static(inter));
+    // The medium weight for labels that need it (tabs, buttons, titles), in both themes.
+    add("Inter-Medium", FontData::from_static(&INTER_MEDIUM));
     add("Hack", FontData::from_static(epaint_default_fonts::HACK_REGULAR));
     // egui's sizes for its emoji fonts.
     add("NotoEmoji-Regular", FontData::from_static(epaint_default_fonts::NOTO_EMOJI_REGULAR).tweak(FontTweak { scale: 0.81, ..Default::default() }));
@@ -43,7 +45,12 @@ pub fn font_definitions(theme: Theme) -> FontDefinitions {
     // Labels in monospace still find letters and symbols Hack lacks.
     fonts.families.insert(FontFamily::Monospace, ["Hack".to_string(), "Inter".to_string()].into_iter().chain(emoji).collect());
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    ternarygrid_icons::add_fill_font(&mut fonts);
+    // The icons sit a little high next to Inter: level with the text.
+    if let Some(phosphor) = fonts.font_data.get_mut("phosphor") {
+        Arc::make_mut(phosphor).tweak.y_offset_factor = 0.08;
+    }
+    // Inter SemiBold is not bundled (binary size): titles use the medium weight.
+    ternarygrid_ui::style::add_weight_families(&mut fonts, "Inter-Medium", "Inter-Medium");
     fonts
 }
 
@@ -66,6 +73,8 @@ pub fn sync_fonts(ctx: &Context) {
 
 /// Apply the appearance preferences: theme, contrast, zoom and UI font size.
 pub fn apply_settings(ctx: &Context, settings: &ternarygrid_config::AppSettings) {
+    // Monochrome icons: colour only where it means something (ternarygrid_icons).
+    ternarygrid_icons::set_colored(false);
     apply_theme(ctx, settings.general.theme, settings.accessibility.high_contrast);
     let scale = settings.general.ui_scale.clamp(0.5, 3.0);
     if (ctx.zoom_factor() - scale).abs() > f32::EPSILON {
@@ -98,6 +107,8 @@ pub fn apply_theme(ctx: &Context, choice: ThemeChoice, high_contrast: bool) {
             style.spacing.item_spacing = egui::vec2(6.0, 4.0);
             style.spacing.button_padding = egui::vec2(6.0, 2.0);
             style.spacing.interact_size.y = 20.0;
+            // Menus as in the design: 5 points around the items.
+            style.spacing.menu_margin = egui::Margin::same(5);
             style.interaction.tooltip_delay = 0.4;
             // Scroll bars stay visible (egui shows them only on hover), wider when used.
             style.spacing.scroll = egui::style::ScrollStyle {
@@ -132,129 +143,93 @@ fn hex(rgb: u32) -> Color32 {
     Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
-/// TernaryGrid's palettes: near-black (light) / near-white (dark) text with a
-/// solid secondary colour instead of egui's translucent grey, calm neutral
-/// panels and a clear blue selection. The dark one is DBeaver's dark theme:
-/// neutral greys, the grid a shade darker than the panels around it, its
-/// header blue-grey, toolbars and tab bars lighter (see [`chrome`]).
+/// TernaryGrid's visuals, built from the design tokens it shares with
+/// TernaryWire and TernaryShell (`ternarygrid_ui::style`): neutral surfaces,
+/// the teal accent of the app icon, soft selection tints instead of saturated
+/// fills. The grid and the editor are drawn on `extreme_bg_color` (the
+/// surface), their headers in `noninteractive.weak_bg_fill`.
 pub fn visuals(theme: Theme) -> Visuals {
+    use egui::{CornerRadius, Shadow};
     let dark = theme == Theme::Dark;
+    let p = ternarygrid_ui::palette(dark);
+    let soft = ternarygrid_ui::soft;
     let mut v = if dark { Visuals::dark() } else { Visuals::light() };
     // Sharper glyphs: no fractional glyph positions (they blur stems).
     v.text_options.subpixel_binning = false;
-    struct P {
-        text: Color32,
-        weak: Color32,
-        strong: Color32,
-        panel: Color32,
-        window: Color32,
-        field: Color32,
-        input: Color32,
-        faint: Color32,
-        code: Color32,
-        line: Color32,
-        button: Color32,
-        button_hover: Color32,
-        button_active: Color32,
-        border: Color32,
-        border_hover: Color32,
-        accent: Color32,
-        selection: Color32,
-        link: Color32,
-        warn: Color32,
-        error: Color32,
-    }
-    let p = if dark {
-        P {
-            text: hex(0xE2E2E2),
-            weak: hex(0xA1A1A1),
-            strong: hex(0xFFFFFF),
-            panel: hex(0x2F2F2F),
-            window: hex(0x2F2F2F),
-            field: hex(0x252525),
-            input: hex(0x3C3F42),
-            faint: hex(0x2A2A2A),
-            code: hex(0x353535),
-            line: hex(0x3D3D40),
-            button: hex(0x3C3C40),
-            button_hover: hex(0x48484D),
-            button_active: hex(0x545459),
-            border: hex(0x57575C),
-            border_hover: hex(0x707075),
-            accent: hex(0x5C8FF0),
-            selection: hex(0x3A5590),
-            link: hex(0x78ABFF),
-            warn: hex(0xE3AE5A),
-            error: hex(0xF07F76),
-        }
-    } else {
-        P {
-            text: hex(0x1F2328),
-            weak: hex(0x4A525C),
-            strong: hex(0x000000),
-            panel: hex(0xF3F4F6),
-            window: hex(0xFFFFFF),
-            field: hex(0xFFFFFF),
-            input: hex(0xFFFFFF),
-            faint: hex(0xF6F8FA),
-            code: hex(0xEEF0F3),
-            line: hex(0xD5DAE0),
-            button: hex(0xE8EBEF),
-            button_hover: hex(0xDCE1E7),
-            button_active: hex(0xCED5DD),
-            border: hex(0xC9D1D9),
-            border_hover: hex(0x9AA5B1),
-            accent: hex(0x0969DA),
-            selection: hex(0xC8DEFF),
-            link: hex(0x0969DA),
-            warn: hex(0x9A6700),
-            error: hex(0xCF222E),
-        }
-    };
     v.override_text_color = None;
-    v.weak_text_color = Some(p.weak);
-    v.panel_fill = p.panel;
-    v.window_fill = p.window;
-    v.window_stroke = Stroke::new(1.0, p.line);
-    v.extreme_bg_color = p.field;
-    v.text_edit_bg_color = Some(p.input);
-    v.faint_bg_color = p.faint;
-    v.code_bg_color = p.code;
-    v.hyperlink_color = p.link;
+    v.weak_text_color = Some(p.text_muted);
+    v.panel_fill = p.canvas;
+    v.window_fill = p.surface;
+    v.window_stroke = Stroke::new(1.0, p.border);
+    v.extreme_bg_color = p.surface;
+    v.text_edit_bg_color = Some(p.surface);
+    v.faint_bg_color = p.stripe;
+    v.code_bg_color = p.subtle;
+    v.hyperlink_color = p.accent_text;
     v.warn_fg_color = p.warn;
-    v.error_fg_color = p.error;
-    v.selection.bg_fill = p.selection;
-    v.selection.stroke = Stroke::new(1.0, if dark { p.strong } else { p.accent });
+    v.error_fg_color = p.err;
+    // Opaque (the accent over the surface): the grid mixes it with its header.
+    v.selection.bg_fill = over(soft(p.accent, if dark { 0.30 } else { 0.18 }), p.surface);
+    v.selection.stroke = Stroke::new(1.0, p.accent_text);
+    v.text_cursor.stroke = Stroke::new(1.5, p.accent);
+    // A blinking caret would repaint twice a second (idle CPU stays at 0 %).
+    v.text_cursor.blink = false;
+    v.window_corner_radius = CornerRadius::same(ternarygrid_ui::style::RADIUS_LG);
+    v.menu_corner_radius = CornerRadius::same(9);
+    // Dialogs and menus float on a soft shadow (as soft as in the rendered design: its CSS
+    // 0 24 60 at 45 % reads much lighter than the same numbers in egui).
+    let (window, popup) = if dark {
+        (Color32::from_black_alpha(90), Color32::from_black_alpha(64))
+    } else {
+        (Color32::from_rgba_unmultiplied(20, 20, 40, 34), Color32::from_rgba_unmultiplied(20, 20, 40, 26))
+    };
+    v.window_shadow = Shadow { offset: [0, 16], blur: 44, spread: 0, color: window };
+    v.popup_shadow = Shadow { offset: [0, 10], blur: 28, spread: 0, color: popup };
+    v.collapsing_header_frame = false;
+    v.indent_has_left_vline = true;
+    v.striped = false;
+    v.slider_trailing_fill = true;
+    v.handle_shape = egui::style::HandleShape::Circle;
+    v.disabled_alpha = 0.45;
+    let radius = CornerRadius::same(ternarygrid_ui::style::RADIUS);
     let w = &mut v.widgets;
+    // Labels, separators, frames; `weak_bg_fill` is the grid's header.
+    w.noninteractive.bg_fill = p.surface;
+    w.noninteractive.weak_bg_fill = p.header;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
     w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
-    w.noninteractive.bg_stroke = Stroke::new(1.0, p.line);
-    w.noninteractive.bg_fill = p.window;
-    // The grid's header and row numbers: blue-grey in the dark theme (DBeaver's #3A4147 over the grid).
-    w.noninteractive.weak_bg_fill = if dark { hex(0x414A52) } else { hex(0xEAEDF1) };
-    w.inactive.fg_stroke = Stroke::new(1.0, p.text);
-    w.inactive.bg_fill = p.button;
-    w.inactive.weak_bg_fill = p.button;
-    // Also the border of text fields: they must stand out in dialogs too.
+    w.noninteractive.corner_radius = radius;
+    // Inputs and select boxes at rest: the surface with a hairline, as in the design
+    // (outlined buttons are drawn by the kit, with the stronger border).
+    w.inactive.bg_fill = p.subtle;
+    w.inactive.weak_bg_fill = p.surface;
     w.inactive.bg_stroke = Stroke::new(1.0, p.border);
-    w.hovered.fg_stroke = Stroke::new(1.5, p.strong);
-    w.hovered.bg_fill = p.button_hover;
-    w.hovered.weak_bg_fill = p.button_hover;
-    w.hovered.bg_stroke = Stroke::new(1.0, p.border_hover);
-    w.active.fg_stroke = Stroke::new(2.0, p.strong);
-    w.active.bg_fill = p.button_active;
-    w.active.weak_bg_fill = p.button_active;
+    w.inactive.fg_stroke = Stroke::new(1.0, p.text);
+    w.inactive.corner_radius = radius;
+    w.inactive.expansion = 0.0;
+    w.hovered.bg_fill = p.subtle;
+    w.hovered.weak_bg_fill = p.hover;
+    w.hovered.bg_stroke = Stroke::new(1.0, p.border_strong);
+    w.hovered.fg_stroke = Stroke::new(1.0, p.text);
+    w.hovered.corner_radius = radius;
+    w.hovered.expansion = 0.0;
+    w.active.bg_fill = p.subtle;
+    w.active.weak_bg_fill = p.subtle;
     w.active.bg_stroke = Stroke::new(1.0, p.accent);
-    w.open.fg_stroke = Stroke::new(1.0, p.strong);
-    w.open.bg_fill = p.button_hover;
-    w.open.weak_bg_fill = p.button_hover;
-    w.open.bg_stroke = Stroke::new(1.0, p.border);
+    w.active.fg_stroke = Stroke::new(1.0, p.text);
+    w.active.corner_radius = radius;
+    w.active.expansion = 0.0;
+    w.open.bg_fill = p.subtle;
+    w.open.weak_bg_fill = p.hover;
+    w.open.bg_stroke = Stroke::new(1.0, p.border_strong);
+    w.open.fg_stroke = Stroke::new(1.0, p.text);
+    w.open.corner_radius = radius;
     v
 }
 
-/// Toolbars, the menu, the status bar and the tab bar: lighter than the
-/// panels in the dark theme (as in DBeaver), the panel colour in the light one.
+/// Toolbars, the menu, the status bar and the tab bar.
 pub fn chrome(v: &Visuals) -> Color32 {
-    if v.dark_mode { hex(0x48484C) } else { v.panel_fill }
+    ternarygrid_ui::palette(v.dark_mode).chrome
 }
 
 /// Frame of the panels drawn in [`chrome`].
@@ -262,29 +237,58 @@ pub fn chrome_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::side_top_panel(style).fill(chrome(&style.visuals))
 }
 
-/// The tab area's style: in the dark theme the tab bar in [`chrome`] and the
-/// active tab dark, as in DBeaver.
+/// The tab area's style, as in TernaryWire and TernaryShell: the tab bar in
+/// [`chrome`], the active tab in the content's colour (it opens onto it, with
+/// rounded top corners), inactive tabs muted. The focused tab's accent line is
+/// painted by the tab viewer (`tabs::DockViewer::on_tab_button`).
 pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
+    use egui::CornerRadius;
     let mut s = egui_dock::Style::from_egui(style);
     let v = &style.visuals;
-    if v.dark_mode {
-        let bar = chrome(v);
-        let active = hex(0x1E1F21);
-        s.tab_bar.bg_fill = bar;
-        s.tab_bar.hline_color = active;
-        for t in [&mut s.tab.active, &mut s.tab.focused, &mut s.tab.active_with_kb_focus, &mut s.tab.focused_with_kb_focus] {
-            t.bg_fill = active;
-            t.outline_color = active;
-            t.text_color = hex(0xFFFFFF);
-        }
-        for t in [&mut s.tab.inactive, &mut s.tab.inactive_with_kb_focus] {
-            t.bg_fill = bar;
-            t.outline_color = bar;
-            t.text_color = hex(0xC8C8C8);
-        }
-        s.tab.hovered.bg_fill = hex(0x545458);
-        s.tab.hovered.outline_color = hex(0x545458);
+    let p = ternarygrid_ui::palette(v.dark_mode);
+    let top = CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
+    // The design's tab bar: 38 points with the hairline under it (painted by the viewer, 1
+    // point thick), the tabs 8 points from its ends and 2 apart; the active tab reaches up
+    // to the top bar's hairline and opens onto the content.
+    s.tab_bar.bg_fill = p.chrome;
+    s.tab_bar.hline_color = Color32::TRANSPARENT;
+    s.tab_bar.height = crate::tabs::TAB_BAR_H;
+    s.tab_bar.inner_margin = egui::Margin { left: 8, right: 8, top: -1, bottom: 0 };
+    s.tab.spacing = 2.0;
+    s.tab.minimum_width = None;
+    s.tab.hline_below_active_tab_name = false;
+    for t in [&mut s.tab.active, &mut s.tab.focused, &mut s.tab.active_with_kb_focus, &mut s.tab.focused_with_kb_focus] {
+        t.bg_fill = p.canvas;
+        t.outline_color = p.border;
+        t.text_color = p.text;
+        t.corner_radius = top;
     }
+    for t in [&mut s.tab.inactive, &mut s.tab.inactive_with_kb_focus] {
+        t.bg_fill = p.chrome;
+        t.outline_color = Color32::TRANSPARENT;
+        t.text_color = p.text_muted;
+        t.corner_radius = top;
+    }
+    s.tab.hovered.bg_fill = p.chrome;
+    s.tab.hovered.outline_color = Color32::TRANSPARENT;
+    s.tab.hovered.text_color = p.text;
+    s.tab.hovered.corner_radius = top;
+    // The content reaches the edges (no frame, no padding: each view has the design's own).
+    s.tab.tab_body.bg_fill = p.canvas;
+    s.tab.tab_body.stroke = Stroke::NONE;
+    s.tab.tab_body.inner_margin = egui::Margin::ZERO;
+    s.dock_area_padding = None;
+    s.separator.width = 1.0;
+    s.separator.color_idle = p.border;
+    s.separator.color_hovered = p.border_strong;
+    s.separator.color_dragged = p.accent;
+    s.buttons.close_tab_color = p.text_muted;
+    s.buttons.close_tab_active_color = p.text;
+    s.buttons.close_tab_bg_fill = p.hover;
+    s.buttons.add_tab_color = p.text_muted;
+    s.buttons.add_tab_active_color = p.text;
+    s.buttons.add_tab_bg_fill = p.hover;
+    s.overlay.selection_color = ternarygrid_ui::soft(p.accent, 0.25);
     s
 }
 
@@ -299,15 +303,32 @@ pub fn connection_marker(c: [u8; 3]) -> Option<Color32> {
     if c == [255, 255, 255] { None } else { Some(rgb(c)) }
 }
 
+/// The colour of a connection type's marker as the design draws it (navigator stripe, tab
+/// line, PRODUCTION pill): the built-in production colour is the theme's error red, other
+/// colours are the user's; white is no marker.
+pub fn marker(c: [u8; 3], dark_mode: bool) -> Option<Color32> {
+    if c == ternarygrid_core::config::ConnectionType::production().color {
+        return Some(ternarygrid_ui::palette(dark_mode).err);
+    }
+    connection_marker(c)
+}
+
+/// The pill of a connection type ("PRODUCTION"): the production red on its soft tint, other
+/// colours on their own tint.
+pub fn marker_pill(ui: &mut egui::Ui, name: &str, c: Color32) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    if c == p.err { ternarygrid_ui::kit::pill_colors(ui, name, p.err, p.prod_soft) } else { ternarygrid_ui::kit::pill(ui, name, c) }
+}
+
 /// Softened version of a marker colour for backgrounds (tab strips, status bar).
 pub fn tint(c: Color32, dark_mode: bool) -> Color32 {
     let alpha = if dark_mode { 70 } else { 90 };
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
 }
 
-/// Fill of primary buttons (white text on it), blue in both themes.
+/// Fill of primary buttons (white text on it): the teal of the app icon.
 pub fn accent(dark_mode: bool) -> Color32 {
-    if dark_mode { hex(0x2F7BEA) } else { hex(0x0B6BDB) }
+    ternarygrid_ui::palette(dark_mode).accent
 }
 
 /// A database type's brand colour (one-colour logos and icons).
@@ -385,15 +406,15 @@ pub fn legible_on(c: Color32, bg: Color32) -> Color32 {
 }
 
 pub fn success_color(dark_mode: bool) -> Color32 {
-    if dark_mode { Color32::from_rgb(110, 200, 120) } else { Color32::from_rgb(30, 130, 50) }
+    ternarygrid_ui::palette(dark_mode).ok
 }
 
 pub fn warning_color(dark_mode: bool) -> Color32 {
-    if dark_mode { Color32::from_rgb(240, 190, 90) } else { Color32::from_rgb(180, 110, 0) }
+    ternarygrid_ui::palette(dark_mode).warn
 }
 
 pub fn error_color(dark_mode: bool) -> Color32 {
-    if dark_mode { Color32::from_rgb(255, 120, 110) } else { Color32::from_rgb(190, 30, 30) }
+    ternarygrid_ui::palette(dark_mode).err
 }
 
 #[cfg(test)]
@@ -426,6 +447,21 @@ mod tests {
         let green = over(connection_marker(ternarygrid_core::config::ConnectionType::test().color).unwrap().gamma_multiply(0.22), v.panel_fill);
         assert!(contrast(logo_color(DbKind::MySql, true), green) < 4.5);
         assert_eq!(legible_on(Color32::WHITE, Color32::BLACK), Color32::WHITE);
+    }
+
+    /// The weights of the design kit are registered (with the icons as their
+    /// fallback), and the icons sit level with the text.
+    #[test]
+    fn weight_families_and_icon_offset() {
+        for theme in [Theme::Light, Theme::Dark] {
+            let fonts = font_definitions(theme);
+            for family in [ternarygrid_ui::style::MEDIUM, ternarygrid_ui::style::SEMIBOLD] {
+                let keys = &fonts.families[&FontFamily::Name(family.into())];
+                assert_eq!(keys.first().map(String::as_str), Some("Inter-Medium"), "{family}");
+                assert!(keys.iter().any(|k| k == "phosphor"), "{family} falls back to the icons");
+            }
+            assert_eq!(fonts.font_data["phosphor"].tweak.y_offset_factor, 0.08);
+        }
     }
 
     #[test]

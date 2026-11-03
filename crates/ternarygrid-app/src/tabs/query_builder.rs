@@ -5,11 +5,12 @@ use crate::backend::Loadable;
 use crate::command::AppCommand;
 use crate::cx::AppContext;
 use crate::tabs::TabView;
-use egui::Ui;
+use egui::{RichText, Sense, Ui, vec2};
 use egui_phosphor::regular as icon;
 use ternarygrid_core::meta::{ObjectKind, ObjectRef, SchemaRef};
 use ternarygrid_core::tr;
-use ternarygrid_visual::builder::{QbEvent, QbViewState, QueryModel, show_query_builder};
+use ternarygrid_ui::{kit, parts, style};
+use ternarygrid_visual::builder::{QbEvent, QbTab, QbViewState, QueryModel, show_query_builder};
 
 pub struct QueryBuilderTab {
     conn: String,
@@ -22,9 +23,47 @@ pub struct QueryBuilderTab {
     pending: Vec<ObjectRef>,
 }
 
+/// One row of the table picker: the kind's icon and the name.
+fn picker_row(ui: &mut Ui, kind: ObjectKind, name: &str) -> egui::Response {
+    let p = style::pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, false, name));
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, style::RADIUS, p.hover);
+    }
+    let cy = rect.center().y;
+    ui.painter().text(egui::pos2(rect.left() + 16.0, cy), egui::Align2::CENTER_CENTER, crate::nav::kind_icon(kind), style::icon_font(14.0), p.text_muted);
+    ui.painter().text(egui::pos2(rect.left() + 32.0, cy), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(style::body_size(ui.ctx())), p.text);
+    resp
+}
+
 impl QueryBuilderTab {
     pub fn new(conn: String, schema: Option<SchemaRef>) -> Self {
         QueryBuilderTab { conn, schema, model: QueryModel::default(), state: None, picker_open: false, picker_filter: String::new(), pending: Vec::new() }
+    }
+
+    /// Add these tables as if chosen in the picker (their definitions load first).
+    #[doc(hidden)]
+    pub fn add_tables(&mut self, tables: &[ObjectRef]) {
+        self.pending.extend(tables.iter().cloned());
+    }
+
+    /// The model (tables, joins, columns, conditions).
+    #[doc(hidden)]
+    pub fn model_mut(&mut self) -> &mut QueryModel {
+        &mut self.model
+    }
+
+    /// Show the bottom tab `tab`, and the table picker filtered by `filter`.
+    #[doc(hidden)]
+    pub fn show_tab(&mut self, tab: QbTab, picker: Option<&str>) {
+        if let Some(s) = self.state.as_mut() {
+            s.tab = tab;
+        }
+        if let Some(f) = picker {
+            self.picker_open = true;
+            self.picker_filter = f.to_string();
+        }
     }
 
     fn picker(&mut self, ui: &mut Ui, cx: &mut AppContext) {
@@ -37,7 +76,6 @@ impl QueryBuilderTab {
         }
         // The schema's own database: another database of the server has its own session.
         let Some(main) = live.ensure_session(backend, schema.database.as_deref()) else {
-            ui.weak(tr("Opening a session…"));
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
             return;
         };
@@ -45,24 +83,33 @@ impl QueryBuilderTab {
         live.meta.request_objects(backend, &main, &schema, ObjectKind::View);
         let mut chosen: Option<ObjectRef> = None;
         let mut open = self.picker_open;
-        egui::Window::new(format!("{} {}", icon::TABLE, tr("Add table"))).id(egui::Id::new(("qb_picker", &self.conn))).open(&mut open).default_size([320.0, 400.0]).show(
+        let content = ui.ctx().content_rect();
+        let at = egui::pos2((content.right() - 360.0).max(content.left()), content.top() + 120.0);
+        let filter_id = egui::Id::new(("qb_picker_filter", &self.conn));
+        let filter_text = &mut self.picker_filter;
+        parts::Dialog::new(tr("Add table")).icon(icon::TABLE).width(320.0).body_padding(egui::Margin::symmetric(14, 12)).show_window(
             ui.ctx(),
+            egui::Id::new(("qb_picker", &self.conn)),
+            &mut open,
+            Some(at),
             |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.picker_filter).hint_text(tr("Filter…")).desired_width(f32::INFINITY));
-                let filter = self.picker_filter.to_lowercase();
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                let p = style::pal(ui);
+                ui.spacing_mut().item_spacing.y = 8.0;
+                kit::search_field(ui, filter_id, filter_text, tr("Filter…"), ui.available_width());
+                let filter = filter_text.to_lowercase();
+                egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     for kind in [ObjectKind::Table, ObjectKind::View] {
                         match live.meta.objects.get(&(schema.clone(), kind)) {
                             Some(Loadable::Loaded(list)) => {
                                 for o in list.iter().filter(|o| filter.is_empty() || o.obj.name.to_lowercase().contains(&filter)) {
-                                    let label = format!("{} {}", crate::nav::kind_icon(kind), o.obj.name);
-                                    if ui.selectable_label(false, label).double_clicked() {
+                                    if picker_row(ui, kind, &o.obj.name).double_clicked() {
                                         chosen = Some(o.obj.clone());
                                     }
                                 }
                             }
                             Some(Loadable::Failed(e)) => {
-                                ui.label(e.message.clone());
+                                ui.label(RichText::new(e.message.clone()).color(p.err));
                             }
                             _ => {
                                 ui.spinner();
@@ -70,8 +117,9 @@ impl QueryBuilderTab {
                         }
                     }
                 });
-                ui.weak(tr("Double-click a table to add it."));
+                ui.label(RichText::new(tr("Double-click a table to add it.")).size(12.0).color(p.text_faint));
             },
+            None,
         );
         self.picker_open = open;
         if let Some(obj) = chosen {
@@ -94,16 +142,23 @@ impl TabView for QueryBuilderTab {
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let Some(live) = cx.conns.live_mut(&self.conn) else {
-            ui.label(tr("The connection is closed."));
-            if ui.button(tr("Connect")).clicked() {
-                cx.commands.push(AppCommand::Connect(self.conn.clone()));
-            }
+            kit::empty_state(ui, icon::PLUGS, tr("The connection is closed."), tr("Connect to add its tables to the query."), |ui| {
+                if kit::primary_icon(ui, icon::PLUGS_CONNECTED, tr("Connect")).clicked() {
+                    cx.commands.push(AppCommand::Connect(self.conn.clone()));
+                }
+            });
             return;
         };
         let dialect = live.dialect.clone();
+        let backend = cx.backend;
         // Tables whose definition arrived.
         let mut still = Vec::new();
         for obj in std::mem::take(&mut self.pending) {
+            if !live.meta.table_defs.contains_key(&obj)
+                && let Some(main) = live.ensure_session(backend, obj.database.as_deref())
+            {
+                live.meta.request_table_def(backend, &main, &obj);
+            }
             match live.meta.table_defs.get(&obj) {
                 Some(Loadable::Loaded(def)) => {
                     let def = def.clone();
@@ -125,10 +180,11 @@ impl TabView for QueryBuilderTab {
                 QbEvent::OpenInEditor(sql) => {
                     cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: self.schema.clone(), text: Some(sql) });
                 }
-                // Run: an editor that executes it as soon as its session is open.
+                // Run: an editor that executes it as soon as its session is open,
+                // with the confirmations of the connection type.
                 QbEvent::RunQuery(sql) => {
                     let mut tab = crate::tabs::sql_editor::SqlEditorTab::new(Some(self.conn.clone()), self.schema.clone(), sql, None, false, tr("Query builder").to_string());
-                    tab.auto_run = true;
+                    tab.run_on_open = true;
                     cx.push(AppCommand::OpenTab(Box::new(tab)));
                 }
                 QbEvent::Changed => {}

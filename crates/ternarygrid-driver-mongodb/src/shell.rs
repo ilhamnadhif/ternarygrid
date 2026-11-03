@@ -143,6 +143,15 @@ impl<'a> P<'a> {
         let start = self.i;
         if matches!(self.s.get(self.i), Some(b'-' | b'+')) {
             self.i += 1;
+            // `-Infinity` / `+Infinity`.
+            if self.src[self.i..].starts_with("Infinity") {
+                self.i += "Infinity".len();
+                return Ok(Bson::Double(if self.s[start] == b'-' {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }));
+            }
         }
         let mut float = false;
         while self.i < self.s.len() {
@@ -155,13 +164,6 @@ impl<'a> P<'a> {
             self.i += 1;
         }
         let text = self.src[start..self.i].replace('_', "");
-        if text == "Infinity" || text == "-Infinity" {
-            return Ok(Bson::Double(if text.starts_with('-') {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            }));
-        }
         if !float && let Ok(n) = text.parse::<i64>() {
             return Ok(match i32::try_from(n) {
                 Ok(n) => Bson::Int32(n),
@@ -520,10 +522,165 @@ pub fn to_shell(v: &Bson) -> String {
         ),
         Bson::Int64(n) => format!("NumberLong(\"{n}\")"),
         Bson::Decimal128(d) => format!("NumberDecimal(\"{d}\")"),
-        Bson::RegularExpression(r) => format!("/{}/{}", r.pattern, r.options),
+        Bson::RegularExpression(r) => regex_literal(&r.pattern, &r.options),
         Bson::Null => "null".into(),
         other => other.clone().into_relaxed_extjson().to_string(),
     }
+}
+
+/// `/pattern/options` that [`parse`] reads back: a `/` outside a character
+/// class is escaped (it would end the literal) and line breaks are written as
+/// escapes (a statement ends at a line break). An empty pattern (`//` starts a
+/// comment) is written as `RegExp("", …)`.
+fn regex_literal(pattern: &str, options: &str) -> String {
+    if pattern.is_empty() {
+        return format!(
+            "RegExp(\"\", {})",
+            serde_json::Value::String(options.to_string())
+        );
+    }
+    let mut out = String::with_capacity(pattern.len() + options.len() + 2);
+    out.push('/');
+    let mut chars = pattern.chars();
+    let mut class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push('\\');
+                match chars.next() {
+                    Some('\n') => out.push('n'),
+                    Some('\r') => out.push('r'),
+                    Some(e) => out.push(e),
+                    // A trailing backslash would escape the closing `/`.
+                    None => out.push('\\'),
+                }
+            }
+            '[' => {
+                class = true;
+                out.push(c);
+            }
+            ']' => {
+                class = false;
+                out.push(c);
+            }
+            '/' if !class => out.push_str("\\/"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('/');
+    out.push_str(options);
+    out
+}
+
+/// Server commands (`db.runCommand({<name>: …})`) that only read.
+const READ_COMMANDS: &[&str] = &[
+    "ping",
+    "buildinfo",
+    "serverstatus",
+    "dbstats",
+    "collstats",
+    "datasize",
+    "listcollections",
+    "listdatabases",
+    "listindexes",
+    "listcommands",
+    "hostinfo",
+    "connectionstatus",
+    "hello",
+    "ismaster",
+    "whatsmyuri",
+    "getcmdlineopts",
+    "getparameter",
+    "getlog",
+    "currentop",
+    "top",
+    "replsetgetstatus",
+    "replsetgetconfig",
+    "usersinfo",
+    "rolesinfo",
+    "connpoolstats",
+    "lockinfo",
+    "dbhash",
+    "count",
+    "distinct",
+    "find",
+    "getmore",
+];
+
+/// A pipeline stage (anywhere in `b`) that writes: `$out`, `$merge`.
+fn writes_stage(b: &Bson) -> bool {
+    match b {
+        Bson::Document(d) => d
+            .iter()
+            .any(|(k, v)| k == "$out" || k == "$merge" || writes_stage(v)),
+        Bson::Array(a) => a.iter().any(writes_stage),
+        _ => false,
+    }
+}
+
+/// The command document `arg` only reads.
+fn command_reads(arg: Option<&Bson>) -> bool {
+    let Some(Bson::Document(d)) = arg else {
+        return false;
+    };
+    let Some((name, value)) = d.iter().next() else {
+        return false;
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "aggregate" => !d.get("pipeline").is_some_and(writes_stage),
+        // Explaining runs nothing, but a write is not looked into.
+        "explain" => command_reads(Some(value)),
+        n => READ_COMMANDS.contains(&n),
+    }
+}
+
+/// What in `cmd` changes data (`None` when it only reads), for read-only
+/// connections. Anything not known to read counts as a write.
+pub fn write_reason(cmd: &Command) -> Option<String> {
+    let Command::Chain {
+        collection, calls, ..
+    } = cmd
+    else {
+        return None;
+    };
+    let first = calls.first()?;
+    let name = first.name.as_str();
+    let explain = calls[1..].iter().any(|c| c.name == "explain");
+    let reads = match collection {
+        None => match name {
+            "runCommand" | "adminCommand" => command_reads(first.args.first()),
+            _ => matches!(
+                name,
+                "stats" | "serverStatus" | "version" | "getName" | "getCollectionNames"
+            ),
+        },
+        Some(_) => match name {
+            "find"
+            | "findOne"
+            | "countDocuments"
+            | "count"
+            | "estimatedDocumentCount"
+            | "distinct"
+            | "getIndexes"
+            | "stats" => true,
+            // `.explain()` only plans the pipeline.
+            "aggregate" => explain || !first.args.iter().any(writes_stage),
+            _ => false,
+        },
+    };
+    if reads {
+        return None;
+    }
+    let command = match (name, first.args.first()) {
+        ("runCommand" | "adminCommand", Some(Bson::Document(d))) => d.keys().next().cloned(),
+        _ => None,
+    };
+    Some(match command {
+        Some(c) => format!("{name}({{{c}: …}})"),
+        None => format!("{name}()"),
+    })
 }
 
 /// A field name as an object key: bare when it is an identifier.
@@ -609,5 +766,117 @@ mod tests {
             to_shell(&Bson::Document(doc! {"a b": 1, "c": [true]})),
             "{\"a b\": 1, c: [true]}"
         );
+    }
+
+    fn arg0(src: &str) -> Bson {
+        let Command::Chain { calls, .. } = parse(src).unwrap() else {
+            panic!()
+        };
+        calls[0].args[0].clone()
+    }
+
+    #[test]
+    fn signed_infinity() {
+        assert_eq!(
+            arg0("db.t.find({a: -Infinity, b: +Infinity, c: Infinity})"),
+            Bson::Document(doc! {
+                "a": f64::NEG_INFINITY,
+                "b": f64::INFINITY,
+                "c": f64::INFINITY,
+            })
+        );
+        assert_eq!(
+            arg0("db.t.find({a: -1.5})"),
+            Bson::Document(doc! {"a": -1.5})
+        );
+        assert!(parse("db.t.find({a: -Inf})").is_err());
+    }
+
+    #[test]
+    fn regexes_round_trip_through_to_shell() {
+        let re = |p: &str, o: &str| {
+            Bson::RegularExpression(bson::Regex {
+                pattern: p.into(),
+                options: o.into(),
+            })
+        };
+        assert_eq!(to_shell(&re("a/b", "i")), "/a\\/b/i");
+        assert_eq!(to_shell(&re("[/]x\\/y", "")), "/[/]x\\/y/");
+        // Each literal reads back as a regex matching the same text.
+        for (p, o, back) in [
+            ("a/b", "i", "a\\/b"),
+            ("^/api/v1/", "", "^\\/api\\/v1\\/"),
+            ("[/]x\\/y", "", "[/]x\\/y"),
+            ("line\nbreak", "m", "line\\nbreak"),
+            ("", "i", ""),
+            ("plain", "s", "plain"),
+        ] {
+            let text = format!("db.t.find({{f: {}}})", to_shell(&re(p, o)));
+            assert_eq!(
+                arg0(&text),
+                Bson::Document(doc! {"f": re(back, o)}),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_are_recognised_for_read_only_connections() {
+        let w = |s: &str| write_reason(&parse(s).unwrap());
+        for read in [
+            "show dbs",
+            "use shop",
+            "db.users.find({a: 1}).sort({b: 1}).limit(3)",
+            "db.users.findOne()",
+            "db.users.find().count()",
+            "db.users.countDocuments({})",
+            "db.users.distinct('a')",
+            "db.users.getIndexes()",
+            "db.users.aggregate([{$match: {a: 1}}, {$group: {_id: '$b'}}])",
+            "db.users.aggregate([{$out: 'copy'}]).explain()",
+            "db.runCommand({ping: 1})",
+            "db.adminCommand({listDatabases: 1})",
+            "db.runCommand({buildinfo: 1})",
+            "db.runCommand({aggregate: 'users', pipeline: [{$match: {}}], cursor: {}})",
+            "db.runCommand({explain: {find: 'users'}})",
+            "db.stats()",
+            "db.getCollectionNames()",
+        ] {
+            assert_eq!(w(read), None, "{read}");
+        }
+        for write in [
+            "db.users.insertOne({a: 1})",
+            "db.users.insertMany([{a: 1}])",
+            "db.users.updateMany({}, {$set: {a: 1}})",
+            "db.users.replaceOne({}, {})",
+            "db.users.deleteMany({})",
+            "db.users.remove({})",
+            "db.users.drop()",
+            "db.users.createIndex({a: 1})",
+            "db.users.dropIndex('a_1')",
+            "db.users.renameCollection('people')",
+            "db.users.findOneAndUpdate({}, {$set: {a: 1}})",
+            "db.users.bulkWrite([])",
+            "db.users.mapReduce('f', 'g', {out: 'x'})",
+            "db.users.aggregate([{$match: {}}, {$out: 'copy'}])",
+            "db.users.aggregate({$match: {}}, {$merge: {into: 'copy'}})",
+            "db.users.aggregate([{$facet: {a: [{$merge: 'x'}]}}])",
+            "db.createCollection('x')",
+            "db.createView('v', 'users', [])",
+            "db.dropDatabase()",
+            "db.runCommand({drop: 'users'})",
+            "db.adminCommand({shutdown: 1})",
+            "db.runCommand({aggregate: 'users', pipeline: [{$out: 'copy'}], cursor: {}})",
+            "db.runCommand({explain: {delete: 'users', deletes: []}})",
+            "db.runCommand({})",
+            "db.runCommand('ping')",
+        ] {
+            assert!(w(write).is_some(), "{write}");
+        }
+        assert_eq!(
+            w("db.runCommand({dropDatabase: 1})").as_deref(),
+            Some("runCommand({dropDatabase: …})")
+        );
+        assert_eq!(w("db.x.insertOne({})").as_deref(), Some("insertOne()"));
     }
 }

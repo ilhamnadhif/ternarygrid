@@ -192,6 +192,12 @@ pub fn run() -> ExitCode {
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
+    // macOS: the top bar is the title bar (the window buttons sit at its left, the empty
+    // parts move the window, a double-click zooms it).
+    #[cfg(target_os = "macos")]
+    {
+        viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
+    }
     let exit_after_first = args.exit_after_first_frame;
     let files = args.files.clone();
     let execute = args.execute;
@@ -204,6 +210,9 @@ pub fn run() -> ExitCode {
         #[cfg(target_os = "macos")]
         {
             app.app_menu = macmenu::AppMenu::install(&cc.egui_ctx);
+            app.native_menu_bar = app.app_menu.is_some();
+            // Room for the close / minimise / zoom buttons in the merged title bar.
+            app.titlebar_inset = app::MAC_TITLEBAR_INSET;
         }
         match std::env::var("TERNARYGRID_BENCH_SCENARIO").as_deref() {
             Ok("workload") => app.start_bench_workload(),

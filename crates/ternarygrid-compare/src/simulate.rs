@@ -10,7 +10,7 @@
 
 use crate::normalize::{SqlNorm, normalize_sql, references};
 use crate::plan::{MigrationOp, MigrationPlan};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use ternarygrid_core::ddl::*;
 
 /// Apply the logical effect of `plan` to `target`. Returns the resulting
@@ -65,12 +65,34 @@ impl Sim<'_> {
         }
     }
 
+    /// Position of table `name`: the exact name, else a case-insensitive match
+    /// (like [`Self::relation_exists`]; the analysis matches names
+    /// case-insensitively with `ignore_identifier_case`, and catalogs may spell
+    /// a referenced table differently from the table itself).
+    fn table_pos(&self, name: &str) -> Option<usize> {
+        let tables = &self.snap.tables;
+        tables.iter().position(|t| t.name == name).or_else(|| tables.iter().position(|t| t.name.eq_ignore_ascii_case(name)))
+    }
+
+    /// Do two table names (e.g. a foreign key's `ref_table` and a table name) denote the same table?
+    fn same_table(&self, a: &str, b: &str) -> bool {
+        a == b || (a.eq_ignore_ascii_case(b) && self.table_pos(a) == self.table_pos(b))
+    }
+
+    /// Spellings of `ref_table` in foreign keys that denote the table `name`.
+    fn ref_spellings(&self, name: &str) -> HashSet<String> {
+        self.snap.tables.iter().flat_map(|t| &t.foreign_keys).filter(|f| self.same_table(&f.ref_table, name)).map(|f| f.ref_table.clone()).collect()
+    }
+
     fn table(&self, name: &str) -> Result<&TableDef, String> {
-        self.snap.tables.iter().find(|t| t.name == name).ok_or_else(|| format!("table {name} does not exist"))
+        self.table_pos(name).map(|p| &self.snap.tables[p]).ok_or_else(|| format!("table {name} does not exist"))
     }
 
     fn table_mut(&mut self, name: &str) -> Result<&mut TableDef, String> {
-        self.snap.tables.iter_mut().find(|t| t.name == name).ok_or_else(|| format!("table {name} does not exist"))
+        match self.table_pos(name) {
+            Some(p) => Ok(&mut self.snap.tables[p]),
+            None => Err(format!("table {name} does not exist")),
+        }
     }
 
     /// Is `name` (of the given category) created by a later step of the plan?
@@ -160,7 +182,7 @@ impl Sim<'_> {
         let mut out = Vec::new();
         for t in &self.snap.tables {
             for f in &t.foreign_keys {
-                if f.ref_table == table && self.is_own_schema(f.ref_schema.as_deref()) && set(&f.ref_columns) == *cols {
+                if self.same_table(&f.ref_table, table) && self.is_own_schema(f.ref_schema.as_deref()) && set(&f.ref_columns) == *cols {
                     out.push((t.name.clone(), f.name.clone().unwrap_or_default()));
                 }
             }
@@ -260,13 +282,12 @@ impl Sim<'_> {
                 t.checks.remove(pos);
             }
             MigrationOp::DropTable { table, cascade } => {
-                let name = table.name.clone();
-                self.table(&name)?;
+                let name = self.table(&table.name)?.name.clone();
                 let referencing: Vec<String> = self
                     .snap
                     .tables
                     .iter()
-                    .filter(|t| t.name != name && t.foreign_keys.iter().any(|f| f.ref_table == name && self.is_own_schema(f.ref_schema.as_deref())))
+                    .filter(|t| t.name != name && t.foreign_keys.iter().any(|f| self.same_table(&f.ref_table, &name) && self.is_own_schema(f.ref_schema.as_deref())))
                     .map(|t| t.name.clone())
                     .collect();
                 let views = self.views_mentioning(&name);
@@ -274,8 +295,9 @@ impl Sim<'_> {
                     return Err(format!("table {name} is still referenced by tables {referencing:?} / views {views:?}"));
                 }
                 if *cascade {
+                    let spellings = self.ref_spellings(&name);
                     for t in &mut self.snap.tables {
-                        t.foreign_keys.retain(|f| f.ref_table != name);
+                        t.foreign_keys.retain(|f| !spellings.contains(&f.ref_table));
                     }
                     let mut gone: BTreeSet<String> = views.into_iter().collect();
                     loop {
@@ -477,8 +499,8 @@ impl Sim<'_> {
     }
 
     fn alter_table(&mut self, from: &TableDef, to: &TableDef, renamed: &[(String, String)]) -> Result<(), String> {
-        let name = from.name.clone();
-        let current = self.table(&name)?.clone();
+        let current = self.table(&from.name)?.clone();
+        let name = current.name.clone();
         // the intermediate state the planner assumed must be the real one
         let names = |v: &[ForeignKeyDef]| v.iter().map(|f| f.name.clone().unwrap_or_else(|| f.columns.join(","))).collect::<BTreeSet<_>>();
         if names(&current.foreign_keys) != names(&from.foreign_keys) {
@@ -524,7 +546,7 @@ impl Sim<'_> {
             }
             for t in &self.snap.tables {
                 for f in &t.foreign_keys {
-                    let refs_col = f.ref_table == name && self.is_own_schema(f.ref_schema.as_deref()) && f.ref_columns.iter().any(|c| c == col);
+                    let refs_col = self.same_table(&f.ref_table, &name) && self.is_own_schema(f.ref_schema.as_deref()) && f.ref_columns.iter().any(|c| c == col);
                     let own_col = t.name == name && f.columns.iter().any(|c| c == col);
                     if refs_col || own_col {
                         return Err(format!("column {name}.{col} is used by foreign key {:?} on {}", f.name, t.name));
@@ -544,9 +566,10 @@ impl Sim<'_> {
             self.check_column_refs(&name, c)?;
         }
         // apply: renames are propagated to referencing foreign keys
+        let spellings = self.ref_spellings(&name);
         for t in &mut self.snap.tables {
             for f in &mut t.foreign_keys {
-                if f.ref_table == name && t.name != name {
+                if spellings.contains(&f.ref_table) && t.name != name {
                     for c in &mut f.ref_columns {
                         *c = renamed_to(c);
                     }
@@ -557,7 +580,7 @@ impl Sim<'_> {
         self.snap.sequences.retain(|s| !s.owned_by.as_deref().is_some_and(|o| dropped_owned.iter().any(|d| o == d || o.ends_with(&format!(".{d}")))));
         let t = self.table_mut(&name)?;
         let mut new = to.clone();
-        new.name = name.clone();
+        new.name = t.name.clone();
         *t = new;
         Ok(())
     }

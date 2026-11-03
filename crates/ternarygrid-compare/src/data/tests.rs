@@ -137,8 +137,9 @@ async fn merge_join_on_numeric_keys() {
     let diff = d.samples.iter().find(|s| s.kind == RowDiffKind::Different).unwrap();
     assert_eq!(diff.key, vec![int(2)]);
     assert_eq!(diff.columns, vec!["name"]);
-    assert_eq!(src.queries, vec!["SELECT * FROM src.items ORDER BY id"]);
-    assert_eq!(tgt.queries, vec!["SELECT * FROM dst.items ORDER BY id"]);
+    // one-row probes decide the strategy before the sorted queries
+    assert_eq!(src.queries, vec!["SELECT * FROM src.items LIMIT 1", "SELECT * FROM src.items ORDER BY id"]);
+    assert_eq!(tgt.queries, vec!["SELECT * FROM dst.items LIMIT 1", "SELECT * FROM dst.items ORDER BY id"]);
     assert!(!src.open.load(AtomicOrdering::SeqCst) && !tgt.open.load(AtomicOrdering::SeqCst), "cursors are closed");
 }
 
@@ -153,7 +154,7 @@ async fn text_keys_use_a_hash_join_independent_of_collation() {
     let d = run(&j, &mut src, &mut tgt).await.unwrap();
     assert_eq!(d.strategy, CompareStrategy::HashJoin);
     assert_eq!((d.identical, d.different, d.only_in_source, d.only_in_target), (1, 1, 1, 1));
-    assert_eq!(src.queries, vec!["SELECT * FROM a.t ORDER BY code"]);
+    assert_eq!(src.queries, vec!["SELECT * FROM a.t LIMIT 1", "SELECT * FROM a.t"], "no ORDER BY for a hash join");
     assert_eq!(tgt.queries, vec!["SELECT * FROM b.t"], "no ORDER BY needed for the probe side");
     assert!(d.sync_statements.contains(&"UPDATE b.t SET qty = 1 WHERE code = 'B'".to_string()));
     assert!(d.sync_statements.contains(&"INSERT INTO b.t (code, qty) VALUES ('c', 3)".to_string()));
@@ -213,6 +214,78 @@ async fn duplicate_and_unsorted_keys_are_errors() {
     let mut tgt = tgt.table("t.t", cols, vec![]);
     let err = run(&job("s.t", "t.t", &["code"]), &mut src, &mut tgt).await.unwrap_err();
     assert!(err.message.contains("Duplicate key"), "{err}");
+}
+
+#[tokio::test]
+async fn hash_join_refuses_duplicate_target_keys() {
+    // A second target row with a matched key must not be reported "only in the
+    // target": its `DELETE ... WHERE code = 'a'` would delete the matched row too.
+    let cols: &[(&str, DataKind)] = &[("code", DataKind::Text), ("qty", DataKind::Int)];
+    let (src, tgt) = sessions();
+    let mut src = src.table("s.t", cols, vec![vec![txt("a"), int(1)], vec![txt("b"), int(2)]]);
+    let mut tgt = tgt.table("t.t", cols, vec![vec![txt("a"), int(1)], vec![txt("b"), int(2)], vec![txt("a"), int(7)]]);
+    let err = run(&job("s.t", "t.t", &["code"]), &mut src, &mut tgt).await.unwrap_err();
+    assert!(err.message.contains("Duplicate key in the target table: a"), "{err}");
+    assert!(!src.open.load(AtomicOrdering::SeqCst) && !tgt.open.load(AtomicOrdering::SeqCst), "cursors closed on error");
+
+    // also with the hash join forced on numeric keys
+    let (src, tgt) = sessions();
+    let mut src = src.table("s.t", ITEM_COLS, vec![vec![int(1), txt("A"), dec("1")]]);
+    let mut tgt = tgt.table("t.t", ITEM_COLS, vec![vec![int(1), txt("A"), dec("1")], vec![int(1), txt("B"), dec("1")]]);
+    let mut j = job("s.t", "t.t", &["id"]);
+    j.options.strategy = CompareStrategy::HashJoin;
+    let err = run(&j, &mut src, &mut tgt).await.unwrap_err();
+    assert!(err.message.contains("Duplicate key in the target table"), "{err}");
+
+    // duplicates under the comparison options (case-insensitive keys) as well
+    let (src, tgt) = sessions();
+    let mut src = src.table("s.t", cols, vec![vec![txt("a"), int(1)]]);
+    let mut tgt = tgt.table("t.t", cols, vec![vec![txt("A"), int(1)], vec![txt("a"), int(1)]]);
+    let mut j = job("s.t", "t.t", &["code"]);
+    j.options.ignore_case = true;
+    let err = run(&j, &mut src, &mut tgt).await.unwrap_err();
+    assert!(err.message.contains("Duplicate key in the target table"), "{err}");
+
+    // target-only keys are not tracked: every such row is reported and deleted
+    let (src, tgt) = sessions();
+    let mut src = src.table("s.t", cols, vec![vec![txt("a"), int(1)]]);
+    let mut tgt = tgt.table("t.t", cols, vec![vec![txt("a"), int(1)], vec![txt("z"), int(1)], vec![txt("z"), int(2)]]);
+    let d = run(&job("s.t", "t.t", &["code"]), &mut src, &mut tgt).await.unwrap();
+    assert_eq!((d.identical, d.only_in_target), (1, 2));
+    assert!(d.sync_statements.iter().all(|s| s == "DELETE FROM t.t WHERE code = 'z'"), "{:?}", d.sync_statements);
+
+    // a text key spelling the same number differently is a different target row
+    let (src, tgt) = sessions();
+    let mut src = src.table("s.t", ITEM_COLS, vec![vec![int(1), txt("A"), dec("1")]]);
+    let mut tgt = tgt.table(
+        "t.t",
+        &[("id", DataKind::Text), ("name", DataKind::Text), ("price", DataKind::Decimal)],
+        vec![vec![txt("1"), txt("A"), dec("1")], vec![txt("01"), txt("A"), dec("1")]],
+    );
+    let d = run(&job("s.t", "t.t", &["id"]), &mut src, &mut tgt).await.unwrap();
+    assert_eq!((d.identical, d.only_in_target), (1, 1));
+    assert_eq!(d.sync_statements, vec!["DELETE FROM t.t WHERE id = '01'".to_string()]);
+}
+
+#[tokio::test]
+async fn auto_strategy_does_not_sort_for_a_hash_join() {
+    // numeric source key, text target key: decided by the probes, neither side is sorted
+    let tgt_cols: &[(&str, DataKind)] = &[("id", DataKind::Text), ("name", DataKind::Text), ("price", DataKind::Decimal)];
+    let (src, tgt) = sessions();
+    let mut src = src.table("s.t", ITEM_COLS, vec![vec![int(2), txt("B"), dec("2")], vec![int(1), txt("A"), dec("1")]]);
+    let mut tgt = tgt.table("t.t", tgt_cols, vec![vec![txt("1"), txt("A"), dec("1")], vec![txt("3"), txt("C"), dec("3")]]);
+    let d = run(&job("s.t", "t.t", &["id"]), &mut src, &mut tgt).await.unwrap();
+    assert_eq!(d.strategy, CompareStrategy::HashJoin);
+    assert_eq!((d.identical, d.different, d.only_in_source, d.only_in_target), (1, 0, 1, 1));
+    assert_eq!(src.queries, vec!["SELECT * FROM s.t LIMIT 1", "SELECT * FROM s.t"]);
+    assert_eq!(tgt.queries, vec!["SELECT * FROM t.t LIMIT 1", "SELECT * FROM t.t"]);
+    // the sequential hash join also works on one shared session
+    let busy = Arc::new(AtomicBool::new(false));
+    let mut src = Fake::new(busy.clone()).table("s.t", ITEM_COLS, vec![vec![int(1), txt("A"), dec("1")]]);
+    let mut tgt = Fake::new(busy.clone()).table("t.t", tgt_cols, vec![vec![txt("1"), txt("A"), dec("1")]]);
+    let d = run(&job("s.t", "t.t", &["id"]), &mut src, &mut tgt).await.unwrap();
+    assert!(d.is_identical());
+    assert!(!busy.load(AtomicOrdering::SeqCst));
 }
 
 #[tokio::test]
@@ -281,8 +354,8 @@ async fn explicit_columns_are_matched_by_position() {
     let d = run(&j, &mut src, &mut tgt).await.unwrap();
     assert_eq!(d.different, 1);
     assert_eq!(d.sync_statements, vec!["UPDATE t.goods SET title = 'A' WHERE item_id = 1".to_string()]);
-    assert_eq!(src.queries, vec!["SELECT id, name, price FROM s.items ORDER BY id"]);
-    assert_eq!(tgt.queries, vec!["SELECT item_id, title, cost FROM t.goods ORDER BY item_id"]);
+    assert_eq!(src.queries, vec!["SELECT id, name, price FROM s.items LIMIT 1", "SELECT id, name, price FROM s.items ORDER BY id"]);
+    assert_eq!(tgt.queries, vec!["SELECT item_id, title, cost FROM t.goods LIMIT 1", "SELECT item_id, title, cost FROM t.goods ORDER BY item_id"]);
 }
 
 #[tokio::test]
@@ -296,7 +369,7 @@ async fn unmatched_columns_and_where_clause() {
     assert!(d.is_identical());
     assert_eq!(d.unmatched_columns, vec!["extra", "other"]);
     assert_eq!(d.warnings.len(), 1);
-    assert_eq!(src.queries, vec!["SELECT * FROM s.t WHERE id < 100 ORDER BY id"]);
+    assert_eq!(src.queries, vec!["SELECT * FROM s.t WHERE id < 100 LIMIT 1", "SELECT * FROM s.t WHERE id < 100 ORDER BY id"]);
 }
 
 #[tokio::test]

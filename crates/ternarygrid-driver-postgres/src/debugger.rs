@@ -137,13 +137,22 @@ fn first_row(msgs: &[SimpleQueryMessage]) -> Option<&tokio_postgres::SimpleQuery
     })
 }
 
+/// Statement run on the target connection before the routine: the routine runs
+/// there, so on a read-only connection it runs read-only too. (The proxy only
+/// drives pldebugger and runs nothing of the user's.)
+fn target_setup(params: &ConnectParams) -> Option<&'static str> {
+    params.read_only.then_some("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+}
+
 /// Start a debugging session for `target` called with `args` (SQL literals).
 pub(crate) async fn start(params: &ConnectParams, target: DebugTarget, args: &[String]) -> DbResult<Box<dyn DebugSession>> {
     let mut p = params.clone();
     p.application_name = "TernaryGrid debugger".into();
-    p.read_only = false;
     let proxy = open_conn(&p).await?;
     let tconn = open_conn(&p).await?;
+    if let Some(setup) = target_setup(params) {
+        tconn.client.batch_execute(setup).await.map_err(pg)?;
+    }
     let pid_msgs = tconn.client.simple_query("SELECT pg_backend_pid()").await.map_err(pg)?;
     let target_pid: i32 = first_row(&pid_msgs).and_then(|r| r.get(0)).and_then(|s| s.parse().ok()).ok_or_else(|| DbError::internal("cannot read the target backend pid"))?;
     let msgs = proxy.client.simple_query("SELECT pldbg_create_listener()").await.map_err(pg)?;
@@ -540,5 +549,19 @@ impl Drop for PgDebugSession {
                 let _ = cancel.send().await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ternarygrid_core::{ConnectionConfig, DbKind};
+
+    #[test]
+    fn routine_of_a_read_only_connection_runs_read_only() {
+        let mut p = ConnectParams::from_config(&ConnectionConfig::new(DbKind::Postgres, "x"), None);
+        assert_eq!(target_setup(&p), None);
+        p.read_only = true;
+        assert_eq!(target_setup(&p), Some("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"));
     }
 }

@@ -1,6 +1,6 @@
 //! SQL generation for the query builder.
 
-use super::model::{JoinKind, QbCondition, QbJoin, QueryModel};
+use super::model::{Connector, JoinKind, QbCondition, QbJoin, QueryModel};
 use std::collections::BTreeSet;
 use ternarygrid_core::{DbKind, Dialect};
 
@@ -41,6 +41,8 @@ impl QueryModel {
         Some(match op.as_str() {
             "" => lhs,
             "IS NULL" | "IS NOT NULL" => format!("{lhs} {op}"),
+            // incomplete (also `IN` without a list, which would render `IN ()`)
+            _ if value.is_empty() => return None,
             "IN" | "NOT IN" => {
                 if value.starts_with('(') {
                     format!("{lhs} {op} {value}")
@@ -48,22 +50,38 @@ impl QueryModel {
                     format!("{lhs} {op} ({value})")
                 }
             }
-            _ if value.is_empty() => return None,
             _ => format!("{lhs} {op} {value}"),
         })
     }
 
+    /// Combines a WHERE / HAVING list strictly left to right, the way the
+    /// list reads in the editor: `a OR b AND c` means `(a OR b) AND c`, so
+    /// everything before a change of connector is parenthesized. A
+    /// condition containing its own top level AND / OR (a free expression
+    /// like `x = 1 OR y = 2`) is parenthesized too.
     fn render_conditions(&self, list: &[QbCondition], dialect: &dyn Dialect) -> Option<String> {
+        let rendered: Vec<(Connector, String)> = list
+            .iter()
+            .filter_map(|c| Some((c.connector, self.render_condition(c, dialect)?)))
+            .collect();
+        let several = rendered.len() > 1;
         let mut out = String::new();
-        for c in list {
-            let Some(text) = self.render_condition(c, dialect) else {
-                continue;
-            };
-            if out.is_empty() {
-                out.push_str(&text);
+        let mut previous: Option<Connector> = None;
+        for (i, (connector, text)) in rendered.into_iter().enumerate() {
+            let text = if several && has_top_level_logic(&text) {
+                format!("({text})")
             } else {
-                out.push_str(&format!("\n    {} {text}", c.connector.sql()));
+                text
+            };
+            if i == 0 {
+                out = text;
+                continue;
             }
+            if previous.is_some_and(|p| p != connector) {
+                out = format!("({out})");
+            }
+            out.push_str(&format!("\n    {} {text}", connector.sql()));
+            previous = Some(connector);
         }
         if out.is_empty() { None } else { Some(out) }
     }
@@ -133,9 +151,23 @@ impl QueryModel {
                             }
                         }
                     }
+                    let kind = kind.unwrap_or_default();
+                    // A loaded model can carry a FULL JOIN although the UI
+                    // does not offer it for MySQL / MariaDB: keep it (so the
+                    // server rejects the statement instead of silently
+                    // returning other rows) and say why.
+                    let note = match (kind, dialect.kind()) {
+                        (JoinKind::Full, DbKind::MySql) => {
+                            " /* FULL JOIN is not supported by MySQL: choose another join type */"
+                        }
+                        (JoinKind::Full, DbKind::MariaDb) => {
+                            " /* FULL JOIN is not supported by MariaDB: choose another join type */"
+                        }
+                        _ => "",
+                    };
                     out.push_str(&format!(
-                        "\n    {} {} ON {}",
-                        kind.unwrap_or_default().sql(),
+                        "\n    {}{note} {} ON {}",
+                        kind.sql(),
                         self.table_ref(i, dialect),
                         conds.join(" AND ")
                     ));
@@ -279,8 +311,59 @@ impl QueryModel {
     }
 }
 
+/// True when `sql` contains a logical operator (`AND`, `OR`, `XOR`, `||`,
+/// `&&`) outside parentheses, string literals and quoted names, i.e. when
+/// it must be parenthesized before being combined with other conditions.
+fn has_top_level_logic(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' | b'`' => quote = Some(c),
+            b'[' => quote = Some(b']'),
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'|' | b'&' if depth == 0 && b.get(i + 1) == Some(&c) => return true,
+            _ if depth == 0 && c.is_ascii_alphabetic() => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80)
+                {
+                    i += 1;
+                }
+                let word_start = start == 0
+                    || !(b[start - 1].is_ascii_alphanumeric()
+                        || b[start - 1] == b'_'
+                        || b[start - 1] == b'.'
+                        || b[start - 1] >= 0x80);
+                let word = &sql[start..i];
+                if word_start
+                    && (word.eq_ignore_ascii_case("and")
+                        || word.eq_ignore_ascii_case("or")
+                        || word.eq_ignore_ascii_case("xor"))
+                {
+                    return true;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::model::tests::{customers, order_items, orders};
     use super::super::model::*;
     use ternarygrid_core::ddl::DdlGenerator;
@@ -288,7 +371,7 @@ mod tests {
     use ternarygrid_core::{DbKind, Dialect};
 
     /// Dialect wrapper reporting another product.
-    struct KindDialect(DbKind, GenericDialect, SqlSyntax);
+    pub(crate) struct KindDialect(DbKind, GenericDialect, SqlSyntax);
     impl Dialect for KindDialect {
         fn kind(&self) -> DbKind {
             self.0
@@ -300,9 +383,9 @@ mod tests {
             self.1.ddl()
         }
     }
-    fn dialect(kind: DbKind) -> KindDialect {
+    pub(crate) fn dialect(kind: DbKind) -> KindDialect {
         let mut syntax = SqlSyntax::ansi();
-        if kind == DbKind::MySql {
+        if matches!(kind, DbKind::MySql | DbKind::MariaDb) {
             syntax.identifier_quotes = &[('`', '`')];
         }
         KindDialect(kind, GenericDialect::new(), syntax)
@@ -348,8 +431,138 @@ mod tests {
         let sql = m.to_sql(&d);
         assert_eq!(
             sql,
-            "SELECT DISTINCT\n    o.\"order\",\n    c.name AS \"customer name\"\nFROM shop.orders o\n    INNER JOIN shop.customers c ON o.customer_id = c.id\nWHERE o.total > 100\n    OR c.region IN ('EU', 'US')\n    AND c.name IS NOT NULL\nORDER BY o.total DESC, c.name\nLIMIT 50"
+            "SELECT DISTINCT\n    o.\"order\",\n    c.name AS \"customer name\"\nFROM shop.orders o\n    INNER JOIN shop.customers c ON o.customer_id = c.id\nWHERE (o.total > 100\n    OR c.region IN ('EU', 'US'))\n    AND c.name IS NOT NULL\nORDER BY o.total DESC, c.name\nLIMIT 50"
         );
+    }
+
+    fn where_clause(m: &QueryModel) -> String {
+        let sql = m.to_sql(&dialect(DbKind::Postgres));
+        sql.split_once("\nWHERE ")
+            .map(|(_, w)| w.to_string())
+            .unwrap_or_default()
+    }
+
+    fn cond(connector: Connector, expr: &str, op: &str, value: &str) -> QbCondition {
+        QbCondition {
+            connector,
+            ..QbCondition::new(expr, op, value)
+        }
+    }
+
+    #[test]
+    fn conditions_combine_left_to_right() {
+        let mut m = model();
+        // a OR b AND c reads (a OR b) AND c
+        m.conditions = vec![
+            cond(Connector::And, "o.total", ">", "1"),
+            cond(Connector::Or, "o.total", "<", "0"),
+            cond(Connector::And, "c.name", "IS NOT NULL", ""),
+        ];
+        assert_eq!(
+            where_clause(&m),
+            "(o.total > 1\n    OR o.total < 0)\n    AND c.name IS NOT NULL"
+        );
+        // a AND b OR c reads (a AND b) OR c
+        m.conditions[1].connector = Connector::And;
+        m.conditions[2].connector = Connector::Or;
+        assert_eq!(
+            where_clause(&m),
+            "(o.total > 1\n    AND o.total < 0)\n    OR c.name IS NOT NULL"
+        );
+        // a OR b AND c OR d: every change of connector closes a group
+        m.conditions[1].connector = Connector::Or;
+        m.conditions[2].connector = Connector::And;
+        m.conditions
+            .push(cond(Connector::Or, "c.region", "=", "'EU'"));
+        assert_eq!(
+            where_clause(&m),
+            "((o.total > 1\n    OR o.total < 0)\n    AND c.name IS NOT NULL)\n    OR c.region = 'EU'"
+        );
+        // the same connector throughout needs no parentheses
+        for c in &mut m.conditions {
+            c.connector = Connector::And;
+        }
+        assert_eq!(
+            where_clause(&m),
+            "o.total > 1\n    AND o.total < 0\n    AND c.name IS NOT NULL\n    AND c.region = 'EU'"
+        );
+        // the connector of a skipped (incomplete) first condition is ignored
+        m.conditions = vec![
+            cond(Connector::And, "o.total", "=", ""),
+            cond(Connector::Or, "o.total", ">", "1"),
+            cond(Connector::And, "c.region", "=", "'EU'"),
+        ];
+        assert_eq!(where_clause(&m), "o.total > 1\n    AND c.region = 'EU'");
+    }
+
+    #[test]
+    fn conditions_with_their_own_or_are_parenthesized() {
+        let mut m = model();
+        m.conditions = vec![
+            cond(Connector::And, "c.region = 'EU' OR c.region = 'US'", "", ""),
+            cond(Connector::And, "o.total", ">", "100"),
+        ];
+        assert_eq!(
+            where_clause(&m),
+            "(c.region = 'EU' OR c.region = 'US')\n    AND o.total > 100"
+        );
+        // alone it needs no parentheses
+        m.conditions.truncate(1);
+        assert_eq!(where_clause(&m), "c.region = 'EU' OR c.region = 'US'");
+        // AND / OR inside literals, quoted names, parentheses or words do not count
+        m.conditions = vec![
+            cond(Connector::And, "c.name", "=", "'tom and jerry'"),
+            cond(Connector::Or, "c.region", "IN", "('a', 'b') "),
+            cond(Connector::Or, "coalesce(c.name, 'x') or_else", "", ""),
+            cond(Connector::Or, "\"brand or\" = 1", "", ""),
+        ];
+        assert_eq!(
+            where_clause(&m),
+            "c.name = 'tom and jerry'\n    OR c.region IN ('a', 'b')\n    OR coalesce(c.name, 'x') or_else\n    OR \"brand or\" = 1"
+        );
+        assert!(super::has_top_level_logic("a || b"));
+        assert!(super::has_top_level_logic("a XOR b"));
+        assert!(super::has_top_level_logic("x BETWEEN 1 AND 2"));
+        assert!(!super::has_top_level_logic("o.and_flag = 1"));
+    }
+
+    #[test]
+    fn in_without_a_value_is_skipped() {
+        let mut m = model();
+        m.conditions = vec![
+            QbCondition::new("c.region", "IN", ""),
+            QbCondition::new("c.region", "NOT IN", "  "),
+        ];
+        let sql = m.to_sql(&dialect(DbKind::Postgres));
+        assert!(!sql.contains("IN ()"), "{sql}");
+        assert!(!sql.contains("WHERE"), "{sql}");
+        m.conditions[0].value = "'EU'".into();
+        assert!(
+            m.to_sql(&dialect(DbKind::Postgres))
+                .ends_with("WHERE c.region IN ('EU')")
+        );
+    }
+
+    #[test]
+    fn full_join_is_flagged_for_mysql_and_mariadb() {
+        let mut m = model();
+        m.joins[0].kind = JoinKind::Full;
+        let pg = m.to_sql(&dialect(DbKind::Postgres));
+        assert!(
+            pg.contains("\n    FULL JOIN shop.customers c ON o.customer_id = c.id"),
+            "{pg}"
+        );
+        for (kind, name) in [(DbKind::MySql, "MySQL"), (DbKind::MariaDb, "MariaDB")] {
+            let sql = m.to_sql(&dialect(kind));
+            assert!(
+                sql.contains(&format!(
+                    "\n    FULL JOIN /* FULL JOIN is not supported by {name}: choose another join type */ shop.customers c ON"
+                )),
+                "{sql}"
+            );
+        }
+        m.joins[0].kind = JoinKind::Left;
+        assert!(!m.to_sql(&dialect(DbKind::MySql)).contains("/*"));
     }
 
     #[test]

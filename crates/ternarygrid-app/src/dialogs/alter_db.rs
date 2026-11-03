@@ -3,13 +3,17 @@
 //! short-lived session in auto-commit mode (PostgreSQL moves a database to
 //! another tablespace outside of a transaction) and a navigator refresh.
 
+use super::{add_field, number_field, opt_field, text_field};
 use crate::backend::Job;
 use crate::command::AppCommand;
 use crate::cx::AppContext;
 use egui::RichText;
 use egui_phosphor::regular as icon;
+use std::cell::Cell;
 use ternarygrid_core::driver::TransactionMode;
 use ternarygrid_core::{DatabaseProps, DbKind, DbResult, Value, tr, trf};
+use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::parts::{self, Dialog};
 
 pub struct AlterDatabaseDialog {
     conn: String,
@@ -107,86 +111,86 @@ impl AlterDatabaseDialog {
         // TernaryGrid's own connection uses the database: PostgreSQL renames none while it is connected.
         let in_use = postgres && renamed && live.current_database.as_deref() == Some(name.as_str());
         let busy = self.job.is_some();
-        let mut keep = true;
         let mut save = false;
         let error = self.error.clone();
         let can = !statements.is_empty() && !busy && !read_only && !in_use;
-        let modal = egui::Modal::new(egui::Id::new(("alter_database", &self.conn))).show(ctx, |ui| {
-            ui.set_width(560.0);
-            crate::widgets::icon_heading(ui, icon::DATABASE, trf("Database {}", &[&name]));
-            ui.weak(trf("On {}", &[&conn_name]));
-            ui.add_space(6.0);
-            match self.original.clone() {
-                Some(original) => self.form(ui, &original, kind, edits, &mut save),
-                None if error.is_none() => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.weak(tr("Reading the database's properties…"));
+        let script = statements.iter().map(|s| format!("{s};\n")).collect::<String>();
+        let (save_clicked, editor, cancel) = (Cell::new(false), Cell::new(false), Cell::new(false));
+        let title = trf("Database {}", &[&name]);
+        let subtitle = trf("On {}", &[&conn_name]);
+        let (resp, _) = Dialog::new(&title).icon(icon::DATABASE).subtitle(&subtitle).width(600.0).body_padding(super::BODY).show_modal(
+            ctx,
+            egui::Id::new(("alter_database", &self.conn)),
+            |ui| {
+                super::form_spacing(ui, 11.0);
+                match self.original.clone() {
+                    Some(original) => self.form(ui, &original, kind, edits, &mut save),
+                    None if error.is_none() => {
+                        parts::spinner_label(ui, tr("Reading the database's properties…"));
+                    }
+                    None => {}
+                }
+                if postgres && (renamed || moved) {
+                    super::form_row(ui, "", |ui| {
+                        ternarygrid_ui::kit::checkbox(ui, &mut self.disconnect_others, tr("Disconnect the other sessions on this database first"))
+                            .on_hover_text(tr("PostgreSQL renames or moves a database only while nobody is connected to it."))
                     });
                 }
-                None => {}
-            }
-            if postgres && (renamed || moved) {
-                ui.checkbox(&mut self.disconnect_others, tr("Disconnect the other sessions on this database first"))
-                    .on_hover_text(tr("PostgreSQL renames or moves a database only while nobody is connected to it."));
-            }
-            if in_use {
-                crate::widgets::error_box(
-                    ui,
-                    tr("The connection itself uses this database, so PostgreSQL cannot rename it: choose another database in the connection's settings first."),
-                );
-            }
-            if self.original.is_some() {
-                ui.add_space(6.0);
-                if statements.is_empty() {
-                    ui.weak(tr("No changes."));
-                } else {
-                    egui::ScrollArea::vertical().id_salt(("alter_db_sql", &self.conn)).max_height(140.0).show(ui, |ui| {
-                        let text = statements.iter().map(|s| format!("{s};\n")).collect::<String>();
-                        let mut t = text.as_str();
-                        ui.add(egui::TextEdit::multiline(&mut t).code_editor().desired_rows(2).desired_width(f32::INFINITY));
-                    });
+                if in_use {
+                    crate::dialogs::error_note(
+                        ui,
+                        tr("The connection itself uses this database, so PostgreSQL cannot rename it: choose another database in the connection's settings first."),
+                    );
                 }
-            }
-            if read_only {
-                crate::widgets::error_box(ui, tr("The connection is read-only."));
-            }
-            if let Some(e) = &error {
-                crate::widgets::error_box(ui, e);
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.add_enabled(can, egui::Button::new(RichText::new(format!("{} {}", icon::CHECK, tr("Save"))).strong())).clicked() {
-                    save = true;
+                if self.original.is_some() {
+                    if statements.is_empty() {
+                        super::muted(ui, tr("No changes."));
+                    } else {
+                        super::sql_preview(ui, ("alter_db_sql", &self.conn), Some(dialect.clone()), script.trim_end(), 140.0, false);
+                    }
                 }
-                if ui.add_enabled(!statements.is_empty(), egui::Button::new(tr("Open in SQL editor"))).clicked() {
-                    let text = statements.iter().map(|s| format!("{s};\n")).collect::<String>();
-                    cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: None, text: Some(text) });
-                    keep = false;
+                if read_only {
+                    crate::dialogs::error_note(ui, tr("The connection is read-only."));
                 }
-                if ui.add_enabled(!busy, egui::Button::new(tr("Cancel"))).clicked() {
-                    keep = false;
+                if let Some(e) = &error {
+                    crate::dialogs::error_note(ui, e);
                 }
-                if busy {
-                    ui.spinner();
+            },
+            |ui| {
+                if ui.add_enabled_ui(!statements.is_empty(), |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::FILE_CODE), tr("Open in SQL editor"), false)).inner.clicked() {
+                    editor.set(true);
                 }
-            });
-        });
-        if save && can {
-            self.start(cx, &name, statements, postgres && self.disconnect_others);
-        }
-        if modal.should_close() && !busy {
+                super::right(ui, |ui| {
+                    if ui.add_enabled_ui(can, |ui| kit::primary_icon(ui, icon::CHECK, tr("Save"))).inner.clicked() {
+                        save_clicked.set(true);
+                    }
+                    if ui.add_enabled_ui(!busy, super::cancel_button).inner.clicked() {
+                        cancel.set(true);
+                    }
+                    if busy {
+                        ui.add(egui::Spinner::new().size(14.0));
+                    }
+                });
+            },
+        );
+        let mut keep = !(cancel.get() || (resp.close && !busy));
+        if editor.get() {
+            cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: None, text: Some(script) });
             keep = false;
+        }
+        if (save || save_clicked.get()) && can {
+            self.start(cx, &name, statements, postgres && self.disconnect_others);
         }
         keep
     }
 
     /// The fields: editable where the product can change them, else shown as read.
     fn form(&mut self, ui: &mut egui::Ui, original: &DatabaseProps, kind: DbKind, edits: ternarygrid_core::DatabaseEdits, save: &mut bool) {
-        egui::Grid::new("alter_db_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label(tr("Name"));
+        let p = ternarygrid_ui::pal(ui);
+        let value = |ui: &mut egui::Ui, v: &str| super::value_text(ui, v, p.text_muted, false);
+        super::form_row(ui, tr("Name"), |ui| {
             if edits.name {
-                let r = ui.add(egui::TextEdit::singleline(&mut self.edited.name).desired_width(320.0));
+                let r = add_field(ui, text_field(&mut self.edited.name, f32::INFINITY));
                 if std::mem::take(&mut self.focus_name) {
                     r.request_focus();
                 }
@@ -194,69 +198,63 @@ impl AlterDatabaseDialog {
                     *save = true;
                 }
             } else {
-                ui.label(&original.name).on_hover_text(tr("This database type cannot rename a database."));
+                value(ui, &original.name).on_hover_text(tr("This database type cannot rename a database."));
             }
-            ui.end_row();
-            let field = |ui: &mut egui::Ui, label: &str, v: &mut Option<String>, editable: bool, shown: bool| {
-                if !editable && !shown {
-                    return;
-                }
-                ui.label(label);
+        });
+        let field = |ui: &mut egui::Ui, label: &str, v: &mut Option<String>, editable: bool, shown: bool| {
+            if !editable && !shown {
+                return;
+            }
+            super::form_row(ui, label, |ui| {
                 if editable {
-                    let mut text = v.clone().unwrap_or_default();
-                    if ui.add(egui::TextEdit::singleline(&mut text).desired_width(320.0)).changed() {
-                        *v = Some(text).filter(|t| !t.trim().is_empty());
-                    }
+                    opt_field(ui, v, "", f32::INFINITY, false);
                 } else {
-                    ui.label(v.as_deref().unwrap_or_default());
+                    value(ui, v.as_deref().unwrap_or_default());
                 }
-                ui.end_row();
-            };
-            field(ui, tr("Owner"), &mut self.edited.owner, edits.owner, original.owner.is_some());
-            let encoding = if matches!(kind, DbKind::MySql | DbKind::MariaDb) { tr("Character set") } else { tr("Encoding") };
-            field(ui, encoding, &mut self.edited.encoding, edits.encoding, original.encoding.is_some());
-            field(ui, tr("Collation"), &mut self.edited.collation, edits.collation, original.collation.is_some());
-            field(ui, tr("Character type"), &mut self.edited.ctype, false, original.ctype.is_some());
-            field(ui, tr("Tablespace"), &mut self.edited.tablespace, edits.tablespace && original.tablespace.is_some(), original.tablespace.is_some());
-            if edits.connection_limit
-                && let Some(n) = self.edited.connection_limit.as_mut()
-            {
-                ui.label(tr("Connection limit"));
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(n).range(-1..=i64::from(i32::MAX)));
-                    ui.weak(tr("-1: no limit"));
-                });
-                ui.end_row();
-            }
-            if edits.allow_connections
-                && let Some(b) = self.edited.allow_connections.as_mut()
-            {
-                ui.label(tr("Connections"));
-                ui.checkbox(b, tr("Allow connections"));
-                ui.end_row();
-            }
-            if edits.is_template
-                && let Some(b) = self.edited.is_template.as_mut()
-            {
-                ui.label(tr("Template"));
-                ui.checkbox(b, tr("Others can be created from it (CREATE DATABASE … TEMPLATE)"));
-                ui.end_row();
-            }
-            if edits.comment || original.comment.is_some() {
-                ui.label(tr("Comment"));
+            });
+        };
+        field(ui, tr("Owner"), &mut self.edited.owner, edits.owner, original.owner.is_some());
+        let encoding = if matches!(kind, DbKind::MySql | DbKind::MariaDb) { tr("Character set") } else { tr("Encoding") };
+        field(ui, encoding, &mut self.edited.encoding, edits.encoding, original.encoding.is_some());
+        field(ui, tr("Collation"), &mut self.edited.collation, edits.collation, original.collation.is_some());
+        field(ui, tr("Character type"), &mut self.edited.ctype, false, original.ctype.is_some());
+        field(ui, tr("Tablespace"), &mut self.edited.tablespace, edits.tablespace && original.tablespace.is_some(), original.tablespace.is_some());
+        if edits.connection_limit
+            && let Some(n) = self.edited.connection_limit.as_mut()
+        {
+            super::form_row(ui, tr("Connection limit"), |ui| {
+                number_field(ui, "alter_db_conn_limit", n, -1..=i64::from(i32::MAX), 90.0);
+                ui.label(RichText::new(tr("-1: no limit")).size(12.0).color(p.text_faint));
+            });
+        }
+        if edits.allow_connections
+            && let Some(b) = self.edited.allow_connections.as_mut()
+        {
+            super::form_row(ui, tr("Connections"), |ui| ternarygrid_ui::kit::checkbox(ui, b, tr("Allow connections")));
+        }
+        if edits.is_template
+            && let Some(b) = self.edited.is_template.as_mut()
+        {
+            super::form_row(ui, tr("Template"), |ui| ternarygrid_ui::kit::checkbox(ui, b, tr("Others can be created from it (CREATE DATABASE … TEMPLATE)")));
+        }
+        if edits.comment || original.comment.is_some() {
+            super::form_row(ui, tr("Comment"), |ui| {
                 let mut text = self.edited.comment.clone().unwrap_or_default();
-                let r = ui.add_enabled(edits.comment, egui::TextEdit::multiline(&mut text).desired_rows(2).desired_width(320.0));
+                let edit = egui::TextEdit::multiline(&mut text)
+                    .margin(egui::Margin::symmetric(13, 6))
+                    .min_size(egui::vec2(0.0, 50.0))
+                    .vertical_align(egui::Align::Center)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY);
+                let r = ui.add_enabled_ui(edits.comment, |ui| add_field(ui, edit)).inner;
                 if r.changed() {
                     self.edited.comment = Some(text).filter(|t| !t.trim().is_empty());
                 }
-                ui.end_row();
-            }
-            if let Some(b) = original.size_bytes {
-                ui.label(tr("Size"));
-                ui.label(crate::nav::long_size(b));
-                ui.end_row();
-            }
-        });
+            });
+        }
+        if let Some(b) = original.size_bytes {
+            super::form_row(ui, tr("Size"), |ui| value(ui, &crate::nav::long_size(b)));
+        }
     }
 
     /// Run `statements` on a session of their own (auto-commit), after closing

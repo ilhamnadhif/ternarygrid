@@ -269,6 +269,11 @@ impl Session for SqliteSession {
         if sql.contains("/*endless*/") {
             return Ok(Box::new(EndlessCursor::new(std::time::Duration::from_millis(1))));
         }
+        // MySQL session variables (`SET time_zone = ...`) are accepted and ignored.
+        if sql.starts_with("SET ") {
+            let done = MaterializedResult { header: ResultHeader::Update { rows_affected: None, last_insert_id: None, tag: None }, rows: Vec::new() };
+            return Ok(Box::new(MemoryCursor::new(vec![done])));
+        }
         if self.mode == TransactionMode::Manual && self.conn.is_autocommit() {
             self.conn.execute_batch("BEGIN").map_err(err)?;
         }
@@ -420,6 +425,29 @@ pub fn generic() -> Arc<dyn Dialect> {
 
 pub fn sqlite_dialect() -> Arc<dyn Dialect> {
     Arc::new(SqliteTestDialect::new())
+}
+
+/// ANSI SQL presenting itself as another product (`kind`), e.g. to exercise
+/// product specific code paths (no upsert, no transactions ...) on SQLite.
+pub struct KindDialect {
+    kind: DbKind,
+    inner: GenericDialect,
+}
+
+impl Dialect for KindDialect {
+    fn kind(&self) -> DbKind {
+        self.kind
+    }
+    fn syntax(&self) -> &SqlSyntax {
+        self.inner.syntax()
+    }
+    fn ddl(&self) -> &dyn DdlGenerator {
+        self.inner.ddl()
+    }
+}
+
+pub fn dialect_of_kind(kind: DbKind) -> Arc<dyn Dialect> {
+    Arc::new(KindDialect { kind, inner: GenericDialect::new() })
 }
 
 // ---------------------------------------------------------------------------

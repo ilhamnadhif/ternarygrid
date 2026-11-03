@@ -44,8 +44,13 @@ fn connect(backend: &Backend, url: &str) -> (ConnectionManager, String) {
 }
 
 fn connect_with(backend: &Backend, url: &str, net: Arc<dyn NetConnector>) -> (ConnectionManager, String) {
+    connect_as(backend, url, net, |_| {})
+}
+
+fn connect_as(backend: &Backend, url: &str, net: Arc<dyn NetConnector>, tweak: impl FnOnce(&mut ternarygrid_core::ConnectionConfig)) -> (ConnectionManager, String) {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let (mut cfg, password) = ternarygrid_config::parse_connection_url(url).expect("valid test URL");
+    tweak(&mut cfg);
     cfg.name = "e2e".into();
     cfg.save_password = true;
     if password.is_none() {
@@ -200,6 +205,51 @@ fn execute_fetch_count_and_metadata() {
         let events = run_script(&backend, &cm, &id, &[&format!("DROP TABLE {table}")]);
         assert!(errors(&events).is_empty(), "{name}: drop {:?}", errors(&events));
         cm.disconnect_all(&backend);
+    }
+}
+
+/// ClickHouse has no transactions: a connection of a manual-commit type
+/// (Production) connects in auto-commit mode, and grid changes are saved.
+#[test]
+fn clickhouse_connects_and_saves_without_transactions() {
+    let Some(url) = std::env::var("TERNARYGRID_TEST_CLICKHOUSE").ok().filter(|u| !u.trim().is_empty()) else { return };
+    let url = url.replacen("http://", "clickhouse://", 1);
+    let backend = Backend::new().unwrap();
+    let (cm, id) = connect_as(&backend, &url, Arc::new(DirectNet), |c| c.connection_type = "prod".into());
+    assert!(!cm.type_of(&id).auto_commit, "Production asks for manual commit");
+    let session = cm.live(&id).unwrap().main.clone();
+    assert_eq!(session.tx_state().mode, ternarygrid_core::TransactionMode::Auto, "what the session really does");
+    let table = format!("ternarygrid_e2e_ch_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let s = session.clone();
+    let t = table.clone();
+    let (rows, committed, count) = backend.block_on(async move {
+        s.execute_update(&format!("CREATE TABLE {t} (id Int32, name String) ENGINE = MergeTree ORDER BY id"), &[]).await.unwrap();
+        let stmts = vec![(format!("INSERT INTO {t} VALUES (1, 'a')"), Vec::new()), (format!("INSERT INTO {t} VALUES (2, 'b')"), Vec::new())];
+        let saved = s.apply_changes(&stmts).await;
+        let (_, rows) = s.query_all(&format!("SELECT count() FROM {t}"), &[]).await.unwrap();
+        s.execute_update(&format!("DROP TABLE {t}"), &[]).await.unwrap();
+        let (n, committed) = saved.expect("saved without a transaction");
+        (n, committed, rows[0][0].as_i64())
+    });
+    assert_eq!((rows, committed, count), (2, true, Some(2)));
+    assert!(!session.tx_state().in_transaction);
+}
+
+/// A procedure returning several row sets: each one is shown, also after a first
+/// one longer than the fetch size.
+#[test]
+fn every_result_of_a_procedure_is_shown() {
+    for (name, url) in servers().into_iter().filter(|(n, _)| *n == "mysql" || *n == "mariadb") {
+        let backend = Backend::new().unwrap();
+        let (cm, id) = connect(&backend, &url);
+        let proc = format!("ternarygrid_e2e_p{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let d = "(SELECT 0 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9)";
+        let create = format!("CREATE PROCEDURE {proc}() BEGIN SELECT a.x + 10 * b.x + 100 * c.x AS n FROM {d} a CROSS JOIN {d} b CROSS JOIN {d} c; SELECT 'second' AS s; END");
+        let events = run_script(&backend, &cm, &id, &[&create, &format!("CALL {proc}()"), &format!("DROP PROCEDURE {proc}")]);
+        assert!(errors(&events).is_empty(), "{name}: {:?}", errors(&events));
+        let rows: Vec<(usize, bool)> =
+            events.iter().filter_map(|e| if let ExecEvent::Rows { index: 1, store, exhausted, .. } = e { Some((store.lock().len(), *exhausted)) } else { None }).collect();
+        assert_eq!(rows, vec![(1000, true), (1, true)], "{name}");
     }
 }
 

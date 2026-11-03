@@ -9,10 +9,10 @@ use egui::{FontId, Id, Pos2, Rect, Sense, TextStyle, Ui, Vec2, pos2, vec2};
 use std::ops::Range;
 use ternarygrid_core::{tr, trf};
 
-/// Thickness of the scroll bars.
-pub(super) const BAR: f32 = 12.0;
+/// Thickness of the scroll bars (over the cells, shown while the pointer is on the grid).
+pub(super) const BAR: f32 = 10.0;
 /// Horizontal cell padding.
-pub(super) const PAD: f32 = 5.0;
+pub(super) const PAD: f32 = 10.0;
 /// Width of the button at the right of a foreign key value that opens the row it references.
 pub(super) const FK_BUTTON: f32 = 16.0;
 
@@ -48,12 +48,15 @@ impl Geo {
         self.nrows as f64 * self.row_h as f64
     }
 
+    /// The bars lie over the cells: the last row and column can scroll clear of them.
     pub fn max_scroll_y(&self) -> f64 {
-        (self.content_h() - self.body.height() as f64).max(0.0)
+        let bar = if self.hbar.is_some() { BAR as f64 } else { 0.0 };
+        (self.content_h() + bar - self.body.height() as f64).max(0.0)
     }
 
     pub fn max_scroll_x(&self) -> f32 {
-        (self.content_w() - self.body.width()).max(0.0)
+        let bar = if self.vbar.is_some() { BAR } else { 0.0 };
+        (self.content_w() + bar - self.body.width()).max(0.0)
     }
 
     /// Screen y of the top of `row`.
@@ -196,7 +199,7 @@ pub(crate) fn detached_menu(
     own: impl FnOnce(&mut Ui),
 ) -> (Vec<GridAction>, Option<CellEdit>) {
     let font = options.font.clone().unwrap_or_else(|| TextStyle::Body.resolve(ui.style()));
-    let geo = compute_geometry(model, state, options, ui.max_rect(), font.size * 1.3, font.size * 0.6);
+    let geo = compute_geometry(model, state, options, ui.max_rect(), font.size, font.size * 0.55);
     let before = state.rt.selection.clone();
     let mut picked = Selection::default();
     for (i, p) in cells.iter().filter_map(|&(r, c)| geo.cols.iter().position(|&x| x == c).map(|pos| CellPos::new(r, pos))).enumerate() {
@@ -229,7 +232,7 @@ pub(crate) fn detached_menu(
     if acting {
         if let Some(resp) = resp {
             egui::Popup::context_menu(resp).show(|ui| {
-                ui.set_min_width(220.0);
+                ternarygrid_ui::kit::menu_look(ui, 280.0);
                 own(ui);
                 f.menu_items(ui);
             });
@@ -300,12 +303,11 @@ pub(super) fn show(model: &mut ResultModel, state: &mut DataGridState, options: 
     ui.allocate_rect(rect, Sense::hover());
 
     state.rt.glyphs.begin_frame(ui.painter(), &font);
-    let mut text_h = state.rt.glyphs.row_height();
-    if text_h <= 0.0 {
-        text_h = font.size * 1.3;
-    }
-    let digit_w = state.rt.glyphs.measure(ui.painter(), "0").unwrap_or(font.size * 0.6);
-    let geo = compute_geometry(model, state, options, rect, text_h, digit_w);
+    state.rt.glyphs_mono.begin_frame(ui.painter(), &FontId::monospace(font.size * 12.0 / 13.0));
+    state.rt.glyphs_small.begin_frame(ui.painter(), &FontId::new(font.size * 12.0 / 13.0, font.family.clone()));
+    state.rt.glyphs_rownum.begin_frame(ui.painter(), &FontId::new(font.size * 11.5 / 13.0, font.family.clone()));
+    let digit_w = state.rt.glyphs_rownum.measure(ui.painter(), "0").unwrap_or(font.size * 0.55);
+    let geo = compute_geometry(model, state, options, rect, font.size, digit_w);
     // Keep scroll offsets in range.
     state.rt.scroll_y = state.rt.scroll_y.clamp(0.0, geo.max_scroll_y());
     state.rt.scroll_x = state.rt.scroll_x.clamp(0.0, geo.max_scroll_x());
@@ -358,7 +360,7 @@ pub(super) fn show(model: &mut ResultModel, state: &mut DataGridState, options: 
     GridResponse { response: body, actions: f.actions, active_cell, selection_changed }
 }
 
-fn compute_geometry(model: &ResultModel, state: &DataGridState, options: &GridOptions, rect: Rect, text_h: f32, digit_w: f32) -> Geo {
+fn compute_geometry(model: &ResultModel, state: &DataGridState, options: &GridOptions, rect: Rect, font_size: f32, digit_w: f32) -> Geo {
     let nrows = model.row_count();
     let cols = state.visible_columns();
     let mut xs = Vec::with_capacity(cols.len() + 1);
@@ -368,11 +370,12 @@ fn compute_geometry(model: &ResultModel, state: &DataGridState, options: &GridOp
         x += state.column_width(c);
         xs.push(x);
     }
-    let row_h = options.row_height_for(text_h);
-    let header_h = (text_h + if options.compact_rows { 10.0 } else { 12.0 }).round();
+    // 28 + its line (29) at 13 points; the header 32 + its line.
+    let row_h = options.row_height_for(font_size);
+    let header_h = row_h + 4.0;
     let rownum_w = if options.show_row_numbers {
         let digits = (nrows.max(1) as f64).log10().floor() as usize + 1;
-        (digits.max(2) as f32 * digit_w + 2.0 * PAD + 10.0).round()
+        (digits as f32 * digit_w + PAD + 8.0).max((46.0 * font_size / 13.0).round()).round()
     } else {
         0.0
     };
@@ -380,20 +383,18 @@ fn compute_geometry(model: &ResultModel, state: &DataGridState, options: &GridOp
     let content_h = nrows as f64 * row_h as f64;
     let avail_w = rect.width() - rownum_w;
     let avail_h = rect.height() - header_h;
-    let mut need_v = content_h > avail_h as f64;
-    let need_h = content_w > avail_w - if need_v { BAR } else { 0.0 };
-    if !need_v && need_h {
-        need_v = content_h > (avail_h - BAR) as f64;
-    }
-    let body = Rect::from_min_max(rect.min + vec2(rownum_w, header_h), rect.max - vec2(if need_v { BAR } else { 0.0 }, if need_h { BAR } else { 0.0 }));
+    let need_v = content_h > avail_h as f64;
+    let need_h = content_w > avail_w;
+    // The bars lie over the cells (along the right and the bottom edge).
+    let body = Rect::from_min_max(rect.min + vec2(rownum_w, header_h), rect.max);
     Geo {
         rect,
         header: Rect::from_min_max(pos2(body.left(), rect.top()), pos2(body.right(), body.top())),
         rownums: Rect::from_min_max(pos2(rect.left(), body.top()), pos2(body.left(), body.bottom())),
         body,
         corner: Rect::from_min_max(rect.min, pos2(body.left(), body.top())),
-        vbar: need_v.then(|| Rect::from_min_max(pos2(body.right(), body.top()), pos2(rect.right(), body.bottom()))),
-        hbar: need_h.then(|| Rect::from_min_max(pos2(body.left(), body.bottom()), pos2(body.right(), rect.bottom()))),
+        vbar: need_v.then(|| Rect::from_min_max(pos2(body.right() - BAR, body.top()), pos2(body.right(), body.bottom() - if need_h { BAR } else { 0.0 }))),
+        hbar: need_h.then(|| Rect::from_min_max(pos2(body.left(), body.bottom() - BAR), pos2(body.right() - if need_v { BAR } else { 0.0 }, body.bottom()))),
         row_h,
         cols,
         xs,
@@ -517,7 +518,9 @@ impl GridFrame<'_> {
 
     /// Scroll by a delta (content moves by `delta`).
     pub fn scroll_by(&mut self, delta: Vec2) {
+        let now = self.ctx.input(|i| i.time);
         let rt = &mut self.state.rt;
+        rt.bars_until = now + 0.8;
         rt.scroll_y = (rt.scroll_y - delta.y as f64).clamp(0.0, self.geo.max_scroll_y());
         rt.scroll_x = (rt.scroll_x - delta.x).clamp(0.0, self.geo.max_scroll_x());
     }

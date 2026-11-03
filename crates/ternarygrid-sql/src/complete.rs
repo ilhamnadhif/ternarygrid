@@ -476,7 +476,7 @@ pub fn complete(
         fk_cache: RefCell::new(HashMap::new()),
     };
     match var_style {
-        Some(style) => c.variables(style, &split.tokens),
+        Some(style) => c.variables(style, &split.tokens, rs),
         None => c.run(),
     }
     let mut items = c.items;
@@ -1520,14 +1520,16 @@ impl Completer<'_> {
         }
     }
 
-    fn variables(&mut self, style: VarStyle, tokens: &[Token]) {
+    /// Variables and parameters used in the script; `typing` is the start of
+    /// the one being typed, which is no proposal.
+    fn variables(&mut self, style: VarStyle, tokens: &[Token], typing: usize) {
         let mut names: Vec<String> = Vec::new();
         let mut add = |n: &str| {
             if !n.is_empty() && !names.iter().any(|x| x == n) {
                 names.push(n.to_string());
             }
         };
-        for t in tokens {
+        for t in tokens.iter().filter(|t| t.start != typing) {
             let text = t.text(self.src);
             match t.kind {
                 TokenKind::ClientCommand => {

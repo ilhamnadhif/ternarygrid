@@ -425,6 +425,9 @@ impl MySqlSession {
             .trim()
             .parse()
             .map_err(|_| DbError::config(format!("Invalid session id '{id}'")))?;
+        if id == self.connection_id() {
+            return Err(DbError::config("Refusing to KILL the current session"));
+        }
         let sql = match mode {
             KillMode::CancelQuery => format!("KILL QUERY {id}"),
             KillMode::Terminate => format!("KILL {id}"),

@@ -128,6 +128,13 @@ pub(crate) fn exec_mode(sql: &str, params: &[Value]) -> ExecMode {
     }
 }
 
+/// Re-read `@@TRANCOUNT` / `DB_NAME()` after `sql` (besides after any error): in manual
+/// mode, inside an open transaction (a procedure may commit it), and when the SQL itself
+/// controls transactions (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`, `SAVE TRAN`) or the database.
+fn refresh_after(mode: TransactionMode, in_transaction: bool, sql: &str) -> bool {
+    mode == TransactionMode::Manual || in_transaction || sqltext::touches_session_state(sql)
+}
+
 impl SqlServerSession {
     /// Connect and initialise a session.
     pub async fn connect(params: &ConnectParams) -> DbResult<SqlServerSession> {
@@ -228,7 +235,8 @@ impl SqlServerSession {
             mode: mode.unwrap_or_else(|| exec_mode(sql, params)),
             timeout: opts.timeout,
             resolve_sources: opts.resolve_sources,
-            refresh_state: !self.suppress_refresh && (self.mode == TransactionMode::Manual || sqltext::touches_session_state(sql)),
+            refresh_state: !self.suppress_refresh && refresh_after(self.mode, self.shared.in_transaction.load(Ordering::SeqCst), sql),
+            refresh_on_error: !self.suppress_refresh,
             tag: sqltext::first_keyword(sql),
             notice: self.reconnect_notice.take(),
             zone: crate::types::Zone::of(self.params.property("time_zone")),
@@ -508,5 +516,18 @@ mod tests {
         assert_eq!(exec_mode("INSERT INTO t VALUES (1)\nGO\nINSERT INTO t VALUES (2)", &[]), ExecMode::Batch);
         assert_eq!(exec_mode("CREATE TABLE t (a int)", &[]), ExecMode::Batch);
         assert_eq!(exec_mode("BEGIN TRAN; DELETE FROM t", &[]), ExecMode::Batch);
+    }
+
+    #[test]
+    fn state_refresh() {
+        use TransactionMode::*;
+        for sql in ["BEGIN TRAN", "begin transaction t1", "COMMIT", "ROLLBACK TRAN", "SAVE TRANSACTION s", "USE other", "SET XACT_ABORT ON"] {
+            assert!(refresh_after(Auto, false, sql), "{sql}");
+        }
+        assert!(!refresh_after(Auto, false, "UPDATE t SET a = 1"));
+        assert!(!refresh_after(Auto, false, "SELECT N'commit' AS [rollback]"));
+        // an open explicit transaction can end without transaction SQL (procedure, deadlock)
+        assert!(refresh_after(Auto, true, "UPDATE t SET a = 1"));
+        assert!(refresh_after(Manual, false, "SELECT 1"));
     }
 }

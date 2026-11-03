@@ -224,6 +224,11 @@ impl MySqlSession {
         self.connect_timeout
     }
 
+    /// Server id of this session's connection (`CONNECTION_ID()`).
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.killer.connection_id() as u64
+    }
+
     fn apply_return(&mut self, r: ConnReturn) {
         self.abort = None;
         self.slot = match (r.conn, r.broken) {
@@ -548,6 +553,7 @@ impl Session for MySqlSession {
             params,
             timeout: opts.timeout.filter(|t| !t.is_zero()),
             tag: sqltext::command_tag(sql),
+            single_result: sqltext::is_single_result(sql),
         };
         let (abort_tx, abort_rx) = watch::channel(false);
         let (cursor, ret) =

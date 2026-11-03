@@ -11,7 +11,7 @@
 //! `keymap.json` (see [`crate::keymap`]).
 
 use crate::keymap::{self, KeymapConfig};
-use crate::paths::{AppPaths, backup_corrupt_file, write_json};
+use crate::paths::{AppPaths, backup_corrupt_file, read_json, write_json};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use ternarygrid_core::DbResult;
@@ -19,7 +19,7 @@ use ternarygrid_core::config::NavigatorView;
 use ternarygrid_core::value::FormatOptions;
 
 /// Current schema version written to `settings.json`.
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 3;
 
 /// Deserializes a value, falling back to its default when it is invalid
 /// (e.g. an enum variant written by a newer version).
@@ -53,8 +53,6 @@ pub struct AppSettings {
     /// Keymap preset and overrides; stored in `keymap.json`.
     #[serde(skip)]
     pub keymap: KeymapConfig,
-    /// Main toolbar.
-    pub toolbar: ToolbarSettings,
     /// AI assistant.
     pub ai: AiSettings,
     /// Secret storage.
@@ -78,7 +76,6 @@ impl Default for AppSettings {
             history: HistorySettings::default(),
             navigator: NavigatorSettings::default(),
             keymap: KeymapConfig::default(),
-            toolbar: ToolbarSettings::default(),
             ai: AiSettings::default(),
             security: SecuritySettings::default(),
             tasks: TaskSettings::default(),
@@ -137,6 +134,9 @@ pub struct GeneralSettings {
     pub show_tips: bool,
     /// Index of the next tip.
     pub next_tip: usize,
+    /// The first-start setup (import from DBeaver, keyboard, look) was
+    /// finished or skipped. Installs from before it existed count as done.
+    pub onboarding_done: bool,
 }
 
 impl Default for GeneralSettings {
@@ -150,6 +150,7 @@ impl Default for GeneralSettings {
             confirm_exit_with_unsaved: true,
             show_tips: true,
             next_tip: 0,
+            onboarding_done: false,
         }
     }
 }
@@ -589,99 +590,6 @@ impl Default for NavigatorSettings {
     }
 }
 
-/// Main toolbar configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ToolbarSettings {
-    /// Ordered action ids ([`crate::actions::Action::id`]); `"|"` is a separator.
-    pub items: Vec<String>,
-    /// Action ids hidden from the toolbar.
-    pub hidden: Vec<String>,
-}
-
-impl Default for ToolbarSettings {
-    fn default() -> Self {
-        use crate::actions::Action as A;
-        // Global actions only: running, explaining, transactions and the
-        // active connection / schema belong to the SQL editor's own toolbar.
-        let groups: [&[A]; 4] = [
-            &[A::NewConnection, A::NewSqlEditor, A::AiAssistant],
-            &[
-                A::Export,
-                A::Import,
-                A::OpenErDiagram,
-                A::OpenSessionManager,
-            ],
-            &[A::OpenHistory, A::PendingTransactions, A::OpenTasks],
-            &[A::CommandPalette],
-        ];
-        ToolbarSettings {
-            items: grouped(&groups),
-            hidden: Vec::new(),
-        }
-    }
-}
-
-/// Action ids of `groups` separated by `"|"`.
-fn grouped(groups: &[&[crate::actions::Action]]) -> Vec<String> {
-    let mut items = Vec::new();
-    for (i, g) in groups.iter().enumerate() {
-        if i > 0 {
-            items.push("|".to_string());
-        }
-        items.extend(g.iter().map(|a| a.id().to_string()));
-    }
-    items
-}
-
-impl ToolbarSettings {
-    /// Earlier defaults: the SQL editor's toolbar repeated (without and with
-    /// group separators), and the global actions before AI, export / import,
-    /// ER diagram and sessions joined them.
-    fn previous_defaults() -> Vec<Vec<String>> {
-        use crate::actions::Action as A;
-        let flat: Vec<String> = A::default_toolbar()
-            .iter()
-            .map(|a| a.id().to_string())
-            .collect();
-        let grouped_v3 = grouped(&[
-            &[A::NewConnection, A::NewSqlEditor],
-            &[A::SelectConnection, A::SelectSchema],
-            &[
-                A::ExecuteStatement,
-                A::ExecuteScript,
-                A::ExplainPlan,
-                A::CancelQuery,
-            ],
-            &[A::Commit, A::Rollback, A::ToggleAutoCommit],
-            &[A::FormatSql, A::OpenHistory],
-        ]);
-        let global_v4 = grouped(&[
-            &[A::NewConnection, A::NewSqlEditor],
-            &[A::OpenHistory, A::PendingTransactions, A::OpenTasks],
-            &[A::CommandPalette],
-        ]);
-        vec![flat, grouped_v3, global_v4]
-    }
-
-    /// Settings saved with an earlier default get the current one;
-    /// customised toolbars are kept.
-    pub fn upgrade_default(&mut self) {
-        if Self::previous_defaults().contains(&self.items) {
-            self.items = ToolbarSettings::default().items;
-        }
-    }
-
-    /// Visible actions in order (unknown ids and separators skipped).
-    pub fn visible_actions(&self) -> Vec<crate::actions::Action> {
-        self.items
-            .iter()
-            .filter(|id| !self.hidden.contains(id))
-            .filter_map(|id| crate::actions::Action::from_id(id))
-            .collect()
-    }
-}
-
 /// AI provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -891,7 +799,7 @@ pub fn load_with_warnings(paths: &AppPaths) -> (AppSettings, Vec<String>) {
             }
         },
     };
-    settings.toolbar.upgrade_default();
+    migrate(&mut settings);
     let (keymap, kw) = keymap::load_config(paths);
     settings.keymap = keymap;
     warnings.extend(kw);
@@ -899,6 +807,18 @@ pub fn load_with_warnings(paths: &AppPaths) -> (AppSettings, Vec<String>) {
         tracing::warn!("{w}");
     }
     (settings, warnings)
+}
+
+/// Brings settings written by an older version up to date.
+fn migrate(settings: &mut AppSettings) {
+    // Version 1 shipped "[NULL]" as the default NULL text; it is "NULL" now.
+    if settings.version < 2 && settings.results.format.null_text == "[NULL]" {
+        settings.results.format.null_text = "NULL".into();
+    }
+    // Versions 1 and 2 shipped numbers without thousands separators; they are on now.
+    if settings.version < 3 && !settings.results.format.thousands_separator {
+        settings.results.format.thousands_separator = true;
+    }
 }
 
 /// Typed parse with per-section fallback.
@@ -932,44 +852,31 @@ fn parse_sections(
 }
 
 /// Writes `settings.json` and `keymap.json` atomically (mode 0600).
+///
+/// Top-level sections this version does not know (written by a newer
+/// version) are carried over from the existing file, so going back and
+/// forth between versions does not lose them.
 pub fn save(paths: &AppPaths, settings: &AppSettings) -> DbResult<()> {
     let mut s = settings.clone();
     s.version = SETTINGS_VERSION;
-    write_json(&paths.settings_file(), &s)?;
+    let path = paths.settings_file();
+    let mut value = serde_json::to_value(&s)?;
+    if let Some(new) = value.as_object_mut()
+        && let Ok(Some(serde_json::Value::Object(old))) = read_json::<serde_json::Value>(&path)
+    {
+        for (key, section) in old {
+            // `keymap` is skipped on purpose: it lives in keymap.json.
+            if key != "keymap" && !new.contains_key(&key) {
+                new.insert(key, section);
+            }
+        }
+    }
+    write_json(&path, &value)?;
     keymap::save_config(paths, &settings.keymap)
 }
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn toolbar_upgrade() {
-        for old in ToolbarSettings::previous_defaults() {
-            let mut t = ToolbarSettings {
-                items: old,
-                hidden: Vec::new(),
-            };
-            t.upgrade_default();
-            assert_eq!(t.items, ToolbarSettings::default().items);
-        }
-        let custom = vec![
-            "sql.execute_statement".to_string(),
-            "tools.query_history".to_string(),
-        ];
-        let mut t = ToolbarSettings {
-            items: custom.clone(),
-            hidden: Vec::new(),
-        };
-        t.upgrade_default();
-        assert_eq!(t.items, custom, "a customised toolbar is kept");
-        assert!(
-            !ToolbarSettings::default()
-                .items
-                .iter()
-                .any(|i| i.starts_with("sql.execute")),
-            "no editor actions by default"
-        );
-    }
 
     use super::*;
     use crate::keymap::KeymapPreset;
@@ -1044,6 +951,81 @@ mod tests {
     }
 
     #[test]
+    fn sections_of_a_newer_version_survive_a_save() {
+        let (_d, p) = paths();
+        std::fs::create_dir_all(p.config_dir()).unwrap();
+        std::fs::write(
+            p.settings_file(),
+            r#"{"results": {"fetch_size": 1000},
+                "brand_new_section": {"x": 1, "nested": ["a"]},
+                "keymap": {"preset": "old"}}"#,
+        )
+        .unwrap();
+        let mut s = load(&p);
+        s.results.fetch_size = 77;
+        save(&p, &s).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(p.settings_file()).unwrap()).unwrap();
+        assert_eq!(
+            v["brand_new_section"],
+            serde_json::json!({"x": 1, "nested": ["a"]})
+        );
+        assert_eq!(v["results"]["fetch_size"], 77, "known sections are written");
+        assert!(v.get("keymap").is_none(), "keymap lives in keymap.json");
+        assert_eq!(load(&p), s);
+        // Saving again (and without an existing file) keeps working.
+        save(&p, &s).unwrap();
+        std::fs::remove_file(p.settings_file()).unwrap();
+        save(&p, &s).unwrap();
+        assert_eq!(load(&p), s);
+    }
+
+    #[test]
+    fn the_old_default_null_text_follows_the_new_default() {
+        let (_d, p) = paths();
+        std::fs::create_dir_all(p.config_dir()).unwrap();
+        let file = |version: u32, text: &str| {
+            format!(
+                r#"{{"version": {version}, "results": {{"format": {{"null_text": "{text}"}}}}}}"#
+            )
+        };
+        std::fs::write(p.settings_file(), file(1, "[NULL]")).unwrap();
+        assert_eq!(load(&p).results.format.null_text, "NULL");
+        std::fs::write(p.settings_file(), file(1, "(null)")).unwrap();
+        assert_eq!(
+            load(&p).results.format.null_text,
+            "(null)",
+            "a chosen text stays"
+        );
+        std::fs::write(p.settings_file(), file(2, "[NULL]")).unwrap();
+        assert_eq!(
+            load(&p).results.format.null_text,
+            "[NULL]",
+            "chosen after the change"
+        );
+        assert_eq!(AppSettings::default().results.format.null_text, "NULL");
+    }
+
+    #[test]
+    fn the_old_default_thousands_separator_follows_the_new_default() {
+        let (_d, p) = paths();
+        std::fs::create_dir_all(p.config_dir()).unwrap();
+        let file = |version: u32, on: bool| {
+            format!(
+                r#"{{"version": {version}, "results": {{"format": {{"thousands_separator": {on}}}}}}}"#
+            )
+        };
+        std::fs::write(p.settings_file(), file(2, false)).unwrap();
+        assert!(load(&p).results.format.thousands_separator);
+        std::fs::write(p.settings_file(), file(3, false)).unwrap();
+        assert!(
+            !load(&p).results.format.thousands_separator,
+            "turned off after the change"
+        );
+        assert!(AppSettings::default().results.format.thousands_separator);
+    }
+
+    #[test]
     fn invalid_section_is_reset_alone() {
         let (_d, p) = paths();
         std::fs::create_dir_all(p.config_dir()).unwrap();
@@ -1087,12 +1069,6 @@ mod tests {
         assert_eq!(s.results.store_budget_bytes(), 48 * 1024 * 1024);
         assert_eq!(s.ai.effort.as_str(), "high");
         assert_eq!(AiProvider::OpenAiCompatible.id(), "openai-compatible");
-        let visible = s.toolbar.visible_actions();
-        assert!(visible.contains(&crate::actions::Action::NewSqlEditor));
-        assert!(
-            !visible.contains(&crate::actions::Action::ExecuteStatement),
-            "running is in the SQL editor's toolbar"
-        );
         let r = s.history.retention();
         assert_eq!(r.max_entries, Some(50_000));
         assert_eq!(r.max_age_days, Some(90));

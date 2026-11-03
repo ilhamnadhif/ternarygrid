@@ -70,9 +70,14 @@
 //!      execute `model.change_statements(dialect)` (parameterised with
 //!      `Dialect::placeholder`) in one transaction, then call
 //!      `model.apply_saved()`; on error keep the changes and show the error.
+//!      [`ResultModel::checked_change_set`] says why changes cannot be saved
+//!      (a changed row that cannot be identified: no `UPDATE` / `DELETE`
+//!      without its key); the grid's Save shows that instead of the action.
 //!    * `ServerQueryChanged { where_clause, order_by }` — server side mode:
 //!      re-run the query with the new `WHERE` / `ORDER BY` (e.g. via
-//!      `Dialect::select_table` or by wrapping the query). Client side mode
+//!      `Dialect::select_table` or by wrapping the query); each is the whole
+//!      new clause, as the filter bar then shows it (a filter by value adds
+//!      its condition to the current one). Client side mode
 //!      is handled entirely inside the grid on a background thread.
 //!    * `NavigateForeignKey { link, values }` — open `link.ref_table` filtered by
 //!      `link.ref_columns = values` (keep a back/forward history, FR-D6).

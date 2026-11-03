@@ -4,7 +4,7 @@ members = ["crates/*"]
 default-members = ["crates/ternarygrid-app"]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -34,6 +34,7 @@ ternarygrid-tasks = { path = "crates/ternarygrid-tasks" }
 ternarygrid-ai = { path = "crates/ternarygrid-ai" }
 ternarygrid-grid = { path = "crates/ternarygrid-grid" }
 ternarygrid-icons = { path = "crates/ternarygrid-icons" }
+ternarygrid-ui = { path = "crates/ternarygrid-ui" }
 ternarygrid-editor = { path = "crates/ternarygrid-editor" }
 ternarygrid-visual = { path = "crates/ternarygrid-visual" }
 
@@ -117,7 +118,7 @@ epaint_default_fonts = "0.36"
 egui_extras = { version = "0.36", default-features = false }
 egui_plot = "0.37"
 egui_dock = "0.21"
-egui-phosphor = { version = "0.14", features = ["regular", "fill"] }
+egui-phosphor = { version = "0.14", features = ["regular"] }
 rfd = "0.17"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 resvg = "0.48"

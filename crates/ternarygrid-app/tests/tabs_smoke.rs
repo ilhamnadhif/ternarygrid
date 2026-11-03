@@ -146,6 +146,40 @@ fn truncate_empties_the_table() {
     assert_eq!(rows[0][0].as_i64(), Some(0));
 }
 
+/// The connection's Read-only flag stops Truncate (the driver would not stop a DELETE).
+#[test]
+fn truncate_is_refused_on_a_read_only_connection() {
+    let mut h = H::new();
+    let mut cfg = h.cm.config(&h.id).unwrap().clone();
+    cfg.read_only = true;
+    h.cm.upsert(cfg);
+    let orders = ObjectRef::table(Some("main".into()), "orders");
+    let mut tab = ternarygrid_app::tabs::dbtools::MaintenanceTab::new(h.id.clone(), vec![orders]).with_op(Some("truncate".into()));
+    h.frames(&mut tab, 3);
+    {
+        let mut cx = AppContext {
+            backend: &h.backend,
+            conns: &mut h.cm,
+            services: &h.services,
+            settings: &mut h.settings,
+            commands: &mut h.commands,
+            toasts: &mut h.toasts,
+            ops: &mut h.ops,
+            keymap: &h.keymap,
+            tab_active: true,
+            current_tab: Some(1),
+            popup: false,
+        };
+        tab.start(&mut cx);
+    }
+    assert!(!tab.is_running());
+    assert!(tab.error().is_some_and(|e| e.contains("read-only")), "{:?}", tab.error());
+    h.frames(&mut tab, 3);
+    let s = h.cm.live(&h.id).unwrap().main.clone();
+    let (_, rows) = h.backend.block_on(async move { s.query_all("SELECT COUNT(*) FROM orders", &[]).await }).unwrap();
+    assert_eq!(rows[0][0].as_i64(), Some(2));
+}
+
 #[test]
 fn every_tab_draws_without_panicking() {
     let mut h = H::new();

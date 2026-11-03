@@ -99,7 +99,7 @@ impl Default for AiConfig {
             model: DEFAULT_ANTHROPIC_MODEL.to_string(),
             api_key: None,
             max_tokens: 16_000,
-            effort: Some("medium".into()),
+            effort: Some("high".into()),
             server_fallback: true,
             timeout_secs: 900,
             retry: RetryPolicy::default(),
@@ -109,10 +109,19 @@ impl Default for AiConfig {
 
 fn host_of(url: &str) -> Option<String> {
     let rest = url.split_once("://").map(|(_, r)| r)?;
-    let authority = rest.split('/').next()?;
+    // The authority ends at the path, the query or the fragment
+    // (`http://evil.example?@127.0.0.1` is a request to evil.example).
+    let authority = rest.split(['/', '?', '#']).next()?;
     let authority = authority.rsplit('@').next()?;
     let host = if let Some(stripped) = authority.strip_prefix('[') { stripped.split(']').next()?.to_string() } else { authority.split(':').next()?.to_string() };
     Some(host.to_ascii_lowercase())
+}
+
+/// `localhost` or a loopback IP address (127.0.0.0/8, `::1`, IPv4-mapped
+/// 127/8). Host *names* that merely start with `127.` are not loopback.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 impl AiConfig {
@@ -184,7 +193,7 @@ impl AiConfig {
 
     /// The service runs on this machine (no proxy, plain HTTP acceptable).
     pub fn is_loopback(&self) -> bool {
-        matches!(host_of(&self.base()).as_deref(), Some("localhost" | "127.0.0.1" | "::1")) || host_of(&self.base()).is_some_and(|h| h.starts_with("127."))
+        host_of(&self.base()).is_some_and(|h| is_loopback_host(&h))
     }
 
     fn api_key(&self) -> Option<&str> {
@@ -238,7 +247,7 @@ mod tests {
         let c = AiConfig::anthropic("sk-test");
         assert_eq!(c.model, "claude-opus-5-5");
         assert_eq!(c.max_tokens, 16_000);
-        assert_eq!(c.effort.as_deref(), Some("medium"));
+        assert_eq!(c.effort.as_deref(), Some("high"), "same default as AiSettings::effort");
         assert!(c.server_fallback);
         assert_eq!(c.endpoint(), "https://api.anthropic.com/v1/messages");
         assert!(c.is_first_party() && c.fallback_eligible());
@@ -296,6 +305,37 @@ mod tests {
         assert!(o.validate().is_err());
         assert!(AiConfig::openai_compatible("http://127.0.0.1:8080", "m", Some("k".into())).validate().is_ok());
         assert!(AiConfig::openai_compatible("http://[::1]:8080", "m", Some("k".into())).is_loopback());
+    }
+
+    #[test]
+    fn loopback_is_an_address_not_a_name_prefix() {
+        let at = |base: &str| AiConfig::openai_compatible(base, "m", Some("k".into()));
+        for local in [
+            "http://localhost:11434",
+            "http://LOCALHOST/v1",
+            "http://localhost.:1234",
+            "http://127.0.0.1",
+            "http://127.1.2.3:8080",
+            "http://[::1]:8080",
+            "http://[::ffff:127.0.0.1]",
+            "http://user@127.0.0.1:1",
+        ] {
+            assert!(at(local).is_loopback(), "{local}");
+            at(local).validate().unwrap();
+        }
+        for remote in [
+            "http://127.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example",
+            "http://evil.example?@127.0.0.1",
+            "http://evil.example#@localhost",
+            "http://127.0.0.1@evil.example",
+            "http://[::2]",
+            "http://10.0.0.1",
+        ] {
+            assert!(!at(remote).is_loopback(), "{remote}");
+            assert!(at(remote).validate().is_err(), "no key over plain http to {remote}");
+        }
     }
 
     #[test]

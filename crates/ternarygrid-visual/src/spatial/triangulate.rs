@@ -3,7 +3,10 @@
 //! a mutually visible vertex found by casting a ray to +x), then ears are
 //! clipped from the resulting simple polygon. Collinear vertices are
 //! dropped; self-intersecting input that cannot be clipped returns `None`
-//! (callers then draw the outline only).
+//! (callers then draw the outline only). Ear clipping is quadratic and runs
+//! on the UI thread, so the work is bounded: polygons above
+//! [`MAX_VERTICES`] or needing more than [`MAX_WORK`] steps also return
+//! `None`.
 
 /// A 2D point.
 pub type Point = [f64; 2];
@@ -30,8 +33,15 @@ impl Triangulation {
     }
 }
 
-/// Polygons with more vertices than this are not triangulated.
-pub const MAX_VERTICES: usize = 50_000;
+/// Polygons with more vertices than this are not triangulated (ear
+/// clipping a convex ring costs about n²/2 steps: 5 000 vertices take tens
+/// of milliseconds in a release build, 50 000 took over ten seconds).
+pub const MAX_VERTICES: usize = 5_000;
+
+/// Upper bound for the steps (vertex visits) spent on one polygon; beyond
+/// it the polygon is not triangulated. Bounds pathological shapes below
+/// [`MAX_VERTICES`] (many holes, repeated clipping passes) as well.
+pub const MAX_WORK: u64 = 15_000_000;
 
 /// Twice the signed area of triangle a, b, c (> 0 when counter-clockwise).
 fn cross(a: Point, b: Point, c: Point) -> f64 {
@@ -111,6 +121,7 @@ pub fn triangulate(outer: &[Point], holes: &[Vec<Point>]) -> Option<Triangulatio
     if total > MAX_VERTICES {
         return None;
     }
+    let mut work: u64 = 0;
     let mut vertices: Vec<Point> = outer.clone();
     let mut poly: Vec<usize> = (0..outer.len()).collect();
     // rightmost holes first
@@ -119,6 +130,11 @@ pub fn triangulate(outer: &[Point], holes: &[Vec<Point>]) -> Option<Triangulatio
     hole_order.sort_by(|&a, &b| max_x(&rings[b]).total_cmp(&max_x(&rings[a])));
     for hi in hole_order {
         let hole = &rings[hi];
+        // bridge search and merge visit the polygon a few times
+        work += 4 * (poly.len() + hole.len()) as u64;
+        if work > MAX_WORK {
+            return None;
+        }
         let base = vertices.len();
         vertices.extend_from_slice(hole);
         let Some(mi) = (0..hole.len()).max_by(|&a, &b| {
@@ -141,7 +157,7 @@ pub fn triangulate(outer: &[Point], holes: &[Vec<Point>]) -> Option<Triangulatio
         merged.extend_from_slice(&poly[j + 1..]);
         poly = merged;
     }
-    let triangles = clip_ears(&vertices, &poly)?;
+    let triangles = clip_ears(&vertices, &poly, MAX_WORK - work)?;
     Some(Triangulation {
         vertices,
         triangles: triangles.into_iter().map(|t| t.map(|i| i as u32)).collect(),
@@ -254,8 +270,9 @@ fn pick_copy(vertices: &[Point], poly: &[usize], k: usize, m: Point) -> usize {
         .unwrap_or(k)
 }
 
-/// Ear clipping of a simple counter-clockwise polygon given as indices.
-fn clip_ears(vertices: &[Point], poly: &[usize]) -> Option<Vec<[usize; 3]>> {
+/// Ear clipping of a simple counter-clockwise polygon given as indices;
+/// gives up (`None`) after `max_work` steps.
+fn clip_ears(vertices: &[Point], poly: &[usize], max_work: u64) -> Option<Vec<[usize; 3]>> {
     let n = poly.len();
     if n < 3 {
         return None;
@@ -278,7 +295,12 @@ fn clip_ears(vertices: &[Point], poly: &[usize]) -> Option<Vec<[usize; 3]>> {
         next[a] = b;
         prev[b] = a;
     };
+    let mut work: u64 = 0;
     while alive > 3 {
+        work += 1;
+        if work > max_work {
+            return None;
+        }
         let (a, b) = (prev[i], next[i]);
         let (pa, pv, pb) = (pt(a), pt(i), pt(b));
         let c = cross(pa, pv, pb);
@@ -297,6 +319,7 @@ fn clip_ears(vertices: &[Point], poly: &[usize]) -> Option<Vec<[usize; 3]>> {
                 let mut blocked = false;
                 let mut k = next[b];
                 while k != a {
+                    work += 1;
                     let r = pt(k);
                     let reflex = cross(pt(prev[k]), r, pt(next[k])) <= 0.0;
                     if reflex
@@ -510,6 +533,44 @@ mod tests {
             .collect();
         let t = check(&ring, &[]);
         assert_eq!(t.triangles.len(), n - 2);
+    }
+
+    #[test]
+    fn huge_polygons_are_bounded() {
+        let circle = |n: usize| -> Vec<Point> {
+            (0..n)
+                .map(|i| {
+                    let a = i as f64 / n as f64 * std::f64::consts::TAU;
+                    [a.cos() * 100.0, a.sin() * 100.0]
+                })
+                .collect()
+        };
+        // above the vertex cap: outline only, no work
+        let started = std::time::Instant::now();
+        assert!(triangulate(&circle(MAX_VERTICES + 1), &[]).is_none());
+        assert!(triangulate(&circle(50_000), &[]).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // the largest allowed convex ring still fits in the work budget
+        let t = check(&circle(MAX_VERTICES), &[]);
+        assert_eq!(t.triangles.len(), MAX_VERTICES - 2);
+        // many holes: the bridging work counts too
+        let holes: Vec<Vec<Point>> = (0..1200)
+            .map(|k| {
+                let (x, y) = (-60.0 + (k % 40) as f64 * 3.0, -60.0 + (k / 40) as f64 * 3.0);
+                vec![[x, y], [x + 1.0, y], [x + 1.0, y + 1.0], [x, y + 1.0]]
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let _ = triangulate(&circle(200), &holes);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // the step budget alone stops the clipping
+        let ring = circle(1000);
+        let poly: Vec<usize> = (0..ring.len()).collect();
+        assert!(clip_ears(&ring, &poly, 10_000).is_none());
+        assert_eq!(
+            clip_ears(&ring, &poly, MAX_WORK).map(|t| t.len()),
+            Some(998)
+        );
     }
 
     #[test]

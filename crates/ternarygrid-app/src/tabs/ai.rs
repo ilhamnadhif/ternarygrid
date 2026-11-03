@@ -21,7 +21,8 @@ use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
 use crate::tabs::ai_agent::{self, Agent, AgentEvent, ToolStep};
 use crate::tabs::ai_history::{ConversationStore, SavedConversation, title_of};
-use egui::{RichText, Ui};
+use crate::tabs::table_designer::pick;
+use egui::{Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType, vec2};
 use egui_phosphor::regular as icon;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -33,6 +34,7 @@ use ternarygrid_core::ddl::SchemaSnapshot;
 use ternarygrid_core::meta::{ObjectKind, ObjectRef, SchemaRef};
 use ternarygrid_core::{DbError, DbKind, DbResult, Dialect, ErrorKind, Secret, tr, trf};
 use ternarygrid_editor::{EditorLanguage, EditorTheme};
+use ternarygrid_ui::{kit, parts, style};
 use tokio_util::sync::CancellationToken;
 
 /// Character budget of the schema description put into the system prompt.
@@ -43,6 +45,9 @@ pub const HISTORY_BUDGET: usize = 100_000;
 pub const SAMPLE_ROWS: u64 = 5;
 /// Longest value text of a sample row.
 const SAMPLE_VALUE_CHARS: usize = 120;
+
+/// Height of the connection and schema selects at the top of the panel (as designed).
+const PICKER_H: f32 = 28.0;
 
 /// Fence tags treated as SQL (same list as `ternarygrid_ai::extract_sql_blocks`).
 const SQL_TAGS: &[&str] = &[
@@ -103,12 +108,12 @@ impl QuickAction {
 
     fn icon(self) -> &'static str {
         match self {
-            QuickAction::Chat => icon::CHAT_TEXT,
-            QuickAction::GenerateSql => icon::MAGIC_WAND,
-            QuickAction::Explain => icon::LIGHTBULB,
+            QuickAction::Chat => icon::SPARKLE,
+            QuickAction::GenerateSql => icon::FILE_SQL,
+            QuickAction::Explain => icon::INFO,
             QuickAction::FixError => icon::WRENCH,
             QuickAction::Optimize => icon::LIGHTNING,
-            QuickAction::Describe => icon::INFO,
+            QuickAction::Describe => icon::TABLE,
         }
     }
 
@@ -281,7 +286,7 @@ pub fn ai_config(settings: &AiSettings, api_key: Option<Secret>) -> AiConfig {
 
 fn provider_label(p: AiProvider) -> &'static str {
     match p {
-        AiProvider::Anthropic => "Anthropic",
+        AiProvider::Anthropic => "Anthropic Claude",
         AiProvider::OpenAiCompatible => tr("OpenAI compatible"),
     }
 }
@@ -385,10 +390,14 @@ pub fn sql_blocks(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Highlighted, non-wrapping layout of SQL text.
+/// Highlighted, non-wrapping layout of SQL text, 20 points a line.
 fn highlight_job(code: &str, lang: Option<&SqlLanguage>, theme: &EditorTheme, font: egui::FontId) -> egui::text::LayoutJob {
     let tokens = lang.map(|l| l.highlight(code)).unwrap_or_default();
-    crate::sqllang::highlight_job(code, &tokens, theme, font)
+    let mut job = crate::sqllang::highlight_job(code, &tokens, theme, font);
+    for s in &mut job.sections {
+        s.format.line_height = Some(20.0);
+    }
+    job
 }
 
 // -------------------------------------------------------------- the chat
@@ -597,6 +606,8 @@ pub struct AiAssistantTab {
     saved: Option<Vec<SavedConversation>>,
     /// An answer finished since the conversation was saved.
     unsaved: bool,
+    /// The history's popup was open in the last frame (its button shows it on).
+    history_open: bool,
 }
 
 /// Shift+Enter starts a new line in the assistant's inputs; Enter sends.
@@ -635,6 +646,7 @@ impl AiAssistantTab {
             conversation: uuid::Uuid::new_v4().to_string(),
             saved: None,
             unsaved: false,
+            history_open: false,
         }
     }
 
@@ -831,7 +843,8 @@ impl AiAssistantTab {
         let mut agent = match live {
             Some(l) if ai.agent_queries => {
                 let schema = self.schema.clone().unwrap_or_default();
-                let opener = l.open_session_future(format!("{} ({})", l.config.name, tr("AI assistant")), schema.database);
+                // Read-only for the driver too (ClickHouse `readonly`, the NoSQL drivers), besides the agent's own checks.
+                let opener = l.open_read_only_session_future(format!("{} ({})", l.config.name, tr("AI assistant")), schema.database);
                 Some(Agent::new(l.kind(), l.main.dialect().syntax().clone(), schema.schema, Box::pin(opener)))
             }
             _ => None,
@@ -938,6 +951,15 @@ impl AiAssistantTab {
         self.unsaved = true;
     }
 
+    /// Test helper: the model and the token counts of the last answer.
+    #[doc(hidden)]
+    pub fn set_answered_by(&mut self, model: &str, input: u64, output: u64) {
+        if let Some(t) = self.turns.last_mut() {
+            t.model = Some(model.to_string());
+            t.usage = Some(Usage { input_tokens: input, output_tokens: output, ..Default::default() });
+        }
+    }
+
     /// Test helper: a query the assistant ran before the answer of the last turn.
     #[doc(hidden)]
     pub fn push_step(&mut self, step: ToolStep) {
@@ -945,6 +967,16 @@ impl AiAssistantTab {
             t.steps.push((0, step));
             self.unsaved = true;
         }
+    }
+
+    /// Test helper: a question whose answer is running `sql` now (nothing is sent).
+    #[doc(hidden)]
+    pub fn push_running(&mut self, question: &str, sql: &str) {
+        let mut t = Turn::new(QuickAction::Chat, question.to_string());
+        t.message = Some(ChatMessage::user(question));
+        t.state = TurnState::Streaming;
+        t.running = Some(sql.to_string());
+        self.turns.push(t);
     }
 
     #[doc(hidden)]
@@ -973,85 +1005,179 @@ impl AiAssistantTab {
         self.lang = Some((kind, SqlLanguage::new(dialect)));
     }
 
+    /// The connection and schema the assistant works with, what is sent with a question
+    /// and the actions (settings, new conversation, history), above the conversation.
     fn header(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        // Two rows: the connection and schema, then what is sent and the actions
-        // (the assistant is a narrow panel at the right).
-        ui.horizontal_wrapped(|ui| {
-            let mut conn = self.conn.clone();
-            if crate::tabs::data_compare::connection_combo(ui, cx, ("ai_conn", self.uid), &mut conn, Some(tr("No connection"))) {
-                self.conn = conn;
-                self.schema = None;
-                self.object = None;
-                self.lang = None;
-            }
-            if let Some(c) = self.conn.clone()
-                && cx.conns.is_connected(&c)
-            {
-                let mut schema = self.schema.clone();
-                if crate::tabs::data_compare::schema_combo(ui, cx, ("ai_schema", self.uid), &c, &mut schema) {
-                    self.schema = schema;
+        let p = ternarygrid_ui::pal(ui);
+        egui::Frame::new().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.set_min_height(PICKER_H);
+                if self.connection_picker(ui, cx) {
+                    self.schema = None;
                     self.object = None;
+                    self.lang = None;
                 }
-            }
-        });
-        ui.horizontal(|ui| {
-            self.context_status(ui, cx);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(ternarygrid_icons::ic(icon::GEAR)).on_hover_text(tr("AI settings")).clicked() {
-                    cx.push(AppCommand::OpenSettings);
+                if let Some(c) = self.conn.clone()
+                    && cx.conns.is_connected(&c)
+                {
+                    self.schema_picker(ui, cx, &c);
                 }
-                if ui.add_enabled(!self.turns.is_empty(), egui::Button::new(ternarygrid_icons::ic(icon::PLUS))).on_hover_text(tr("New conversation")).clicked() {
-                    self.reset();
-                }
-                self.history_button(ui, cx);
-                ui.add(egui::Label::new(RichText::new(cx.settings.ai.model.clone()).weak().small()).truncate());
+            });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.set_min_height(24.0);
+                icon_box(ui, icon::DATABASE, 13.0, p.text_muted);
+                self.context_status(ui, cx);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // 8 apart, as the design's row.
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.add(egui::Label::new(RichText::new(cx.settings.ai.model.clone()).size(11.0).color(p.text_faint)).truncate());
+                    self.history_button(ui, cx);
+                    if ui.add_enabled_ui(!self.turns.is_empty(), |ui| kit::icon_button_ex(ui, icon::PLUS, tr("New conversation"), false, 24.0)).inner.clicked() {
+                        self.reset();
+                    }
+                    if kit::icon_button_ex(ui, icon::GEAR, tr("AI settings"), false, 24.0).clicked() {
+                        cx.push(AppCommand::OpenSettings);
+                    }
+                });
             });
         });
+        parts::hline(ui);
+    }
+
+    /// The connection, its database's logo in front; true when another one was chosen.
+    fn connection_picker(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
+        let names: Vec<(String, String, bool, DbKind)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone(), cx.conns.is_connected(&c.id), c.kind)).collect();
+        let current = self.conn.as_ref().and_then(|c| names.iter().find(|(i, ..)| i == c));
+        if let Some((.., kind)) = current {
+            let dark = ui.visuals().dark_mode;
+            if let Some(img) = crate::dblogo::image(ui.ctx(), *kind, 15.0, crate::theme::logo_color(*kind, dark)) {
+                ui.add(img);
+            }
+        }
+        let text = match (current, &self.conn) {
+            (Some((_, name, ..)), _) => name.clone(),
+            (None, None) => tr("No connection").to_string(),
+            (None, Some(_)) => tr("Choose a connection…").to_string(),
+        };
+        let mut chosen: Option<Option<String>> = None;
+        let none = self.conn.is_none();
+        // As wide as its text (10 and 8 of padding, the chevron 8 from it), at most 220.
+        let w = (ui.painter().layout_no_wrap(text.clone(), egui::FontId::proportional(13.0), Color32::PLACEHOLDER).size().x + 41.0).clamp(80.0, 220.0);
+        crate::tabs::table_designer::select(ui, ("ai_conn", self.uid), text, w, PICKER_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            if pick(ui, none, tr("No connection")) && !none {
+                chosen = Some(None);
+            }
+            for (id, name, connected, _) in &names {
+                // The chosen one checked, the others with their state (connected or not).
+                let glyph = if *connected { icon::PLUGS_CONNECTED } else { icon::PLUGS };
+                let on = self.conn.as_deref() == Some(id.as_str());
+                let clicked = if on { pick(ui, true, name) } else { kit::menu_item(ui, Some(glyph), name, "").clicked() };
+                if clicked && !on {
+                    chosen = Some(Some(id.clone()));
+                }
+            }
+        });
+        let Some(conn) = chosen else { return false };
+        if let Some(c) = &conn
+            && !cx.conns.is_connected(c)
+        {
+            cx.push(AppCommand::Connect(c.clone()));
+        }
+        self.conn = conn;
+        true
+    }
+
+    /// The schema of a connected connection (its current one until another is chosen).
+    fn schema_picker(&mut self, ui: &mut Ui, cx: &mut AppContext, conn: &str) {
+        let backend = cx.backend;
+        let fallback = crate::tabs::data_compare::default_schema(cx, conn);
+        let Some(live) = cx.conns.live_mut(conn) else { return };
+        let main = live.main.clone();
+        live.meta.request_schemas(backend, &main, None);
+        let loading = live.meta.schemas_of(None).is_loading();
+        let mut names: Vec<String> = live.meta.schemas_of(None).get().map(|v| v.iter().filter(|s| !s.is_system).map(|s| s.name.clone()).collect()).unwrap_or_default();
+        if let Some(f) = fallback.as_ref().and_then(|f| f.schema.clone())
+            && !names.contains(&f)
+        {
+            names.insert(0, f);
+        }
+        if self.schema.is_none()
+            && let Some(f) = fallback.or_else(|| names.first().map(|n| SchemaRef::new(None, Some(n.clone()))))
+        {
+            self.schema = Some(f);
+            self.object = None;
+        }
+        let label = self.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
+        let mut chosen: Option<String> = None;
+        crate::tabs::table_designer::select(ui, ("ai_schema", self.uid), label, 130.0, PICKER_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            for n in &names {
+                let on = self.schema.as_ref().and_then(|s| s.schema.as_deref()) == Some(n.as_str());
+                if pick(ui, on, n) && !on {
+                    chosen = Some(n.clone());
+                }
+            }
+        });
+        if let Some(n) = chosen {
+            self.schema = Some(SchemaRef::new(None, Some(n)));
+            self.object = None;
+        }
+        if loading {
+            ui.add(egui::Spinner::new().size(14.0));
+        }
     }
 
     /// The saved conversations: one opens with a click, the trash deletes it.
     fn history_button(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        let resp = ui.button(ternarygrid_icons::ic(icon::CLOCK_COUNTER_CLOCKWISE)).on_hover_text(tr("Conversation history"));
-        if resp.clicked() || self.saved.is_none() && egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp)) {
+        let p = ternarygrid_ui::pal(ui);
+        let resp = kit::icon_button_ex(ui, icon::CLOCK_COUNTER_CLOCKWISE, tr("Conversation history"), self.history_open, 24.0);
+        let popup_id = egui::Popup::default_response_id(&resp);
+        if resp.clicked() || self.saved.is_none() && egui::Popup::is_id_open(ui.ctx(), popup_id) {
             self.saved = Some(Self::store(cx).list());
         }
         let mut open: Option<SavedConversation> = None;
         let mut delete: Option<String> = None;
         let mut clear = false;
-        egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            ui.set_width(340.0);
-            let saved = self.saved.as_deref().unwrap_or_default();
-            if saved.is_empty() {
-                ui.weak(tr("No saved conversations"));
-                return;
-            }
-            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
-                for c in saved {
-                    let when = chrono::DateTime::from_timestamp(c.updated, 0).map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
-                    let conn = c.connection.as_deref().and_then(|id| cx.conns.config(id)).map(|c| c.name.clone()).unwrap_or_default();
-                    let detail = [conn, when].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(egui::Button::new(ternarygrid_icons::ic(icon::TRASH)).frame_when_inactive(false)).on_hover_text(tr("Delete")).clicked() {
-                                delete = Some(c.id.clone());
-                            }
-                            ui.vertical(|ui| {
-                                let title = egui::Button::selectable(c.id == self.conversation, c.title.as_str()).wrap_mode(egui::TextWrapMode::Truncate);
-                                if ui.add(title).on_hover_text(c.title.as_str()).clicked() {
-                                    open = Some(c.clone());
-                                }
-                                ui.add(egui::Label::new(RichText::new(detail).small().weak()).truncate());
-                            });
-                        });
+        // As designed: 60 points from the panel's left edge, 9 under the button (on the
+        // context's hairline).
+        let at = egui::pos2(ui.clip_rect().left() + 60.0, resp.rect.bottom() + 9.0);
+        egui::Popup::from_toggle_button_response(&resp)
+            .anchor(at)
+            .align(egui::RectAlign::BOTTOM_START)
+            .gap(0.0)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_width(340.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let saved = self.saved.as_deref().unwrap_or_default();
+                if saved.is_empty() {
+                    egui::Frame::new().inner_margin(Margin::same(8)).show(ui, |ui| {
+                        ui.label(RichText::new(tr("No saved conversations")).color(p.text_faint));
                     });
-                    ui.add_space(2.0);
+                    return;
+                }
+                egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                    for c in saved {
+                        let when = chrono::DateTime::from_timestamp(c.updated, 0).map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
+                        let conn = c.connection.as_deref().and_then(|id| cx.conns.config(id)).map(|c| c.name.clone()).unwrap_or_default();
+                        let detail = [conn, when].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+                        match history_item(ui, &c.title, &detail, c.id == self.conversation) {
+                            Some(HistoryClick::Open) => open = Some(c.clone()),
+                            Some(HistoryClick::Delete) => delete = Some(c.id.clone()),
+                            None => {}
+                        }
+                    }
+                });
+                let y = ui.cursor().top() + 3.0;
+                ui.painter().hline(ui.max_rect().x_range().shrink(4.0), y, Stroke::new(1.0, p.border));
+                ui.add_space(7.0);
+                if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::TRASH), tr("Clear history"), true).clicked() {
+                    clear = true;
                 }
             });
-            ui.separator();
-            if ui.button(format!("{}  {}", icon::BROOM, tr("Clear history"))).clicked() {
-                clear = true;
-            }
-        });
+        self.history_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
         let store = Self::store(cx);
         let done = if clear {
             store.clear()
@@ -1067,19 +1193,21 @@ impl AiAssistantTab {
             self.saved = Some(store.list());
         }
         if let Some(c) = open {
-            egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(&resp));
+            egui::Popup::close_id(ui.ctx(), popup_id);
             self.open_saved(c, cx);
         }
     }
 
     /// What is sent besides the question.
     fn context_status(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
+        let faint = |text: &str| RichText::new(text).size(12.0).color(p.text_faint);
         if !cx.settings.ai.include_schema_context {
-            ui.weak(tr("Schema context: off"));
+            ui.label(faint(tr("Schema context: off")));
             return;
         }
         let (Some(conn), Some(schema)) = (self.conn.clone(), self.schema.clone()) else {
-            ui.weak(tr("Schema context: none"));
+            ui.label(faint(tr("Schema context: none")));
             return;
         };
         let backend = cx.backend;
@@ -1088,299 +1216,387 @@ impl AiAssistantTab {
         live.meta.request_snapshot(backend, &main, &schema);
         match live.meta.snapshots.get(&schema) {
             Some(l) if l.is_loading() => {
-                ui.spinner();
-                ui.weak(tr("Reading the schema…"));
+                ui.add(egui::Spinner::new().size(12.0).color(p.accent_text));
+                ui.label(faint(tr("Reading the schema…")));
             }
             Some(l) if l.error().is_some() => {
                 let e = l.error().map(|e| e.full_text()).unwrap_or_default();
-                ui.label(RichText::new(format!("{} {}", icon::WARNING, tr("No schema context"))).color(crate::theme::warning_color(ui.visuals().dark_mode))).on_hover_text(e);
+                ui.label(RichText::new(kit::with_icon(icon::WARNING, tr("No schema context"))).size(12.0).color(p.warn)).on_hover_text(e);
             }
             Some(l) => {
                 if let Some(s) = l.get() {
-                    ui.weak(trf("Schema context: {} tables, {} views", &[&s.tables.len(), &s.views.len()]))
+                    ui.add(egui::Label::new(faint(&trf("Schema context: {} tables, {} views", &[&s.tables.len(), &s.views.len()]))).truncate())
                         .on_hover_text(tr("Table and column names of this schema are sent with each question. No data rows are sent."));
                 }
             }
             None => {}
         }
         if cx.settings.ai.send_sample_data {
-            ui.weak(tr("· sample rows on"));
+            ui.label(faint(tr("· sample rows on")));
         }
     }
 
+    /// Nothing can be sent yet: why, and the way to the settings.
     fn setup_ui(ui: &mut Ui, cx: &mut AppContext, status: &AiStatus) {
+        let p = ternarygrid_ui::pal(ui);
+        let (title, body) = match status {
+            AiStatus::Disabled => (
+                tr("The AI assistant is turned off.").to_string(),
+                Some(tr(
+                    "Turn it on in the settings and enter the API key of your provider. Only the schema structure and what you type are sent, and only to the provider you choose.",
+                )),
+            ),
+            AiStatus::MissingKey(provider) => (
+                trf("No API key is saved for {}.", &[provider]),
+                Some(tr("Enter the key in the AI section of the settings. It is kept in the system keychain or the encrypted vault.")),
+            ),
+            AiStatus::Invalid(_) => (tr("The AI settings are incomplete.").to_string(), None),
+            AiStatus::Ready => (String::new(), None),
+        };
+        // In the middle of the panel: the block's height is measured on the frame before.
+        let height_id = ui.id().with("ai_setup_height");
+        let block_h = ui.data(|d| d.get_temp::<f32>(height_id)).unwrap_or(170.0);
         ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
-            crate::widgets::icon_heading(ui, icon::SPARKLE, tr("AI assistant"));
-            ui.add_space(8.0);
-            match status {
-                AiStatus::Disabled => {
-                    ui.label(tr("The AI assistant is turned off."));
-                    ui.weak(tr("Turn it on in the settings and enter the API key of your provider. Only the schema structure and what you type are sent, and only to the provider you choose."));
-                }
-                AiStatus::MissingKey(p) => {
-                    ui.label(trf("No API key is saved for {}.", &[p]));
-                    ui.weak(tr("Enter the key in the AI section of the settings. It is kept in the system keychain or the encrypted vault."));
-                }
-                AiStatus::Invalid(e) => {
-                    ui.label(tr("The AI settings are incomplete."));
-                    crate::widgets::error_box(ui, e);
-                }
-                AiStatus::Ready => {}
+            ui.add_space(((ui.available_height() - block_h) / 2.0).max(20.0));
+            let top = ui.cursor().top();
+            ui.spacing_mut().item_spacing.y = 10.0;
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
+            ui.painter().circle_filled(r.center(), 26.0, p.accent_soft);
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, icon::SPARKLE, style::icon_font(24.0), p.accent_text);
+            kit::semibold_label(ui, &title, 14.0, p.text);
+            if let Some(body) = body {
+                ui.scope(|ui| {
+                    ui.set_max_width(ui.available_width().min(320.0));
+                    ui.add(egui::Label::new(RichText::new(body).size(13.0).color(p.text_muted).line_height(Some(19.5))).wrap());
+                });
             }
-            ui.add_space(8.0);
-            if ui.button((ternarygrid_icons::ic(icon::GEAR), tr("Open settings"))).clicked() {
+            if let AiStatus::Invalid(e) = status {
+                egui::Frame::new().inner_margin(Margin::symmetric(16, 0)).show(ui, |ui| crate::widgets::error_box(ui, e));
+            }
+            if kit::primary_icon(ui, icon::GEAR, tr("Open settings")).clicked() {
                 cx.push(AppCommand::OpenSettings);
             }
+            let h = ui.min_rect().bottom() - top;
+            ui.data_mut(|d| d.insert_temp(height_id, h));
         });
     }
 
-    fn code_block(&self, ui: &mut Ui, cx: &mut AppContext, id: (u64, usize, usize, usize), lang_tag: &str, code: &str, sql: bool) {
+    /// A code block of an answer: its language and actions on a header band, the code under it
+    /// (SQL can be run unless it is the query running now).
+    #[allow(clippy::too_many_arguments)]
+    fn code_block(&self, ui: &mut Ui, cx: &mut AppContext, id: (u64, usize, usize, usize), lang_tag: &str, code: &str, sql: bool, runnable: bool) {
+        let p = ternarygrid_ui::pal(ui);
         let theme = EditorTheme::from_visuals(ui.visuals());
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
-        egui::Frame::group(ui.style()).fill(theme.background).show(ui, |ui| {
+        let label = if sql {
+            "SQL".to_string()
+        } else if lang_tag.is_empty() {
+            tr("Code").to_string()
+        } else {
+            lang_tag.to_string()
+        };
+        egui::Frame::new().fill(p.surface).stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.weak(if sql {
-                    "SQL".to_string()
-                } else if lang_tag.is_empty() {
-                    tr("Code").to_string()
-                } else {
-                    lang_tag.to_string()
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if sql && self.conn.is_some() && ui.small_button((ternarygrid_icons::ic(icon::PLAY), tr("Run"))).on_hover_text(tr("Run in a new SQL editor")).clicked() {
-                        cx.push(AppCommand::RunSqlInEditor { connection: self.conn.clone(), schema: self.schema.clone(), text: editor_text(code) });
-                    }
-                    if sql && ui.small_button((ternarygrid_icons::ic(icon::FILE_SQL), tr("Open in SQL editor"))).clicked() {
-                        self.open_in_editor(cx, code);
-                    }
-                    if ui.small_button((ternarygrid_icons::ic(icon::COPY), tr("Copy"))).clicked() {
-                        ui.ctx().copy_text(code.to_string());
-                    }
-                });
-            });
-            egui::ScrollArea::horizontal().id_salt(("ai_code", id)).auto_shrink([false, true]).show(ui, |ui| {
-                let lang = if sql { self.lang.as_ref().map(|(_, l)| l) } else { None };
-                ui.add(egui::Label::new(highlight_job(code, lang, &theme, font.clone())).selectable(true).extend());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            egui::Frame::new().fill(p.header).corner_radius(CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }).inner_margin(Margin { left: 10, right: 6, top: 4, bottom: 4 }).show(
+                ui,
+                |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.set_min_height(24.0);
+                        ui.label(RichText::new(label).size(11.5).color(p.text_faint));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), true).clicked() {
+                                ui.ctx().copy_text(code.to_string());
+                            }
+                            if sql && kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FILE_CODE), tr("Open in SQL editor"), true).clicked() {
+                                self.open_in_editor(cx, code);
+                            }
+                            if sql
+                                && runnable
+                                && self.conn.is_some()
+                                && kit::button_full(ui, kit::Kind::Ghost, Some(icon::PLAY), tr("Run"), true, true).on_hover_text(tr("Run in a new SQL editor")).clicked()
+                            {
+                                cx.push(AppCommand::RunSqlInEditor { connection: self.conn.clone(), schema: self.schema.clone(), text: editor_text(code) });
+                            }
+                        });
+                    });
+                },
+            );
+            parts::hline(ui);
+            // Long lines scroll sideways without a bar (as designed, the code is cut at the edge).
+            egui::Frame::new().inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt(("ai_code", id))
+                    .auto_shrink([false, true])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        let lang = if sql { self.lang.as_ref().map(|(_, l)| l) } else { None };
+                        ui.add(egui::Label::new(highlight_job(code, lang, &theme, FontId::monospace(12.5))).selectable(true).extend());
+                    });
             });
         });
     }
 
-    /// A query the assistant ran: collapsed to one line, opening on its SQL
-    /// and result.
+    /// A query the assistant ran: one line ("Ran a query · 3 row(s)") over its result (open at
+    /// first; the line folds it). Its SQL shows with "SQL" at the right of the line (at once
+    /// when the query failed or returned no columns).
     fn step_ui(&self, ui: &mut Ui, cx: &mut AppContext, step: &ToolStep, id: (u64, usize, usize)) {
-        let dark = ui.visuals().dark_mode;
-        let title = if step.ok {
-            RichText::new(format!("{} {} · {}", icon::DATABASE, tr("Ran a query"), step.summary))
-        } else {
-            RichText::new(format!("{} {}", icon::WARNING, tr("The query did not run"))).color(crate::theme::warning_color(dark))
-        };
-        egui::CollapsingHeader::new(title).id_salt(("ai_step", id)).show(ui, |ui| {
-            self.code_block(ui, cx, (id.0, id.1, usize::MAX - 1 - id.2, 0), "", &step.sql, true);
+        let p = ternarygrid_ui::pal(ui);
+        let open_id = egui::Id::new(("ai_step_open", id));
+        let sql_id = egui::Id::new(("ai_step_sql", id));
+        let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(true);
+        let mut show_sql = ui.data(|d| d.get_temp::<bool>(sql_id)).unwrap_or(!step.ok || step.columns.is_empty());
+        egui::Frame::new().stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+            let title = if step.ok { format!("{} · {}", tr("Ran a query"), step.summary) } else { tr("The query did not run").to_string() };
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
+            resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, open, &title));
+            // "SQL" at the right end of the line: shows or hides the statement.
+            let sql_g = ui.painter().layout_no_wrap("SQL".to_string(), FontId::proportional(11.5), p.text_faint);
+            let sql_rect = Rect::from_min_max(egui::pos2(rect.right() - sql_g.size().x - 8.0, rect.top()), rect.max);
+            let sql_resp = ui.interact(sql_rect, ui.id().with(("ai_step_sql_btn", id)), Sense::click()).on_hover_text(tr("Show the query"));
+            sql_resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, show_sql, "SQL"));
+            if sql_resp.clicked() {
+                show_sql = !show_sql;
+                open = open || show_sql;
+                ui.data_mut(|d| {
+                    d.insert_temp(sql_id, show_sql);
+                    d.insert_temp(open_id, open);
+                });
+            } else if resp.clicked() {
+                open = !open;
+                ui.data_mut(|d| d.insert_temp(open_id, open));
+            }
+            let sql_color = if show_sql {
+                p.accent_text
+            } else if sql_resp.hovered() {
+                p.text
+            } else {
+                p.text_faint
+            };
+            ui.painter().galley(egui::pos2(sql_rect.right() - sql_g.size().x, rect.center().y - sql_g.size().y / 2.0), sql_g, sql_color);
+            let painter = ui.painter();
+            let cy = rect.center().y;
+            let caret = if open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
+            painter.text(egui::pos2(rect.left() + 5.0, cy), Align2::CENTER_CENTER, caret, style::icon_font(11.0), p.text_faint);
+            let (glyph, color) = if step.ok { (icon::DATABASE, p.text_muted) } else { (icon::WARNING, p.warn) };
+            // The design's row: the caret (11), 8, the icon (13), 8, the text.
+            painter.text(egui::pos2(rect.left() + 25.5, cy), Align2::CENTER_CENTER, glyph, style::icon_font(13.0), color);
+            let text_color = if !step.ok {
+                p.warn
+            } else if resp.hovered() {
+                p.text
+            } else {
+                p.text_muted
+            };
+            painter.text(egui::pos2(rect.left() + 40.0, cy), Align2::LEFT_CENTER, &title, FontId::proportional(12.5), text_color);
+            if resp.has_focus() {
+                painter.rect_stroke(rect.expand(2.0), CornerRadius::same(style::RADIUS), Stroke::new(1.5, p.accent), StrokeKind::Outside);
+            }
+            if !open {
+                return;
+            }
             if !step.ok {
                 crate::widgets::error_box(ui, &step.summary);
-                return;
+            } else if !step.columns.is_empty() {
+                result_table(ui, ("ai_step_rows", id), &step.columns, &step.rows);
             }
-            if step.columns.is_empty() {
-                return;
+            if show_sql {
+                self.code_block(ui, cx, (id.0, id.1, usize::MAX - 1 - id.2, 0), "", &step.sql, true, true);
             }
-            egui::ScrollArea::both().id_salt(("ai_step_rows", id)).max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                egui::Grid::new(("ai_step_grid", id)).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
-                    for c in &step.columns {
-                        ui.label(RichText::new(c).strong());
-                    }
-                    ui.end_row();
-                    for r in &step.rows {
-                        for v in r {
-                            ui.add(egui::Label::new(RichText::new(v).monospace()).truncate());
-                        }
-                        ui.end_row();
-                    }
-                });
-            });
         });
     }
 
     fn segments_ui(&self, ui: &mut Ui, cx: &mut AppContext, segments: &[AnswerSegment], id: (u64, usize, usize)) {
+        let p = ternarygrid_ui::pal(ui);
         for (i, s) in segments.iter().enumerate() {
             match s {
                 AnswerSegment::Text(t) => {
-                    ui.add(egui::Label::new(t.as_str()).wrap().selectable(true));
+                    ui.add(egui::Label::new(RichText::new(t.as_str()).size(13.0).color(p.text).line_height(Some(19.5))).wrap().selectable(true));
                 }
-                AnswerSegment::Code { lang, code, sql } => self.code_block(ui, cx, (id.0, id.1, id.2, i), lang, code, *sql),
+                AnswerSegment::Code { lang, code, sql } => self.code_block(ui, cx, (id.0, id.1, id.2, i), lang, code, *sql, true),
             }
         }
     }
 
     fn conversation_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
         if self.turns.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-                ui.weak(tr("Ask a question or choose a quick action below. SQL in answers can be copied or opened in a SQL editor."));
+            egui::Frame::new().inner_margin(Margin::symmetric(24, 30)).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(tr("Ask a question or choose a quick action below. SQL in answers can be copied or opened in a SQL editor."))
+                                .color(p.text_faint)
+                                .line_height(Some(19.5)),
+                        )
+                        .wrap(),
+                    );
+                });
             });
             return;
         }
-        let dark = ui.visuals().dark_mode;
         egui::ScrollArea::vertical().id_salt(("ai_chat", self.uid)).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-            for ti in 0..self.turns.len() {
-                let (action, shown, state, model, usage, truncated, fallback, answer_empty) = {
-                    let t = &self.turns[ti];
-                    (t.action, t.shown.clone(), t.state.clone(), t.model.clone(), t.usage, t.truncated, t.fallback_from.clone(), t.answer.trim().is_empty())
-                };
-                let (steps, running, after_step) = {
-                    let t = &self.turns[ti];
-                    (t.steps.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>(), t.running.clone(), t.steps.last().is_some_and(|(at, _)| *at >= t.answer.len()))
-                };
-                // question
-                egui::Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(6.0).inner_margin(8.0).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
+            egui::Frame::new().inner_margin(Margin::same(14)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 14.0;
+                for ti in 0..self.turns.len() {
+                    self.turn_ui(ui, cx, ti);
+                }
+            });
+        });
+    }
+
+    /// One question (a bubble at the right) and its answer.
+    fn turn_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, ti: usize) {
+        let p = ternarygrid_ui::pal(ui);
+        let (shown, state, model, usage, truncated, fallback, answer_empty) = {
+            let t = &self.turns[ti];
+            (t.shown.clone(), t.state.clone(), t.model.clone(), t.usage, t.truncated, t.fallback_from.clone(), t.answer.trim().is_empty())
+        };
+        let (steps, running, after_step) = {
+            let t = &self.turns[ti];
+            (t.steps.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>(), t.running.clone(), t.steps.last().is_some_and(|(at, _)| *at >= t.answer.len()))
+        };
+        // The question (88 % as wide as the panel, as the design measures it).
+        let bubble_w = (ui.available_width() + 28.0) * 0.88;
+        ui.with_layout(Layout::top_down(Align::Max), |ui| {
+            egui::Frame::new().fill(p.subtle).corner_radius(CornerRadius::same(style::RADIUS_LG)).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
+                ui.set_max_width(bubble_w - 24.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} {}", icon::USER, tr("You"))).strong());
-                        if action != QuickAction::Chat {
-                            ui.weak(format!("{} {}", action.icon(), action.label()));
-                        }
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        icon_box(ui, icon::USER, 13.0, p.text_muted);
+                        // The question's text names its action ("Fix error: …").
+                        kit::semibold_label(ui, tr("You"), 12.5, p.text);
                     });
                     let segs = answer_segments(&shown);
                     self.segments_ui(ui, cx, &segs, (self.uid, ti, 0));
                 });
-                ui.add_space(4.0);
-                // answer
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} {}", icon::SPARKLE, tr("Assistant"))).strong());
-                    if let Some(m) = &model {
-                        ui.weak(m);
-                    }
-                });
-                match &state {
-                    TurnState::Preparing => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak(tr("Reading from the database…"));
-                        });
-                    }
-                    TurnState::Streaming if answer_empty && steps.is_empty() && running.is_none() => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak(tr("Thinking…"));
-                        });
-                    }
-                    _ => {}
+            });
+        });
+        // The answer.
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                icon_box(ui, icon::SPARKLE, 13.0, p.accent_text);
+                kit::semibold_label(ui, tr("Assistant"), 12.5, p.text);
+                if let Some(m) = &model {
+                    ui.label(RichText::new(m).size(11.0).color(p.text_faint));
                 }
-                let parts = self.turns[ti].parts().to_vec();
-                for (pi, segs) in parts.iter().enumerate() {
-                    self.segments_ui(ui, cx, segs, (self.uid, ti, 1 + pi));
-                    if let Some(step) = steps.get(pi) {
-                        self.step_ui(ui, cx, step, (self.uid, ti, pi));
+            });
+            match &state {
+                TurnState::Preparing => {
+                    parts::spinner_label(ui, tr("Reading from the database…"));
+                }
+                TurnState::Streaming if answer_empty && steps.is_empty() && running.is_none() => {
+                    parts::spinner_label(ui, tr("Thinking…"));
+                }
+                _ => {}
+            }
+            let parts_ = self.turns[ti].parts().to_vec();
+            for (pi, segs) in parts_.iter().enumerate() {
+                self.segments_ui(ui, cx, segs, (self.uid, ti, 1 + pi));
+                if let Some(step) = steps.get(pi) {
+                    self.step_ui(ui, cx, step, (self.uid, ti, pi));
+                }
+            }
+            if state == TurnState::Streaming {
+                if let Some(sql) = &running {
+                    parts::spinner_label(ui, tr("Running a query…"));
+                    self.code_block(ui, cx, (self.uid, ti, usize::MAX, 0), "", sql, true, false);
+                } else if after_step {
+                    parts::spinner_label(ui, tr("Thinking…"));
+                }
+            }
+            let faint = |text: String| RichText::new(text).size(11.5).color(p.text_faint);
+            match &state {
+                TurnState::Stopped => {
+                    ui.label(faint(kit::with_icon(icon::STOP, tr("Stopped."))));
+                }
+                TurnState::Failed(e) => crate::widgets::error_box(ui, e),
+                TurnState::Refused(e) => {
+                    ui.label(RichText::new(kit::with_icon(icon::WARNING, tr("The model declined to answer this request."))).color(p.warn));
+                    ui.label(faint(e.clone()));
+                }
+                TurnState::Done => {
+                    if truncated {
+                        ui.label(RichText::new(kit::with_icon(icon::WARNING, tr("The answer was cut off at the token limit."))).color(p.warn));
+                    }
+                    if let (Some(from), Some(m)) = (&fallback, &model) {
+                        ui.label(faint(trf("Answered by {} because {} declined.", &[m, from])));
+                    }
+                    if let Some(u) = usage {
+                        let input = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
+                        ui.label(faint(trf("{} input / {} output tokens", &[&grouped(input), &grouped(u.output_tokens)])));
                     }
                 }
-                if state == TurnState::Streaming {
-                    if let Some(sql) = &running {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak(tr("Running a query…"));
-                        });
-                        self.code_block(ui, cx, (self.uid, ti, usize::MAX, 0), "", sql, true);
-                    } else if after_step {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak(tr("Thinking…"));
-                        });
-                    }
-                }
-                match &state {
-                    TurnState::Stopped => {
-                        ui.weak(format!("{} {}", icon::STOP, tr("Stopped.")));
-                    }
-                    TurnState::Failed(e) => crate::widgets::error_box(ui, e),
-                    TurnState::Refused(e) => {
-                        ui.label(RichText::new(format!("{} {}", icon::WARNING, tr("The model declined to answer this request."))).color(crate::theme::warning_color(dark)));
-                        ui.weak(e);
-                    }
-                    TurnState::Done => {
-                        if truncated {
-                            ui.label(RichText::new(format!("{} {}", icon::WARNING, tr("The answer was cut off at the token limit."))).color(crate::theme::warning_color(dark)));
-                        }
-                        if let (Some(from), Some(m)) = (&fallback, &model) {
-                            ui.weak(trf("Answered by {} because {} declined.", &[m, from]));
-                        }
-                        if let Some(u) = usage {
-                            ui.weak(trf("{} input / {} output tokens", &[&(u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens), &u.output_tokens]));
-                        }
-                    }
-                    _ => {}
-                }
-                ui.add_space(10.0);
+                _ => {}
             }
         });
     }
 
     fn composer_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            for a in QuickAction::ALL {
-                ui.selectable_value(&mut self.action, a, format!("{} {}", a.icon(), a.label()));
-            }
-        });
-        let connected = self.conn.as_ref().is_some_and(|c| cx.conns.is_connected(c));
-        match self.action {
-            QuickAction::Describe if connected => self.object_picker(ui, cx),
-            QuickAction::Optimize if connected => {
-                ui.checkbox(&mut self.include_plan, tr("Include the execution plan (EXPLAIN runs on the connection, the query is not executed)"));
-            }
-            _ => {}
-        }
-        let busy = self.pending.is_some();
-        let mut send = false;
-        let rows = if self.action.takes_sql() || self.action == QuickAction::Describe { 4 } else { 2 };
-        let mut edit = egui::TextEdit::multiline(&mut self.input)
-            .hint_text(self.action.hint())
-            .desired_rows(rows)
-            .desired_width(f32::INFINITY)
-            .return_key(NEW_LINE)
-            .id_salt(("ai_input", self.uid));
-        if self.action.takes_sql() || self.action == QuickAction::Describe {
-            edit = edit.code_editor();
-        }
-        let resp = ui.add(edit);
-        if self.focus_input {
-            self.focus_input = false;
-            resp.request_focus();
-        }
-        if resp.has_focus() && enter_pressed(ui) {
-            send = true;
-        }
-        if self.action == QuickAction::FixError {
-            let r = ui.add(
-                egui::TextEdit::multiline(&mut self.error_input)
-                    .hint_text(tr("Error message from the database"))
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .return_key(NEW_LINE)
-                    .id_salt(("ai_error", self.uid)),
-            );
-            if r.has_focus() && enter_pressed(ui) {
-                send = true;
-            }
-        }
-        ui.horizontal(|ui| {
-            if busy {
-                if ui.button(RichText::new(format!("{} {}", icon::STOP, tr("Stop"))).color(crate::theme::error_color(ui.visuals().dark_mode))).clicked() {
-                    self.stop();
+        let p = ternarygrid_ui::pal(ui);
+        egui::Frame::new().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                for a in QuickAction::ALL {
+                    if action_chip(ui, a.icon(), a.label(), self.action == a).clicked() {
+                        self.action = a;
+                    }
                 }
-                ui.spinner();
-            } else if ui.button(RichText::new(format!("{} {}", icon::PAPER_PLANE_RIGHT, tr("Send"))).strong()).clicked() {
+            });
+            let connected = self.conn.as_ref().is_some_and(|c| cx.conns.is_connected(c));
+            match self.action {
+                QuickAction::Describe if connected => self.object_picker(ui, cx),
+                QuickAction::Optimize if connected => {
+                    kit::checkbox(ui, &mut self.include_plan, tr("Include the execution plan (EXPLAIN runs on the connection, the query is not executed)"));
+                }
+                _ => {}
+            }
+            let busy = self.pending.is_some();
+            let mut send = false;
+            let code = self.action.takes_sql() || self.action == QuickAction::Describe;
+            let rows = if code { 4 } else { 2 };
+            let resp = input_box(ui, &mut self.input, ("ai_input", self.uid), self.action.hint(), rows, code);
+            if self.focus_input {
+                self.focus_input = false;
+                resp.request_focus();
+            }
+            if resp.has_focus() && enter_pressed(ui) {
                 send = true;
             }
-            let (enter, shift_enter) = if crate::keys::IS_MAC { ("↩", "⇧↩") } else { ("Enter", "Shift+Enter") };
-            ui.weak(trf("{} to send, {} for a new line", &[&enter, &shift_enter]));
+            if self.action == QuickAction::FixError {
+                let r = input_box(ui, &mut self.error_input, ("ai_error", self.uid), tr("Error message from the database"), 2, false);
+                if r.has_focus() && enter_pressed(ui) {
+                    send = true;
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if busy {
+                    if kit::button_ex(ui, kit::Kind::Danger, Some(icon::STOP), tr("Stop"), true).clicked() {
+                        self.stop();
+                    }
+                    ui.add(egui::Spinner::new().size(14.0).color(p.accent_text));
+                } else if kit::button_ex(ui, kit::Kind::Primary, Some(icon::PAPER_PLANE_TILT), tr("Send"), true).clicked() {
+                    send = true;
+                }
+                let (enter, shift_enter) = if crate::keys::IS_MAC { ("↩", "⇧↩") } else { ("Enter", "Shift+Enter") };
+                ui.label(RichText::new(trf("{} to send, {} for a new line", &[&enter, &shift_enter])).size(11.5).color(p.text_faint));
+            });
             if let Some(n) = &self.notice {
-                ui.label(RichText::new(n).color(crate::theme::warning_color(ui.visuals().dark_mode)));
+                ui.add(egui::Label::new(RichText::new(kit::with_icon(icon::WARNING, n)).size(12.5).color(p.warn)).wrap());
+            }
+            if send && !busy {
+                self.send(cx);
             }
         });
-        if send && !busy {
-            self.send(cx);
-        }
     }
 
     /// Send the question of [`AiAssistantTab::ask_about`] once the connection
@@ -1414,15 +1630,18 @@ impl AiAssistantTab {
     }
 
     fn object_picker(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
         let Some(snap) = self.snapshot(cx) else {
-            ui.weak(tr("Choose a schema to pick an object, or paste its definition below."));
+            ui.label(RichText::new(tr("Choose a schema to pick an object, or paste its definition below.")).size(12.5).color(p.text_faint));
             return;
         };
         ui.horizontal(|ui| {
-            ui.label(tr("Object:"));
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.set_min_height(style::CONTROL_H);
+            ui.label(RichText::new(tr("Object:")).color(p.text_muted));
             let label = self.object.as_ref().map(|o| o.name.clone()).unwrap_or_else(|| tr("(paste a definition)").to_string());
-            egui::ComboBox::from_id_salt(("ai_obj", self.uid)).selected_text(label).width(240.0).show_ui(ui, |ui| {
-                if ui.selectable_label(self.object.is_none(), tr("(paste a definition)")).clicked() {
+            crate::tabs::table_designer::select(ui, ("ai_obj", self.uid), label, 240.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                if pick(ui, self.object.is_none(), tr("(paste a definition)")) {
                     self.object = None;
                 }
                 let db = self.schema.as_ref().and_then(|s| s.database.clone());
@@ -1432,16 +1651,221 @@ impl AiAssistantTab {
                 for o in items {
                     let o = o.with_database(db.clone());
                     let on = self.object.as_ref() == Some(&o);
-                    if ui.selectable_label(on, format!("{} {}", crate::nav::kind_icon(o.kind), o.name)).clicked() {
+                    let clicked = if on { pick(ui, true, &o.name) } else { kit::menu_item(ui, Some(crate::nav::kind_icon(o.kind)), &o.name, "").clicked() };
+                    if clicked {
                         self.object = Some(o);
                     }
                 }
             });
             if cx.settings.ai.send_sample_data && self.object.as_ref().is_some_and(|o| o.kind.has_data()) {
-                ui.weak(trf("The first {} rows are sent as a sample.", &[&SAMPLE_ROWS]));
+                ui.label(RichText::new(trf("The first {} rows are sent as a sample.", &[&SAMPLE_ROWS])).size(12.0).color(p.text_faint));
             }
         });
     }
+}
+
+/// `n` with its thousands grouped by commas (token counts).
+fn grouped(n: impl std::fmt::Display) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) && c.is_ascii_digit() {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A quick action chip: its icon and name, the chosen one on the accent tint.
+fn action_chip(ui: &mut Ui, glyph: &str, text: &str, on: bool) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    let label = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(12.0), Color32::PLACEHOLDER);
+    let icon_g = ui.painter().layout_no_wrap(glyph.to_string(), style::icon_font(12.5), Color32::PLACEHOLDER);
+    let width = 10.0 + icon_g.size().x + 5.0 + label.size().x + 10.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, on, text));
+    if ui.is_rect_visible(rect) {
+        let hovered = resp.hovered();
+        let (fill, color) = if on {
+            (p.accent_soft, p.accent_text)
+        } else if hovered {
+            (p.subtle, p.text)
+        } else {
+            (p.subtle, p.text_muted)
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(13), fill);
+        let iw = icon_g.size().x;
+        painter.galley(egui::pos2(rect.left() + 10.0, rect.center().y - icon_g.size().y / 2.0), icon_g, color);
+        painter.galley(egui::pos2(rect.left() + 15.0 + iw, rect.center().y - label.size().y / 2.0), label, color);
+        if resp.has_focus() {
+            style::focus_halo(ui, rect, 13);
+        }
+    }
+    resp
+}
+
+/// A multi-line input on a rounded surface (the composer's question and error message);
+/// Enter is left to the caller (it sends), Shift+Enter starts a new line.
+fn input_box(ui: &mut Ui, text: &mut String, id: impl std::hash::Hash + std::fmt::Debug, hint: &str, rows: usize, code: bool) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    let out = egui::Frame::new().fill(p.surface).stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let mut edit = egui::TextEdit::multiline(text)
+            .frame(egui::Frame::NONE)
+            .margin(Margin::ZERO)
+            .hint_text(RichText::new(hint).color(p.text_faint))
+            .desired_rows(rows)
+            // The design's question box is 64 high (its text 46).
+            .min_size(vec2(0.0, if code { 0.0 } else { 46.0 }))
+            .desired_width(f32::INFINITY)
+            .return_key(NEW_LINE)
+            .id_salt(id);
+        if code {
+            edit = edit.code_editor();
+        }
+        ui.add(edit)
+    });
+    if out.inner.has_focus() {
+        style::focus_halo(ui, out.response.rect, 8);
+    }
+    out.inner
+}
+
+/// What was clicked in an entry of the history.
+enum HistoryClick {
+    Open,
+    Delete,
+}
+
+/// An entry of the history: its title, where and when, and a trash button; the current
+/// conversation on the accent tint.
+fn history_item(ui: &mut Ui, title: &str, detail: &str, current: bool) -> Option<HistoryClick> {
+    let p = ternarygrid_ui::pal(ui);
+    // 8 × 10 of padding, the title's line as tall as the trash button (22), 2, the detail.
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, current, title));
+    let trash_rect = Rect::from_center_size(egui::pos2(rect.right() - 21.0, rect.top() + 19.0), Vec2::splat(22.0));
+    let trash = ui.interact(trash_rect, resp.id.with("delete"), Sense::click()).on_hover_text(tr("Delete"));
+    trash.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, tr("Delete")));
+    let resp = resp.on_hover_text(title);
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if current {
+            painter.rect_filled(rect, CornerRadius::same(style::RADIUS), p.accent_soft);
+        } else if resp.hovered() || trash.hovered() {
+            painter.rect_filled(rect, CornerRadius::same(style::RADIUS), p.hover);
+        }
+        if trash.hovered() {
+            painter.rect_filled(trash_rect, CornerRadius::same(style::RADIUS), p.subtle);
+        }
+        let trash_color = if trash.hovered() { p.text } else { p.text_muted };
+        painter.text(trash_rect.center(), Align2::CENTER_CENTER, icon::TRASH, style::icon_font(11.0), trash_color);
+        let font = if current { style::medium(ui.ctx(), 13.0) } else { FontId::proportional(13.0) };
+        let max_w = (rect.width() - 50.0).max(40.0);
+        let mut job = egui::text::LayoutJob::simple_singleline(title.to_string(), font, p.text);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
+        let g = painter.layout_job(job);
+        painter.galley(egui::pos2(rect.left() + 10.0, rect.top() + 19.0 - g.size().y / 2.0), g, p.text);
+        let mut job = egui::text::LayoutJob::simple_singleline(detail.to_string(), FontId::proportional(11.5), p.text_faint);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
+        painter.galley(egui::pos2(rect.left() + 10.0, rect.top() + 32.0), painter.layout_job(job), p.text_faint);
+    }
+    if trash.clicked() {
+        Some(HistoryClick::Delete)
+    } else if resp.clicked() {
+        Some(HistoryClick::Open)
+    } else {
+        None
+    }
+}
+
+/// An icon in a `size` square (as the design's SVG icons take their size).
+fn icon_box(ui: &mut Ui, glyph: &str, size: f32, color: Color32) {
+    let (r, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, glyph, style::icon_font(size), color);
+}
+
+/// The rows a query of the assistant returned, as a small bordered table (numbers at the right).
+fn result_table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, columns: &[String], rows: &[Vec<String>]) {
+    let p = ternarygrid_ui::pal(ui);
+    let numeric: Vec<bool> = (0..columns.len()).map(|i| !rows.is_empty() && rows.iter().all(|r| r.get(i).is_some_and(|v| looks_numeric(v)))).collect();
+    // The design's table: a 32 point header and rows of 26, each with its hairline.
+    let (head_h, row_h) = (33.0, 27.0);
+    // The design stripes the second, fourth… row; egui the first, third…: the frame shows the
+    // stripe through the rows egui leaves bare, and egui's stripes are the surface.
+    parts::bordered(ui).fill(p.stripe).show(ui, |ui| {
+        let r = ui.max_rect();
+        let band = Rect::from_min_size(r.min, vec2(r.width(), head_h));
+        ui.painter().rect_filled(band, CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, p.header);
+        ui.painter().hline(band.x_range(), band.bottom() - 0.5, Stroke::new(1.0, p.border));
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        ui.visuals_mut().faint_bg_color = p.surface;
+        ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
+        egui::ScrollArea::horizontal().id_salt(("ai_rows_h", &id)).auto_shrink([false, true]).show(ui, |ui| {
+            let room = ui.available_width();
+            let mut tb = egui_extras::TableBuilder::new(ui)
+                .id_salt(("ai_rows", &id))
+                .striped(true)
+                .auto_shrink([false, true])
+                .max_scroll_height(220.0)
+                .vscroll(rows.len() > 8)
+                .cell_layout(Layout::left_to_right(Align::Center));
+            // The first column 1.4 shares, numbers in the middle 0.6, the others 1 (as designed).
+            let weights: Vec<f32> = (0..columns.len())
+                .map(|i| {
+                    if i == 0 {
+                        1.4
+                    } else if numeric[i] && i + 1 < columns.len() {
+                        0.6
+                    } else {
+                        1.0
+                    }
+                })
+                .collect();
+            let total: f32 = weights.iter().sum();
+            for (i, w) in weights.iter().enumerate() {
+                tb = if i + 1 == weights.len() {
+                    tb.column(egui_extras::Column::remainder().at_least(60.0).clip(true))
+                } else {
+                    tb.column(egui_extras::Column::exact((room * w / total).floor().max(60.0)).clip(true))
+                };
+            }
+            let cell = |ui: &mut Ui, text: RichText, right: bool| {
+                let layout = if right { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
+                ui.with_layout(layout, |ui| {
+                    ui.add_space(10.0);
+                    ui.add(egui::Label::new(text).truncate());
+                    ui.add_space(10.0);
+                });
+            };
+            tb.header(head_h, |mut h| {
+                for (i, c) in columns.iter().enumerate() {
+                    h.col(|ui| cell(ui, RichText::new(c).font(style::semibold(ui.ctx(), 12.0)).color(p.text_muted), numeric[i]));
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, rows.len(), |mut row| {
+                    let Some(values) = rows.get(row.index()) else { return };
+                    for (i, _) in columns.iter().enumerate() {
+                        let v = values.get(i).map(String::as_str).unwrap_or("");
+                        row.col(|ui| {
+                            let r = ui.max_rect();
+                            ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.line));
+                            cell(ui, RichText::new(v).size(13.0).color(p.text), numeric[i]);
+                        });
+                    }
+                });
+            });
+        });
+    });
+}
+
+/// A value shown at the right of its column: a number, with grouping commas or a decimal point.
+fn looks_numeric(v: &str) -> bool {
+    let t = v.trim();
+    !t.is_empty() && t.chars().any(|c| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '-' | '+' | 'e' | 'E'))
 }
 
 impl TabView for AiAssistantTab {
@@ -1468,17 +1892,21 @@ impl TabView for AiAssistantTab {
         }
         self.sync_language(cx);
         let status = self.status(cx);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        self.header(ui, cx);
         if status != AiStatus::Ready {
-            self.header(ui, cx);
-            ui.separator();
             Self::setup_ui(ui, cx, &status);
             return;
         }
-        self.header(ui, cx);
-        ui.separator();
         self.maybe_auto_send(cx);
-        egui::Panel::bottom(egui::Id::new(("ai_composer", self.uid))).resizable(true).default_size(170.0).size_range(110.0..=600.0).show(ui, |ui| self.composer_ui(ui, cx));
-        egui::CentralPanel::default().show(ui, |ui| self.conversation_ui(ui, cx));
+        let p = ternarygrid_ui::pal(ui);
+        egui::Panel::bottom(egui::Id::new(("ai_composer", self.uid)))
+            .resizable(true)
+            .default_size(200.0)
+            .size_range(110.0..=600.0)
+            .frame(egui::Frame::new().fill(p.canvas))
+            .show(ui, |ui| self.composer_ui(ui, cx));
+        egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| self.conversation_ui(ui, cx));
         if self.pending.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
@@ -1490,4 +1918,17 @@ impl TabView for AiAssistantTab {
     }
 
     crate::impl_tab_any!();
+}
+
+#[cfg(test)]
+mod look_tests {
+    use super::grouped;
+
+    #[test]
+    fn token_counts_are_grouped() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(318), "318");
+        assert_eq!(grouped(2104), "2,104");
+        assert_eq!(grouped(1_234_567u64), "1,234,567");
+    }
 }

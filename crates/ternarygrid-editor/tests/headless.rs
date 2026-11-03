@@ -1044,3 +1044,88 @@ fn folding_and_occurrences() {
     h.state.unfold_all();
     h.frame(vec![]);
 }
+
+#[test]
+fn accesskit_value_of_large_documents_is_the_cursor_line() {
+    let text: String = (0..20_000).map(|i| format!("select {i};\n")).collect();
+    assert!(text.len() > 100_000);
+    let mut h = Harness::new(&text);
+    h.ctx.enable_accesskit();
+    h.focus();
+    let ctx = h.ctx.clone();
+    let line = h.state.line_range(12_345);
+    h.state.set_cursor(&ctx, line.start);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let update = h.accesskit.take().expect("accesskit update");
+    let editor = h.state.id().accesskit_id();
+    let node = update
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == editor)
+        .map(|(_, n)| n)
+        .expect("editor node");
+    assert_eq!(node.value(), Some("select 12345;"));
+}
+
+#[test]
+fn ime_delete_surrounding_stays_on_the_cursor_line() {
+    let mut h = Harness::new("abc\ndef");
+    h.focus();
+    let ctx = h.ctx.clone();
+    h.state.set_cursor(&ctx, 2);
+    h.frame(vec![]);
+    h.frame(vec![Event::Ime(ImeEvent::DeleteSurrounding {
+        before_chars: 5,
+        after_chars: 5,
+    })]);
+    assert_eq!(h.text(), "\ndef", "only the cursor line's text is deleted");
+    assert_eq!(h.state.cursor(), 0);
+    h.state.set_cursor(&ctx, h.text().len());
+    h.frame(vec![]);
+    h.frame(vec![Event::Ime(ImeEvent::DeleteSurrounding {
+        before_chars: 1,
+        after_chars: 3,
+    })]);
+    assert_eq!(h.text(), "\nde");
+}
+
+#[test]
+fn option_letter_shortcut_helper_keeps_text_of_other_keys() {
+    let ctx = egui::Context::default();
+    let shortcut = egui::KeyboardShortcut::new(Modifiers::ALT, Key::X);
+    let key = |key: Key, pressed: bool, modifiers: Modifiers| Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers,
+    };
+    // Alt+X produced no text (Windows / Linux); "y" was typed in the same frame.
+    let input = RawInput {
+        events: vec![
+            key(Key::X, true, Modifiers::ALT),
+            key(Key::X, false, Modifiers::ALT),
+            key(Key::Y, true, Modifiers::NONE),
+            Event::Text("y".into()),
+        ],
+        ..Default::default()
+    };
+    let mut found = false;
+    let mut texts = Vec::new();
+    ctx.run_ui(input, |ui| {
+        found = consume_shortcut_with_text(ui.ctx(), &shortcut);
+        texts = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        });
+    })
+    .drop_without_applying_deltas();
+    assert!(found);
+    assert_eq!(texts, vec!["y".to_owned()]);
+}

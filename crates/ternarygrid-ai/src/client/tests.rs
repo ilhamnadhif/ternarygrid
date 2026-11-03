@@ -182,7 +182,7 @@ async fn anthropic_streaming_end_to_end() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["max_tokens"], 16000);
     assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
-    assert_eq!(body["output_config"]["effort"], "medium");
+    assert_eq!(body["output_config"]["effort"], "high");
     assert_eq!(body["messages"][0]["content"], "How many users?");
     assert!(body.get("fallbacks").is_none() && body.get("thinking").is_none());
 }
@@ -249,7 +249,7 @@ async fn rejected_fallback_beta_is_retried_without_it() {
     assert_eq!(seen[0].json()["fallbacks"], "default");
     assert!(seen[1].header("anthropic-beta").is_none());
     assert!(seen[1].json().get("fallbacks").is_none());
-    assert_eq!(seen[1].json()["output_config"]["effort"], "medium", "effort is kept");
+    assert_eq!(seen[1].json()["output_config"]["effort"], "high", "effort is kept");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -388,4 +388,33 @@ async fn connection_errors_and_local_validation() {
     assert!(AiClient::new(AiConfig::default()).is_err(), "first-party API needs a key");
     let dbg = format!("{client:?}");
     assert!(!dbg.contains("sk-ant-test-key"));
+}
+
+fn read_capped(stream: &str, max_line: usize, max_event: usize) -> DbResult<Streamed> {
+    let mut deltas = Vec::new();
+    read_events(
+        AiProviderKind::Anthropic,
+        std::io::Cursor::new(stream.as_bytes().to_vec()),
+        &mut |t: &str| deltas.push(t.to_string()),
+        &CancellationToken::new(),
+        max_line,
+        max_event,
+    )
+}
+
+#[test]
+fn oversized_lines_and_events_fail_instead_of_buffering() {
+    let ok = text_stream("claude-opus-5-5", &["fine"], "end_turn");
+    assert!(matches!(read_capped(&ok, 1024, 4096), Ok(Streamed::Done(_))));
+    // One endless line (no newline ever comes).
+    let long_line = format!("data: {}", "x".repeat(5000));
+    let e = read_capped(&long_line, 1024, 1 << 20).err().expect("line cap");
+    assert_eq!(e.kind, ErrorKind::Connection);
+    assert!(e.message.contains("line longer than 1024 bytes"), "{e}");
+    // Short lines that never end the event (no blank line).
+    let long_event = "data: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(200);
+    let e = read_capped(&long_event, 1024, 4096).err().expect("event cap");
+    assert!(e.message.contains("event larger than 4096 bytes"), "{e}");
+    // The real limits are generous.
+    const { assert!(MAX_SSE_LINE >= 1 << 20 && MAX_SSE_EVENT >= MAX_SSE_LINE) };
 }

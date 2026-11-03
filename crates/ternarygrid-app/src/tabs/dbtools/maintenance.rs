@@ -8,7 +8,9 @@ use crate::command::AppCommand;
 use crate::conn::session::SessionHandle;
 use crate::cx::AppContext;
 use crate::ops::{OpHandle, OpProgress, OpState};
+use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
+use crate::tabs::dbtools::look;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use parking_lot::Mutex;
@@ -19,6 +21,7 @@ use ternarygrid_core::admin::{MaintenanceOp, TabularData};
 use ternarygrid_core::driver::{ExecOptions, ResultHeader, ServerMessage, TransactionMode};
 use ternarygrid_core::meta::{ObjectKind, ObjectRef};
 use ternarygrid_core::{DbResult, Dialect, tr, trf};
+use ternarygrid_ui::{kit, parts};
 use tokio_util::sync::CancellationToken;
 
 /// Rows kept per result set.
@@ -77,6 +80,8 @@ pub struct MaintenanceTab {
     /// Run requested; starts as soon as the session is open.
     pending: bool,
     error: Option<String>,
+    /// Highlighting of the statements (the connection's dialect).
+    lang: Option<SqlLanguage>,
 }
 
 fn message_text(m: &ServerMessage) -> String {
@@ -204,7 +209,7 @@ async fn run_all(
 impl MaintenanceTab {
     pub fn new(conn: String, objects: Vec<ObjectRef>) -> Self {
         let database = objects.iter().find_map(|o| o.database.clone());
-        MaintenanceTab { done: false, conn, objects, op: None, options: BTreeMap::new(), session: ToolSession::new(database), run: None, pending: false, error: None }
+        MaintenanceTab { done: false, conn, objects, op: None, options: BTreeMap::new(), session: ToolSession::new(database), run: None, pending: false, error: None, lang: None }
     }
 
     /// Opened on the operation `id` (Truncate… in the navigator's menu).
@@ -279,8 +284,16 @@ impl MaintenanceTab {
             return;
         }
         self.error = None;
-        if self.preview_sql(cx).is_empty() {
+        let statements = self.preview_sql(cx);
+        if statements.is_empty() {
             self.error = Some(tr("Nothing to run for the selected objects.").to_string());
+            return;
+        }
+        if let (Some(cfg), Some(d)) = (cx.conns.config(&self.conn), self.dialect(cx))
+            && cfg.read_only
+            && statements.iter().any(|s| ternarygrid_sql::classify(s, d.syntax()).is_write)
+        {
+            self.error = Some(trf("The connection \"{}\" is read-only.", &[&cfg.name]));
             return;
         }
         self.pending = true;
@@ -380,23 +393,18 @@ impl MaintenanceTab {
         }
     }
 
-    fn header(&self, ui: &mut Ui, cx: &AppContext) {
-        let name = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_else(|| self.conn.clone());
-        ui.horizontal(|ui| {
-            if !cx.popup {
-                ui.heading(tr("Maintenance"));
-            }
-            ui.label(RichText::new(name).strong());
-        });
+    /// "Objects:" and a chip for each target.
+    fn objects_ui(&self, ui: &mut Ui, cx: &AppContext) {
         let targets = self.targets(cx);
         ui.horizontal_wrapped(|ui| {
-            ui.weak(tr("Objects:"));
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            look::muted(ui, tr("Objects:"));
             for t in targets.iter().take(20) {
                 let label = if t.kind == ObjectKind::Database { if t.name.is_empty() { tr("(current database)").to_string() } else { t.name.clone() } } else { t.display_path() };
-                ui.label(format!("{} {label}", crate::nav::kind_icon(t.kind)));
+                look::chip(ui, &label);
             }
             if targets.len() > 20 {
-                ui.weak(trf("… {} more", &[&(targets.len() - 20)]));
+                look::faint(ui, &trf("… {} more", &[&(targets.len() - 20)]));
             }
         });
     }
@@ -404,7 +412,7 @@ impl MaintenanceTab {
     fn ops_ui(&mut self, ui: &mut Ui, cx: &AppContext) {
         let ops = self.ops(cx);
         if ops.is_empty() {
-            ui.label(tr("No maintenance operations are available for the selected objects."));
+            look::muted(ui, tr("No maintenance operations are available for the selected objects."));
             return;
         }
         match ops.iter().find(|o| Some(o.id) == self.op.as_deref()) {
@@ -419,132 +427,213 @@ impl MaintenanceTab {
             }
             Some(_) => {}
         }
-        ui.strong(tr("Operation"));
+        ui.spacing_mut().item_spacing.y = 10.0;
+        look::title(ui, tr("Operation"));
         let mut chosen = None;
-        for op in &ops {
-            let selected = self.op.as_deref() == Some(op.id);
-            if ui.radio(selected, tr(op.label)).on_hover_text(tr(op.description)).clicked() && !selected {
-                chosen = Some(op.id);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            for op in &ops {
+                let selected = self.op.as_deref() == Some(op.id);
+                if look::radio(ui, selected, tr(op.label)).on_hover_text(tr(op.description)).clicked() && !selected {
+                    chosen = Some(op.id);
+                }
             }
-            if selected {
-                ui.indent(("op_desc", op.id), |ui| {
-                    ui.weak(tr(op.description));
-                    if op.needs_autocommit {
-                        ui.weak(tr("Runs outside of a transaction (auto-commit)."));
-                    }
-                });
-            }
-        }
+        });
         if let Some(id) = chosen {
             self.select_op(cx, id);
         }
-        if let Some(op) = ops.iter().find(|o| Some(o.id) == self.op.as_deref())
-            && !op.options.is_empty()
-        {
-            ui.add_space(6.0);
-            ui.strong(tr("Options"));
-            for (key, label, default) in op.options {
-                let mut on = self.options.get(*key).copied().unwrap_or(*default);
-                if ui.checkbox(&mut on, tr(label)).changed() {
-                    self.options.insert(key.to_string(), on);
-                }
-            }
+        let Some(op) = ops.iter().find(|o| Some(o.id) == self.op.as_deref()) else { return };
+        look::faint(ui, tr(op.description));
+        if !op.options.is_empty() {
+            ui.add_space(4.0);
+            look::title(ui, tr("Options"));
+            self.options_ui(ui, op);
         }
     }
 
-    fn run_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        let sql = self.preview_sql(cx);
-        ui.horizontal(|ui| {
-            ui.strong(tr("SQL"));
-            if !sql.is_empty() && ui.small_button((ternarygrid_icons::ic(icon::FILE_SQL), tr("Open in SQL editor"))).clicked() {
-                let text = sql.iter().map(|s| format!("{s};\n")).collect::<String>();
-                cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: None, text: Some(text) });
-            }
-        });
-        let text = if sql.is_empty() { tr("-- nothing to run").to_string() } else { sql.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n") };
-        egui::ScrollArea::vertical().id_salt(("maint_sql", &self.conn)).max_height(140.0).show(ui, |ui| {
-            let mut t = text.as_str();
-            ui.add(egui::TextEdit::multiline(&mut t).code_editor().desired_width(f32::INFINITY).desired_rows(2));
-        });
-        let running = self.is_running();
-        let truncate = self.is_truncate();
-        let red = crate::theme::error_color(ui.visuals().dark_mode);
-        if truncate {
-            ui.label(RichText::new(format!("{} {}", icon::WARNING, tr("Every row of the table(s) is deleted at once, without a transaction to roll back."))).color(red));
-        }
-        ui.horizontal(|ui| {
-            let run = if truncate {
-                egui::Button::new(RichText::new(format!("{}  {}", icon::ERASER, tr("Truncate"))).color(egui::Color32::WHITE).strong()).fill(red)
-            } else {
-                crate::widgets::primary_button(ui, icon::PLAY, tr("Run"))
-            };
-            if ui.add_enabled(!running && !sql.is_empty(), run).clicked() {
-                self.start(cx);
-            }
-            if running && ui.button((ternarygrid_icons::ic(icon::STOP), tr("Cancel"))).clicked() {
-                self.cancel(cx);
-            }
-            if self.pending {
-                ui.spinner();
-                ui.weak(tr("Opening a session…"));
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
-            }
-        });
-        if !cx.conns.is_connected(&self.conn) {
-            ui.horizontal(|ui| {
-                ui.label(tr("The connection is closed."));
-                if ui.button((ternarygrid_icons::ic(icon::PLUGS_CONNECTED), tr("Connect"))).clicked() {
-                    cx.push(AppCommand::Connect(self.conn.clone()));
+    /// The check boxes of the operation's options.
+    fn options_ui(&mut self, ui: &mut Ui, op: &MaintenanceOp) {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            for (key, label, default) in op.options {
+                let mut on = self.options.get(*key).copied().unwrap_or(*default);
+                if look::checkbox(ui, &mut on, tr(label)).changed() {
+                    self.options.insert(key.to_string(), on);
                 }
-            });
+            }
+        });
+    }
+
+    /// The statements that will run, highlighted (`gutter`: with line numbers).
+    fn sql_ui(&mut self, ui: &mut Ui, cx: &AppContext, sql: &[String], gutter: bool) {
+        let text = if sql.is_empty() { tr("-- nothing to run").to_string() } else { sql.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n") };
+        if self.lang.is_none()
+            && let Some(d) = self.dialect(cx)
+        {
+            self.lang = Some(SqlLanguage::new(d));
         }
-        if let Some(e) = &self.error {
-            crate::widgets::error_box(ui, e);
-        }
+        look::code_block(ui, self.lang.as_ref(), &text, gutter);
+    }
+
+    /// The result line of the last run (at the right of Run).
+    fn status_ui(&self, ui: &mut Ui) {
         let Some(run) = &self.run else { return };
-        let dark = ui.visuals().dark_mode;
-        let (log, results) = {
-            let s = run.shared.lock();
-            (s.log.clone(), s.results.clone())
-        };
-        ui.horizontal(|ui| {
-            let elapsed = run.ended.unwrap_or_else(Instant::now).duration_since(run.started);
+        let p = ternarygrid_ui::pal(ui);
+        let results = run.shared.lock().results.clone();
+        let elapsed = crate::widgets::format_duration(run.ended.unwrap_or_else(Instant::now).duration_since(run.started));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if run.job.is_some() {
+                ui.label(RichText::new(trf("Running… {}", &[&elapsed])).size(12.5).color(p.text_muted));
                 ui.spinner();
-                ui.label(trf("Running… {}", &[&crate::widgets::format_duration(elapsed)]));
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
             } else {
                 let failed = results.iter().filter(|r| r.error.is_some()).count();
                 if failed == 0 && !results.is_empty() {
-                    ui.label(RichText::new(format!("{} {}", icon::CHECK_CIRCLE, trf("{} statement(s) executed", &[&results.len()]))).color(crate::theme::success_color(dark)));
+                    ui.label(RichText::new(format!("{} · {elapsed}", trf("{} statement(s) executed", &[&results.len()]))).size(12.5).color(p.ok));
                 } else {
-                    ui.label(RichText::new(format!("{} {}", icon::X_CIRCLE, trf("{} statement(s) failed", &[&failed]))).color(crate::theme::error_color(dark)));
+                    ui.label(RichText::new(format!("{} · {elapsed}", trf("{} statement(s) failed", &[&failed]))).size(12.5).color(p.err));
                 }
-                ui.weak(crate::widgets::format_duration(elapsed));
             }
         });
-        egui::ScrollArea::both().id_salt(("maint_log", &self.conn)).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-            for (level, line) in &log {
-                let t = RichText::new(line).monospace();
-                let t = match level {
-                    Level::Info => t,
-                    Level::Notice => t.weak(),
-                    Level::Ok => t.color(crate::theme::success_color(dark)),
-                    Level::Error => t.color(crate::theme::error_color(dark)),
+    }
+
+    /// The log and the result tables of the last run.
+    fn log_ui(&self, ui: &mut Ui, cx: &AppContext) {
+        let Some(run) = &self.run else { return };
+        let p = ternarygrid_ui::pal(ui);
+        let (log, results) = {
+            let s = run.shared.lock();
+            (s.log.clone(), s.results.clone())
+        };
+        let lines: Vec<(String, egui::Color32)> = log
+            .iter()
+            .map(|(level, line)| {
+                let c = match level {
+                    Level::Info => p.text_muted,
+                    Level::Notice => p.text_faint,
+                    Level::Ok => p.ok,
+                    Level::Error => p.err,
                 };
-                ui.add(egui::Label::new(t).extend());
+                (line.clone(), c)
+            })
+            .collect();
+        let h = (lines.len() as f32 * 18.0 + 4.0).clamp(54.0, 200.0);
+        look::log_box(ui, ("maint_log", &self.conn), &lines, Some(h));
+        let fmt = cx.settings.results.format.clone();
+        for (i, r) in results.iter().enumerate() {
+            let Some(data) = &r.rows else { continue };
+            ui.label(RichText::new(r.sql.as_str()).font(look::mono(12.0)).color(p.text));
+            let headers = look::headers(&data.columns.iter().map(String::as_str).collect::<Vec<_>>());
+            let rows: Vec<Vec<look::Cell>> = data.rows.iter().map(|row| row.iter().map(|v| look::Cell::new(v.display(&fmt).into_owned())).collect()).collect();
+            let h = (rows.len() as f32 + 1.5) * (ui.text_style_height(&egui::TextStyle::Body) + 13.0);
+            ui.allocate_ui(egui::vec2(ui.available_width(), h.min(300.0)), |ui| {
+                look::table(ui, ("maint_rows", &self.conn, i), &headers, &rows, None);
+            });
+        }
+    }
+
+    fn connect_note(&self, ui: &mut Ui, cx: &mut AppContext) {
+        if !cx.conns.is_connected(&self.conn) {
+            look::note_with(ui, parts::Tone::Info, None, tr("The connection is closed."), |ui| {
+                if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUGS_CONNECTED), tr("Connect"), true).clicked() {
+                    cx.push(AppCommand::Connect(self.conn.clone()));
+                }
+            });
+        }
+    }
+
+    fn open_in_editor(&self, cx: &mut AppContext, sql: &[String]) {
+        let text = sql.iter().map(|s| format!("{s};\n")).collect::<String>();
+        cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: None, text: Some(text) });
+    }
+
+    fn run_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let sql = self.preview_sql(cx);
+        ui.spacing_mut().item_spacing.y = 10.0;
+        let mut open = false;
+        parts::section_header(ui, tr("SQL"), |ui| {
+            if !sql.is_empty() && kit::ghost(ui, Some(icon::FILE_SQL), tr("Open in SQL editor")).clicked() {
+                open = true;
             }
-            let fmt = cx.settings.results.format.clone();
-            for (i, r) in results.iter().enumerate() {
-                let Some(data) = &r.rows else { continue };
-                ui.add_space(6.0);
-                ui.label(RichText::new(r.sql.as_str()).monospace().strong());
-                let headers: Vec<&str> = data.columns.iter().map(String::as_str).collect();
-                let rows: Vec<Vec<String>> = data.rows.iter().map(|row| row.iter().map(|v| v.display(&fmt).into_owned()).collect()).collect();
-                let h = (rows.len() as f32 + 1.5) * (ui.text_style_height(&egui::TextStyle::Body) + 6.0);
-                ui.allocate_ui(egui::vec2(ui.available_width(), h.min(300.0)), |ui| {
-                    crate::widgets::simple_table(ui, ("maint_rows", &self.conn, i), &headers, &rows, None);
-                });
+        });
+        if open {
+            self.open_in_editor(cx, &sql);
+        }
+        self.sql_ui(ui, cx, &sql, true);
+        if self.current_op(cx).is_some_and(|o| o.needs_autocommit) {
+            look::faint(ui, tr("Runs outside of a transaction (auto-commit)."));
+        }
+        let running = self.is_running();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if ui.add_enabled_ui(!running && !sql.is_empty(), |ui| kit::primary_icon(ui, icon::PLAY, tr("Run"))).inner.clicked() {
+                self.start(cx);
+            }
+            if running && kit::secondary(ui, Some(icon::STOP), tr("Cancel")).clicked() {
+                self.cancel(cx);
+            }
+            if self.pending {
+                parts::spinner_label(ui, tr("Opening a session…"));
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+            self.status_ui(ui);
+        });
+        self.connect_note(ui, cx);
+        if let Some(e) = &self.error {
+            look::error(ui, e);
+        }
+        self.log_ui(ui, cx);
+    }
+
+    /// Truncate: the options, the statement, the warning; its buttons are in the footer.
+    fn truncate_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        self.objects_ui(ui, cx);
+        let ops = self.ops(cx);
+        match ops.iter().find(|o| o.id == MaintenanceOp::TRUNCATE) {
+            Some(op) => {
+                if self.options.is_empty() && !op.options.is_empty() {
+                    self.select_op(cx, MaintenanceOp::TRUNCATE);
+                }
+                ui.add_enabled_ui(!self.is_running(), |ui| self.options_ui(ui, op));
+            }
+            None => {
+                look::muted(ui, tr("No maintenance operations are available for the selected objects."));
+            }
+        }
+        let sql = self.preview_sql(cx);
+        self.sql_ui(ui, cx, &sql, false);
+        look::note(ui, parts::Tone::Error, None, tr("Every row of the table(s) is deleted at once, without a transaction to roll back."));
+        self.connect_note(ui, cx);
+        if self.pending {
+            parts::spinner_label(ui, tr("Opening a session…"));
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+        if self.run.is_some() {
+            ui.horizontal(|ui| self.status_ui(ui));
+        }
+        if let Some(e) = &self.error {
+            look::error(ui, e);
+        }
+        self.log_ui(ui, cx);
+    }
+
+    fn truncate_footer(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let sql = self.preview_sql(cx);
+        let running = self.is_running();
+        if ui.add_enabled_ui(!sql.is_empty(), |ui| kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), false)).inner.clicked() {
+            self.open_in_editor(cx, &sql);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.add_enabled_ui(!running && !sql.is_empty(), |ui| kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::TRASH), tr("Truncate"), false)).inner.clicked() {
+                self.start(cx);
+            }
+            if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                if running {
+                    self.cancel(cx);
+                } else {
+                    // Closes the pop-up.
+                    self.done = true;
+                }
             }
         });
     }
@@ -556,7 +645,8 @@ impl TabView for MaintenanceTab {
     }
 
     fn popup_size(&self) -> Option<egui::Vec2> {
-        Some(egui::vec2(700.0, 520.0))
+        // The design's windows inside their border.
+        Some(if self.is_truncate() { egui::vec2(620.0, 355.0) } else { egui::vec2(860.0, 509.0) })
     }
 
     fn title(&self) -> String {
@@ -568,7 +658,7 @@ impl TabView for MaintenanceTab {
         }
     }
     fn icon(&self) -> &'static str {
-        icon::BROOM
+        if self.is_truncate() { icon::TRASH } else { icon::WRENCH }
     }
     fn connection_id(&self) -> Option<&str> {
         Some(&self.conn)
@@ -576,14 +666,43 @@ impl TabView for MaintenanceTab {
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll(cx);
-        self.header(ui, cx);
-        ui.separator();
-        egui::Panel::left(egui::Id::new(("maint_ops", &self.conn))).resizable(true).default_size(300.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt(("maint_ops_scroll", &self.conn)).show(ui, |ui| {
-                ui.add_enabled_ui(!self.is_running(), |ui| self.ops_ui(ui, cx));
+        let conn = self.conn.clone();
+        if self.is_truncate() {
+            look::footer(ui, ("truncate_footer", &conn), |ui| self.truncate_footer(ui, cx));
+            look::body(ui, ("truncate_body", &conn), |ui| {
+                if !cx.popup {
+                    look::title(ui, &self.title());
+                }
+                self.truncate_ui(ui, cx);
             });
+            return;
+        }
+        look::body(ui, ("maint_body", &conn), |ui| {
+            if !cx.popup {
+                let name = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_else(|| self.conn.clone());
+                look::title(ui, tr("Maintenance"));
+                look::conn_title(ui, &name, None);
+            }
+            self.objects_ui(ui, cx);
+            let p = ternarygrid_ui::pal(ui);
+            // As in the design: the operations 300 wide, a hairline 18 to their right, the SQL 18
+            // further.
+            let row = ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let left = ui
+                    .vertical(|ui| {
+                        ui.set_width(300.0);
+                        ui.add_enabled_ui(!self.is_running(), |ui| self.ops_ui(ui, cx));
+                    })
+                    .response
+                    .rect;
+                ui.add_space(37.0);
+                ui.vertical(|ui| self.run_ui(ui, cx));
+                left
+            });
+            let x = row.inner.right() + 18.5;
+            ui.painter().vline(x, row.response.rect.y_range(), egui::Stroke::new(1.0, p.border));
         });
-        egui::CentralPanel::default().show(ui, |ui| self.run_ui(ui, cx));
     }
 
     fn on_close(&mut self, cx: &mut AppContext) -> bool {

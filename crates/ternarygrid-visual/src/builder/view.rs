@@ -7,19 +7,19 @@ use super::model::{
     Aggregate, Connector, JoinKind, OPERATORS, QB_FONT, QB_HEADER, QB_ROW, QbCondition, QbJoin,
     QbSelectItem, QueryModel,
 };
-use crate::common::colors;
 use crate::common::paint::{self, font_px};
 use crate::common::view::{ViewTransform, distance_to_polyline, handle_pan_zoom, round_pos};
 use crate::er::scene::route;
 use egui::{
-    Align2, CornerRadius, CursorIcon, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui,
-    Vec2, pos2, vec2,
+    Align2, Color32, CornerRadius, CursorIcon, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
+    Ui, Vec2, pos2, vec2,
 };
 use egui_phosphor::regular as icon;
 use std::fmt;
 use std::sync::Arc;
 use ternarygrid_core::dialect::GenericDialect;
 use ternarygrid_core::{Dialect, tr, trf};
+use ternarygrid_ui::{kit, parts, style};
 
 /// Bottom tabs of the builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -163,16 +163,22 @@ pub fn show_query_builder(
     let before = model.clone();
     let mut events = Vec::new();
     let sql_now = model.to_sql(state.dialect.as_ref());
+    let p = style::pal(ui);
+    ui.spacing_mut().item_spacing.y = 0.0;
     if state.show_toolbar {
         toolbar(ui, model, &sql_now, &mut events);
     }
+    // The canvas 270 high as in the design.
+    let bottom = (ui.available_height() - 270.0).max(240.0);
     egui::Panel::bottom(id.with("bottom"))
         .resizable(true)
-        .default_size(260.0)
+        .default_size(bottom)
+        .frame(egui::Frame::new().fill(p.canvas))
         .show(ui, |ui| {
             egui::Panel::right(id.with("sql"))
                 .resizable(true)
-                .default_size(380.0)
+                .default_size(440.0)
+                .frame(egui::Frame::new().fill(p.surface))
                 .show(ui, |ui| {
                     sql_preview(ui, &sql_now, &mut events);
                 });
@@ -188,80 +194,272 @@ pub fn show_query_builder(
     }
 }
 
+/// A check box like the design's: an accent box with a white check when on.
+fn check(ui: &mut Ui, on: &mut bool, label: &str) -> egui::Response {
+    let p = style::pal(ui);
+    let enabled = ui.is_enabled();
+    let galley = (!label.is_empty()).then(|| {
+        ui.painter().layout_no_wrap(
+            label.to_string(),
+            egui::FontId::proportional(style::body_size(ui.ctx())),
+            Color32::PLACEHOLDER,
+        )
+    });
+    let w = 16.0 + galley.as_ref().map_or(0.0, |g| g.size().x + 8.0);
+    let h = galley.as_ref().map_or(16.0, |g| g.size().y).max(20.0);
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, *on, label)
+    });
+    let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+    let b = Rect::from_center_size(pos2(rect.left() + 8.0, rect.center().y), Vec2::splat(16.0));
+    paint_check(ui.painter(), b, *on, enabled && resp.hovered(), &p, fade);
+    if resp.has_focus() {
+        style::focus_halo(ui, b, 4);
+    }
+    if let Some(g) = galley {
+        ui.painter().galley(
+            pos2(b.right() + 8.0, rect.center().y - g.size().y / 2.0),
+            g,
+            fade(p.text),
+        );
+    }
+    resp
+}
+
+/// The box of a check box in `b`.
+fn paint_check(
+    painter: &egui::Painter,
+    b: Rect,
+    on: bool,
+    hovered: bool,
+    p: &style::Palette,
+    fade: impl Fn(Color32) -> Color32,
+) {
+    let r = CornerRadius::same((b.width() * 0.25).round() as u8);
+    if on {
+        painter.rect_filled(b, r, fade(p.accent));
+        let c = b.center();
+        let s = b.width() / 16.0;
+        let pts = vec![
+            pos2(c.x - 3.6 * s, c.y + 0.2 * s),
+            pos2(c.x - 1.0 * s, c.y + 2.8 * s),
+            pos2(c.x + 3.8 * s, c.y - 2.6 * s),
+        ];
+        painter.add(egui::Shape::line(
+            pts,
+            Stroke::new(2.0 * s.max(0.6), fade(Color32::WHITE)),
+        ));
+    } else {
+        let border = if hovered { p.accent } else { p.border_strong };
+        painter.rect(
+            b,
+            r,
+            p.surface,
+            Stroke::new(1.5, fade(border)),
+            StrokeKind::Inside,
+        );
+    }
+}
+
 fn toolbar(ui: &mut Ui, model: &mut QueryModel, sql: &str, events: &mut Vec<QbEvent>) {
-    ui.horizontal(|ui| {
-        if ui
-            .button((ternarygrid_icons::ic(icon::PLUS), tr("Add table")))
-            .clicked()
+    parts::toolbar(ui, |ui| {
+        if kit::button_ex(
+            ui,
+            kit::Kind::Secondary,
+            Some(icon::PLUS),
+            tr("Add table"),
+            true,
+        )
+        .clicked()
         {
             events.push(QbEvent::AddTableRequested);
         }
         let has_sql = !sql.is_empty();
-        if ui
-            .add_enabled(
-                has_sql,
-                egui::Button::new((ternarygrid_icons::ic(icon::PLAY), tr("Run"))),
-            )
-            .clicked()
-        {
-            events.push(QbEvent::RunQuery(sql.to_string()));
-        }
-        if ui
-            .add_enabled(
-                has_sql,
-                egui::Button::new(format!(
-                    "{} {}",
-                    icon::ARROW_SQUARE_OUT,
-                    tr("Open in editor")
-                )),
-            )
-            .clicked()
-        {
-            events.push(QbEvent::OpenInEditor(sql.to_string()));
-        }
-        ui.separator();
-        ui.checkbox(&mut model.distinct, "DISTINCT");
-        let mut limited = model.limit.is_some();
-        if ui.checkbox(&mut limited, tr("Limit")).changed() {
-            model.limit = if limited { Some(100) } else { None };
-        }
-        if let Some(l) = model.limit.as_mut() {
-            ui.add(egui::DragValue::new(l).range(1..=u64::MAX).speed(1.0));
-        }
-    });
-}
-
-fn sql_preview(ui: &mut Ui, sql: &str, events: &mut Vec<QbEvent>) {
-    ui.horizontal(|ui| {
-        ui.strong(tr("SQL"));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button((ternarygrid_icons::ic(icon::COPY), tr("Copy")))
-                .clicked()
-            {
-                ui.ctx().copy_text(sql.to_string());
+        ui.add_enabled_ui(has_sql, |ui| {
+            if kit::button_ex(ui, kit::Kind::Primary, Some(icon::PLAY), tr("Run"), true).clicked() {
+                events.push(QbEvent::RunQuery(sql.to_string()));
             }
-            if ui
-                .small_button(ternarygrid_icons::ic(icon::ARROW_SQUARE_OUT))
-                .on_hover_text(tr("Open in editor"))
-                .clicked()
-                && !sql.is_empty()
+            if kit::button_ex(
+                ui,
+                kit::Kind::Ghost,
+                Some(icon::ARROW_SQUARE_OUT),
+                tr("Open in editor"),
+                true,
+            )
+            .clicked()
             {
                 events.push(QbEvent::OpenInEditor(sql.to_string()));
             }
         });
+        kit::vdivider(ui, 18.0);
+        ui.spacing_mut().item_spacing.x = 12.0;
+        check(ui, &mut model.distinct, "DISTINCT");
+        let mut limited = model.limit.is_some();
+        if check(ui, &mut limited, tr("Limit")).changed() {
+            model.limit = if limited { Some(100) } else { None };
+        }
+        if let Some(l) = model.limit.as_mut() {
+            ui.add_sized(
+                [70.0, 24.0],
+                egui::DragValue::new(l).range(1..=u64::MAX).speed(1.0),
+            );
+        }
     });
+}
+
+/// SQL keywords coloured in the preview.
+const KEYWORDS: &[&str] = &[
+    "select", "from", "where", "join", "left", "right", "full", "inner", "outer", "cross", "on",
+    "group", "by", "order", "limit", "offset", "as", "and", "or", "not", "null", "is", "in",
+    "having", "distinct", "asc", "desc", "union", "all", "like", "between", "exists", "case",
+    "when", "then", "else", "end", "top", "fetch", "first", "rows", "only", "next", "count", "sum",
+    "avg", "min", "max", "true", "false", "with", "ilike",
+];
+
+/// A highlighted layout of the generated SQL (keywords, strings, numbers, comments).
+/// The height of a line of the SQL preview (the design's editor).
+const LINE_H: f32 = 21.0;
+
+fn sql_job(ui: &Ui, text: &str, font: egui::FontId) -> egui::text::LayoutJob {
+    let p = style::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    let keyword = if dark {
+        Color32::from_rgb(0x7a, 0xa7, 0xff)
+    } else {
+        Color32::from_rgb(0x25, 0x54, 0xc7)
+    };
+    let string = if dark {
+        Color32::from_rgb(0xe6, 0xa9, 0x6b)
+    } else {
+        Color32::from_rgb(0xa5, 0x53, 0x1a)
+    };
+    let number = if dark {
+        Color32::from_rgb(0xc3, 0x9b, 0xf2)
+    } else {
+        Color32::from_rgb(0x7a, 0x3f, 0xc4)
+    };
+    let mut job = egui::text::LayoutJob::default();
+    // 21 points a line, as the design's code.
+    let fmt = |c: Color32, italics: bool| egui::TextFormat {
+        font_id: font.clone(),
+        color: c,
+        italics,
+        line_height: Some(LINE_H),
+        ..Default::default()
+    };
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let c = rest.chars().next().unwrap_or(' ');
+        let (len, color, italics) = if rest.starts_with("--") {
+            (rest.find('\n').unwrap_or(rest.len()), p.text_faint, true)
+        } else if c == '\'' {
+            let end = rest[1..].find('\'').map(|e| e + 2).unwrap_or(rest.len());
+            (end, string, false)
+        } else if c.is_ascii_digit() {
+            let end = rest
+                .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+                .unwrap_or(rest.len());
+            (end, number, false)
+        } else if c.is_alphanumeric() || c == '_' {
+            let end = rest
+                .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                .unwrap_or(rest.len());
+            let word = &rest[..end];
+            let prev_dot = i > 0 && bytes[i - 1] == b'.';
+            let kw = !prev_dot && KEYWORDS.contains(&word.to_ascii_lowercase().as_str());
+            (end, if kw { keyword } else { p.text }, false)
+        } else {
+            (c.len_utf8(), p.text, false)
+        };
+        let len = len.max(c.len_utf8()).min(rest.len());
+        job.append(&rest[..len], 0.0, fmt(color, italics));
+        i += len;
+    }
+    job
+}
+
+fn sql_preview(ui: &mut Ui, sql: &str, events: &mut Vec<QbEvent>) {
+    let p = style::pal(ui);
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(14, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                kit::semibold_label(ui, tr("SQL"), 13.0, p.text);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if kit::icon_button_sized(
+                        ui,
+                        icon::ARROW_SQUARE_OUT,
+                        tr("Open in editor"),
+                        false,
+                        26.0,
+                        13.0,
+                    )
+                    .clicked()
+                        && !sql.is_empty()
+                    {
+                        events.push(QbEvent::OpenInEditor(sql.to_string()));
+                    }
+                    if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), true)
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(sql.to_string());
+                    }
+                });
+            });
+        });
+    let font = egui::FontId::monospace(13.0);
     egui::ScrollArea::both()
         .id_salt("ternarygrid_qb_sql")
         .auto_shrink(false)
         .show(ui, |ui| {
-            let mut text = sql;
-            ui.add(
-                egui::TextEdit::multiline(&mut text)
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .hint_text(tr("Add tables to build a query")),
-            );
+            ui.add_space(10.0);
+            if sql.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new(tr("Add tables to build a query")).color(p.text_faint),
+                    );
+                });
+                return;
+            }
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                let lines = sql.lines().count().max(1);
+                // The numbers right-aligned 44 from the left, the text at 60, as the design's.
+                ui.vertical(|ui| {
+                    ui.set_width(60.0);
+                    for i in 1..=lines {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            ui.add_space(16.0);
+                            ui.label(
+                                egui::RichText::new(i.to_string())
+                                    .font(font.clone())
+                                    .line_height(Some(LINE_H))
+                                    .color(p.text_faint),
+                            );
+                        });
+                    }
+                });
+                let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+                    ui.fonts_mut(|f| f.layout_job(sql_job(ui, buf.as_str(), font.clone())))
+                };
+                let mut text = sql;
+                ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .font(font.clone())
+                        .frame(egui::Frame::NONE)
+                        .margin(egui::Margin::ZERO)
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut layouter),
+                );
+            });
         });
 }
 
@@ -447,104 +645,95 @@ fn canvas(
     }
     if let Some(ctx_target) = state.context.clone() {
         let mut alias_edit = std::mem::take(&mut state.alias_edit);
-        let menu = response.context_menu(|ui| match &ctx_target {
-            QbContext::Join(i) => {
-                if let Some(j) = model.joins.get_mut(*i) {
-                    ui.label(
-                        RichText::new(format!(
-                            "{}.{} = {}.{}",
-                            j.left_alias, j.left_column, j.right_alias, j.right_column
-                        ))
-                        .strong(),
-                    );
-                    ui.separator();
-                    for k in JoinKind::ALL {
-                        if k == JoinKind::Full && !full_join && j.kind != k {
-                            continue;
+        let menu = response.context_menu(|ui| {
+            kit::menu_look(ui, 220.0);
+            match &ctx_target {
+                QbContext::Join(i) => {
+                    if let Some(j) = model.joins.get_mut(*i) {
+                        kit::menu_caption(
+                            ui,
+                            &format!(
+                                "{}.{} = {}.{}",
+                                j.left_alias, j.left_column, j.right_alias, j.right_column
+                            ),
+                        );
+                        kit::menu_separator(ui);
+                        for k in JoinKind::ALL {
+                            if k == JoinKind::Full && !full_join && j.kind != k {
+                                continue;
+                            }
+                            let mut on = j.kind == k;
+                            if kit::menu_check(ui, &mut on, tr(k.label())).clicked() {
+                                j.kind = k;
+                                ui.close();
+                            }
                         }
-                        if ui.radio(j.kind == k, tr(k.label())).clicked() {
-                            j.kind = k;
+                        kit::menu_separator(ui);
+                        if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Remove join"), "")
+                            .clicked()
+                        {
+                            model.joins.remove(*i);
                             ui.close();
                         }
                     }
-                    ui.separator();
-                    if ui
-                        .button((ternarygrid_icons::ic(icon::TRASH), tr("Remove join")))
+                }
+                QbContext::Table(a) => {
+                    kit::menu_caption(ui, a.as_str());
+                    kit::menu_separator(ui);
+                    let select_all =
+                        kit::menu_item(ui, Some(icon::CHECK_SQUARE), tr("Select all columns"), "")
+                            .clicked();
+                    if select_all
+                        || kit::menu_item(ui, Some(icon::SQUARE), tr("Clear selection"), "")
+                            .clicked()
+                    {
+                        let cols: Vec<String> = model
+                            .table(a)
+                            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+                            .unwrap_or_default();
+                        for c in cols {
+                            model.set_column_selected(a, &c, select_all);
+                        }
+                        ui.close();
+                    }
+                    kit::menu_separator(ui);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(tr("Alias")).color(style::pal(ui).text_muted));
+                        let r = ui
+                            .add(egui::TextEdit::singleline(&mut alias_edit).desired_width(100.0));
+                        let apply = kit::icon_button_sized(
+                            ui,
+                            icon::CHECK,
+                            tr("Rename alias"),
+                            false,
+                            24.0,
+                            13.0,
+                        )
+                        .clicked()
+                            || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                        if apply && model.rename_alias(a, &alias_edit) {
+                            ui.close();
+                        }
+                    });
+                    kit::menu_separator(ui);
+                    if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Remove table"), "")
                         .clicked()
                     {
-                        model.joins.remove(*i);
+                        model.remove_table(a);
                         ui.close();
                     }
                 }
-            }
-            QbContext::Table(a) => {
-                ui.label(RichText::new(a.as_str()).strong());
-                ui.separator();
-                if ui
-                    .button(format!(
-                        "{} {}",
-                        icon::CHECK_SQUARE,
-                        tr("Select all columns")
-                    ))
-                    .clicked()
-                {
-                    let cols: Vec<String> = model
-                        .table(a)
-                        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-                        .unwrap_or_default();
-                    for c in cols {
-                        model.set_column_selected(a, &c, true);
-                    }
-                    ui.close();
-                }
-                if ui
-                    .button((ternarygrid_icons::ic(icon::SQUARE), tr("Clear selection")))
-                    .clicked()
-                {
-                    let cols: Vec<String> = model
-                        .table(a)
-                        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-                        .unwrap_or_default();
-                    for c in cols {
-                        model.set_column_selected(a, &c, false);
-                    }
-                    ui.close();
-                }
-                ui.horizontal(|ui| {
-                    ui.label(tr("Alias"));
-                    let r = ui.add(egui::TextEdit::singleline(&mut alias_edit).desired_width(90.0));
-                    let apply = ui
-                        .button(ternarygrid_icons::ic(icon::CHECK))
-                        .on_hover_text(tr("Rename alias"))
-                        .clicked()
-                        || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    if apply && model.rename_alias(a, &alias_edit) {
+                QbContext::Background => {
+                    if kit::menu_item(ui, Some(icon::PLUS), tr("Add table…"), "").clicked() {
+                        events.push(QbEvent::AddTableRequested);
                         ui.close();
                     }
-                });
-                if ui
-                    .button((ternarygrid_icons::ic(icon::TRASH), tr("Remove table")))
-                    .clicked()
-                {
-                    model.remove_table(a);
-                    ui.close();
-                }
-            }
-            QbContext::Background => {
-                if ui
-                    .button((ternarygrid_icons::ic(icon::PLUS), tr("Add table…")))
-                    .clicked()
-                {
-                    events.push(QbEvent::AddTableRequested);
-                    ui.close();
-                }
-                if ui
-                    .button((ternarygrid_icons::ic(icon::ARROWS_IN), tr("Reset view")))
-                    .clicked()
-                {
-                    state.zoom = 1.0;
-                    state.pan = vec2(10.0, 10.0);
-                    ui.close();
+                    if kit::menu_item(ui, Some(icon::ARROWS_IN), tr("Reset view"), "").clicked() {
+                        state.zoom = 1.0;
+                        state.pan = vec2(10.0, 10.0);
+                        ui.close();
+                    }
                 }
             }
         });
@@ -557,33 +746,51 @@ fn canvas(
 
     // painting
     let painter = ui.painter_at(rect);
-    let v = ui.visuals();
-    painter.rect_filled(rect, 0.0, v.extreme_bg_color);
+    let p = style::pal(ui);
     let zoom = state.zoom;
-    let line = v.text_color().gamma_multiply(0.6);
+    painter.rect_filled(rect, 0.0, p.surface);
+    // a dotted grid that pans and zooms with the tables
+    let step = 20.0 * zoom;
+    if step >= 6.0 {
+        let o = view.to_screen(origin, pos2(0.0, 0.0));
+        let x0 = rect.left() + (o.x - rect.left()).rem_euclid(step);
+        let y0 = rect.top() + (o.y - rect.top()).rem_euclid(step);
+        let dot = (zoom * 1.0).clamp(0.6, 1.4);
+        let mut y = y0;
+        while y < rect.bottom() {
+            let mut x = x0;
+            while x < rect.right() {
+                painter.circle_filled(pos2(x, y), dot, p.border);
+                x += step;
+            }
+            y += step;
+        }
+    }
     for (i, j) in model.joins.iter().enumerate() {
         let Some(pts) = join_points(model, j) else {
             continue;
         };
         let hot = hover == Some(QbHit::Join(i)) || state.context == Some(QbContext::Join(i));
-        let stroke = Stroke::new(
-            if hot { 2.5 } else { 1.5 },
-            if hot { v.selection.stroke.color } else { line },
-        );
+        let color = if hot { p.accent_hover } else { p.accent };
+        let stroke = Stroke::new(if hot { 2.5 } else { 2.0 }, color);
         let screen: Vec<Pos2> = pts.iter().map(|p| view.to_screen(origin, *p)).collect();
-        if let (Some(a), Some(b)) = (screen.first(), screen.last()) {
-            painter.circle_filled(*a, 3.0, stroke.color);
-            painter.circle_filled(*b, 3.0, stroke.color);
-        }
         painter.line(screen.clone(), stroke);
-        if let (Some(p), Some(px)) = (join_label_pos(&pts), font_px(10.5, zoom)) {
-            let galley =
-                paint::single_line(&painter, kind_symbol(j.kind), px, false, f32::INFINITY);
-            let sp = view.to_screen(origin, p);
-            let r = Rect::from_center_size(sp, galley.size() + vec2(10.0, 4.0));
-            painter.rect_filled(r, r.height() * 0.5, v.window_fill);
-            painter.rect_stroke(r, r.height() * 0.5, stroke, StrokeKind::Inside);
-            painter.galley(r.min + vec2(5.0, 2.0), galley, v.text_color());
+        if let (Some(pos), Some(px)) = (join_label_pos(&pts), font_px(10.5, zoom)) {
+            let galley = painter.layout_no_wrap(
+                kind_symbol(j.kind).to_string(),
+                style::semibold(ui.ctx(), px),
+                p.on_accent,
+            );
+            let sp = view.to_screen(origin, pos);
+            let r = Rect::from_center_size(
+                sp,
+                vec2(
+                    galley.size().x + 14.0 * zoom,
+                    (18.0 * zoom).max(galley.size().y),
+                ),
+            );
+            painter.rect_filled(r, r.height() * 0.5, color);
+            painter.galley(r.center() - galley.size() / 2.0, galley, p.on_accent);
         }
     }
     for t in &model.tables {
@@ -591,10 +798,10 @@ fn canvas(
         if !srect.intersects(rect) {
             continue;
         }
-        let radius = (5.0 * zoom).clamp(0.0, 10.0);
-        painter.rect_filled(srect, radius, v.window_fill);
-        let header = Rect::from_min_size(srect.min, vec2(srect.width(), QB_HEADER * zoom));
+        let radius = (6.0 * zoom).clamp(0.0, 10.0);
         let r8 = radius.round() as u8;
+        painter.rect_filled(srect, r8, p.surface);
+        let header = Rect::from_min_size(srect.min, vec2(srect.width(), QB_HEADER * zoom));
         painter.rect_filled(
             header,
             CornerRadius {
@@ -603,56 +810,49 @@ fn canvas(
                 sw: 0,
                 se: 0,
             },
-            colors::tint(v, colors::categorical(0, v.dark_mode), 0.14),
+            p.accent_soft,
         );
         let hovered_header =
             matches!(&hover, Some(QbHit::Header(a)) | Some(QbHit::Close(a)) if *a == t.alias);
-        if let Some(px) = font_px(QB_FONT + 0.5, zoom) {
+        if let Some(px) = font_px(QB_FONT, zoom) {
             let x = header.left() + 8.0 * zoom;
-            let r1 = paint::text(
-                &painter,
+            let r1 = painter.text(
                 pos2(x, header.center().y),
                 Align2::LEFT_CENTER,
                 icon::TABLE,
-                px,
-                v.weak_text_color(),
-                false,
-                f32::INFINITY,
+                style::icon_font(px + 0.5),
+                p.accent_text,
             );
-            let r2 = paint::text(
-                &painter,
-                pos2(r1.right() + 5.0 * zoom, header.center().y),
+            let name_max = (header.width() * 0.62).max(20.0);
+            let name = crate::common::text::truncate_to_width(&t.obj.name, name_max, px, true);
+            let r2 = painter.text(
+                pos2(r1.right() + 6.0 * zoom, header.center().y),
                 Align2::LEFT_CENTER,
-                &t.obj.name,
-                px,
-                v.strong_text_color(),
-                false,
-                (header.width() * 0.6).max(20.0),
+                name,
+                style::semibold(ui.ctx(), px),
+                p.text,
             );
             paint::text(
                 &painter,
                 pos2(r2.right() + 6.0 * zoom, header.center().y),
                 Align2::LEFT_CENTER,
                 &t.alias,
-                px,
-                v.weak_text_color(),
+                px - 1.5,
+                p.text_faint,
                 false,
                 f32::INFINITY,
             );
             let close_color = if matches!(&hover, Some(QbHit::Close(a)) if *a == t.alias) {
-                v.error_fg_color
+                p.err
             } else {
-                v.weak_text_color()
+                p.text_faint
             };
-            paint::text(
-                &painter,
+            painter.text(
                 pos2(header.right() - 8.0 * zoom, header.center().y),
                 Align2::RIGHT_CENTER,
                 icon::X,
-                px,
+                style::icon_font(px - 1.0),
                 close_color,
-                false,
-                f32::INFINITY,
             );
         }
         for (i, c) in t.columns.iter().enumerate() {
@@ -663,45 +863,25 @@ fn canvas(
                 matches!(&hover, Some(QbHit::Row(a, col)) if *a == t.alias && *col == c.name);
             let join_source = matches!(&state.drag, Some(QbDrag::Join { alias, column, .. }) if *alias == t.alias && *column == c.name);
             if hovered_row || join_source {
-                painter.rect_filled(
-                    row.shrink2(vec2(2.0, 0.0)),
-                    2.0,
-                    v.selection.bg_fill.gamma_multiply(0.35),
-                );
+                painter.rect_filled(row.shrink2(vec2(2.0, 0.0)), 3.0, p.hover);
             }
-            let Some(px) = font_px(QB_FONT, zoom) else {
+            let Some(px) = font_px(QB_FONT - 1.0, zoom) else {
                 continue;
             };
             let cb = Rect::from_center_size(
-                pos2(row.left() + 14.0 * zoom, row.center().y),
-                Vec2::splat(11.0 * zoom),
+                pos2(row.left() + 15.5 * zoom, row.center().y),
+                Vec2::splat(14.0 * zoom),
             );
-            painter.rect_stroke(
-                cb,
-                2.0,
-                Stroke::new(1.0, v.widgets.inactive.fg_stroke.color),
-                StrokeKind::Inside,
-            );
-            if c.selected {
-                painter.rect_filled(cb.shrink(1.0), 2.0, v.selection.bg_fill);
-                painter.line(
-                    vec![
-                        cb.left_center() + vec2(2.0, 0.0),
-                        cb.center_bottom() - vec2(0.5, 2.5),
-                        cb.right_top() + vec2(-2.0, 2.5),
-                    ],
-                    Stroke::new(1.5, v.selection.stroke.color),
-                );
-            }
-            let name_x = row.left() + 26.0 * zoom;
+            paint_check(&painter, cb, c.selected, false, &p, |c| c);
+            let name_x = row.left() + 30.0 * zoom;
             let tr_rect = paint::text(
                 &painter,
                 pos2(row.right() - 8.0 * zoom, row.center().y),
                 Align2::RIGHT_CENTER,
                 &c.data_type,
                 px - 1.0,
-                v.weak_text_color(),
-                false,
+                p.text_faint,
+                true,
                 row.width() * 0.45,
             );
             paint::text(
@@ -710,17 +890,17 @@ fn canvas(
                 Align2::LEFT_CENTER,
                 &c.name,
                 px,
-                v.text_color(),
+                p.text,
                 false,
                 (tr_rect.left() - name_x - 6.0).max(10.0),
             );
         }
         let stroke = if hovered_header {
-            Stroke::new(1.5, v.selection.stroke.color)
+            Stroke::new(1.5, p.accent)
         } else {
-            v.widgets.noninteractive.bg_stroke
+            Stroke::new(1.0, p.border_strong)
         };
-        painter.rect_stroke(srect, radius, stroke, StrokeKind::Inside);
+        painter.rect_stroke(srect, r8, stroke, StrokeKind::Inside);
     }
     if let Some(QbDrag::Join {
         alias,
@@ -742,7 +922,7 @@ fn canvas(
                 view.to_screen(origin, start),
                 view.to_screen(origin, *current),
             ],
-            Stroke::new(2.0, v.selection.stroke.color),
+            Stroke::new(2.0, p.accent),
             6.0,
             4.0,
         );
@@ -753,7 +933,7 @@ fn canvas(
             Align2::CENTER_CENTER,
             tr("Add tables with the + button, then tick columns and drag columns onto each other to join"),
             egui::FontId::proportional(13.0),
-            v.weak_text_color(),
+            p.text_muted,
         );
     }
     match &hover {
@@ -790,43 +970,122 @@ fn apply_row_action<T>(list: &mut Vec<T>, action: Option<RowAction>) {
     }
 }
 
+/// Width of the move up / move down / remove buttons of a row.
+const ROW_BUTTONS_W: f32 = 92.0;
+
 fn row_buttons(ui: &mut Ui, i: usize, action: &mut Option<RowAction>) {
-    if ui
-        .small_button(ternarygrid_icons::ic(icon::ARROW_UP))
-        .on_hover_text(tr("Move up"))
-        .clicked()
-    {
+    ui.spacing_mut().item_spacing.x = 2.0;
+    if kit::icon_button_ex(ui, icon::ARROW_UP, tr("Move up"), false, 24.0).clicked() {
         *action = Some(RowAction::Up(i));
     }
-    if ui
-        .small_button(ternarygrid_icons::ic(icon::ARROW_DOWN))
-        .on_hover_text(tr("Move down"))
-        .clicked()
-    {
+    if kit::icon_button_ex(ui, icon::ARROW_DOWN, tr("Move down"), false, 24.0).clicked() {
         *action = Some(RowAction::Down(i));
     }
-    if ui
-        .small_button(ternarygrid_icons::ic(icon::TRASH))
-        .on_hover_text(tr("Remove"))
-        .clicked()
-    {
+    if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 24.0).clicked() {
         *action = Some(RowAction::Delete(i));
     }
 }
 
+/// A bordered table of widget rows like the design's: the header on the header colour,
+/// striped rows `row_h` high; `widths` are the column widths, the last one takes the rest.
+fn grid(
+    ui: &mut Ui,
+    names: &[&str],
+    widths: &[f32],
+    rows: usize,
+    row_h: f32,
+    mut cell: impl FnMut(&mut Ui, usize, usize),
+) {
+    let p = style::pal(ui);
+    let n = widths.len();
+    egui::Frame::new()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(8)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            let total = ui.available_width();
+            let fixed: f32 = widths[..n.saturating_sub(1)].iter().sum();
+            let col_w = |i: usize| {
+                if i + 1 == n {
+                    (total - fixed).max(widths[i])
+                } else {
+                    widths[i]
+                }
+            };
+            let (head, _) = ui.allocate_exact_size(vec2(total, 32.0), Sense::hover());
+            ui.painter().rect_filled(
+                head,
+                CornerRadius {
+                    nw: 8,
+                    ne: 8,
+                    sw: 0,
+                    se: 0,
+                },
+                p.header,
+            );
+            ui.painter().hline(
+                head.x_range(),
+                head.bottom() - 0.5,
+                Stroke::new(1.0, p.border),
+            );
+            let mut x = head.left();
+            for (i, name) in names.iter().enumerate() {
+                let g = ui.painter().layout_no_wrap(
+                    name.to_string(),
+                    style::semibold(ui.ctx(), 12.0),
+                    p.text_muted,
+                );
+                kit::paint_semibold(
+                    ui.painter(),
+                    pos2(x + 10.0, head.center().y - g.size().y / 2.0),
+                    g,
+                    p.text_muted,
+                );
+                x += col_w(i);
+            }
+            for r in 0..rows {
+                let (row, _) = ui.allocate_exact_size(vec2(total, row_h), Sense::hover());
+                if r % 2 == 1 {
+                    ui.painter().rect_filled(
+                        row.shrink2(vec2(1.0, 0.0)),
+                        0.0,
+                        style::soft(p.hover, 0.5),
+                    );
+                }
+                let mut x = row.left();
+                for c in 0..n {
+                    let cr = Rect::from_min_size(pos2(x, row.top()), vec2(col_w(c), row_h));
+                    let mut cu = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(cr.shrink2(vec2(8.0, 0.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .id_salt(("qb_cell", r, c)),
+                    );
+                    cell(&mut cu, r, c);
+                    x += col_w(c);
+                }
+            }
+        });
+}
+
 /// Text field with a menu of column references next to it.
 fn expr_field(ui: &mut Ui, value: &mut String, refs: &[String], width: f32) {
+    ui.spacing_mut().item_spacing.x = 4.0;
     ui.add(
         egui::TextEdit::singleline(value)
-            .desired_width(width)
+            .desired_width((width - 30.0).max(60.0))
+            .font(egui::FontId::monospace(12.5))
+            .margin(egui::Margin::symmetric(8, 4))
             .hint_text(tr("column or expression")),
     );
     ui.menu_button(icon::LIST, |ui| {
+        kit::menu_look(ui, 220.0);
         egui::ScrollArea::vertical()
             .max_height(260.0)
             .show(ui, |ui| {
                 for r in refs {
-                    if ui.button(r.as_str()).clicked() {
+                    if kit::menu_item(ui, None, r, "").clicked() {
                         *value = r.clone();
                         ui.close();
                     }
@@ -837,8 +1096,36 @@ fn expr_field(ui: &mut Ui, value: &mut String, refs: &[String], width: f32) {
     .on_hover_text(tr("Pick a column"));
 }
 
+/// An item of a combo box's list in the menu look: a check mark at the selected one; true
+/// when it was clicked.
+fn choice(ui: &mut Ui, selected: bool, label: &str) -> bool {
+    let mut on = selected;
+    kit::menu_check(ui, &mut on, label).clicked()
+}
+
+/// A small text field of a grid cell.
+fn cell_field(ui: &mut Ui, value: &mut String, hint: &str, mono: bool) -> egui::Response {
+    let mut edit = egui::TextEdit::singleline(value)
+        .desired_width(ui.available_width())
+        .margin(egui::Margin::symmetric(8, 4))
+        .hint_text(hint);
+    if mono {
+        edit = edit.font(egui::FontId::monospace(12.5));
+    }
+    ui.add(edit)
+}
+
+fn add_button(ui: &mut Ui, label: &str) -> bool {
+    ui.add_space(8.0);
+    kit::button_ex(ui, kit::Kind::Ghost, Some(icon::PLUS), label, true).clicked()
+}
+
 fn tabs(ui: &mut Ui, model: &mut QueryModel, state: &mut QbViewState) {
-    ui.horizontal(|ui| {
+    let p = style::pal(ui);
+    // As the design's underline tabs: 16 from the left, 18 apart, a hairline across the panel.
+    let row = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 18.0;
+        ui.add_space(16.0);
         for t in QbTab::ALL {
             let count = match t {
                 QbTab::Columns => model.select.len(),
@@ -851,66 +1138,98 @@ fn tabs(ui: &mut Ui, model: &mut QueryModel, state: &mut QbViewState) {
             } else {
                 tr(t.label()).to_string()
             };
-            ui.selectable_value(&mut state.tab, t, label);
+            if kit::underline_tab(ui, None, &label, None, state.tab == t, 34.0).clicked() {
+                state.tab = t;
+            }
         }
     });
-    ui.separator();
+    ui.painter().hline(
+        ui.max_rect().x_range(),
+        row.response.rect.bottom() - 0.5,
+        Stroke::new(1.0, p.border),
+    );
     let refs = model.column_refs();
     egui::ScrollArea::vertical()
         .id_salt("ternarygrid_qb_tabs")
         .auto_shrink(false)
-        .show(ui, |ui| match state.tab {
-            QbTab::Columns => columns_grid(ui, model, &refs),
-            QbTab::Conditions => {
-                conditions_grid(ui, "ternarygrid_qb_where", &mut model.conditions, &refs);
-            }
-            QbTab::Grouping => grouping(ui, model, &refs),
-            QbTab::Order => order_grid(ui, model, &refs),
+        .show(ui, |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    match state.tab {
+                        QbTab::Columns => columns_grid(ui, model, &refs),
+                        QbTab::Conditions => {
+                            conditions_grid(
+                                ui,
+                                "ternarygrid_qb_where",
+                                &mut model.conditions,
+                                &refs,
+                            );
+                        }
+                        QbTab::Grouping => grouping(ui, model, &refs, state.dialect.as_ref()),
+                        QbTab::Order => order_grid(ui, model, &refs),
+                    }
+                });
         });
 }
 
 fn columns_grid(ui: &mut Ui, model: &mut QueryModel, refs: &[String]) {
     let mut action = None;
     let mut changed = false;
-    egui::Grid::new("ternarygrid_qb_columns")
-        .striped(true)
-        .num_columns(5)
-        .spacing(vec2(8.0, 4.0))
-        .show(ui, |ui| {
-            ui.strong(tr("Output"));
-            ui.strong(tr("Expression"));
-            ui.strong(tr("Alias"));
-            ui.strong(tr("Aggregate"));
-            ui.label("");
-            ui.end_row();
-            for (i, item) in model.select.iter_mut().enumerate() {
-                ui.checkbox(&mut item.visible, "");
-                ui.horizontal(|ui| {
+    let n = model.select.len();
+    if n > 0 {
+        let flex = (ui.available_width() - 64.0 - 160.0 - ROW_BUTTONS_W).max(240.0);
+        let widths = [64.0, flex * 0.58, flex * 0.42, 160.0, ROW_BUTTONS_W];
+        let names = [
+            tr("Output"),
+            tr("Expression"),
+            tr("Alias"),
+            tr("Aggregate"),
+            "",
+        ];
+        let select = &mut model.select;
+        grid(ui, &names, &widths, n, 36.0, |ui, r, c| {
+            let item = &mut select[r];
+            match c {
+                0 => {
+                    check(ui, &mut item.visible, "").on_hover_text(tr("Output"));
+                }
+                1 => {
                     let before = item.expr.clone();
-                    expr_field(ui, &mut item.expr, refs, 220.0);
+                    let w = ui.available_width();
+                    expr_field(ui, &mut item.expr, refs, w);
                     changed |= before != item.expr;
-                });
-                ui.add(egui::TextEdit::singleline(&mut item.alias).desired_width(120.0));
-                egui::ComboBox::from_id_salt(("ternarygrid_qb_agg", i))
-                    .selected_text(item.aggregate.map(|a| a.label()).unwrap_or("–"))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut item.aggregate, None, "–");
-                        for a in Aggregate::ALL {
-                            ui.selectable_value(&mut item.aggregate, Some(a), a.label());
-                        }
-                    });
-                ui.horizontal(|ui| row_buttons(ui, i, &mut action));
-                ui.end_row();
+                }
+                2 => {
+                    cell_field(ui, &mut item.alias, "", false);
+                }
+                3 => {
+                    egui::ComboBox::from_id_salt(("ternarygrid_qb_agg", r))
+                        .icon(kit::combo_caret)
+                        .popup_style(egui::containers::menu::menu_style.into())
+                        .width(140.0)
+                        .selected_text(item.aggregate.map(|a| a.label()).unwrap_or("–"))
+                        .show_ui(ui, |ui| {
+                            kit::menu_look(ui, 140.0);
+                            for a in
+                                std::iter::once(None).chain(Aggregate::ALL.into_iter().map(Some))
+                            {
+                                if choice(ui, item.aggregate == a, a.map_or("–", |a| a.label())) {
+                                    item.aggregate = a;
+                                }
+                            }
+                        });
+                }
+                _ => row_buttons(ui, r, &mut action),
             }
         });
+    }
     if action.is_some() {
         changed = true;
     }
     apply_row_action(&mut model.select, action);
-    if ui
-        .button((ternarygrid_icons::ic(icon::PLUS), tr("Add expression")))
-        .clicked()
-    {
+    if add_button(ui, tr("Add expression")) {
         model.select.push(QbSelectItem::default());
     }
     if changed {
@@ -920,63 +1239,74 @@ fn columns_grid(ui: &mut Ui, model: &mut QueryModel, refs: &[String]) {
 
 fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &[String]) {
     let mut action = None;
-    egui::Grid::new(salt)
-        .striped(true)
-        .num_columns(5)
-        .spacing(vec2(8.0, 4.0))
-        .show(ui, |ui| {
-            ui.label("");
-            ui.strong(tr("Expression"));
-            ui.strong(tr("Operator"));
-            ui.strong(tr("Value"));
-            ui.label("");
-            ui.end_row();
-            for (i, c) in list.iter_mut().enumerate() {
-                if i == 0 {
-                    ui.weak(tr("where"));
-                } else {
+    let p = style::pal(ui);
+    let n = list.len();
+    if n > 0 {
+        let flex = (ui.available_width() - 90.0 - 120.0 - ROW_BUTTONS_W).max(240.0);
+        let widths = [90.0, flex * 0.55, 120.0, flex * 0.45, ROW_BUTTONS_W];
+        let names = ["", tr("Expression"), tr("Operator"), tr("Value"), ""];
+        grid(ui, &names, &widths, n, 36.0, |ui, i, c| {
+            let cond = &mut list[i];
+            match c {
+                0 if i == 0 => {
+                    ui.label(egui::RichText::new(tr("where")).color(p.text_faint));
+                }
+                0 => {
                     egui::ComboBox::from_id_salt((salt, "conn", i))
-                        .width(60.0)
-                        .selected_text(c.connector.sql())
+                        .icon(kit::combo_caret)
+                        .popup_style(egui::containers::menu::menu_style.into())
+                        .width(66.0)
+                        .selected_text(cond.connector.sql())
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut c.connector, Connector::And, "AND");
-                            ui.selectable_value(&mut c.connector, Connector::Or, "OR");
+                            kit::menu_look(ui, 90.0);
+                            for c in [Connector::And, Connector::Or] {
+                                if choice(ui, cond.connector == c, c.sql()) {
+                                    cond.connector = c;
+                                }
+                            }
                         });
                 }
-                ui.horizontal(|ui| expr_field(ui, &mut c.expr, refs, 200.0));
-                egui::ComboBox::from_id_salt((salt, "op", i))
-                    .width(100.0)
-                    .selected_text(if c.operator.is_empty() {
-                        tr("(expression)")
-                    } else {
-                        c.operator.as_str()
-                    })
-                    .show_ui(ui, |ui| {
-                        for op in OPERATORS {
-                            let label = if op.is_empty() {
-                                tr("(expression)")
-                            } else {
-                                op
-                            };
-                            ui.selectable_value(&mut c.operator, op.to_string(), label);
-                        }
+                1 => {
+                    let w = ui.available_width();
+                    expr_field(ui, &mut cond.expr, refs, w);
+                }
+                2 => {
+                    egui::ComboBox::from_id_salt((salt, "op", i))
+                        .icon(kit::combo_caret)
+                        .popup_style(egui::containers::menu::menu_style.into())
+                        .width(100.0)
+                        .selected_text(if cond.operator.is_empty() {
+                            tr("(expression)")
+                        } else {
+                            cond.operator.as_str()
+                        })
+                        .show_ui(ui, |ui| {
+                            kit::menu_look(ui, 140.0);
+                            for op in OPERATORS {
+                                let label = if op.is_empty() {
+                                    tr("(expression)")
+                                } else {
+                                    op
+                                };
+                                if choice(ui, cond.operator == op, label) {
+                                    cond.operator = op.to_string();
+                                }
+                            }
+                        });
+                }
+                3 => {
+                    let needs_value =
+                        !matches!(cond.operator.as_str(), "IS NULL" | "IS NOT NULL" | "");
+                    ui.add_enabled_ui(needs_value, |ui| {
+                        cell_field(ui, &mut cond.value, tr("'text', 42, a.column"), true);
                     });
-                let needs_value = !matches!(c.operator.as_str(), "IS NULL" | "IS NOT NULL" | "");
-                ui.add_enabled(
-                    needs_value,
-                    egui::TextEdit::singleline(&mut c.value)
-                        .desired_width(180.0)
-                        .hint_text(tr("'text', 42, a.column")),
-                );
-                ui.horizontal(|ui| row_buttons(ui, i, &mut action));
-                ui.end_row();
+                }
+                _ => row_buttons(ui, i, &mut action),
             }
         });
+    }
     apply_row_action(list, action);
-    if ui
-        .button((ternarygrid_icons::ic(icon::PLUS), tr("Add condition")))
-        .clicked()
-    {
+    if add_button(ui, tr("Add condition")) {
         list.push(QbCondition::new(
             refs.first().cloned().unwrap_or_default(),
             "=",
@@ -985,74 +1315,99 @@ fn conditions_grid(ui: &mut Ui, salt: &str, list: &mut Vec<QbCondition>, refs: &
     }
 }
 
-fn grouping(ui: &mut Ui, model: &mut QueryModel, refs: &[String]) {
-    ui.weak(tr("Columns without an aggregate are grouped automatically when the select list contains aggregates."));
+/// The "Effective GROUP BY" hint, rendered with the builder's dialect so it
+/// matches the generated SQL.
+fn effective_group_by_hint(model: &QueryModel, dialect: &dyn Dialect) -> Option<String> {
+    let effective = model.effective_group_by(dialect);
+    if effective.is_empty() {
+        None
+    } else {
+        Some(trf("Effective GROUP BY: {}", &[&effective.join(", ")]))
+    }
+}
+
+fn grouping(ui: &mut Ui, model: &mut QueryModel, refs: &[String], dialect: &dyn Dialect) {
+    let p = style::pal(ui);
+    ui.label(
+        egui::RichText::new(tr(
+            "Columns without an aggregate are grouped automatically when the select list contains aggregates.",
+        ))
+        .color(p.text_muted),
+    );
     let mut action = None;
-    egui::Grid::new("ternarygrid_qb_group")
-        .striped(true)
-        .num_columns(2)
-        .spacing(vec2(8.0, 4.0))
-        .show(ui, |ui| {
-            for (i, g) in model.group_by.iter_mut().enumerate() {
-                ui.horizontal(|ui| expr_field(ui, g, refs, 240.0));
-                ui.horizontal(|ui| row_buttons(ui, i, &mut action));
-                ui.end_row();
+    let n = model.group_by.len();
+    if n > 0 {
+        let widths = [
+            (ui.available_width() - ROW_BUTTONS_W).max(200.0),
+            ROW_BUTTONS_W,
+        ];
+        let group_by = &mut model.group_by;
+        grid(ui, &[tr("Expression"), ""], &widths, n, 36.0, |ui, i, c| {
+            if c == 0 {
+                let w = ui.available_width();
+                expr_field(ui, &mut group_by[i], refs, w.min(420.0));
+            } else {
+                row_buttons(ui, i, &mut action);
             }
         });
+    }
     apply_row_action(&mut model.group_by, action);
-    if ui
-        .button((
-            ternarygrid_icons::ic(icon::PLUS),
-            tr("Add group by expression"),
-        ))
-        .clicked()
-    {
+    if add_button(ui, tr("Add group by expression")) {
         model
             .group_by
             .push(refs.first().cloned().unwrap_or_default());
     }
-    let effective = {
-        let d = GenericDialect::new();
-        model.effective_group_by(&d)
-    };
-    if !effective.is_empty() {
-        ui.weak(trf("Effective GROUP BY: {}", &[&effective.join(", ")]));
+    if let Some(hint) = effective_group_by_hint(model, dialect) {
+        ui.label(egui::RichText::new(hint).size(12.0).color(p.text_faint));
     }
-    ui.separator();
-    ui.strong(tr("Having"));
+    ui.add_space(6.0);
+    kit::semibold_label(ui, tr("Having"), 13.0, p.text);
     conditions_grid(ui, "ternarygrid_qb_having", &mut model.having, refs);
 }
 
 fn order_grid(ui: &mut Ui, model: &mut QueryModel, refs: &[String]) {
     let mut action = None;
-    egui::Grid::new("ternarygrid_qb_order")
-        .striped(true)
-        .num_columns(3)
-        .spacing(vec2(8.0, 4.0))
-        .show(ui, |ui| {
-            for (i, (expr, desc)) in model.order_by.iter_mut().enumerate() {
-                ui.horizontal(|ui| expr_field(ui, expr, refs, 240.0));
-                let label = if *desc {
-                    format!("{} DESC", icon::SORT_DESCENDING)
-                } else {
-                    format!("{} ASC", icon::SORT_ASCENDING)
-                };
-                if ui
-                    .button(label)
-                    .on_hover_text(tr("Toggle sort direction"))
-                    .clicked()
-                {
-                    *desc = !*desc;
+    let n = model.order_by.len();
+    if n > 0 {
+        let widths = [
+            (ui.available_width() - 120.0 - ROW_BUTTONS_W).max(200.0),
+            120.0,
+            ROW_BUTTONS_W,
+        ];
+        let order_by = &mut model.order_by;
+        grid(
+            ui,
+            &[tr("Expression"), tr("Direction"), ""],
+            &widths,
+            n,
+            36.0,
+            |ui, i, c| {
+                let (expr, desc) = &mut order_by[i];
+                match c {
+                    0 => {
+                        let w = ui.available_width();
+                        expr_field(ui, expr, refs, w.min(420.0));
+                    }
+                    1 => {
+                        let (glyph, label) = if *desc {
+                            (icon::SORT_DESCENDING, "DESC")
+                        } else {
+                            (icon::SORT_ASCENDING, "ASC")
+                        };
+                        if kit::button_ex(ui, kit::Kind::Secondary, Some(glyph), label, true)
+                            .on_hover_text(tr("Toggle sort direction"))
+                            .clicked()
+                        {
+                            *desc = !*desc;
+                        }
+                    }
+                    _ => row_buttons(ui, i, &mut action),
                 }
-                ui.horizontal(|ui| row_buttons(ui, i, &mut action));
-                ui.end_row();
-            }
-        });
+            },
+        );
+    }
     apply_row_action(&mut model.order_by, action);
-    if ui
-        .button((ternarygrid_icons::ic(icon::PLUS), tr("Add sort expression")))
-        .clicked()
-    {
+    if add_button(ui, tr("Add sort expression")) {
         model
             .order_by
             .push((refs.first().cloned().unwrap_or_default(), false));
@@ -1070,6 +1425,31 @@ mod tests {
         let y = t.column_y(column).expect("column");
         let view = ViewTransform::new(state.zoom, state.pan);
         view.to_screen(state.last_canvas.min, pos2(t.rect().center().x, y))
+    }
+
+    #[test]
+    fn effective_group_by_hint_uses_the_dialect() {
+        use crate::builder::sql::tests::dialect;
+        use ternarygrid_core::DbKind;
+        let mut model = QueryModel::default();
+        model.add_table(&customers());
+        model.add_table(&orders());
+        assert_eq!(
+            effective_group_by_hint(&model, &dialect(DbKind::MySql)),
+            None
+        );
+        model.group_by.push("o.order".into()); // reserved word -> quoted
+        let hint = effective_group_by_hint(&model, &dialect(DbKind::MySql)).unwrap();
+        assert!(hint.ends_with("o.`order`"), "{hint}");
+        let sql = model.to_sql(&dialect(DbKind::MySql));
+        assert!(sql.contains("GROUP BY o.`order`"), "{sql}");
+        // the grouping tab renders with a MySQL state
+        let mut state = QbViewState::new(Arc::new(dialect(DbKind::MySql)));
+        state.tab = QbTab::Grouping;
+        let mut h = Harness::new(1000.0, 700.0);
+        h.idle(2, &mut |ui: &mut Ui| {
+            show_query_builder(ui, &mut model, &mut state);
+        });
     }
 
     #[test]

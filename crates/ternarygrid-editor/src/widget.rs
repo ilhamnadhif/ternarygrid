@@ -22,16 +22,20 @@ use crate::state::{DragMode, EditorState, ScrollRequest, Severity};
 use crate::text::{Selection, word_range_at};
 use crate::theme::EditorTheme;
 
-/// Left padding between gutter and text.
-const PAD_LEFT: f32 = 6.0;
+/// Left padding between gutter and text (the gutter's own right padding is the gap).
+const PAD_LEFT: f32 = 0.0;
 /// Padding above the first line.
-const PAD_TOP: f32 = 2.0;
+const PAD_TOP: f32 = 10.0;
+/// The gutter's room between the line numbers and the text: the fold markers.
+const GUTTER_GAP: f32 = 16.0;
 /// Width reserved for gutter markers.
 const MARK_W: f32 = 12.0;
 /// Width of the fold marker column of the gutter.
 const FOLD_W: f32 = 12.0;
 /// Bracket matching scan limit (bytes in each direction).
 const BRACKET_SCAN: usize = 64 * 1024;
+/// Larger documents report only the cursor line as their accessibility value.
+const A11Y_FULL_VALUE_BYTES: usize = 100_000;
 
 /// An action offered by the context menu (and accepted by
 /// [`EditorState::apply_action`]).
@@ -289,21 +293,32 @@ impl<'a> SqlEditor<'a> {
         // Metrics.
         let font_id = FontId::new(options.font_size.max(4.0), options.font_family.clone());
         let ppp = ctx.pixels_per_point();
-        let (font_h, char_w) =
-            ctx.fonts_mut(|f| (f.row_height(&font_id), f.glyph_width(&font_id, '0')));
+        let (font_h, char_w, tab_w) = ctx.fonts_mut(|f| {
+            (
+                f.row_height(&font_id),
+                f.glyph_width(&font_id, '0'),
+                f.glyph_width(&font_id, '\t'),
+            )
+        });
         let char_w = if char_w > 0.0 {
             char_w
         } else {
             font_id.size * 0.6
         };
-        let row_h = ((font_h + options.line_spacing.max(0.0)) * ppp).round() / ppp;
+        let row_h = ((font_h + options.line_spacing.max(0.0))
+            .max(options.line_height * font_id.size)
+            * ppp)
+            .round()
+            / ppp;
         let text_dy = (((row_h - font_h) / 2.0).max(0.0) * ppp).floor() / ppp;
         let digits = st.line_count().to_string().len().max(2) as f32;
+        // The markers, the numbers (right-aligned, ending 44 points in as in the design, or
+        // further for long scripts), then 16 points for the fold markers.
         let gutter_w = if options.line_numbers {
-            (MARK_W + digits * char_w + 10.0).round()
+            (MARK_W + 4.0 + digits * char_w).max(44.0).round()
         } else {
             MARK_W
-        } + if options.folding { FOLD_W } else { 0.0 };
+        } + GUTTER_GAP;
 
         if st.find.open {
             find_bar::show_find_bar(ui, st, lang, options, theme);
@@ -327,6 +342,8 @@ impl<'a> SqlEditor<'a> {
             char_width: char_w,
             wrap_width: wrap,
             pixels_per_point: ppp,
+            tab_size: options.tab_size.max(1),
+            tab_width: tab_w,
         };
         // Keep the first visible line in place when row geometry changes
         // (re-wrapping after a resize, font change, background refinement of
@@ -561,21 +578,21 @@ impl<'a> SqlEditor<'a> {
             let text = st.text.as_str();
             let cursor_line = st.index.line_range(st.index.line_of_offset(st.sel.cursor));
             let value = || {
-                if text.len() <= 100_000 {
+                if text.len() <= A11Y_FULL_VALUE_BYTES {
                     text
                 } else {
                     &text[cursor_line.clone()]
                 }
             };
             response.widget_info(|| egui::WidgetInfo::text_edit(enabled, value(), value(), ""));
+            ctx.accesskit_node_builder(st.id, |b| {
+                b.set_role(egui::accesskit::Role::MultilineTextInput);
+                b.set_value(value());
+                if options.read_only {
+                    b.set_read_only();
+                }
+            });
         }
-        ctx.accesskit_node_builder(st.id, |b| {
-            b.set_role(egui::accesskit::Role::MultilineTextInput);
-            b.set_value(st.text.clone());
-            if options.read_only {
-                b.set_read_only();
-            }
-        });
 
         // Events.
         let focused = ctx.memory(|m| m.has_focus(st.id));
@@ -735,7 +752,7 @@ fn pointer(
                 && cursor_line > a
                 && cursor_line <= b
             {
-                st.sel = crate::text::Selection::caret(st.index.line_start(a));
+                st.set_selection(crate::text::Selection::caret(st.index.line_start(a)));
             }
             st.sync_folds(lang);
             ui.ctx().request_repaint();
@@ -849,8 +866,9 @@ fn pointer(
 }
 
 /// Expose the visible lines as AccessKit text runs (with the caret /
-/// selection) when a screen reader is active. The whole document is the
-/// value of the text node; runs cover what is on screen, matching what a
+/// selection) when a screen reader is active. The document (only the cursor
+/// line for large documents) is the value of the text node; runs cover what
+/// is on screen, matching what a
 /// virtualized view can describe without laying out every line.
 fn accessibility(ui: &Ui, st: &mut EditorState, frame: &Frame, lines: Range<usize>, focused: bool) {
     let ctx = ui.ctx().clone();
@@ -1094,6 +1112,13 @@ fn paint(
         }
     }
     let cursor_line = st.index.line_of_offset(st.sel.cursor);
+    for l in error_lines(st, &lines) {
+        tp.rect_filled(
+            band(st.layout.line_top(l), st.layout.line_rows(l) as f32),
+            0.0,
+            theme.error_line,
+        );
+    }
     if options.highlight_current_line
         && st.sel.is_empty()
         && lines.contains(&cursor_line)
@@ -1295,11 +1320,45 @@ fn paint(
         }
     }
 
-    // Gutter.
-    paint_gutter(&painter, st, options, theme, frame, lines, cursor_line);
+    // Gutter (fold markers while the pointer is over it).
+    let show_folds = ui.rect_contains_pointer(frame.gutter);
+    paint_gutter(
+        &painter,
+        st,
+        options,
+        theme,
+        frame,
+        lines,
+        cursor_line,
+        show_folds,
+    );
     Some(caret)
 }
 
+/// The gutter's part of line `l`.
+fn gutter_band(st: &mut EditorState, frame: &Frame, l: usize) -> Rect {
+    let top = frame.origin.y + st.layout.line_top(l);
+    let rows = st.layout.line_rows(l) as f32;
+    Rect::from_min_max(
+        pos2(frame.gutter.left(), top),
+        pos2(frame.gutter.right(), top + rows * frame.row_h),
+    )
+}
+
+/// The visible lines with an error (their background is the theme's `error_line`).
+fn error_lines(st: &EditorState, lines: &Range<usize>) -> Vec<usize> {
+    let mut out: Vec<usize> = st
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| st.index.line_of_offset(d.range.start))
+        .filter(|l| lines.contains(l) && !st.layout.is_hidden(*l))
+        .collect();
+    out.dedup();
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_gutter(
     painter: &Painter,
     st: &mut EditorState,
@@ -1308,14 +1367,28 @@ fn paint_gutter(
     frame: &Frame,
     lines: Range<usize>,
     cursor_line: usize,
+    show_folds: bool,
 ) {
     let g = frame.gutter;
     painter.rect_filled(g, 0.0, theme.gutter_background);
-    painter.vline(
-        g.right() - 0.5,
-        g.y_range(),
-        Stroke::new(1.0, theme.gutter_separator),
-    );
+    if theme.gutter_separator != Color32::TRANSPARENT {
+        painter.vline(
+            g.right() - 0.5,
+            g.y_range(),
+            Stroke::new(1.0, theme.gutter_separator),
+        );
+    }
+    // The cursor line's and error lines' backgrounds run under the numbers too.
+    for l in error_lines(st, &lines) {
+        painter.rect_filled(gutter_band(st, frame, l), 0.0, theme.error_line);
+    }
+    if options.highlight_current_line
+        && st.sel.is_empty()
+        && lines.contains(&cursor_line)
+        && !st.layout.is_hidden(cursor_line)
+    {
+        painter.rect_filled(gutter_band(st, frame, cursor_line), 0.0, theme.current_line);
+    }
     // Statement bar.
     if let Some(r) = st.statement.clone() {
         let a = st.index.line_of_offset(r.start).max(lines.start);
@@ -1347,7 +1420,11 @@ fn paint_gutter(
             None => marks.push((line, d.severity)),
         }
     }
-    for (line, sev) in marks {
+    // An error line has its own background (`error_line`): its marker would repeat it.
+    for (line, sev) in marks
+        .into_iter()
+        .filter(|(_, s)| *s != Severity::Error || theme.error_line == Color32::TRANSPARENT)
+    {
         let color = match sev {
             Severity::Error => theme.error,
             Severity::Warning => theme.warning,
@@ -1356,15 +1433,17 @@ fn paint_gutter(
         let y = frame.origin.y + st.layout.line_top(line) + frame.row_h / 2.0;
         painter.circle_filled(pos2(g.left() + MARK_W / 2.0 + 1.0, y), 3.5, color);
     }
-    let fold_w = if options.folding { FOLD_W } else { 0.0 };
     if options.folding {
         for l in lines.clone() {
             if st.layout.is_hidden(l) || st.folds.region_at(l).is_none() {
                 continue;
             }
             let collapsed = st.folds.collapsed.contains(&l);
+            if !collapsed && !show_folds {
+                continue;
+            }
             let c = pos2(
-                g.right() - 3.0 - FOLD_W / 2.0,
+                g.right() - GUTTER_GAP / 2.0,
                 frame.origin.y + st.layout.line_top(l) + frame.row_h / 2.0,
             );
             let s = 3.5;
@@ -1398,7 +1477,7 @@ fn paint_gutter(
             theme.gutter_text
         };
         let galley = painter.layout_no_wrap((l + 1).to_string(), frame.font_id.clone(), color);
-        let x = g.right() - 6.0 - fold_w - galley.size().x;
+        let x = g.right() - GUTTER_GAP - galley.size().x;
         painter.galley(pos2(x, top), galley, color);
     }
 }

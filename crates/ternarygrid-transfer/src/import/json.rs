@@ -5,6 +5,16 @@
 //! The document is streamed: one record at a time is copied out of the input
 //! and parsed by a small parser that keeps number texts exactly (decimals
 //! never pass through `f64`). Nested objects and arrays become JSON text.
+//! The rows of a wrapper object (`{"total": 2, "items": [...]}`) are streamed
+//! as well (its other members are skipped): whether such an array holds the
+//! rows or is a value of one record of a stream of objects is only known at
+//! the end of the object, so up to 8 MiB of it are kept until then; a larger
+//! array is taken for the rows and streamed.
+//!
+//! [`JsonInputFormat::Auto`] reads JSON Lines when the first line holds one
+//! complete value and more values follow. Otherwise a top-level array or a
+//! wrapper object must be the whole document (content after it is an error
+//! rather than silently ignored), and a plain object starts a stream of objects.
 
 use crate::convert::kind_from_name;
 use crate::encoding::DecodingReader;
@@ -13,7 +23,7 @@ use crate::source::RowSource;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Chain, Cursor, Read};
 use std::path::Path;
 use ternarygrid_core::{ColumnMeta, DataKind, DbError, DbResult, Row, Value};
 
@@ -368,6 +378,19 @@ impl<R: BufRead> Stream<R> {
         }
     }
 
+    /// [`Self::skip_ws`], appending the skipped whitespace to `out`.
+    fn skip_ws_keep(&mut self, out: &mut Vec<u8>) -> DbResult<Option<u8>> {
+        loop {
+            match self.peek()? {
+                Some(c @ (b' ' | b'\t' | b'\r' | b'\n')) => {
+                    out.push(c);
+                    self.bump()?;
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
     fn error(&self, msg: impl std::fmt::Display) -> DbError {
         parse_error("JSON", format!("line {}", self.line), msg)
     }
@@ -481,15 +504,78 @@ impl<R: BufRead> Stream<R> {
 
 enum Mode {
     Lines,
+    /// Elements of an array; `wrapped`: the array is a member of the top-level
+    /// object, whose remaining members are skipped after it.
     Array {
         first: bool,
+        wrapped: bool,
     },
-    /// The records of a wrapper's array read along with the wrapper.
-    Buffered,
     Done,
 }
 
-type JsonInput = BufReader<DecodingReader<Box<dyn Read + Send>>>;
+/// The input, after the bytes read ahead by the JSON Lines detection.
+type JsonInput = Chain<Cursor<Vec<u8>>, BufReader<DecodingReader<Box<dyn Read + Send>>>>;
+
+/// At most this much is read ahead to find the end of the first line.
+const LOOKAHEAD: u64 = 1024 * 1024;
+
+/// Bytes of an array of objects kept while it is unknown whether it holds the
+/// rows of a wrapper object or is a value of one record (see the module docs).
+const WRAPPER_BUFFER: usize = 8 * 1024 * 1024;
+
+/// An array that may hold the rows of a wrapper: its text and the byte ranges of its elements.
+struct Candidate {
+    raw: Vec<u8>,
+    elements: Vec<(usize, usize)>,
+    /// The first member of the object (preferred, like DBeaver's `{"table": [...]}`).
+    first: bool,
+}
+
+/// Consume whitespace into `head`; true when a non-whitespace byte follows.
+fn skip_ws_into(r: &mut impl BufRead, head: &mut Vec<u8>) -> std::io::Result<bool> {
+    loop {
+        if head.len() as u64 >= LOOKAHEAD {
+            return Ok(false);
+        }
+        let buf = r.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(false);
+        }
+        let n = buf.iter().position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n')).unwrap_or(buf.len());
+        head.extend_from_slice(&buf[..n]);
+        let more = n < buf.len();
+        r.consume(n);
+        if more {
+            return Ok(true);
+        }
+    }
+}
+
+/// JSON Lines detection: the first line holds one complete object or array
+/// and another value follows on the next lines. Returns the bytes read ahead
+/// (to be read again) and the verdict.
+fn detect_lines(r: &mut impl BufRead) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut head = Vec::new();
+    if !skip_ws_into(r, &mut head)? {
+        return Ok((head, false));
+    }
+    let start = head.len();
+    r.by_ref().take(LOOKAHEAD).read_until(b'\n', &mut head)?;
+    if !head.ends_with(b"\n") {
+        return Ok((head, false));
+    }
+    let line = &head[start..];
+    let mut p = Parser { b: line, i: 0 };
+    let complete = matches!(line.first(), Some(b'{' | b'[')) && p.skip(0).is_ok() && {
+        p.ws();
+        p.i == line.len()
+    };
+    if !complete {
+        return Ok((head, false));
+    }
+    let more = skip_ws_into(r, &mut head)?;
+    Ok((head, more))
+}
 
 /// Streams the records of a JSON document as rows.
 pub struct JsonSource {
@@ -498,9 +584,11 @@ pub struct JsonSource {
     columns: Vec<ColumnMeta>,
     index: HashMap<String, usize>,
     pending: VecDeque<Row>,
+    /// Records parsed ahead (elements of a buffered wrapper array).
     buffered: VecDeque<Record>,
     buf: Vec<u8>,
     unknown: Vec<String>,
+    wrapper_buffer: usize,
 }
 
 /// Keys under which an API response puts its rows (`{"total": 2, "items": [...]}`).
@@ -536,8 +624,16 @@ impl JsonSource {
 
     /// Read JSON from any reader.
     pub fn from_reader(reader: impl Read + Send + 'static, options: JsonReadOptions) -> DbResult<Self> {
+        Self::open_reader(reader, options, WRAPPER_BUFFER)
+    }
+
+    fn open_reader(reader: impl Read + Send + 'static, options: JsonReadOptions, wrapper_buffer: usize) -> DbResult<Self> {
         let decoded = DecodingReader::new(Box::new(reader) as Box<dyn Read + Send>, &options.encoding)?;
-        let stream = Stream { r: BufReader::with_capacity(64 * 1024, decoded), line: 1 };
+        let mut input = BufReader::with_capacity(64 * 1024, decoded);
+        // `{"tags": [{…}], "id": 1}` on the first line of JSON Lines must not be
+        // taken for a wrapper of the `tags` rows: JSON Lines are detected first.
+        let (head, lines) = if options.format == JsonInputFormat::Auto { detect_lines(&mut input).map_err(Stream::<JsonInput>::io)? } else { (Vec::new(), false) };
+        let stream = Stream { r: Cursor::new(head).chain(input), line: 1 };
         let mut src = JsonSource {
             stream,
             mode: Mode::Done,
@@ -547,15 +643,17 @@ impl JsonSource {
             buffered: VecDeque::new(),
             buf: Vec::new(),
             unknown: Vec::new(),
+            wrapper_buffer,
         };
         let mut first_record: Option<Record> = None;
         let mut declared: Option<Vec<ColumnMeta>> = None;
         match (options.format, src.stream.skip_ws()?) {
             (_, None) => {}
             (JsonInputFormat::Lines, _) => src.mode = Mode::Lines,
+            (JsonInputFormat::Auto, _) if lines => src.mode = Mode::Lines,
             (JsonInputFormat::Array | JsonInputFormat::Auto, Some(b'[')) => {
                 src.stream.bump()?;
-                src.mode = Mode::Array { first: true };
+                src.mode = Mode::Array { first: true, wrapped: false };
             }
             (JsonInputFormat::Array, _) => return Err(src.stream.error("expected '[' at the start of the document")),
             (JsonInputFormat::Auto, Some(b'{')) => first_record = src.open_object(&mut declared)?,
@@ -598,31 +696,26 @@ impl JsonSource {
         Ok(src)
     }
 
-    /// Walk a top-level object: a wrapper (`{"t": [...]}`, `{"columns":..,"rows":..}`)
-    /// switches to array mode; a plain object is the first record of a JSON Lines stream.
+    /// Walk a top-level object: a wrapper (`{"t": [...]}`, `{"total": 2, "items": [...]}`,
+    /// `{"columns":..,"rows":..}`) switches to the records of its array; a plain
+    /// object is the first record of a stream of objects (or the only record).
     fn open_object(&mut self, declared: &mut Option<Vec<ColumnMeta>>) -> DbResult<Option<Record>> {
         self.stream.bump()?;
         let mut members: Vec<(String, Value)> = Vec::new();
-        // The largest array of objects after other members (`{"total":2,"items":[{..}]}`).
-        let mut candidate: Option<Vec<u8>> = None;
+        let mut candidate: Option<Candidate> = None;
         loop {
             match self.stream.skip_ws()? {
                 Some(b'}') => {
                     self.stream.bump()?;
-                    // The whole document is this object: a wrapper of the array, not a JSON Lines record.
-                    if let Some(raw) = candidate
+                    // The whole document is this object: a wrapper of the array, not a record of a stream.
+                    if let Some(c) = candidate
                         && self.stream.skip_ws()?.is_none()
                     {
-                        let mut p = Parser { b: &raw, i: 1 };
-                        loop {
-                            p.ws();
-                            match p.peek() {
-                                Some(b']') | None => break,
-                                Some(b',') => p.i += 1,
-                                _ => self.buffered.push_back(p.item().map_err(|e| self.stream.error(e))?),
-                            }
+                        for &(a, b) in &c.elements {
+                            let rec = Parser { b: &c.raw[a..b], i: 0 }.record().map_err(|e| self.stream.error(e))?;
+                            self.buffered.push_back(rec);
                         }
-                        self.mode = Mode::Buffered;
+                        self.mode = Mode::Done;
                         return Ok(None);
                     }
                     self.mode = Mode::Lines;
@@ -645,23 +738,37 @@ impl JsonSource {
                         Some(b'[') => {
                             self.stream.bump()?;
                             let next = self.stream.skip_ws()?;
-                            // A wrapper's array is its first member; a later array (`{"id":1,"tags":[]}`)
-                            // belongs to a record of a JSON Lines stream.
-                            if key == "rows" || (members.is_empty() && (next == Some(b'{') || next == Some(b']'))) {
-                                self.mode = Mode::Array { first: true };
+                            // `rows` of the columns + rows layout.
+                            if key == "rows" {
+                                self.mode = Mode::Array { first: true, wrapped: true };
                                 return Ok(None);
+                            }
+                            // The rows of a wrapper: its first member when it is an array of
+                            // objects (DBeaver's `{"table": [...]}`), or an array of objects
+                            // under a key APIs use for their rows (`{"total": 2, "items": [{…}]}`,
+                            // but not `{"id": 1, "orders": [{…}]}`, one record with a nested array).
+                            let first = members.is_empty() && (next == Some(b'{') || next == Some(b']'));
+                            if first || (next == Some(b'{') && is_rows_key(&key)) {
+                                let (array, complete) = self.buffer_array(first)?;
+                                if !complete {
+                                    // Too large to be a value of one record: the wrapper's rows, streamed.
+                                    for &(a, b) in &array.elements {
+                                        let rec = Parser { b: &array.raw[a..b], i: 0 }.record().map_err(|e| self.stream.error(e))?;
+                                        self.buffered.push_back(rec);
+                                    }
+                                    self.mode = Mode::Array { first: true, wrapped: true };
+                                    return Ok(None);
+                                }
+                                members.push((key, Value::json(String::from_utf8_lossy(&array.raw).into_owned())));
+                                if candidate.as_ref().is_none_or(|c| !c.first && c.raw.len() < array.raw.len()) {
+                                    candidate = Some(array);
+                                }
+                                continue;
                             }
                             // An array valued member of a plain record.
                             let mut raw = vec![b'['];
                             self.stream.capture(&mut raw, 1)?;
-                            let text = String::from_utf8_lossy(&raw).into_owned();
-                            // Only under a key APIs use for their rows: `{"id": 1, "orders": [{…}]}`
-                            // is one record with a nested array, not a wrapper.
-                            let rows_key = is_rows_key(&key);
-                            members.push((key, Value::json(text)));
-                            if next == Some(b'{') && rows_key && candidate.as_ref().is_none_or(|c| c.len() < raw.len()) {
-                                candidate = Some(raw);
-                            }
+                            members.push((key, Value::json(String::from_utf8_lossy(&raw).into_owned())));
                         }
                         _ => {
                             let mut raw = Vec::new();
@@ -677,28 +784,91 @@ impl JsonSource {
         }
     }
 
+    /// Read an array (its `[` consumed) element by element, and whether it
+    /// ended before `wrapper_buffer` bytes (else the stream is left before the
+    /// next element).
+    fn buffer_array(&mut self, first: bool) -> DbResult<(Candidate, bool)> {
+        let mut raw = vec![b'['];
+        let mut elements = Vec::new();
+        if self.stream.skip_ws_keep(&mut raw)? == Some(b']') {
+            self.stream.bump()?;
+            raw.push(b']');
+            return Ok((Candidate { raw, elements, first }, true));
+        }
+        loop {
+            let start = raw.len();
+            self.stream.capture(&mut raw, 0)?;
+            elements.push((start, raw.len()));
+            match self.stream.skip_ws_keep(&mut raw)? {
+                Some(b',') => {
+                    self.stream.bump()?;
+                    raw.push(b',');
+                }
+                Some(b']') => {
+                    self.stream.bump()?;
+                    raw.push(b']');
+                    return Ok((Candidate { raw, elements, first }, true));
+                }
+                None => return Err(self.stream.error("unexpected end of input inside the array")),
+                Some(c) => return Err(self.stream.error(format!("expected ',' or ']' but found '{}'", c as char))),
+            }
+            if raw.len() > self.wrapper_buffer {
+                return Ok((Candidate { raw, elements, first }, false));
+            }
+            self.stream.skip_ws_keep(&mut raw)?;
+        }
+    }
+
+    /// After the wrapper's array: skip the remaining members of the object.
+    fn close_wrapper(&mut self) -> DbResult<()> {
+        loop {
+            match self.stream.skip_ws()? {
+                Some(b'}') => {
+                    self.stream.bump()?;
+                    return Ok(());
+                }
+                Some(b',') => {
+                    self.stream.bump()?;
+                    self.stream.skip_ws()?;
+                    self.stream.read_string()?;
+                    self.stream.expect_byte(b':')?;
+                    self.buf.clear();
+                    let mut buf = std::mem::take(&mut self.buf);
+                    let r = self.stream.capture(&mut buf, 0);
+                    self.buf = buf;
+                    r?;
+                }
+                None => return Err(self.stream.error("unexpected end of input")),
+                Some(c) => return Err(self.stream.error(format!("unexpected character '{}'", c as char))),
+            }
+        }
+    }
+
     fn next_record(&mut self) -> DbResult<Option<Record>> {
+        if let Some(rec) = self.buffered.pop_front() {
+            return Ok(Some(rec));
+        }
         match self.mode {
             Mode::Done => return Ok(None),
-            Mode::Buffered => {
-                let rec = self.buffered.pop_front();
-                if rec.is_none() {
-                    self.mode = Mode::Done;
-                }
-                return Ok(rec);
-            }
             Mode::Lines => {
                 if self.stream.skip_ws()?.is_none() {
                     self.mode = Mode::Done;
                     return Ok(None);
                 }
             }
-            Mode::Array { first } => {
+            Mode::Array { first, wrapped } => {
                 let c = self.stream.skip_ws()?;
                 match c {
                     Some(b']') => {
                         self.stream.bump()?;
                         self.mode = Mode::Done;
+                        if wrapped {
+                            self.close_wrapper()?;
+                        }
+                        // Content after the document would be silently lost.
+                        if self.stream.skip_ws()?.is_some() {
+                            return Err(self.stream.error("unexpected content after the end of the JSON document (for one record per line, read it as JSON Lines)"));
+                        }
                         return Ok(None);
                     }
                     Some(b',') if !first => {
@@ -708,7 +878,7 @@ impl JsonSource {
                     _ if first => {}
                     Some(c) => return Err(self.stream.error(format!("expected ',' or ']' but found '{}'", c as char))),
                 }
-                self.mode = Mode::Array { first: false };
+                self.mode = Mode::Array { first: false, wrapped };
             }
         }
         self.buf.clear();
@@ -721,7 +891,7 @@ impl JsonSource {
 
     /// Encoding used to read the document (after BOM detection).
     pub fn encoding(&self) -> &'static str {
-        self.stream.r.get_ref().encoding().name()
+        self.stream.r.get_ref().1.get_ref().encoding().name()
     }
 
     fn make_row(&mut self, rec: Record) -> Row {
@@ -858,6 +1028,86 @@ mod tests {
         assert_eq!(s.columns()[0].kind, DataKind::Int);
         assert_eq!(s.columns()[1].name, "name");
         assert_eq!(s.next_batch(10).await.unwrap(), vec![vec![Value::Int(1), Value::text("a")], vec![Value::Int(2), Value::Null]]);
+    }
+
+    #[tokio::test]
+    async fn json_lines_are_detected_before_wrappers() {
+        // The first record starts with an array of objects: not a wrapper of its elements.
+        let lines = "{\"tags\": [{\"t\": 1}], \"id\": 1}\n{\"tags\": [], \"id\": 2}\n{\"id\": 3}\n";
+        let (names, rows) = read(lines, JsonInputFormat::Auto).await;
+        assert_eq!(names, vec!["tags", "id"]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::json("[{\"t\": 1}]"), Value::Int(1)]);
+        assert_eq!(rows[2], vec![Value::Null, Value::Int(3)]);
+        // ... or with a `rows` member, or a rows key after other members
+        let lines = "{\"rows\": [1, 2], \"id\": 1}\r\n\r\n{\"id\": 2, \"items\": [{\"a\": 1}]}\n";
+        let (names, rows) = read(lines, JsonInputFormat::Auto).await;
+        assert_eq!(names, vec!["rows", "id", "items"]);
+        assert_eq!(rows.len(), 2);
+        // JSON Lines of arrays.
+        let (names, rows) = read("[1, \"a\"]\n[2, \"b\"]\n", JsonInputFormat::Auto).await;
+        assert_eq!(names, vec!["column1", "column2"]);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::text("a")], vec![Value::Int(2), Value::text("b")]]);
+        // A one-line document followed by a newline is still one document.
+        let (_, rows) = read("[{\"id\": 1}, {\"id\": 2}]\n", JsonInputFormat::Auto).await;
+        assert_eq!(rows.len(), 2);
+        let (_, rows) = read("{\"users\": [{\"id\": 1}, {\"id\": 2}]}\n", JsonInputFormat::Auto).await;
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+
+    #[tokio::test]
+    async fn content_after_the_document_is_an_error() {
+        // A streamed wrapper followed by more content: the loss is reported.
+        let doc = "{\"users\": [\n{\"id\": 1},\n{\"id\": 2}\n]}\n{\"users\": [{\"id\": 3}]}\n";
+        let r = JsonSource::open_reader(std::io::Cursor::new(doc.as_bytes().to_vec()), JsonReadOptions::default(), 8);
+        assert!(r.is_err());
+        let doc = "[\n{\"a\": 1}\n]\n[{\"a\": 2}]";
+        assert!(JsonSource::from_reader(std::io::Cursor::new(doc.as_bytes().to_vec()), JsonReadOptions::default()).is_err());
+        // Members after the wrapper's array are skipped.
+        let doc = "{\n\"data\": [{\"id\": 1}],\n\"meta\": {\"pages\": [1, 2]}, \"next\": null\n}\n";
+        let (names, rows) = read(doc, JsonInputFormat::Auto).await;
+        assert_eq!(names, vec!["id"]);
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[tokio::test]
+    async fn envelope_rows_are_streamed() {
+        // `{"total": …, "items": [...]}` larger than the buffer: rows are delivered
+        // before the end of the array is read (the broken tail is only reached later).
+        let doc = "{\"total\": 3, \"items\": [{\"id\": 1}, {\"id\": 2}, {\"id\": 3}, oops";
+        let opts = JsonReadOptions { sample_rows: 1, ..Default::default() };
+        let mut s = JsonSource::open_reader(std::io::Cursor::new(doc.as_bytes().to_vec()), opts, 12).unwrap();
+        assert_eq!(s.columns()[0].name, "id");
+        assert_eq!(s.next_batch(2).await.unwrap(), vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        assert_eq!(s.next_batch(1).await.unwrap(), vec![vec![Value::Int(3)]]);
+        assert!(s.next_batch(1).await.is_err());
+        // Within the buffer the whole document is checked first.
+        let opts = JsonReadOptions { sample_rows: 1, ..Default::default() };
+        assert!(JsonSource::from_reader(std::io::Cursor::new(doc.as_bytes().to_vec()), opts).is_err());
+        // A large wrapper with metadata around its rows.
+        let big = format!("{{\"total\": 50, \"items\": [{}], \"next\": null}}", (1..=50).map(|i| format!("{{\"id\": {i}}}")).collect::<Vec<_>>().join(", "));
+        let mut s = JsonSource::open_reader(std::io::Cursor::new(big.into_bytes()), JsonReadOptions::default(), 64).unwrap();
+        let mut ids = Vec::new();
+        loop {
+            let b = s.next_batch(7).await.unwrap();
+            if b.is_empty() {
+                break;
+            }
+            ids.extend(b.into_iter().map(|r| r[0].clone()));
+        }
+        assert_eq!(ids, (1..=50).map(Value::Int).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn stream_of_pretty_printed_objects() {
+        // `jq` style output: objects spanning lines, one after another, with arrays of
+        // objects (first member, rows key) that are values of each record.
+        let doc = "{\n  \"tags\": [{\"t\": 1}],\n  \"id\": 1,\n  \"items\": [{\"a\": 1}]\n}\n{\n  \"tags\": [],\n  \"id\": 2\n}\n";
+        let (names, rows) = read(doc, JsonInputFormat::Auto).await;
+        assert_eq!(names, vec!["tags", "id", "items"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![Value::json("[{\"t\": 1}]"), Value::Int(1), Value::json("[{\"a\": 1}]")]);
+        assert_eq!(rows[1], vec![Value::json("[]"), Value::Int(2), Value::Null]);
     }
 
     #[tokio::test]
