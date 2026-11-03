@@ -78,8 +78,12 @@ pub fn shortcuts_table(ui: &mut egui::Ui, cx: &mut AppContext) {
             egui::Grid::new(("shortcuts", cat.label())).num_columns(2).striped(true).spacing([24.0, 4.0]).min_col_width(240.0).show(ui, |ui| {
                 for a in actions {
                     ui.label(action_label(a));
-                    let keys: Vec<String> = cx.keymap.shortcuts(a).iter().map(|s| s.format(IS_MAC)).collect();
-                    ui.monospace(keys.join("   "));
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        for s in cx.keymap.shortcuts(a) {
+                            ternarygrid_ui::kit::kbd(ui, &s.format(IS_MAC));
+                        }
+                    });
                     ui.end_row();
                 }
             });
@@ -105,10 +109,10 @@ pub fn action_icon(action: Action) -> &'static str {
     match action {
         Action::ExecuteStatement => i::PLAY,
         Action::ExecuteScript => i::FAST_FORWARD,
-        Action::ExecuteSelection => i::TEXT_AA,
-        Action::ExecuteInNewTab => i::PLUS_SQUARE,
+        Action::ExecuteSelection => i::CURSOR_TEXT,
+        Action::ExecuteInNewTab => i::ARROW_SQUARE_OUT,
         Action::ExplainPlan | Action::ExplainAnalyze | Action::ShowPlanDiagram => i::TREE_VIEW,
-        Action::CancelQuery => i::STOP,
+        Action::CancelQuery => i::STOP_CIRCLE,
         Action::NewSqlEditor => i::FILE_SQL,
         Action::OpenSqlConsole => i::TERMINAL_WINDOW,
         Action::SelectConnection => i::PLUGS,
@@ -121,7 +125,7 @@ pub fn action_icon(action: Action) -> &'static str {
         Action::GoToLine => i::ARROW_LINE_DOWN,
         Action::ToggleComment | Action::ToggleBlockComment => i::CHAT_TEXT,
         Action::Autocomplete => i::LIST_MAGNIFYING_GLASS,
-        Action::UpperCase | Action::LowerCase => i::TEXT_AA,
+        Action::UpperCase | Action::LowerCase => i::TEXT_T,
         Action::CancelDataChanges => i::ARROW_COUNTER_CLOCKWISE,
         Action::Export => i::EXPORT,
         Action::Import => i::DOWNLOAD_SIMPLE,
@@ -169,7 +173,7 @@ pub fn action_icon(action: Action) -> &'static str {
         Action::OpenTasks => i::LIST_CHECKS,
         Action::OpenSessionManager => i::USERS,
         Action::AiAssistant => i::SPARKLE,
-        Action::OpenSettings => i::GEAR,
+        Action::OpenSettings => i::GEAR_SIX,
         Action::Quit => i::SIGN_OUT,
         Action::Help => i::QUESTION,
         Action::ShowShortcuts => i::KEYBOARD,

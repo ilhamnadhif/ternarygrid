@@ -84,6 +84,14 @@ pub struct MaintenanceTab {
     lang: Option<SqlLanguage>,
 }
 
+fn statements_executed(n: usize) -> String {
+    ternarygrid_core::trn(n, tr("1 statement executed"), tr("{} statements executed"))
+}
+
+fn statements_failed(n: usize) -> String {
+    ternarygrid_core::trn(n, tr("1 statement failed"), tr("{} statements failed"))
+}
+
 fn message_text(m: &ServerMessage) -> String {
     let mut s = format!("{}: {}", m.severity, m.message);
     if let Some(d) = &m.detail {
@@ -188,7 +196,7 @@ async fn run_all(
                     done = format!("{t} — {done}");
                 }
                 if let Some(n) = r.affected.filter(|n| *n > 0) {
-                    done.push_str(&format!(" — {}", trf("{} row(s)", &[&n])));
+                    done.push_str(&format!(" — {}", ternarygrid_core::trn(n as usize, tr("1 row"), tr("{} rows"))));
                 }
                 push(Level::Ok, done);
                 shared.lock().results.push(r);
@@ -218,7 +226,7 @@ impl MaintenanceTab {
         self
     }
 
-    fn is_truncate(&self) -> bool {
+    pub(crate) fn is_truncate(&self) -> bool {
         self.op.as_deref() == Some(MaintenanceOp::TRUNCATE)
     }
 
@@ -377,18 +385,18 @@ impl MaintenanceTab {
             let state = if run.cancel.is_cancelled() {
                 OpState::Cancelled
             } else if failed > 0 || shared.results.is_empty() {
-                OpState::Failed(trf("{} statement(s) failed", &[&failed]))
+                OpState::Failed(statements_failed(failed))
             } else {
                 if shared.results.iter().all(|r| r.rows.is_none()) {
                     quiet_success = Some(shared.results.len());
                 }
-                OpState::Succeeded(trf("{} statement(s) executed", &[&shared.results.len()]))
+                OpState::Succeeded(statements_executed(shared.results.len()))
             };
             drop(shared);
             cx.ops.finish(run.op.id, state);
         }
         if let Some(n) = quiet_success {
-            cx.toasts.success(trf("{} statement(s) executed", &[&n]));
+            cx.toasts.success(statements_executed(n));
             self.done = true;
         }
     }
@@ -410,7 +418,8 @@ impl MaintenanceTab {
     }
 
     fn ops_ui(&mut self, ui: &mut Ui, cx: &AppContext) {
-        let ops = self.ops(cx);
+        // Truncate is not maintenance: the navigator offers it on its own (its own window).
+        let ops: Vec<MaintenanceOp> = self.ops(cx).into_iter().filter(|o| o.id != MaintenanceOp::TRUNCATE).collect();
         if ops.is_empty() {
             look::muted(ui, tr("No maintenance operations are available for the selected objects."));
             return;
@@ -475,26 +484,44 @@ impl MaintenanceTab {
         look::code_block(ui, self.lang.as_ref(), &text, gutter);
     }
 
-    /// The result line of the last run (at the right of Run).
+    /// A session being opened, the run in progress or how the last one ended (a line of the body).
     fn status_ui(&self, ui: &mut Ui) {
+        if self.pending {
+            parts::spinner_label(ui, tr("Opening a session…"));
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            return;
+        }
         let Some(run) = &self.run else { return };
         let p = ternarygrid_ui::pal(ui);
         let results = run.shared.lock().results.clone();
         let elapsed = crate::widgets::format_duration(run.ended.unwrap_or_else(Instant::now).duration_since(run.started));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
             if run.job.is_some() {
-                ui.label(RichText::new(trf("Running… {}", &[&elapsed])).size(12.5).color(p.text_muted));
                 ui.spinner();
+                ui.label(RichText::new(trf("Running… {}", &[&elapsed])).size(12.5).color(p.text_muted));
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
             } else {
                 let failed = results.iter().filter(|r| r.error.is_some()).count();
-                if failed == 0 && !results.is_empty() {
-                    ui.label(RichText::new(format!("{} · {elapsed}", trf("{} statement(s) executed", &[&results.len()]))).size(12.5).color(p.ok));
+                let (glyph, color, text) = if failed == 0 && !results.is_empty() {
+                    (icon::CHECK_CIRCLE, p.ok, statements_executed(results.len()))
                 } else {
-                    ui.label(RichText::new(format!("{} · {elapsed}", trf("{} statement(s) failed", &[&failed]))).size(12.5).color(p.err));
-                }
+                    (icon::X_CIRCLE, p.err, statements_failed(failed))
+                };
+                ui.label(RichText::new(glyph).font(ternarygrid_ui::style::icon_font(15.0)).color(color));
+                ui.label(RichText::new(format!("{text} · {elapsed}")).size(12.5).color(color));
             }
         });
+    }
+
+    /// The last run ended without a failure (its result tables are shown).
+    fn ran_ok(&self) -> bool {
+        self.run.as_ref().is_some_and(|r| {
+            r.job.is_none() && !r.cancel.is_cancelled() && {
+                let s = r.shared.lock();
+                !s.results.is_empty() && s.results.iter().all(|x| x.error.is_none())
+            }
+        })
     }
 
     /// The log and the result tables of the last run.
@@ -547,42 +574,77 @@ impl MaintenanceTab {
         cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: None, text: Some(text) });
     }
 
+    /// The statements, the run's state, its log and results (its buttons are in the footer).
     fn run_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let sql = self.preview_sql(cx);
         ui.spacing_mut().item_spacing.y = 10.0;
-        let mut open = false;
-        parts::section_header(ui, tr("SQL"), |ui| {
-            if !sql.is_empty() && kit::ghost(ui, Some(icon::FILE_SQL), tr("Open in SQL editor")).clicked() {
-                open = true;
-            }
-        });
-        if open {
-            self.open_in_editor(cx, &sql);
-        }
+        look::title(ui, tr("SQL"));
         self.sql_ui(ui, cx, &sql, true);
         if self.current_op(cx).is_some_and(|o| o.needs_autocommit) {
             look::faint(ui, tr("Runs outside of a transaction (auto-commit)."));
         }
-        let running = self.is_running();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if ui.add_enabled_ui(!running && !sql.is_empty(), |ui| kit::primary_icon(ui, icon::PLAY, tr("Run"))).inner.clicked() {
-                self.start(cx);
-            }
-            if running && kit::secondary(ui, Some(icon::STOP), tr("Cancel")).clicked() {
-                self.cancel(cx);
-            }
-            if self.pending {
-                parts::spinner_label(ui, tr("Opening a session…"));
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
-            }
-            self.status_ui(ui);
-        });
+        self.status_ui(ui);
         self.connect_note(ui, cx);
         if let Some(e) = &self.error {
             look::error(ui, e);
         }
         self.log_ui(ui, cx);
+    }
+
+    /// The footer of both windows: Open in SQL editor at the left; Cancel (Stop while it runs)
+    /// and the operation's button at the right; after a run that showed results, Run again and
+    /// Close.
+    fn footer_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        let sql = self.preview_sql(cx);
+        let running = self.is_running();
+        if ui.add_enabled_ui(!sql.is_empty(), |ui| kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), false)).inner.clicked() {
+            self.open_in_editor(cx, &sql);
+        }
+        let truncate = self.is_truncate();
+        let ran_ok = !running && self.ran_ok();
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let start;
+            if ran_ok {
+                if kit::primary(ui, tr("Close")).clicked() {
+                    self.done = true;
+                }
+                start = ui.add_enabled_ui(!sql.is_empty(), |ui| kit::secondary(ui, Some(icon::PLAY), tr("Run again"))).inner.clicked();
+            } else {
+                let can = !running && !sql.is_empty();
+                start = if truncate {
+                    let label = match self.objects.as_slice() {
+                        [one] => trf("Truncate {}", &[&one.name]),
+                        many => ternarygrid_core::trn(many.len(), tr("Truncate 1 table"), tr("Truncate {} tables")),
+                    };
+                    ui.add_enabled_ui(can, |ui| kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::ERASER), &label, false)).inner.clicked()
+                } else {
+                    ui.add_enabled_ui(can, |ui| kit::primary_icon(ui, icon::PLAY, tr("Run"))).inner.clicked()
+                };
+                if running {
+                    if kit::secondary(ui, Some(icon::STOP_CIRCLE), tr("Stop")).clicked() {
+                        self.cancel(cx);
+                    }
+                } else if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                    // Closes the pop-up.
+                    self.done = true;
+                }
+            }
+            if start {
+                self.start(cx);
+            }
+        });
+    }
+
+    /// What truncating does, in the statement's terms: DELETE (SQLite) can be rolled back by
+    /// the server, TRUNCATE cannot here (it runs in auto-commit).
+    fn truncate_warning(&self, cx: &AppContext, sql: &[String]) -> String {
+        let targets = self.targets(cx);
+        let what = match targets.as_slice() {
+            [one] => one.display_path(),
+            many => ternarygrid_core::trn(many.len(), tr("the table"), tr("the {} tables")),
+        };
+        let delete = sql.iter().all(|s| s.trim_start().to_ascii_uppercase().starts_with("DELETE"));
+        if delete { trf("Every row of {} will be deleted.", &[&what]) } else { trf("Every row of {} will be deleted at once; TRUNCATE cannot be rolled back.", &[&what]) }
     }
 
     /// Truncate: the options, the statement, the warning; its buttons are in the footer.
@@ -602,40 +664,16 @@ impl MaintenanceTab {
         }
         let sql = self.preview_sql(cx);
         self.sql_ui(ui, cx, &sql, false);
-        look::note(ui, parts::Tone::Error, None, tr("Every row of the table(s) is deleted at once, without a transaction to roll back."));
+        if !sql.is_empty() {
+            let warning = self.truncate_warning(cx, &sql);
+            look::note(ui, parts::Tone::Warning, None, &warning);
+        }
         self.connect_note(ui, cx);
-        if self.pending {
-            parts::spinner_label(ui, tr("Opening a session…"));
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
-        }
-        if self.run.is_some() {
-            ui.horizontal(|ui| self.status_ui(ui));
-        }
+        self.status_ui(ui);
         if let Some(e) = &self.error {
             look::error(ui, e);
         }
         self.log_ui(ui, cx);
-    }
-
-    fn truncate_footer(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        let sql = self.preview_sql(cx);
-        let running = self.is_running();
-        if ui.add_enabled_ui(!sql.is_empty(), |ui| kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FILE_SQL), tr("Open in SQL editor"), false)).inner.clicked() {
-            self.open_in_editor(cx, &sql);
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add_enabled_ui(!running && !sql.is_empty(), |ui| kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::TRASH), tr("Truncate"), false)).inner.clicked() {
-                self.start(cx);
-            }
-            if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
-                if running {
-                    self.cancel(cx);
-                } else {
-                    // Closes the pop-up.
-                    self.done = true;
-                }
-            }
-        });
     }
 }
 
@@ -658,7 +696,7 @@ impl TabView for MaintenanceTab {
         }
     }
     fn icon(&self) -> &'static str {
-        if self.is_truncate() { icon::TRASH } else { icon::WRENCH }
+        if self.is_truncate() { icon::ERASER } else { icon::WRENCH }
     }
     fn connection_id(&self) -> Option<&str> {
         Some(&self.conn)
@@ -667,8 +705,8 @@ impl TabView for MaintenanceTab {
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll(cx);
         let conn = self.conn.clone();
+        look::footer(ui, ("maint_footer", &conn, self.is_truncate()), |ui| self.footer_ui(ui, cx));
         if self.is_truncate() {
-            look::footer(ui, ("truncate_footer", &conn), |ui| self.truncate_footer(ui, cx));
             look::body(ui, ("truncate_body", &conn), |ui| {
                 if !cx.popup {
                     look::title(ui, &self.title());

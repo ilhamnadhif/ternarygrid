@@ -55,7 +55,7 @@ impl CatalogGroup {
             CatalogGroup::Security => "Security",
             CatalogGroup::Storage => "Storage",
             CatalogGroup::Administer => "Administer",
-            CatalogGroup::SystemInfo => "System Info",
+            CatalogGroup::SystemInfo => "System info",
             CatalogGroup::None => "",
         }
     }

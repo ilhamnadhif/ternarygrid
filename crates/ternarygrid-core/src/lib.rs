@@ -30,7 +30,7 @@ pub use config::{ConnectionConfig, DbKind, QueryLanguage};
 pub use dialect::{DatabaseEdits, DatabaseProps, Dialect, NewDatabase, SqlSyntax};
 pub use driver::{CancelHandle, ConnectParams, Driver, ExecOptions, QueryCursor, ResultHeader, ServerMessage, Session, TransactionMode};
 pub use error::{DbError, DbResult, ErrorKind};
-pub use i18n::{tr, trf};
+pub use i18n::{tr, trf, trn};
 pub use meta::{ObjectKind, ObjectRef, SchemaRef};
 pub use rowstore::{RowStore, SharedRowStore};
 pub use secret::Secret;

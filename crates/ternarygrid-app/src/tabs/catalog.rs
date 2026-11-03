@@ -11,6 +11,15 @@ use egui_phosphor::regular as icon;
 use ternarygrid_core::catalog::{self, CatalogContext, CatalogFolder, CatalogRow};
 use ternarygrid_core::{SchemaRef, tr};
 
+/// A catalog column's name as a label: its first letter capitalised ("can login" → "Can login").
+fn sentence(name: &str) -> String {
+    let mut c = name.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
 pub struct CatalogObjectTab {
     conn: String,
     folder_id: &'static str,
@@ -112,7 +121,7 @@ impl TabView for CatalogObjectTab {
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if !self.started {
             if !cx.conns.is_connected(&self.conn) {
-                ui.weak(tr("not connected"));
+                ui.label(RichText::new(tr("Not connected.")).color(ternarygrid_ui::pal(ui).text_muted));
                 return;
             }
             self.start(cx);
@@ -147,7 +156,7 @@ impl TabView for CatalogObjectTab {
                             .iter()
                             .filter(|(k, _)| !k.eq_ignore_ascii_case("detail") || row.values.len() <= 2)
                             .map(|(k, v)| ternarygrid_core::meta::Property {
-                                name: k.replace('_', " "),
+                                name: sentence(&k.replace('_', " ")),
                                 value: if v.is_null() { "NULL".to_string() } else { v.to_text().into_owned() },
                                 group: None,
                             })
@@ -158,7 +167,7 @@ impl TabView for CatalogObjectTab {
                         });
                     }
                     Loadable::Loaded(None) => {
-                        ui.weak(tr("The object no longer exists."));
+                        ui.label(RichText::new(tr("The object no longer exists.")).color(pal.text_muted));
                     }
                     Loadable::Failed(e) => {
                         crate::widgets::error_box(ui, &e.full_text());
@@ -171,7 +180,7 @@ impl TabView for CatalogObjectTab {
                     title(ui, tr(folder.label));
                     match items {
                         Loadable::Loaded(v) if v.is_empty() => {
-                            ui.label(RichText::new(tr("(empty)")).color(pal.text_faint));
+                            ui.label(RichText::new(tr("None")).color(pal.text_faint));
                         }
                         Loadable::Loaded(v) => {
                             ui.scope(|ui| {

@@ -182,28 +182,20 @@ fn fetched_at_text(at: chrono::DateTime<chrono::Local>, now: chrono::DateTime<ch
 /// The filter bar: the WHERE (or client filter) field with its keyword inside, column
 /// suggestions and history; the ordering; Apply; and a ⋯ menu with where filters run (the
 /// database or the fetched rows) and the table's default filter. The ordering is a chip
-/// ("Sort ↓ created_at ×", a click edits the ORDER BY) on a table's data page, or, in the
-/// [`full`](Self::full) style of the SQL editor's results, an ORDER BY field followed by ×
-/// (clear filter and order).
+/// ("Sort ↓ created_at ×", a click edits the ORDER BY, × drops it); the same on a table's
+/// data page and under the SQL editor.
 pub struct FilterBar<'a> {
     model: &'a mut ResultModel,
     grid: &'a mut DataGridState,
     state: &'a mut ToolbarState,
     /// Quotes suggested column names that need it (else plain, or "…").
     dialect: Option<std::sync::Arc<dyn ternarygrid_core::Dialect>>,
-    full: bool,
 }
 
 impl<'a> FilterBar<'a> {
     /// New filter bar.
     pub fn new(model: &'a mut ResultModel, grid: &'a mut DataGridState, state: &'a mut ToolbarState) -> Self {
-        FilterBar { model, grid, state, dialect: None, full: false }
-    }
-
-    /// The SQL editor's style: an ORDER BY field (360 wide) and × instead of the sort chip.
-    pub fn full(mut self, full: bool) -> Self {
-        self.full = full;
-        self
+        FilterBar { model, grid, state, dialect: None }
     }
 
     /// The database's dialect, for quoting suggested column names.
@@ -214,7 +206,7 @@ impl<'a> FilterBar<'a> {
 
     /// Show it. Returns actions for the application (server side filters).
     pub fn show(self, ui: &mut Ui) -> Vec<GridAction> {
-        let FilterBar { model, grid, state, dialect, full } = self;
+        let FilterBar { model, grid, state, dialect } = self;
         let kind = dialect.as_ref().map(|d| d.kind());
         // Redis has no server side filter: the read commands take no condition.
         let redis = kind == Some(ternarygrid_core::DbKind::Redis);
@@ -254,7 +246,7 @@ impl<'a> FilterBar<'a> {
             // The ordering (chip or field), Apply, × and ⋯ keep their widths; the WHERE field takes the rest.
             let gap = ui.spacing().item_spacing.x;
             let sort = sort_summary(model, grid, state);
-            let order_w = if full { ORDER_W + 2.0 * 28.0 + gap } else { sort_chip_width(ui, sort.as_ref()) + 30.0 };
+            let order_w = sort_chip_width(ui, sort.as_ref()) + 30.0;
             let apply_w = kit::button_width(ui, Some(icon::PLAY), tr("Apply"), false);
             let flexible = (ui.available_width() - order_w - apply_w - 3.0 * gap).max(160.0);
             const WHERE_WORDS: [&str; 10] = ["AND", "OR", "NOT", "IS NULL", "IS NOT NULL", "LIKE", "ILIKE", "IN", "BETWEEN", "NULL"];
@@ -295,35 +287,28 @@ impl<'a> FilterBar<'a> {
                 }
             };
             let order_popup = ui.id().with("order_by_popup");
-            if full {
-                order_field(ui, ORDER_W, &mut state.order_text, &mut state.rt.order_suggest, &state.order_history, &mut apply);
-            } else {
-                // ORDER BY as a chip ("Sort ↓ created_at ×"): a click edits the ORDER BY text, × drops it.
-                let (chip, remove) = sort_chip(ui, sort.as_ref(), sort_chip_width(ui, sort.as_ref()));
-                clear_sort = remove;
-                Popup::menu(&chip).id(order_popup).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                    ui.set_min_width(380.0);
-                    ui.label(kit::section_title(ui, tr("Order rows by")));
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        order_field(ui, 300.0, &mut state.order_text, &mut state.rt.order_suggest, &state.order_history, &mut apply);
-                        if kit::button_ex(ui, kit::Kind::Primary, None, tr("Apply"), false).clicked() {
-                            apply = true;
-                        }
-                    });
-                    if apply {
-                        ui.close();
+            // ORDER BY as a chip ("Sort ↓ created_at ×"): a click edits the ORDER BY text, × drops it.
+            let (chip, remove) = sort_chip(ui, sort.as_ref(), sort_chip_width(ui, sort.as_ref()));
+            clear_sort = remove;
+            Popup::menu(&chip).id(order_popup).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.set_min_width(380.0);
+                ui.label(kit::section_title(ui, tr("Order rows by")));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    order_field(ui, 300.0, &mut state.order_text, &mut state.rt.order_suggest, &state.order_history, &mut apply);
+                    if kit::button_ex(ui, kit::Kind::Primary, None, tr("Apply"), false).clicked() {
+                        apply = true;
                     }
                 });
-            }
+                if apply {
+                    ui.close();
+                }
+            });
             if kit::button_ex(ui, kit::Kind::Primary, Some(icon::PLAY), tr("Apply"), false).on_hover_text(tr("Apply filter and order (Enter)")).clicked() {
                 apply = true;
             }
             let filtered = !state.filter_text.trim().is_empty() || !state.order_text.trim().is_empty() || !grid.sort.is_empty() || model.has_client_view();
-            if full && kit::icon_button_ex(ui, icon::X, tr("Clear filter and order"), false, 28.0).clicked() {
-                clear = true;
-            }
-            let menu = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("Filter options"), false, if full { 28.0 } else { 30.0 });
+            let menu = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("Filter options"), false, 30.0);
             Popup::menu(&menu).id(ui.id().with("filter_options")).show(|ui| {
                 kit::menu_look(ui, 300.0);
                 kit::menu_caption(ui, tr("Filter and sort"));
@@ -343,17 +328,15 @@ impl<'a> FilterBar<'a> {
                 if kit::menu_check(ui, &mut on, tr("Client: over the fetched rows")).on_hover_text(client_hint).clicked() {
                     grid.mode = DataMode::Client;
                 }
-                // The chip's ORDER BY editor and × (the full style shows both in the bar).
-                if !full {
-                    kit::menu_separator(ui);
-                    if kit::menu_item(ui, Some(icon::ARROWS_DOWN_UP), tr("Edit ORDER BY…"), "").clicked() {
-                        ui.close();
-                        Popup::open_id(ui.ctx(), order_popup);
-                    }
-                    if ui.add_enabled_ui(filtered, |ui| kit::menu_item(ui, Some(icon::X), tr("Clear filter and order"), "")).inner.clicked() {
-                        clear = true;
-                        ui.close();
-                    }
+                // The chip's ORDER BY editor and ×.
+                kit::menu_separator(ui);
+                if kit::menu_item(ui, Some(icon::ARROWS_DOWN_UP), tr("Edit ORDER BY…"), "").clicked() {
+                    ui.close();
+                    Popup::open_id(ui.ctx(), order_popup);
+                }
+                if ui.add_enabled_ui(filtered, |ui| kit::menu_item(ui, Some(icon::X), tr("Clear filter and order"), "")).inner.clicked() {
+                    clear = true;
+                    ui.close();
                 }
                 if crate::model::source_table(model.columns()).is_ok() {
                     kit::menu_separator(ui);
@@ -439,9 +422,6 @@ struct Field<'a> {
 
 /// Height of the filter bar's fields, chip and buttons.
 const FIELD_H: f32 = 30.0;
-
-/// Width of the full style's ORDER BY field.
-const ORDER_W: f32 = 360.0;
 
 /// What the sort chip shows: the first ORDER BY column, its direction, how many follow.
 struct SortSummary {
@@ -615,27 +595,22 @@ fn prefixed_field(
     resp
 }
 
-/// The footer of a result. On a table's data page: on the left the status ("400 rows · more
-/// available · 286 ms"), Fetch next and ⋯ (refresh, auto refresh, fetch all, the total count,
-/// row operations, Chart, Spatial view, the XML view, the panels); on the right the views,
-/// Export and the panel toggle. In the [`full`](Self::full) style of the SQL editor's results
-/// each of those has its own button: refresh, auto refresh, the status with the time the rows
-/// were read, Fetch more, fetch all, the total count on the left; add, duplicate and delete
-/// rows (or why the rows are read-only), the five views, Chart, Spatial view, Export, the
-/// panel toggle and the panel chooser on the right. In the middle, in both, the pending
-/// changes with Discard and Save (only while there are some).
+/// The footer of a result, the same under a table's data and the SQL editor: on the left the
+/// status ("400 rows · more available · 286 ms", the time the rows were read in its tooltip),
+/// Fetch next and ⋯ (refresh, auto refresh, fetch all, the total count, row operations, Chart,
+/// Spatial view, the XML view, the panels); in the middle the pending changes with Discard
+/// and Save (only while there are some); on the right the views, Export and the panels.
 pub struct ResultToolbar<'a> {
     model: &'a mut ResultModel,
     grid: &'a mut DataGridState,
     state: &'a mut ToolbarState,
     fetch_size: usize,
-    full: bool,
 }
 
 impl<'a> ResultToolbar<'a> {
     /// New toolbar.
     pub fn new(model: &'a mut ResultModel, grid: &'a mut DataGridState, state: &'a mut ToolbarState) -> Self {
-        ResultToolbar { model, grid, state, fetch_size: 0, full: false }
+        ResultToolbar { model, grid, state, fetch_size: 0 }
     }
 
     /// The rows one "Fetch next" reads (its label says how many; 0: "Fetch more").
@@ -644,79 +619,44 @@ impl<'a> ResultToolbar<'a> {
         self
     }
 
-    /// The SQL editor's style: every action a button of its own, no ⋯.
-    pub fn full(mut self, full: bool) -> Self {
-        self.full = full;
-        self
-    }
-
     /// Show it. Returns actions for the application.
     pub fn show(self, ui: &mut Ui) -> Vec<GridAction> {
-        let ResultToolbar { model, grid, state, fetch_size, full } = self;
+        let ResultToolbar { model, grid, state, fetch_size } = self;
         let mut actions = Vec::new();
         auto_refresh_tick(ui, model, grid.is_editing(), state, &mut actions);
         let p = ternarygrid_ui::pal(ui);
-        // The full style's icon buttons: 26 square, 14 point icons.
-        let small = |ui: &mut Ui, ic: &str, tip: &str, on: bool| kit::icon_button_sized(ui, ic, tip, on, 26.0, 14.0);
-        let notify = |r: Result<usize, String>, actions: &mut Vec<GridAction>| {
-            if let Err(e) = r {
-                actions.push(GridAction::Notify { message: e, error: true });
-            }
-        };
+        // A narrow footer (a side panel open, a split editor) keeps the status, the views and
+        // ⋯; Add row and Export move into ⋯ instead of running into the status.
+        let compact = ui.available_width() < COMPACT_W;
         let row = ui.horizontal(|ui| {
             ui.set_min_height(FOOTER_H);
-            ui.spacing_mut().item_spacing.x = if full { 4.0 } else { 10.0 };
-            if full {
-                if small(ui, icon::ARROW_CLOCKWISE, tr("Refresh (Cmd+R)"), false).clicked() {
-                    actions.push(GridAction::Refresh);
-                }
-                let tip = state.auto_refresh_secs.map_or_else(|| tr("Auto refresh").to_string(), |s| trf("Auto refresh: every {}", &[&auto_label(s)]));
-                let clock = small(ui, icon::CLOCK, &tip, state.auto_refresh_secs.is_some());
-                Popup::menu(&clock).id(ui.id().with("auto_refresh_menu")).show(|ui| auto_refresh_menu(ui, state, &mut actions));
-                divider(ui);
-            }
+            ui.spacing_mut().item_spacing.x = 10.0;
             // --- status: the row count stands out; Fetch next follows it
             let (rows, mut rest) = status_parts(model);
             if state.auto_refresh_secs.is_some() && (model.has_changes() || model.fetch.fetching) {
                 rest.push_str(" · ");
                 rest.push_str(tr("auto refresh paused"));
             }
-            // When the rows were read: in the full style's text, else in the tooltip.
+            // When the rows were read: in the tooltip.
             let read_at = model.fetch.fetched_at.map(|at| fetched_at_text(at, chrono::Local::now()));
-            if let (true, Some(at)) = (full, &read_at) {
-                rest.push_str(" · ");
-                rest.push_str(at);
-            }
             let mut job = egui::text::LayoutJob::default();
             let size = 12.5;
             job.append(&rows, 0.0, egui::TextFormat::simple(ternarygrid_ui::style::medium(ui.ctx(), size), p.text));
             job.append(&rest, 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), p.text_muted));
             let status = ui.add(egui::Label::new(job).selectable(false));
-            if let (false, Some(at)) = (full, read_at) {
+            if let Some(at) = read_at {
                 status.on_hover_text(trf("Read at {}", &[&at]));
             }
             let fetching = model.fetch.fetching;
-            // The full style hides them while the rows come (the mockups' running statement).
-            if model.fetch.has_more && !(full && fetching) {
-                let label = if fetch_size > 0 && !full { trf("Fetch next {}", &[&fetch_size]) } else { tr("Fetch more").to_string() };
-                let r = ui
-                    .add_enabled_ui(!fetching, |ui| {
-                        if full { kit::button_ex(ui, kit::Kind::Ghost, Some(icon::ARROW_DOWN), &label, true) } else { flat_button(ui, None, &label, Flat::Link) }
-                    })
-                    .inner
-                    .on_hover_text(tr("Fetch next page"));
+            if model.fetch.has_more {
+                let label = if fetch_size > 0 { trf("Fetch next {}", &[&fetch_size]) } else { tr("Fetch more").to_string() };
+                let r = ui.add_enabled_ui(!fetching, |ui| flat_button(ui, None, &label, Flat::Link)).inner.on_hover_text(tr("Fetch next page"));
                 if r.clicked() {
                     actions.push(GridAction::FetchMore);
                 }
-                if full && ui.add_enabled_ui(!fetching, |ui| small(ui, icon::DOWNLOAD_SIMPLE, tr("Fetch all rows"), false)).inner.clicked() {
-                    actions.push(GridAction::FetchAll);
-                }
             }
-            if full && ui.add_enabled_ui(!model.fetch.counting, |ui| small(ui, icon::HASH, tr("Calculate total row count"), false)).inner.clicked() {
-                actions.push(GridAction::CountTotal);
-            }
-            // Auto refresh on: its interval, a click changes it (the full style's clock is on).
-            if let (false, Some(s)) = (full, state.auto_refresh_secs) {
+            // Auto refresh on: its interval, a click changes it.
+            if let Some(s) = state.auto_refresh_secs {
                 let r = flat_button(ui, Some(icon::TIMER), &auto_label(s), Flat::Accent).on_hover_text(tr("Auto refresh"));
                 Popup::menu(&r).id(ui.id().with("auto_refresh_chip")).show(|ui| auto_refresh_menu(ui, state, &mut actions));
             }
@@ -731,32 +671,24 @@ impl<'a> ResultToolbar<'a> {
                     ui.ctx().request_repaint_after(crate::grid::CANCEL_AFTER - running);
                 }
             }
-            // ⋯: what the footer does besides fetching the next rows.
-            if !full {
-                let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More result actions"), false, 26.0);
-                Popup::menu(&more).id(ui.id().with("result_more")).show(|ui| more_menu(ui, model, grid, state, &mut actions));
-            }
-            // A failed fetch popped up once; a click shows it again.
-            if let Some(e) = &model.fetch.error {
-                let label = egui::Label::new(RichText::new(format!("{} {}", icon::WARNING_CIRCLE, e)).size(12.5).color(p.err)).truncate().sense(egui::Sense::click());
-                if ui.add(label).on_hover_text(tr("Show the error")).clicked() {
-                    state.error_popup = Some(e.clone());
+            // A failed fetch shows in its bar over the rows; closed, a short note here brings it back
+            // (the message once on screen, not twice).
+            if let Some(e) = &model.fetch.error
+                && state.dismissed_fetch_error.as_ref() == Some(e)
+            {
+                let label = egui::Label::new(RichText::new(format!("{} {}", icon::WARNING_CIRCLE, tr("The fetch failed"))).size(12.5).color(p.err)).sense(egui::Sense::click());
+                if ui.add(label).on_hover_text(e.as_str()).clicked() {
+                    state.dismissed_fetch_error = None;
                 }
             }
             let left_end = ui.min_rect().right();
-            // --- right, right to left: the panel toggle, Export, the views
+            // --- right, right to left: the panel toggle at the edge, ⋯ (the less used actions,
+            // the last of the result's actions as in every bar), Export, the views, Add row
             let right_start = ui
                 .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = if full { 4.0 } else { 8.0 };
-                    if full {
-                        let chooser = kit::icon_button_sized(ui, icon::CARET_DOWN, tr("Choose panels"), false, 20.0, 11.0);
-                        Popup::menu(&chooser).id(ui.id().with("panel_chooser")).show(|ui| {
-                            kit::menu_look(ui, 200.0);
-                            panel_items(ui, state, &mut actions);
-                        });
-                    }
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     let visible = !state.open_panels.is_empty() && !state.panels_hidden;
-                    if panel_toggle(ui, visible, if full { 26.0 } else { 28.0 }).clicked() {
+                    if panel_toggle(ui, visible, 28.0).clicked() {
                         if visible {
                             state.panels_hidden = true;
                         } else {
@@ -766,45 +698,33 @@ impl<'a> ResultToolbar<'a> {
                             state.panels_hidden = false;
                         }
                     }
-                    let export = if full {
-                        kit::button_ex(ui, kit::Kind::Ghost, Some(icon::EXPORT), tr("Export"), true)
-                    } else {
-                        flat_button(ui, Some(icon::EXPORT), tr("Export"), Flat::Plain)
-                    };
-                    if export.on_hover_text(tr("Export…")).clicked() {
-                        actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
-                    }
-                    if full {
-                        divider(ui);
-                        if small(ui, icon::MAP_TRIFOLD, tr("Spatial view"), false).clicked() {
-                            actions.push(GridAction::ShowSpatial);
-                        }
-                        if small(ui, icon::CHART_BAR, tr("Chart"), false).clicked() {
-                            actions.push(GridAction::ShowChart);
+                    let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More result actions"), false, 28.0);
+                    Popup::menu(&more).id(ui.id().with("result_more")).show(|ui| more_menu(ui, model, grid, state, compact, &mut actions));
+                    if !compact {
+                        let export = flat_button(ui, Some(icon::EXPORT), tr("Export"), Flat::Plain);
+                        if export.on_hover_text(tr("Export…")).clicked() {
+                            actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
                         }
                     }
-                    if let Some(kind) = view_switch(ui, state.view, full)
+                    if let Some(kind) = view_switch(ui, state.view)
                         && state.view != kind
                     {
                         state.view = kind;
                         actions.push(GridAction::SwitchView(kind));
                     }
-                    if full {
-                        divider(ui);
-                    }
-                    if model.is_editable() {
-                        if full {
-                            if small(ui, icon::TRASH, tr("Delete selected rows"), false).clicked() {
-                                notify(grid::delete_selected(model, grid), &mut actions);
-                            }
-                            if small(ui, icon::COPY, tr("Duplicate selected rows"), false).clicked() {
-                                notify(grid::duplicate_selected(model, grid), &mut actions);
-                            }
-                            if small(ui, icon::PLUS, tr("Add row"), false).clicked() {
-                                notify(grid::add_row(model, grid), &mut actions);
-                            }
+                    // Adding a row is the edit people look for under the rows (as in DBeaver's
+                    // footer); the other row operations are in ⋯, the context menu and the keys.
+                    if model.is_editable() && !compact {
+                        let add = flat_button(ui, Some(icon::PLUS), tr("Add row"), Flat::Plain).on_hover_text(tr("Add a row after the selected one (Insert)"));
+                        if add.clicked()
+                            && let Err(e) = grid::add_row(model, grid)
+                        {
+                            actions.push(GridAction::Notify { message: e, error: true });
                         }
-                    } else if let Some(r) = model.read_only_reason() {
+                    }
+                    if !model.is_editable()
+                        && let Some(r) = model.read_only_reason()
+                    {
                         // 🔒 No unique key, 5 apart, the reason in the tooltip.
                         ui.scope(|ui| {
                             ui.spacing_mut().item_spacing.x = 5.0;
@@ -850,12 +770,8 @@ impl<'a> ResultToolbar<'a> {
 /// Height of the footer's row.
 const FOOTER_H: f32 = 30.0;
 
-/// The full footer's hairline between groups: 16 high.
-fn divider(ui: &mut Ui) {
-    let p = ternarygrid_ui::pal(ui);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 16.0), egui::Sense::hover());
-    ui.painter().vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, p.border));
-}
+/// Below this width the footer moves Add row and Export into ⋯.
+const COMPACT_W: f32 = 760.0;
 
 /// The look of a [`flat_button`].
 #[derive(Clone, Copy, PartialEq)]
@@ -943,14 +859,8 @@ const VIEWS: [(ResultViewKind, &str, &str); 5] = [
 ];
 
 /// The view switcher, one pill (laid out right to left: the pill is allocated at once): the
-/// five views raised (the full style, the kit's group), or the first four, the shown one
-/// outlined (a table's data page). Returns the view clicked.
-fn view_switch(ui: &mut Ui, current: ResultViewKind, full: bool) -> Option<ResultViewKind> {
-    if full {
-        let segments: Vec<kit::Segment> = VIEWS.iter().map(|(kind, ic, name)| kit::Segment { icon: ic, tooltip: tr(name), on: current == *kind }).collect();
-        let clicked = kit::button_group(ui, &segments).iter().position(|r| r.clicked());
-        return clicked.map(|i| VIEWS[i].0);
-    }
+/// first four views, the shown one raised (the XML view is in ⋯). Returns the view clicked.
+fn view_switch(ui: &mut Ui, current: ResultViewKind) -> Option<ResultViewKind> {
     let p = ternarygrid_ui::pal(ui);
     let views = &VIEWS[..4];
     let (bw, bh, pad, gap) = (30.0, 24.0, 2.0, 2.0);
@@ -966,7 +876,7 @@ fn view_switch(ui: &mut Ui, current: ResultViewKind, full: bool) -> Option<Resul
         resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, tr(name)));
         let resp = resp.on_hover_text(tip);
         if on {
-            ui.painter().rect(r, 5, p.surface, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            ternarygrid_ui::kit::raised(ui.painter(), r, egui::CornerRadius::same(5), p.thumb);
         } else if resp.hovered() {
             ui.painter().rect_filled(r, 5, p.hover);
         }
@@ -1006,7 +916,10 @@ fn pending_pill(ui: &mut Ui, count: &str, pending: usize) -> Option<bool> {
     if key_button(ui, None, tr("Discard"), None, false, 26.0).on_hover_text(tr("Discard pending changes")).clicked() {
         out = Some(false);
     }
-    if key_button(ui, None, tr("Save"), Some(SAVE_KEYS), true, 26.0).on_hover_text(trf("Save {} pending change(s) (Cmd+S)", &[&pending])).clicked() {
+    if key_button(ui, None, tr("Save"), Some(SAVE_KEYS), true, 26.0)
+        .on_hover_text(ternarygrid_core::trn(pending, tr("Save 1 pending change (⌘S)"), tr("Save {} pending changes (⌘S)")))
+        .clicked()
+    {
         out = Some(true);
     }
     out
@@ -1077,7 +990,7 @@ fn auto_refresh_menu(ui: &mut Ui, state: &mut ToolbarState, actions: &mut Vec<Gr
     });
 }
 
-/// The panels as check items (the ⋯ menu, the full footer's chooser).
+/// The panels as check items (the ⋯ menu, the panel strip's +).
 fn panel_items(ui: &mut Ui, state: &ToolbarState, actions: &mut Vec<GridAction>) {
     for (kind, _, name) in PANELS {
         let mut open = state.is_panel_open(kind) && !state.panels_hidden;
@@ -1090,8 +1003,16 @@ fn panel_items(ui: &mut Ui, state: &ToolbarState, actions: &mut Vec<GridAction>)
 
 /// The footer's ⋯ menu: refresh, auto refresh, fetching, rows, Chart / Spatial view, the XML
 /// view, panels.
-fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, state: &mut ToolbarState, actions: &mut Vec<GridAction>) {
+fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, state: &mut ToolbarState, compact: bool, actions: &mut Vec<GridAction>) {
     kit::menu_look(ui, 260.0);
+    // What a narrow footer leaves out.
+    if compact {
+        if kit::menu_item(ui, Some(icon::EXPORT), tr("Export…"), "").clicked() {
+            actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
+            ui.close();
+        }
+        kit::menu_separator(ui);
+    }
     if kit::menu_item(ui, Some(icon::ARROW_CLOCKWISE), tr("Refresh"), keys("⌘R", "Ctrl+R")).clicked() {
         actions.push(GridAction::Refresh);
         ui.close();

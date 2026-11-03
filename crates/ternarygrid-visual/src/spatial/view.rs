@@ -516,7 +516,12 @@ fn fit(state: &mut SpatialState, layers: &[SpatialLayer], rect: Rect, geographic
         state.scale = 1.0;
         return;
     };
-    let min_span = if geographic {
+    // The bounding box (and 10 % around it), whatever its units; a floor for a single point
+    // (and a line along an axis keeps a twentieth of its length across).
+    let span = b.width().max(b.height());
+    let min_span = if span > 0.0 {
+        span * 0.05
+    } else if geographic {
         0.02
     } else {
         (b.center().0.abs().max(b.center().1.abs()) * 1e-3).max(10.0)
@@ -606,8 +611,26 @@ fn hit_test(
 }
 
 fn toolbar(ui: &mut Ui, layers: &[SpatialLayer], state: &mut SpatialState, srid: Option<i32>) {
-    use ternarygrid_ui::kit;
     let pal = ternarygrid_ui::pal(ui);
+    // 12 / 16 from the edges, as the bar above it (the hint at the right off the window's edge).
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 16,
+            top: 2,
+            bottom: 2,
+        })
+        .show(ui, |ui| toolbar_row(ui, layers, state, srid, pal));
+}
+
+fn toolbar_row(
+    ui: &mut Ui,
+    layers: &[SpatialLayer],
+    state: &mut SpatialState,
+    srid: Option<i32>,
+    pal: ternarygrid_ui::style::Palette,
+) {
+    use ternarygrid_ui::kit;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         if kit::icon_button_ex(ui, icon::CORNERS_OUT, tr("Zoom to fit"), false, 26.0).clicked() {
@@ -631,7 +654,12 @@ fn toolbar(ui: &mut Ui, layers: &[SpatialLayer], state: &mut SpatialState, srid:
         }
         kit::vdivider(ui, 16.0);
         let items: usize = layers.iter().map(|l| l.items.len()).sum();
-        ui.label(egui::RichText::new(trf("{} geometries", &[&items])).color(pal.text_faint));
+        let count = if items == 1 {
+            tr("1 geometry").to_string()
+        } else {
+            trf("{} geometries", &[&items])
+        };
+        ui.label(egui::RichText::new(count).color(pal.text_muted));
         let errors: usize = layers.iter().map(|l| l.errors.len()).sum();
         if errors > 0 {
             let detail = layers

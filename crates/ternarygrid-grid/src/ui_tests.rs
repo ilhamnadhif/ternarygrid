@@ -627,7 +627,7 @@ fn record_view_has_the_grids_menu_and_keys() {
     v.frame(vec![press(value, PointerButton::Secondary, Modifiers::NONE)]);
     v.frame(vec![release(value, PointerButton::Secondary, Modifiers::NONE)]);
     v.frame(vec![]);
-    for item in ["Copy with column names", "Set NULL", "Set DEFAULT", "Add row", "Duplicate row(s)", "Delete row(s)", "Filter by value", "Generate SQL"] {
+    for item in ["Copy with column names", "Set NULL", "Set DEFAULT", "Add row", "Duplicate row", "Delete row", "Filter by value", "Generate SQL"] {
         assert!(v.find(item).is_some(), "{item} in the menu");
     }
     assert!(v.find("Zoom").is_none(), "the grid's own");
@@ -692,28 +692,18 @@ fn a_long_fetch_shows_a_spinner_then_cancel() {
 }
 
 #[test]
-fn the_panel_tab_x_closes_it() {
+fn every_panel_has_a_tab() {
     let mut v = Viewer::new(crate::test_support::editable_model(3));
-    v.state.open_panel(PanelKind::Grouping);
+    v.state.open_panel(PanelKind::Value);
     v.frame(vec![]);
     v.frame(vec![]);
-    assert!(v.state.toolbar.is_panel_open(PanelKind::Grouping));
-    // The × of the tab (not a × of the grid's toolbar: the one right of "Grouping").
-    let tab = v.find("Grouping").expect("the tab");
-    let update = v.output.accesskit_update.as_ref().unwrap();
-    let x = update
-        .nodes
-        .iter()
-        .filter_map(|(_, n)| {
-            let b = n.bounds().filter(|_| n.label().is_some_and(|l| l == "Close panel"))?;
-            Some(egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
-        })
-        .filter(|p| p.x > tab.x && (p.y - tab.y).abs() < 10.0)
-        .min_by(|a, b| a.x.total_cmp(&b.x))
-        .expect("the tab's ×");
-    v.click(x);
+    assert!(!v.state.toolbar.is_panel_open(PanelKind::Calc));
+    // The other panels are icons in the strip, named for screen readers and in the tooltip.
+    let calc = v.find("Calc").expect("the Calc tab, before it was ever opened");
+    v.click(calc);
     v.frame(vec![]);
-    assert!(!v.state.toolbar.is_panel_open(PanelKind::Grouping), "× closes the panel");
+    assert!(v.state.toolbar.is_panel_open(PanelKind::Calc), "a click opens it");
+    assert_eq!(v.state.active_panel, Some(PanelKind::Calc), "and shows it");
 }
 
 #[test]

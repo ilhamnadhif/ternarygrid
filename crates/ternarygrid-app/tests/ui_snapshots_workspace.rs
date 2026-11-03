@@ -94,15 +94,34 @@ impl Raster {
                 if area.abs() < 1e-9 {
                     continue;
                 }
+                // Each edge's pixels belong to one triangle only (a top-left style rule on the
+                // edge's direction, both triangles of a shared edge see it reversed): else a
+                // translucent quad's diagonal (a modal backdrop) is blended twice, a dotted seam.
+                let owns = |a: (f32, f32), b: (f32, f32)| {
+                    let (dx, dy) = ((b.0 - a.0) * area.signum(), (b.1 - a.1) * area.signum());
+                    dy > 0.0 || (dy == 0.0 && dx > 0.0)
+                };
+                let edge = [owns(pts[1], pts[2]), owns(pts[2], pts[0]), owns(pts[0], pts[1])];
+                // The edge function of a→b at p, computed from the edge's endpoints in one fixed
+                // order: the two triangles of a shared edge get exactly opposite values, so a
+                // pixel on it is neither lost (a dark speck) nor drawn twice.
+                let side = |a: (f32, f32), b: (f32, f32), p: (f32, f32)| {
+                    let (a, b, flip) = if (a.0, a.1) <= (b.0, b.1) { (a, b, 1.0) } else { (b, a, -1.0) };
+                    flip * ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0))
+                };
                 for y in miny..maxy {
                     for x in minx..maxx {
-                        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                        let w0 = ((pts[1].0 - px) * (pts[2].1 - py) - (pts[2].0 - px) * (pts[1].1 - py)) / area;
-                        let w1 = ((pts[2].0 - px) * (pts[0].1 - py) - (pts[0].0 - px) * (pts[2].1 - py)) / area;
-                        let w2 = 1.0 - w0 - w1;
-                        if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
+                        let p = (x as f32 + 0.5, y as f32 + 0.5);
+                        let e = [side(pts[1], pts[2], p), side(pts[2], pts[0], p), side(pts[0], pts[1], p)];
+                        let inside = |i: usize| {
+                            let s = e[i] * area.signum();
+                            s > 0.0 || (s == 0.0 && edge[i])
+                        };
+                        if !(inside(0) && inside(1) && inside(2)) {
                             continue;
                         }
+                        let (w0, w1) = (e[0] / area, e[1] / area);
+                        let w2 = 1.0 - w0 - w1;
                         let u = w0 * v[0].uv.x + w1 * v[1].uv.x + w2 * v[2].uv.x;
                         let vv = w0 * v[0].uv.y + w1 * v[1].uv.y + w2 * v[2].uv.y;
                         let tx = ((u * tex.size[0] as f32) as usize).min(tex.size[0] - 1);
@@ -216,13 +235,18 @@ impl Shots {
 
     /// Write the last frame as `<name>-<theme>.png`.
     fn shot(&mut self, name: &str) {
+        // The pointer away from the content (no hover effects).
+        self.shot_hovering(name, egui::pos2(1439.0, 899.0));
+    }
+
+    /// [`Shots::shot`] with the pointer at `pos` (a row's hover state).
+    fn shot_hovering(&mut self, name: &str, pos: egui::Pos2) {
         if self.only.as_deref().is_some_and(|o| !o.split(',').any(|o| name.starts_with(o))) {
             return;
         }
         self.h.state_mut().toasts.clear();
-        // The pointer away from the content (no hover effects).
-        self.h.event(egui::Event::PointerMoved(egui::pos2(1439.0, 899.0)));
-        self.frames(8);
+        self.h.event(egui::Event::PointerMoved(pos));
+        self.frames(30);
         let out = self.h.output();
         let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
         let size = self.h.ctx.content_rect().size() * ppp();
@@ -443,7 +467,7 @@ fn shots(s: &mut Shots) {
     s.click("Projects and scripts");
     s.frames(4);
     s.shot("projects");
-    s.click("Database Navigator");
+    s.click("Database navigator");
 
     // Query history: a few statements, one failing.
     run_sql(s, &conn, "select * from product order by price desc");
@@ -527,10 +551,34 @@ fn shots(s: &mut Shots) {
         }
         s.frames(3);
         s.shot(name);
-        if section == "Network profiles" {
-            s.click("New profile");
-            s.frames(3);
-            s.shot("set_network_form");
+        match section {
+            // A row under the pointer: its shortcut records a new one, Remove at its end.
+            "Keyboard shortcuts" => {
+                let cell = s.h.query_all_by_label("Record a shortcut").nth(3).map(|n| n.rect());
+                if let Some(r) = cell {
+                    s.shot_hovering("set_keys_hover", r.center());
+                }
+            }
+            // Clearing the history asks first (how many entries go).
+            "Query history" => {
+                s.click("Clear history…");
+                s.frames(20);
+                s.shot("set_history_clear");
+                s.click("Cancel");
+                s.frames(10);
+            }
+            "Network profiles" => {
+                // Deleting a profile asks first; a new profile is saved at once and selected.
+                s.click("Delete profile…");
+                s.frames(20);
+                s.shot("set_network_delete");
+                s.click("Cancel");
+                s.frames(10);
+                s.click("New profile");
+                s.frames(3);
+                s.shot("set_network_form");
+            }
+            _ => {}
         }
     }
     // A select open (the menu look of the drop-downs): the formatter of the SQL editor.
@@ -628,7 +676,7 @@ fn shots(s: &mut Shots) {
     use ternarygrid_tasks::{MessageLevel as L, RunStatus as R, Trigger as T};
     record(&tb, 330, 41, R::Succeeded, T::Schedule, None, &[]);
     record(&te, 360, 6, R::Succeeded, T::Schedule, None, &[]);
-    record(&t1, 300, 41, R::Succeeded, T::Schedule, None, &[(0, L::Info, "Connecting to ternarygrid-sample.db…"), (41, L::Info, "1 statement(s) run")]);
+    record(&t1, 300, 41, R::Succeeded, T::Schedule, None, &[(0, L::Info, "Connecting to ternarygrid-sample.db…"), (41, L::Info, "1 statement executed")]);
     record(&t2, 2900, 3, R::Succeeded, T::Manual, None, &[(3, L::Info, "12 differences")]);
     record(&t2, 1460, 4, R::Succeeded, T::Schedule, None, &[(4, L::Info, "14 differences")]);
     let refused = "connection refused (os error 61): tplus-staging:3306";
@@ -661,7 +709,7 @@ fn shots(s: &mut Shots) {
     s.focused::<ternarygrid_app::tabs::tasks::TasksTab>().select_task(&t3.id);
     s.focused::<ternarygrid_app::tabs::tasks::TasksTab>().add_to_selection(&t2.id);
     s.frames(3);
-    s.click("Delete");
+    s.click("Delete…");
     s.frames(20);
     s.shot("task_delete");
     s.click("Cancel");

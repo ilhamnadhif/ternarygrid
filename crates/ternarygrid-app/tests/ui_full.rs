@@ -611,9 +611,10 @@ fn menus_actions_commands_and_dialogs() {
     nav_row(&h, "zz_drop_me").unwrap().click_secondary();
     frames(&mut h, 2);
     click(&mut h, "Drop…");
-    assert!(has(&h, "Drop objects"), "drop dialog: {:?}", labels(&h));
+    assert!(has(&h, "Drop object"), "drop dialog: {:?}", labels(&h));
     pause(&mut h);
-    h.query_all_by_label("Drop").last().unwrap().click();
+    // The button names the verb and the object.
+    h.query_all_by_label("Drop table").last().unwrap().click();
     wait(&mut h, "dropped", |h| nav_row(h, "zz_drop_me").is_none());
     no_errors(&mut h, "drop");
     assert_eq!(query_one(&db, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'zz_drop_me'"), "0");
@@ -655,7 +656,7 @@ fn menus_actions_commands_and_dialogs() {
     pause(&mut h);
     nav_row(&h, &dup).unwrap().click_secondary();
     frames(&mut h, 2);
-    click(&mut h, "Delete");
+    click(&mut h, "Delete connection…");
     frames(&mut h, 2);
     let delete_buttons: Vec<String> = labels(&h).into_iter().filter(|l| l.contains("Delete")).collect();
     pause(&mut h);
@@ -694,7 +695,7 @@ fn menus_actions_commands_and_dialogs() {
     let cancelled = h.output().viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose));
     assert!(cancelled, "close cancelled while a tab is dirty");
     frames(&mut h, 2);
-    assert!(has(&h, "Quit TernaryGrid?"), "quit confirmation: {:?}", labels(&h));
+    assert!(has(&h, "Quit TernaryGrid") && has(&h, "Quit without saving"), "quit confirmation: {:?}", labels(&h));
     no_errors(&mut h, "quit");
 }
 
@@ -801,7 +802,15 @@ fn settings_grid_menu_and_editor_helpers() {
     open(&mut h);
     frames(&mut h, 2);
     click(&mut h, "Filter by value");
-    let eq = labels(&h).into_iter().find(|l| l.trim_start_matches(egui_phosphor::regular::SQUARE).trim_start().starts_with("id = ")).unwrap_or_else(|| panic!("{:?}", labels(&h)));
+    // The cell's value (`id = 5`), or for the sweep's new row (its id NULL: Generate UUID is
+    // offered on uuid and text columns only) `id IS NULL`.
+    let eq = labels(&h)
+        .into_iter()
+        .find(|l| {
+            let l = l.trim_start_matches(egui_phosphor::regular::SQUARE).trim_start();
+            l.starts_with("id = ") || l == "id IS NULL"
+        })
+        .unwrap_or_else(|| panic!("{:?}", labels(&h)));
     click(&mut h, &eq);
     // The menu sweep left pending edits: reloading asks first, and discarding them
     // drops the new row the filter may name.
@@ -1108,9 +1117,10 @@ fn tool_tabs_run() {
     h.event(egui::Event::Text("code".into()));
     frames(&mut h, 2);
     click(&mut h, "Create table…");
-    assert!(has(&h, "Execute"), "designer confirmation: {:?}", labels(&h));
+    // The confirmation's button is named after what it does.
+    assert!(h.query_all_by_label("Create table").next().is_some(), "designer confirmation: {:?}", labels(&h));
     pause(&mut h);
-    h.query_all_by_label_contains("Execute").last().unwrap().click();
+    h.query_all_by_label("Create table").last().unwrap().click();
     wait(&mut h, "table created", |_| query_one(&db, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'zz_designed'") == "1");
     settle(&mut h, "table designer");
     let ddl = query_one(&db, "SELECT sql FROM sqlite_master WHERE name = 'zz_designed'");
@@ -1594,9 +1604,10 @@ fn workspace_from_dbeaver() {
     // The rail shows the projects, then the navigator again.
     click(&mut h, "Projects and scripts");
     assert!(has(&h, "Scripts"), "the projects view: {:?}", labels(&h));
-    click(&mut h, "Database Navigator");
-    wait(&mut h, "the navigator", |h| nav_row(h, "Tables").is_some() || has(h, "Database Navigator"));
-    // A SQL editor: its connection in the top bar, its transaction mode and result in the status bar.
+    click(&mut h, "Database navigator");
+    wait(&mut h, "the navigator", |h| nav_row(h, "Tables").is_some() || has(h, "Database navigator"));
+    // A SQL editor: its connection in the top bar, its transaction mode in the status bar, the
+    // result in the results' footer.
     h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: Some("select * from customer".into()) });
     frames(&mut h, 3);
     wait(&mut h, "editor session", |h| focused_editor(h).session_ready());
@@ -1605,7 +1616,7 @@ fn workspace_from_dbeaver() {
     wait(&mut h, "the result", |h| !focused_editor(h).is_running() && focused_editor(h).result_count() > 0);
     frames(&mut h, 2);
     assert!(has(&h, "Auto-commit"), "transaction mode in the status bar: {:?}", labels(&h));
-    assert!(labels(&h).iter().any(|l| l.contains(" rows")), "the result in the status bar: {:?}", labels(&h));
+    assert!(labels(&h).iter().any(|l| l.contains(" rows")), "the result in the footer: {:?}", labels(&h));
     settle(&mut h, "top bar, rail and status bar");
 
     // Production: reading runs without a question, changing data asks.
@@ -1880,7 +1891,10 @@ fn connection_folders() {
     // Deleted: the connection moves to the top level, nothing else is lost.
     h.state_mut().push_command(AppCommand::DeleteFolder("Prod".into()));
     frames(&mut h, 3);
-    click(&mut h, "Delete folder");
+    // The footer's button (the dialog's title says the same).
+    pause(&mut h);
+    h.query_all_by_label("Delete folder").last().expect("Delete folder button").click();
+    frames(&mut h, 2);
     assert!(h.state().conns.folders().is_empty(), "{:?}", h.state().conns.folders());
     assert_eq!(folder_of(&h), None);
     assert!(h.state().conns.config(&conn).is_some(), "the connection is kept");

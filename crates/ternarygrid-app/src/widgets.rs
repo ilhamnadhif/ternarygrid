@@ -18,6 +18,14 @@ pub struct TableResponse {
 /// Space before and after the text of a table cell.
 const CELL_PAD: f32 = 10.0;
 
+/// Marks a cell of [`styled_table`] as an unset value ("(unnamed)"): shown faint.
+const UNSET: char = '\u{2063}';
+
+/// `text` as an unset value of a [`styled_table`] cell (faint, whatever the column's style).
+pub fn unset(text: &str) -> String {
+    format!("{UNSET}{text}")
+}
+
 /// How the cells of a column of [`styled_table`] look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CellStyle {
@@ -188,6 +196,10 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
                         ui.add_space(CELL_PAD);
                         let short: String = c.chars().take(300).collect();
                         let first_line = short.lines().next().unwrap_or("");
+                        if let Some(text) = first_line.strip_prefix(UNSET) {
+                            ui.add(egui::Label::new(RichText::new(text).font(body_font.clone()).color(pal.text_faint)).truncate().selectable(false));
+                            return;
+                        }
                         if st == CellStyle::Chip {
                             if !first_line.is_empty() {
                                 let (fg, bg) = chip_colors(first_line, &pal);
@@ -203,7 +215,16 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
                         let mut chars = first_line.chars();
                         let lead = chars.next().map(String::from);
                         let key = lead.as_deref() == Some(icon::KEY);
-                        let icon = lead.and_then(|g| if key { Some((g, pal.warn)) } else { ternarygrid_icons::color(&g).map(|c| (g, c)) });
+                        let link = lead.as_deref() == Some(icon::LINK_SIMPLE);
+                        let icon = lead.and_then(|g| {
+                            if key {
+                                Some((g, pal.warn))
+                            } else if link {
+                                Some((g, pal.text_faint))
+                            } else {
+                                ternarygrid_icons::color(&g).map(|c| (g, c))
+                            }
+                        });
                         let text = match icon {
                             Some((g, color)) => {
                                 ui.label(RichText::new(g).font(ternarygrid_ui::style::icon_font(12.0)).color(color));
@@ -240,9 +261,39 @@ fn table_in(ui: &mut Ui, id: egui::Id, headers: &[&str], rows: &[Vec<String>], s
     out
 }
 
+/// A property's name as a label: in sentence case, words apart (`root_page` → "Root page",
+/// `name` → "Name"); names already written for people stay as they are.
+fn property_label(name: &str) -> String {
+    let words = name.replace('_', " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(c) if c.is_lowercase() => c.to_uppercase().chain(chars).collect(),
+        _ => words,
+    }
+}
+
+/// A size in bytes shown readably: "Size (bytes)" / 4096 → ("Size", "4.0 KB"); "Unused bytes"
+/// → "Unused space". `None` when the property is no byte size.
+fn byte_property(name: &str, value: &str) -> Option<(String, String)> {
+    let n: i64 = value.trim().parse().ok()?;
+    let label = match name.strip_suffix(" (bytes)") {
+        Some(l) => l.to_string(),
+        None => format!("{} {}", name.strip_suffix(" bytes")?, tr("space")),
+    };
+    Some((label, format_bytes(n)))
+}
+
+/// SQL in a property's value (a definition, a trigger's statement): shown in monospace, coloured.
+fn is_sql_property(name: &str, value: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let v = value.trim_start().get(..7).unwrap_or("").to_ascii_uppercase();
+    matches!(n.as_str(), "sql" | "definition" | "ddl" | "source" | "body" | "query") || v.starts_with("CREATE ") || v.starts_with("SELECT ")
+}
+
 /// Name/value list, grouped when properties carry a group: each group's title (12, faint,
-/// semibold), then its rows in a bordered, striped list (the name muted in `label_w`, 12 from
-/// the value, 7 / 14 around; the mockups' pages use 180 to 220).
+/// semibold), then its rows in a bordered, striped list (the name muted at the left of
+/// `label_w`, 12 from the value, 7 / 14 around; the mockups' pages use 180 to 220). Names in
+/// sentence case (the raw name in the tooltip), byte sizes readable, SQL in monospace.
 pub fn property_grid(ui: &mut Ui, label_w: f32, props: &[Property]) {
     let mut groups: Vec<Option<&str>> = Vec::new();
     for p in props {
@@ -266,12 +317,36 @@ pub fn property_grid(ui: &mut Ui, label_w: f32, props: &[Property]) {
             ui.spacing_mut().item_spacing.y = 0.0;
             for (i, p) in props.iter().filter(|p| p.group.as_deref() == g).enumerate() {
                 let bg = ui.painter().add(egui::Shape::Noop);
+                let (name, value) = byte_property(&p.name, &p.value).unwrap_or_else(|| (property_label(&p.name), p.value.clone()));
+                let sql = is_sql_property(&p.name, &p.value);
                 let row = egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 7)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        ui.add_sized([label_w, 16.0], egui::Label::new(RichText::new(&p.name).color(pal.text_muted)).truncate());
-                        ui.add(egui::Label::new(RichText::new(&p.value).color(if p.value == "NULL" { pal.text_faint } else { pal.text })).wrap());
+                        // The name at the left of its column (a ragged right, not a ragged left).
+                        let label = ui
+                            .allocate_ui_with_layout(egui::vec2(label_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.set_min_width(label_w);
+                                ui.add(egui::Label::new(RichText::new(&name).color(pal.text_muted)).truncate())
+                            })
+                            .inner;
+                        if name != p.name {
+                            label.on_hover_text(&p.name);
+                        }
+                        if sql {
+                            let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
+                            let lang = crate::sqllang::SqlLanguage::new(std::sync::Arc::new(ternarygrid_core::dialect::GenericDialect::new()));
+                            let tokens = ternarygrid_editor::EditorLanguage::highlight(&lang, &value);
+                            let mut job = crate::sqllang::highlight_job(&value, &tokens, &theme, egui::FontId::monospace(12.5));
+                            job.wrap.max_width = ui.available_width();
+                            ui.add(egui::Label::new(job).wrap());
+                        } else {
+                            let color = if value == "NULL" { pal.text_faint } else { pal.text };
+                            let resp = ui.add(egui::Label::new(RichText::new(&value).color(color)).wrap());
+                            if value != p.value {
+                                resp.on_hover_text(&p.value);
+                            }
+                        }
                     });
                 });
                 let fill = if i % 2 == 1 { stripe } else { pal.surface };
@@ -351,32 +426,25 @@ pub fn code_lines(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, text:
     });
 }
 
-/// Read-only code in a bordered box as the mockups' code blocks: line numbers in a faint
-/// gutter, monospace 12.5 on lines of 20, coloured by `tokens`, cut at the right (no wrap);
-/// it scrolls past `max_height`.
+/// Read-only code in a bordered box as the mockups' code blocks (the kit's): line numbers in
+/// a faint gutter, monospace 12.5 on lines of 20, coloured by `tokens`, not wrapped (room for
+/// the scroll bar under the last line); it scrolls past `max_height`.
 pub fn code_block(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, text: &str, tokens: &[(std::ops::Range<usize>, ternarygrid_editor::TokenStyle)], max_height: f32) {
-    let pal = ternarygrid_ui::pal(ui);
+    code_block_ex(ui, id, text, tokens, false, max_height);
+}
+
+/// [`code_block`], its long lines wrapped at the box's width when `wrap` (confirmations).
+pub fn code_block_ex(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    text: &str,
+    tokens: &[(std::ops::Range<usize>, ternarygrid_editor::TokenStyle)],
+    wrap: bool,
+    max_height: f32,
+) {
     let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-    let font = egui::FontId::monospace(12.5);
-    let mut job = crate::sqllang::highlight_job(text, tokens, &theme, font.clone());
-    for s in &mut job.sections {
-        s.format.line_height = Some(20.0);
-    }
-    job.wrap.max_width = f32::INFINITY;
-    let galley = ui.fonts_mut(|f| f.layout_job(job));
-    let lines = text.lines().count().max(1);
-    let gutter = 32.0 + 14.0;
-    ternarygrid_ui::parts::bordered(ui).inner_margin(egui::Margin::symmetric(0, 10)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        egui::ScrollArea::both().id_salt(egui::Id::new(id)).max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(gutter + galley.size().x + 12.0, lines as f32 * 20.0), egui::Sense::hover());
-            for i in 0..lines {
-                let y = rect.top() + i as f32 * 20.0 + 10.0;
-                ui.painter().text(egui::pos2(rect.left() + 32.0, y), egui::Align2::RIGHT_CENTER, (i + 1).to_string(), font.clone(), pal.text_faint);
-            }
-            ui.painter().galley(egui::pos2(rect.left() + gutter, rect.top()), galley, pal.text);
-        });
-    });
+    let job = crate::sqllang::highlight_job(text, tokens, &theme, egui::FontId::monospace(12.5));
+    ternarygrid_ui::parts::code_block(ui, egui::Id::new(id), job, true, wrap, max_height);
 }
 
 /// Human readable byte size.

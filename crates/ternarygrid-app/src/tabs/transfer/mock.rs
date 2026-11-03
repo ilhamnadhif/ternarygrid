@@ -2,10 +2,10 @@
 //! generators are chosen from the column names, types and constraints
 //! (`auto_generators`) and can be changed per column.
 
-use super::wizard::{self, Clicked, W, line};
+use super::wizard::{self, Clicked, LABEL_W, W, line};
 use super::{
-    MessageLog, Running, combo, connection_name, error_text, next_uid, not_connected, number_edit, on_error_options, opt_number, parsed_edit, progress_ui, reload_table_def,
-    section, table_def_of,
+    MessageLog, ProgressKind, Running, close_wizard, combo, connection_name, error_text, next_uid, not_connected, number_edit, on_error_options, opt_number, outcome_tone,
+    parsed_edit, progress_ui, reload_table_def, section, table_def_of,
 };
 use crate::command::AppCommand;
 use crate::cx::AppContext;
@@ -25,6 +25,8 @@ use ternarygrid_ui::parts::{self, Tone};
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+/// Timestamps are shown to the minute (seconds are still read when typed).
+const DATETIME_SHOWN: &str = "%Y-%m-%d %H:%M";
 
 /// The mock data tab.
 pub struct MockDataTab {
@@ -202,7 +204,7 @@ impl MockDataTab {
     fn settings_ui(&mut self, ui: &mut Ui) {
         let id = self.uid;
         let c = &mut self.config;
-        wizard::form(ui, ("mock_settings", id), 2, 120.0, |f| {
+        wizard::form(ui, ("mock_settings", id), 2, LABEL_W, |f| {
             f.row(tr("Rows"), |ui| wizard::number(ui, &mut c.rows, 1..=100_000_000, 120.0));
             f.row(tr("Rows per batch"), |ui| wizard::number(ui, &mut c.batch_size, 1..=100_000, 120.0));
             f.row(tr("Seed"), |ui| {
@@ -226,10 +228,10 @@ impl MockDataTab {
         let Some(def) = self.def.clone() else { return };
         let id = self.uid;
         ui.horizontal(|ui| {
-            if wizard::ghost(ui, Some(icon::MAGIC_WAND), tr("Choose automatically again")).clicked() {
+            if wizard::action(ui, Some(icon::MAGIC_WAND), tr("Choose automatically again")).clicked() {
                 self.config.generators = self.auto.clone();
             }
-            wizard::faint(ui, tr("Columns left out get their default value (auto-increment, defaults)."));
+            wizard::muted(ui, tr("Columns left out get their default value (auto-increment, defaults)."));
         });
         for col in &def.columns {
             if !self.config.generators.iter().any(|g| g.column == col.name) {
@@ -237,13 +239,14 @@ impl MockDataTab {
             }
         }
         let p = ternarygrid_ui::pal(ui);
+        // The settings take what is left (the two fields of a range of timestamps fit).
         let cols = [
-            wizard::col(tr("Column"), W::Px(130.0)),
-            wizard::col(tr("Type"), W::Px(170.0)),
-            wizard::col(tr("Generator"), W::Px(230.0)),
-            wizard::col(tr("Settings"), W::Min(200.0)),
-            wizard::col(tr("NULL"), W::Px(60.0)),
-            wizard::col(tr("Unique"), W::Px(60.0)),
+            wizard::col(tr("Column"), W::Px(120.0)),
+            wizard::col(tr("Type"), W::Px(110.0)),
+            wizard::col(tr("Generator"), W::Px(210.0)),
+            wizard::col(tr("Settings"), W::Min(300.0)),
+            wizard::col(tr("NULL"), W::Px(64.0)),
+            wizard::col(tr("Unique"), W::Px(64.0)),
         ];
         let (auto, generators) = (&self.auto, &mut self.config.generators);
         wizard::table(
@@ -267,14 +270,26 @@ impl MockDataTab {
                         }
                     }
                     1 => {
-                        let mut ty = col.data_type.clone();
-                        if !col.nullable {
-                            ty.push_str(" NOT NULL");
+                        // The type, its constraints on a second, fainter line.
+                        let flags: Vec<&str> = [(!col.nullable).then_some("NOT NULL"), col.auto_increment.then_some("AUTO")].into_iter().flatten().collect();
+                        let rect = ui.max_rect();
+                        let line = |text: &str, size: f32, color: egui::Color32| {
+                            let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), egui::FontId::proportional(size), color);
+                            job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width());
+                            ui.painter().layout_job(job)
+                        };
+                        let ty = line(&col.data_type, 11.5, p.text_muted);
+                        let second = (!flags.is_empty()).then(|| line(&flags.join(" · "), 10.5, p.text_faint));
+                        let h = ty.size().y + second.as_ref().map_or(0.0, |g| g.size().y);
+                        let mut y = rect.center().y - h / 2.0;
+                        let full = [col.data_type.as_str()].into_iter().chain(flags.iter().copied()).collect::<Vec<_>>().join(" ");
+                        let th = ty.size().y;
+                        ui.painter().galley(egui::pos2(rect.left(), y), ty, p.text_muted);
+                        y += th;
+                        if let Some(g) = second {
+                            ui.painter().galley(egui::pos2(rect.left(), y), g, p.text_faint);
                         }
-                        if col.auto_increment {
-                            ty.push_str(" AUTO");
-                        }
-                        ui.add(egui::Label::new(RichText::new(&ty).size(11.5).color(p.text_faint)).truncate()).on_hover_text(ty);
+                        ui.allocate_rect(rect, egui::Sense::hover()).on_hover_text(full);
                     }
                     2 => {
                         let auto = auto.iter().find(|g| g.column == col.name).map(|g| g.generator.clone());
@@ -309,19 +324,15 @@ impl MockDataTab {
         match &self.result {
             Some(Ok(s)) => {
                 let time = crate::widgets::format_duration(std::time::Duration::from_millis(s.duration_ms));
-                let tone = if s.rows_inserted == 0 && s.rows_failed > 0 { Tone::Warning } else { Tone::Success };
-                wizard::outcome(ui, tone, &describe(s), Some(&time));
+                wizard::outcome(ui, outcome_tone(s.rows_inserted, s.rows_failed), &describe(s), Some(&time));
                 for w in &s.warnings {
                     ui.label(RichText::new(format!("{} {w}", icon::WARNING)).color(p.warn));
                 }
                 if !s.errors.is_empty() {
                     section(ui, tr("Rejected rows"));
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 5.5;
-                        for e in s.errors.iter().take(100) {
-                            ui.add(egui::Label::new(RichText::new(trf("Row {}: {}", &[&e.row, &e.message])).monospace().size(11.5).color(p.err)).wrap());
-                        }
-                    });
+                    let failures: Vec<wizard::Failure> =
+                        s.errors.iter().map(|e| wizard::Failure { object: None, row: Some(e.row), column: e.column.clone(), message: e.message.clone() }).collect();
+                    wizard::failures_table(ui, ("mock_errors", self.uid), &failures, 200.0);
                 }
             }
             Some(Err(e)) => {
@@ -330,8 +341,10 @@ impl MockDataTab {
             }
             None => return false,
         }
-        self.log.ui(ui, ("mock_log", self.uid), 200.0);
-        kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked()
+        let changed = kit::secondary(ui, Some(icon::PENCIL_SIMPLE), tr("Change settings")).clicked();
+        // The rejected rows are listed above: the log is folded away.
+        self.log.ui(ui, ("mock_log", self.uid), 200.0, matches!(self.result, Some(Ok(_))));
+        changed
     }
 
     fn confirm_ui(&mut self, ctx: &egui::Context, cx: &mut AppContext) {
@@ -340,23 +353,24 @@ impl MockDataTab {
         }
         let (mut run, mut cancel) = (false, false);
         let text = trf("All rows of {} are deleted before the new rows are generated.", &[&self.table.display_path()]);
-        let (resp, _) = parts::Dialog::new(tr("Delete the existing rows?")).icon(icon::WARNING).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
-            ctx,
-            egui::Id::new(("mock_confirm", self.uid)),
-            |ui| {
-                ui.add(egui::Label::new(RichText::new(&text).size(13.5)).wrap());
-            },
-            |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Delete and generate"), false).clicked() {
-                        run = true;
-                    }
-                    if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
-                        cancel = true;
-                    }
-                });
-            },
-        );
+        let (resp, _) =
+            parts::Dialog::new(tr("Delete the existing rows?")).icon(icon::ERASER).tone(Tone::Error).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
+                ctx,
+                egui::Id::new(("mock_confirm", self.uid)),
+                |ui| {
+                    ui.add(egui::Label::new(RichText::new(&text).size(13.5)).wrap());
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if kit::button_ex(ui, Kind::DangerFilled, Some(icon::ERASER), tr("Delete and generate"), false).clicked() {
+                            run = true;
+                        }
+                        if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
         if run {
             self.start(cx);
         }
@@ -367,8 +381,8 @@ impl MockDataTab {
 }
 
 fn describe(s: &MockSummary) -> String {
-    let inserted = super::group(s.rows_inserted);
-    if s.rows_failed > 0 { trf("{} rows generated, {} rejected", &[&inserted, &super::group(s.rows_failed)]) } else { trf("{} rows generated", &[&inserted]) }
+    let inserted = super::rows_text(s.rows_inserted);
+    if s.rows_failed > 0 { trf("{} generated, {} rejected", &[&inserted, &super::group(s.rows_failed)]) } else { trf("{} generated", &[&inserted]) }
 }
 
 /// Generators offered for a column, with their default settings.
@@ -378,13 +392,13 @@ fn choices(col: &ColumnDef, auto: Option<&GeneratorKind>, current: &GeneratorKin
     let five_years = today - ChronoDuration::days(5 * 365);
     let limit = text_limit(col).unwrap_or(40);
     let mut out = vec![
-        (GeneratorKind::Skip, tr("Leave out (default value)").to_string()),
+        (GeneratorKind::Skip, tr("Leave out (default)").to_string()),
         (GeneratorKind::Null, tr("NULL").to_string()),
         (GeneratorKind::Constant { value: String::new() }, tr("Fixed value").to_string()),
         (GeneratorKind::Sequence { start: 1, step: 1, after_max: true }, tr("Sequence").to_string()),
         (GeneratorKind::IntRange { min: 1, max: 1000 }, tr("Whole numbers").to_string()),
         (GeneratorKind::DecimalRange { min: 0.0, max: 1000.0, scale: 2 }, tr("Decimal numbers").to_string()),
-        (GeneratorKind::FloatRange { min: 0.0, max: 1000.0, decimals: 2 }, tr("Floating point numbers").to_string()),
+        (GeneratorKind::FloatRange { min: 0.0, max: 1000.0, decimals: 2 }, tr("Floating point").to_string()),
         (GeneratorKind::Bool { true_ratio: 0.5 }, tr("True / false").to_string()),
         (GeneratorKind::DateRange { from: five_years, to: today }, tr("Dates").to_string()),
         (GeneratorKind::DateTimeRange { from: now - ChronoDuration::days(730), to: now }, tr("Timestamps").to_string()),
@@ -413,7 +427,7 @@ fn choices(col: &ColumnDef, auto: Option<&GeneratorKind>, current: &GeneratorKin
     ];
     let fk = [auto, Some(current)].into_iter().flatten().find(|g| matches!(g, GeneratorKind::ForeignKey { .. })).cloned();
     if let Some(fk) = fk {
-        out.push((fk, tr("Value of the referenced table").to_string()));
+        out.push((fk, tr("Referenced value").to_string()));
     }
     // Keep the automatic choice's settings (sizes, ranges, enum values).
     if let Some(a) = auto
@@ -435,9 +449,14 @@ fn generator_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, col:
     let options = choices(col, auto, value);
     let current = options.iter().find(|(g, _)| discriminant(g) == discriminant(value)).map(|(_, l)| l.clone()).unwrap_or_default();
     let w = ui.available_width();
-    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(w).height(420.0).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt(id)
+        .icon(kit::combo_caret)
+        .popup_style(egui::containers::menu::menu_style.into())
+        .selected_text(current)
+        .width(w)
+        .truncate()
+        .height(420.0)
+        .show_ui(ui, |ui| {
             kit::menu_look(ui, w);
             for (g, label) in options {
                 let selected = discriminant(&g) == discriminant(value);
@@ -445,8 +464,7 @@ fn generator_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, col:
                     *value = g;
                 }
             }
-        },
-    );
+        });
 }
 
 fn date_edit(ui: &mut Ui, value: &mut NaiveDate) {
@@ -458,9 +476,9 @@ fn date_edit(ui: &mut Ui, value: &mut NaiveDate) {
 }
 
 fn datetime_edit(ui: &mut Ui, value: &mut NaiveDateTime) {
-    parsed_edit(ui, value.format(DATETIME_FORMAT).to_string(), DATETIME_FORMAT, 140.0, false, |t| {
+    parsed_edit(ui, value.format(DATETIME_SHOWN).to_string(), DATETIME_SHOWN, 136.0, false, |t| {
         let t = t.trim();
-        if let Ok(d) = NaiveDateTime::parse_from_str(t, DATETIME_FORMAT) {
+        if let Ok(d) = NaiveDateTime::parse_from_str(t, DATETIME_FORMAT).or_else(|_| NaiveDateTime::parse_from_str(t, DATETIME_SHOWN)) {
             *value = d;
         } else if let Ok(d) = NaiveDate::parse_from_str(t, DATE_FORMAT) {
             *value = d.and_time(chrono::NaiveTime::MIN);
@@ -480,7 +498,7 @@ fn params_ui(ui: &mut Ui, g: &mut GeneratorKind) {
             number_edit(ui, start, 48.0);
             wizard::hint(ui, tr("step"));
             number_edit(ui, step, 36.0);
-            wizard::check(ui, after_max, tr("after the largest value"));
+            wizard::check(ui, after_max, tr("after max")).on_hover_text(tr("Start after the largest value already in the column"));
         }
         GeneratorKind::IntRange { min, max } => {
             number_edit(ui, min, 64.0);
@@ -588,21 +606,33 @@ impl TabView for MockDataTab {
         wizard::bottom_panel(ui, egui::Id::new(("mock_bottom", uid)), |ui| {
             let running = self.run.is_some();
             let ok = self.validate().is_ok() && !running;
-            // Saving as a task is shown as in the design but not offered (no task runs mock data).
-            let save = Some((false, Some(tr("Mock data generation cannot be saved as a task."))));
-            let footer = wizard::Footer { back: None, next: None, run: (tr("Generate"), ok), save, error: self.error.as_deref() };
-            if wizard::footer(ui, &footer) == Some(Clicked::Run) {
-                if self.config.mode == MockMode::TruncateFirst {
-                    self.confirm = true;
-                } else {
-                    self.start(cx);
+            // No task runs mock data: no "Save as task…".
+            let footer = wizard::Footer {
+                back: None,
+                next: None,
+                run: (tr("Generate"), ok),
+                save: None,
+                error: self.error.as_deref(),
+                running: self.run.as_ref().map(|r| r.is_cancelling()),
+                finished: self.result.is_some(),
+            };
+            match wizard::footer(ui, &footer) {
+                Some(Clicked::Run) => {
+                    if self.config.mode == MockMode::TruncateFirst {
+                        self.confirm = true;
+                    } else {
+                        self.start(cx);
+                    }
                 }
+                Some(Clicked::Cancel) => self.cancel(),
+                Some(Clicked::Close) => close_wizard(cx, &mut self.done),
+                _ => {}
             }
         });
         wizard::body(ui, egui::Id::new(("mock_body", uid)), |ui| {
             if cx.conns.live(&self.conn).is_none() {
                 ui.horizontal(|ui| {
-                    wizard::faint(ui, tr("The connection is closed."));
+                    wizard::muted(ui, tr("The connection is closed."));
                     if kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Connect")).clicked() {
                         cx.push(AppCommand::Connect(self.conn.clone()));
                     }
@@ -624,10 +654,8 @@ impl TabView for MockDataTab {
             }
             if let Some(run) = &self.run {
                 wizard::title(ui, tr("Generating…"));
-                if progress_ui(ui, &run.progress, run.is_cancelling()) {
-                    run.cancel();
-                }
-                self.log.ui(ui, ("mock_log", uid), 200.0);
+                progress_ui(ui, &run.progress, ProgressKind { label: tr("Tables"), items: (tr("table"), tr("tables")), files: false });
+                self.log.ui(ui, ("mock_log", uid), 200.0, false);
                 return;
             }
             if self.result.is_some() {

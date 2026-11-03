@@ -216,8 +216,13 @@ impl TabView for ChangePasswordTab {
         let conn = self.conn.clone();
         // Changed: what happened, Reconnect and Close.
         if let Some(Ok(c)) = self.outcome.clone() {
+            // The next step is the footer's main button: Reconnect.
             look::footer(ui, ("pw_footer", &conn), |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if kit::primary_icon(ui, icon::ARROW_CLOCKWISE, tr("Reconnect")).clicked() {
+                        cx.push(AppCommand::Reconnect(self.conn.clone()));
+                        self.done = true;
+                    }
                     if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Close"), false).clicked() {
                         self.done = true;
                     }
@@ -235,13 +240,7 @@ impl TabView for ChangePasswordTab {
                 if let Some(e) = &c.saved_error {
                     look::error(ui, &format!("{}\n{e}", tr("The saved password could not be updated.")));
                 }
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    ui.label(tr("Reconnect so that new sessions use the new password."));
-                    if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::ARROW_CLOCKWISE), tr("Reconnect"), true).clicked() {
-                        cx.push(AppCommand::Reconnect(self.conn.clone()));
-                    }
-                });
+                look::muted(ui, tr("Reconnect so that new sessions use the new password."));
             });
             return;
         }
@@ -267,8 +266,15 @@ impl TabView for ChangePasswordTab {
                 look::title(ui, tr("Change password"));
             }
             let lw = 150.0;
-            look::row(ui, tr("Connection"), lw, |ui| ternarygrid_ui::kit::semibold_label(ui, &cfg.name, 13.0, p.text));
-            look::row(ui, tr("User"), lw, |ui| ui.label(cfg.user.clone().filter(|u| !u.is_empty()).unwrap_or_else(|| tr("(current user)").to_string())));
+            // The connection is named in the window's header; whose password changes is the
+            // login user's (the server's own when the connection does not name one).
+            if !cx.popup {
+                look::row(ui, tr("Connection"), lw, |ui| ternarygrid_ui::kit::semibold_label(ui, &cfg.name, 13.0, p.text));
+            }
+            look::row(ui, tr("User"), lw, |ui| match cfg.user.clone().filter(|u| !u.is_empty()) {
+                Some(u) => ternarygrid_ui::kit::semibold_label(ui, &u, 13.0, p.text),
+                None => look::muted(ui, tr("The login user of the connection")),
+            });
             look::divider(ui);
             if !connected {
                 look::note_with(ui, parts::Tone::Info, None, tr("Connect first: the password is changed by the server."), |ui| {
@@ -290,7 +296,7 @@ impl TabView for ChangePasswordTab {
                 let show = self.show;
                 look::row(ui, tr("New password"), lw, |ui| field(ui, &mut self.new_password, show));
                 look::row(ui, tr("Confirm password"), lw, |ui| field(ui, &mut self.confirm, show));
-                look::row_top(ui, "", lw, |ui| look::checkbox(ui, &mut self.show, tr("Show the password")));
+                look::row_top(ui, "", lw, |ui| look::checkbox(ui, &mut self.show, tr("Show password")));
                 look::row_top(ui, "", lw, |ui| {
                     if saves_password(&cfg) {
                         look::checkbox(ui, &mut self.update_saved, tr("Update the saved password of the connection"));

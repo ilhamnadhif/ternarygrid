@@ -29,7 +29,7 @@ use egui_phosphor::regular as icon;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use ternarygrid_core::{DbResult, tr, trf};
+use ternarygrid_core::{DbResult, tr, trf, trn};
 use ternarygrid_tasks::{MessageLevel, Progress, RunLog, RunStatus, RunningInfo, TaskDef, TaskEvent, TaskRun, Trigger};
 use ternarygrid_ui::kit::{self, Kind};
 use ternarygrid_ui::parts::Tone;
@@ -74,9 +74,23 @@ fn status_color(s: RunStatus, p: &ternarygrid_ui::Palette) -> Color32 {
     }
 }
 
-/// Time for lists: the time today, otherwise date and time.
-fn when(t: DateTime<Local>) -> String {
-    if t.date_naive() == Local::now().date_naive() { t.format("%H:%M:%S").to_string() } else { t.format("%Y-%m-%d %H:%M").to_string() }
+/// A time in the lists, relative to `now`: "Today 14:00", "Tomorrow 02:00", "Yesterday
+/// 12:50", the weekday within a week ("Wed 09:00"), else the date ("2026-11-20 09:00").
+fn when(t: DateTime<Local>, now: DateTime<Local>) -> String {
+    use chrono::Datelike;
+    let hm = t.format("%H:%M").to_string();
+    match (t.date_naive() - now.date_naive()).num_days() {
+        0 => trf("Today {}", &[&hm]),
+        1 => trf("Tomorrow {}", &[&hm]),
+        -1 => trf("Yesterday {}", &[&hm]),
+        -6..=6 => format!("{} {hm}", weekday_names()[t.weekday().num_days_from_monday() as usize]),
+        _ => t.format("%Y-%m-%d %H:%M").to_string(),
+    }
+}
+
+/// The full time of a run (tooltips, the run history).
+fn full_time(t: DateTime<Local>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn run_duration(run: &TaskRun) -> String {
@@ -84,14 +98,15 @@ fn run_duration(run: &TaskRun) -> String {
     short_duration((end - run.started).to_std().unwrap_or_default())
 }
 
-/// A run's length as the task list shows it: "850 ms", "41s", "1m 12s", "2h 5m".
+/// A run's length as the task list shows it (as the query history's: "850 ms", "41 s",
+/// "1m 12s", "2h 05m").
 fn short_duration(d: Duration) -> String {
     let s = d.as_secs();
     match s {
         0 => format!("{} ms", d.as_millis()),
-        1..60 => format!("{s}s"),
-        60..3600 => format!("{}m {}s", s / 60, s % 60),
-        _ => format!("{}h {}m", s / 3600, s % 3600 / 60),
+        1..60 => format!("{s} s"),
+        60..3600 => format!("{}m {:02}s", s / 60, s % 60),
+        _ => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
     }
 }
 
@@ -674,17 +689,17 @@ impl TasksTab {
                     }));
                 }
                 self.selected.clear();
-                cx.toasts.info(trf("{} task(s) deleted", &[&tasks.len()]));
+                cx.toasts.info(trn(tasks.len(), tr("1 task deleted"), tr("{} tasks deleted")));
             }
             StoreDone::Duplicated(tasks) | StoreDone::Imported(tasks) => {
                 self.selected = tasks.iter().map(|t| t.id.clone()).collect();
                 self.focus = tasks.first().map(|t| t.id.clone());
-                cx.toasts.success(trf("{} task(s) added", &[&tasks.len()]));
+                cx.toasts.success(trn(tasks.len(), tr("1 task added"), tr("{} tasks added")));
                 // Imported scheduled tasks come in disabled: they run on their own only once enabled.
                 let disabled = if imported { tasks.iter().filter(|t| t.schedule.is_some() && !t.enabled).count() } else { 0 };
                 if disabled > 0 {
-                    cx.toasts
-                        .warning(trf("{} imported scheduled task(s) are disabled", &[&disabled]), Some(tr("Review them, then enable them to run on their schedule.").to_string()));
+                    let title = trn(disabled, tr("1 imported scheduled task is disabled"), tr("{} imported scheduled tasks are disabled"));
+                    cx.toasts.warning(title, Some(tr("Review them, then enable them to run on their schedule.").to_string()));
                 }
             }
             StoreDone::Toggled(tasks) => {
@@ -692,8 +707,11 @@ impl TasksTab {
                     self.sync_os(cx, t);
                 }
             }
-            StoreDone::Exported { path, count } => cx.toasts.success(trf("{} task(s) exported to {}", &[&count, &path.display()])),
-            StoreDone::Moved(n) => cx.toasts.info(trf("{} task(s) moved", &[&n])),
+            StoreDone::Exported { path, count } => {
+                let what = trn(count, tr("1 task"), tr("{} tasks"));
+                cx.toasts.success(trf("{} exported to {}", &[&what, &path.display()]));
+            }
+            StoreDone::Moved(n) => cx.toasts.info(trn(n, tr("1 task moved"), tr("{} tasks moved"))),
             StoreDone::Folder | StoreDone::Reloaded => {}
         }
         self.refresh_tasks(cx);
@@ -842,16 +860,17 @@ impl TasksTab {
         if cx.settings.tasks.scheduler_enabled {
             return;
         }
+        let mut turn_on = false;
         egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 0 }).show(ui, |ui| {
-            let text = tr("Scheduled runs are turned off: tasks run only when you start them (or through the system scheduler). Turn on \"Run scheduled tasks while TernaryGrid is open\" in the settings.");
-            // The note itself opens the settings (the design has no button in it).
-            let w = ui.available_width();
-            let r = ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| ternarygrid_ui::parts::callout(ui, Tone::Warning, None, text, |_| {})).inner;
-            let r = r.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tr("Open settings"));
-            if r.clicked() {
-                cx.push(AppCommand::OpenSettings);
-            }
+            look::banner(ui, Tone::Warning, tr("Scheduled runs are off — tasks run only when you start them."), |ui| {
+                let b = kit::button_ex(ui, Kind::Secondary, None, tr("Turn on"), true);
+                turn_on = b.on_hover_text(tr("Run scheduled tasks while TernaryGrid is open (Settings › General)")).clicked();
+            });
         });
+        if turn_on {
+            cx.settings.tasks.scheduler_enabled = true;
+            cx.push(AppCommand::SettingsChanged);
+        }
     }
 
     fn toolbar(&mut self, ui: &mut Ui, cx: &mut AppContext) {
@@ -881,16 +900,13 @@ impl TasksTab {
             if ghost(ui, one, Some(icon::PENCIL_SIMPLE), tr("Edit")).clicked() {
                 self.edit_task(&sel[0]);
             }
-            if ghost(ui, any, Some(icon::COPY), tr("Duplicate")).clicked() {
-                self.duplicate(cx, sel.clone());
-            }
-            if ghost(ui, any, Some(icon::TRASH), tr("Delete")).clicked() {
-                self.confirm_delete = Some(sel.clone());
-            }
             let all_enabled = any && sel.iter().all(|id| self.task(id).is_some_and(|t| t.enabled));
-            let label = if all_enabled { tr("Disable") } else { tr("Enable") };
-            if ghost(ui, any, None, label).clicked() {
+            let (glyph, label) = if all_enabled { (icon::TOGGLE_LEFT, tr("Disable")) } else { (icon::TOGGLE_RIGHT, tr("Enable")) };
+            if ghost(ui, any, Some(glyph), label).clicked() {
                 self.set_enabled(cx, sel.clone(), !all_enabled);
+            }
+            if ghost(ui, any, Some(icon::TRASH), tr("Delete…")).clicked() {
+                self.confirm_delete = Some(sel.clone());
             }
             kit::vdivider(ui, 18.0);
             let r = ui.add_enabled_ui(any && can_run, |ui| kit::button_ex(ui, Kind::Secondary, Some(icon::PLAY), tr("Run now"), true)).inner;
@@ -901,23 +917,34 @@ impl TasksTab {
                 self.run_tasks(cx, sel.clone());
             }
             let any_running = sel.iter().any(|id| running.contains(id));
-            if ghost(ui, any_running, Some(icon::STOP), tr("Cancel run")).clicked() {
+            if ghost(ui, any_running, Some(icon::STOP_CIRCLE), tr("Stop")).on_hover_text(tr("Stop the runs of the selected tasks")).clicked() {
                 self.cancel_runs(cx, &sel);
             }
-            kit::vdivider(ui, 18.0);
-            let export_label = if any { tr("Export selected…") } else { tr("Export all…") };
-            if ghost(ui, !self.tasks.is_empty(), Some(icon::EXPORT), export_label).clicked() {
-                self.export(cx, sel.clone());
-            }
-            if ghost(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import…")).clicked() {
-                self.import(cx);
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let w = (ui.available_width() - 40.0).clamp(90.0, 190.0);
-                kit::search_field(ui, egui::Id::new("tasks_filter"), &mut self.filter, tr("Filter…"), w);
+                // The less used actions in ⋯, then Refresh and the filter (as tall as the buttons).
+                let more = kit::icon_button(ui, icon::DOTS_THREE, tr("More actions"));
+                egui::Popup::menu(&more).show(|ui| {
+                    kit::menu_look(ui, 220.0);
+                    if ui.add_enabled_ui(any, |ui| kit::menu_item(ui, Some(icon::COPY), tr("Duplicate"), "")).inner.clicked() {
+                        self.duplicate(cx, sel.clone());
+                        ui.close();
+                    }
+                    kit::menu_separator(ui);
+                    let export_label = if any { tr("Export selected tasks…") } else { tr("Export all tasks…") };
+                    if ui.add_enabled_ui(!self.tasks.is_empty(), |ui| kit::menu_item(ui, Some(icon::EXPORT), export_label, "")).inner.clicked() {
+                        ui.close();
+                        self.export(cx, sel.clone());
+                    }
+                    if kit::menu_item(ui, Some(icon::DOWNLOAD_SIMPLE), tr("Import tasks…"), "").clicked() {
+                        ui.close();
+                        self.import(cx);
+                    }
+                });
                 if kit::icon_button(ui, icon::ARROW_CLOCKWISE, tr("Refresh")).clicked() {
                     self.reload_all(cx);
                 }
+                let w = (ui.available_width() - 8.0).clamp(90.0, 200.0);
+                look::search_field_h(ui, egui::Id::new("tasks_filter"), &mut self.filter, tr("Filter…"), w, ternarygrid_ui::style::SMALL_H);
             });
         });
     }
@@ -1024,25 +1051,43 @@ impl TasksTab {
         let modifiers = ui.input(|i| i.modifiers);
         let mut actions: Vec<RowAction> = Vec::new();
         let now = Local::now();
-        // The design's columns: 34, 1.6fr, 130, 160, 100, 1.2fr (inside the table's hairline).
-        let fr = ((ui.available_width() - 2.0 - (34.0 + 130.0 + 160.0 + 100.0)) / 2.8).max(60.0);
+        // The next run of each task: planned by the scheduler, or expected from its schedule
+        // (`true`: not planned yet, shown faint).
+        let next: Vec<Option<(DateTime<Local>, bool)>> = visible
+            .iter()
+            .map(|t| {
+                if !t.enabled {
+                    None
+                } else if let Some(n) = next_runs.get(&t.id) {
+                    Some((*n, false))
+                } else {
+                    t.schedule.as_ref().and_then(|s| {
+                        let anchor = self.latest.get(&t.id).map(|r| r.started.with_timezone(&Local)).unwrap_or_else(|| t.updated.with_timezone(&Local));
+                        s.next_after_skipping(&anchor.min(now), &now).map(|n| (n, true))
+                    })
+                }
+            })
+            .collect();
+        let schedules: Vec<String> = visible.iter().map(|t| t.schedule.as_ref().map_or_else(|| tr("Manual").to_string(), |s| s.describe())).collect();
+        // Type, Schedule and Next run as wide as their content; Name and Last run share the
+        // rest (inside the table's hairline). A disabled task: its name faint, "Disabled" as
+        // its next run (Enable / Disable in the toolbar and the row's menu).
+        let os = if visible.iter().any(|t| t.os_scheduler) { 20.0 } else { 0.0 };
+        let type_w = look::fit(ui, visible.iter().map(|t| kind_label(&t.kind)).chain([tr("Type")]), 0.0, 90.0, 170.0);
+        let sched_w = look::fit(ui, schedules.iter().map(String::as_str).chain([tr("Schedule")]), os, 90.0, 220.0);
+        let next_texts: Vec<String> = next.iter().flatten().map(|(n, _)| when(*n, now)).collect();
+        let next_w = look::fit(ui, next_texts.iter().map(String::as_str).chain([tr("Next run"), tr("Disabled")]), 0.0, 90.0, 160.0);
+        let fr = ((ui.available_width() - 2.0 - (type_w + sched_w + next_w)) / 2.0).max(120.0);
         let cols = [
-            look::Col::new("", look::Width::Exact(34.0)),
-            look::Col::new(tr("Name"), look::Width::Initial((fr * 1.6).floor())),
-            look::Col::new(tr("Type"), look::Width::Initial(130.0)),
-            look::Col::new(tr("Schedule"), look::Width::Initial(160.0)),
-            look::Col::new(tr("Next run"), look::Width::Initial(100.0)),
+            look::Col::new(tr("Name"), look::Width::Initial(fr.floor())),
+            look::Col::new(tr("Type"), look::Width::Fit(type_w)),
+            look::Col::new(tr("Schedule"), look::Width::Fit(sched_w)),
+            look::Col::new(tr("Next run"), look::Width::Fit(next_w)),
             look::Col::new(tr("Last run"), look::Width::Rest(160.0)),
         ];
         look::table(ui, "tasks_table", &cols, visible.len(), |row, i| {
             let t = &visible[i];
             row.set_selected(self.selected.iter().any(|s| s == &t.id));
-            look::cell(row, false, |ui| {
-                let mut on = t.enabled;
-                if look::checkbox(ui, &mut on, "").on_hover_text(tr("Enabled: the scheduler runs the task on its schedule")).changed() {
-                    actions.push(RowAction::Enable(vec![t.id.clone()], on));
-                }
-            });
             look::cell(row, false, |ui| {
                 // The design's 14 point icon, 8 from the name.
                 let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
@@ -1057,39 +1102,25 @@ impl TasksTab {
             look::cell(row, false, |ui| {
                 look::cell_text(ui, RichText::new(kind_label(&t.kind)).color(pal.text_muted));
             });
-            look::cell(row, false, |ui| match &t.schedule {
-                Some(s) => {
-                    look::cell_text(ui, RichText::new(s.describe()).color(pal.text_muted));
-                    if t.os_scheduler {
-                        ui.label(RichText::new(icon::CLOCK).color(pal.text_faint)).on_hover_text(trf("Also registered with {}", &[&scheduler_name()]));
-                    }
-                }
-                None => {
-                    look::cell_text(ui, RichText::new(tr("Manual")).color(pal.text_muted));
+            look::cell(row, false, |ui| {
+                look::cell_text(ui, RichText::new(&schedules[i]).color(pal.text_muted));
+                if t.os_scheduler {
+                    ui.label(RichText::new(icon::DESKTOP).color(pal.text_faint)).on_hover_text(trf("Also registered with {}", &[&scheduler_name()]));
                 }
             });
-            look::cell(row, false, |ui| {
-                let next = if !t.enabled {
-                    None
-                } else if let Some(n) = next_runs.get(&t.id) {
-                    Some((*n, false))
-                } else {
-                    t.schedule.as_ref().and_then(|s| {
-                        let anchor = self.latest.get(&t.id).map(|r| r.started.with_timezone(&Local)).unwrap_or_else(|| t.updated.with_timezone(&Local));
-                        s.next_after_skipping(&anchor.min(now), &now).map(|n| (n, true))
-                    })
-                };
-                match next {
-                    Some((n, false)) => {
-                        look::cell_text(ui, look::mono(ui, &when(n), pal.text_muted));
-                    }
-                    Some((n, true)) => {
-                        let hint = if scheduling { tr("Expected; the scheduler has not planned it yet") } else { tr("Scheduled runs are turned off") };
-                        look::cell_text(ui, look::mono(ui, &when(n), pal.text_faint)).on_hover_text(hint);
-                    }
-                    None => {
-                        look::cell_text(ui, look::mono(ui, "—", pal.text_faint));
-                    }
+            look::cell(row, false, |ui| match next[i] {
+                Some((n, false)) => {
+                    look::cell_text(ui, RichText::new(when(n, now)).color(pal.text_muted)).on_hover_text(full_time(n));
+                }
+                Some((n, true)) => {
+                    let hint = if scheduling { tr("Expected; the scheduler has not planned it yet") } else { tr("Scheduled runs are off") };
+                    look::cell_text(ui, RichText::new(when(n, now)).color(pal.text_faint)).on_hover_text(format!("{}\n{hint}", full_time(n)));
+                }
+                None if !t.enabled => {
+                    look::cell_text(ui, RichText::new(tr("Disabled")).color(pal.text_faint)).on_hover_text(tr("Enable the task to run it on its schedule"));
+                }
+                None => {
+                    look::cell_text(ui, RichText::new("—").color(pal.text_faint));
                 }
             });
             look::cell(row, false, |ui| {
@@ -1105,13 +1136,16 @@ impl TasksTab {
                     }
                     look::cell_text(ui, RichText::new(text).color(status_color(RunStatus::Running, &pal)));
                 } else if let Some(l) = self.latest.get(&t.id) {
-                    let text = format!("{} · {} · {}", status_label(l.status), when(l.started.with_timezone(&Local)), run_duration(l));
+                    let started = l.started.with_timezone(&Local);
+                    let text = format!("{} · {} · {}", status_label(l.status), when(started, now), run_duration(l));
                     let r = look::cell_text(ui, RichText::new(text).color(status_color(l.status, &pal)));
-                    if let Some(e) = &l.error {
-                        r.on_hover_text(e);
-                    }
+                    let tip = match &l.error {
+                        Some(e) => format!("{}\n{e}", full_time(started)),
+                        None => full_time(started),
+                    };
+                    r.on_hover_text(tip);
                 } else {
-                    look::cell_text(ui, RichText::new(tr("never")).color(pal.text_faint));
+                    look::cell_text(ui, RichText::new(tr("Never")).color(pal.text_faint));
                 }
             });
             let resp = row.response();
@@ -1132,7 +1166,7 @@ impl TasksTab {
                     actions.push(RowAction::Run(targets.clone()));
                     ui.close();
                 }
-                if running.contains_key(&t.id) && kit::menu_item(ui, Some(icon::STOP), tr("Cancel run"), "").clicked() {
+                if running.contains_key(&t.id) && kit::menu_item(ui, Some(icon::STOP_CIRCLE), tr("Stop run"), "").clicked() {
                     actions.push(RowAction::Cancel(targets.clone()));
                     ui.close();
                 }
@@ -1146,7 +1180,7 @@ impl TasksTab {
                     ui.close();
                 }
                 kit::submenu(ui, Some(icon::FOLDER), tr("Move to"), 200.0, &mut |ui| {
-                    if kit::menu_item(ui, None, tr("(top level)"), "").clicked() {
+                    if kit::menu_item(ui, Some(icon::LIST_CHECKS), tr("Top level"), "").clicked() {
                         actions.push(RowAction::Move(targets.clone(), None));
                         ui.close();
                     }
@@ -1157,7 +1191,7 @@ impl TasksTab {
                         }
                     }
                 });
-                if kit::menu_item(ui, Some(icon::UPLOAD_SIMPLE), tr("Export…"), "").clicked() {
+                if kit::menu_item(ui, Some(icon::EXPORT), tr("Export…"), "").clicked() {
                     actions.push(RowAction::Export(targets.clone()));
                     ui.close();
                 }
@@ -1241,12 +1275,12 @@ impl TasksTab {
             .default_size(((width - 16.0) * 1.3 / 2.3).floor() + 8.0)
             .frame(runs_frame)
             .show(ui, |ui| {
+                // The run's message is in its details at the right (and on the row's hover).
                 let cols = [
                     look::Col::new(tr("Status"), look::Width::Initial(100.0)),
-                    look::Col::new(tr("Trigger"), look::Width::Initial(100.0)),
-                    look::Col::new(tr("Started"), look::Width::Initial(160.0)),
-                    look::Col::new(tr("Duration"), look::Width::Initial(80.0)),
-                    look::Col::new(tr("Message"), look::Width::Rest(40.0)),
+                    look::Col::new(tr("Trigger"), look::Width::Initial(120.0)),
+                    look::Col::new(tr("Started"), look::Width::Initial(170.0)),
+                    look::Col::new(tr("Duration"), look::Width::Rest(80.0)),
                 ];
                 look::table(ui, "tasks_history_table", &cols, self.history.len(), |row, i| {
                     let r = &self.history[i];
@@ -1258,16 +1292,15 @@ impl TasksTab {
                         look::cell_text(ui, trigger_label(r.trigger));
                     });
                     look::cell(row, false, |ui| {
-                        look::cell_text(ui, look::mono(ui, &r.started.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string(), pal.text_muted));
+                        look::cell_text(ui, look::mono(ui, &full_time(r.started.with_timezone(&Local)), pal.text_muted));
                     });
                     look::cell(row, false, |ui| {
                         look::cell_text(ui, run_duration(r));
                     });
-                    look::cell(row, false, |ui| {
-                        let msg = r.error.clone().or_else(|| r.messages.last().map(|m| m.text.clone())).unwrap_or_default();
-                        look::cell_text(ui, msg.lines().next().unwrap_or_default());
-                    });
-                    if row.response().clicked() {
+                    let resp = row.response();
+                    let msg = r.error.clone().or_else(|| r.messages.last().map(|m| m.text.clone())).unwrap_or_default();
+                    let resp = if msg.is_empty() { resp } else { resp.on_hover_text(msg.lines().take(6).collect::<Vec<_>>().join("\n")) };
+                    if resp.clicked() {
                         clicked = Some(r.run_id.clone());
                     }
                 });
@@ -1290,11 +1323,11 @@ impl TasksTab {
         ui.spacing_mut().interact_size.y = 16.0;
         ui.horizontal_wrapped(|ui| {
             kit::semibold_label(ui, status_label(run.status), 13.0, color);
-            let mut facts = format!("{} · {}", run.started.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"), run_duration(run));
+            let mut facts = format!("{} · {}", full_time(run.started.with_timezone(&Local)), run_duration(run));
             if let Some(rows) = run.rows {
-                facts.push_str(&format!(" · {}", trf("{} row(s)", &[&rows])));
+                facts.push_str(&format!(" · {}", trn(rows as usize, tr("1 row"), tr("{} rows"))));
             }
-            ui.label(RichText::new(facts).size(12.0).color(pal.text_faint));
+            ui.label(RichText::new(facts).size(12.0).color(pal.text_muted));
             if run.status == RunStatus::Running {
                 if let Some(p) = self.progress.get(&run.run_id) {
                     match p.total {
@@ -1307,7 +1340,7 @@ impl TasksTab {
                         }
                     }
                 }
-                if kit::ghost(ui, Some(icon::STOP), tr("Cancel run")).clicked()
+                if kit::ghost(ui, Some(icon::STOP_CIRCLE), tr("Stop run")).clicked()
                     && let Some(s) = cx.services.scheduler.as_ref()
                 {
                     s.cancel(&run.run_id);
@@ -1353,7 +1386,8 @@ impl TasksTab {
         }
         look::small_heading(ui, tr("Messages"));
         if run.dropped_messages > 0 {
-            ui.label(RichText::new(trf("{} message(s) were dropped from the middle of the log", &[&run.dropped_messages])).size(12.0).color(pal.text_faint));
+            let text = trn(run.dropped_messages, tr("1 message was dropped from the middle of the log"), tr("{} messages were dropped from the middle of the log"));
+            ui.label(RichText::new(text).size(12.0).color(pal.text_muted));
         }
         egui::ScrollArea::vertical().id_salt(("task_run_messages", &run.run_id)).auto_shrink([false, false]).stick_to_bottom(run.status == RunStatus::Running).show(ui, |ui| {
             // 8 apart on the design's lines of 15 (its monospace's line height).
@@ -1393,14 +1427,18 @@ impl TasksTab {
             let names: Vec<String> = ids.iter().filter_map(|id| self.task(id).map(|t| t.path())).collect();
             let os = ids.iter().any(|id| self.task(id).is_some_and(|t| t.os_scheduler));
             let (delete, cancel) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
-            let dialog = ternarygrid_ui::parts::Dialog::new(tr("Delete tasks")).icon(icon::TRASH).width(480.0);
+            let n = names.len();
+            let title = if n == 1 { tr("Delete task") } else { tr("Delete tasks") };
+            let action = trn(n, tr("Delete task"), tr("Delete {} tasks"));
+            let dialog = ternarygrid_ui::parts::Dialog::new(title).tone(Tone::Error).icon(icon::TRASH).width(480.0);
             let (resp, ()) = dialog.show_modal(
                 &ctx,
                 egui::Id::new("tasks_confirm_delete"),
                 |ui| {
                     let pal = ternarygrid_ui::pal(ui);
                     let size = ternarygrid_ui::style::body_size(ui.ctx()) + 0.5;
-                    ui.label(RichText::new(trf("Delete {} task(s)?", &[&names.len()])).font(ternarygrid_ui::style::medium(ui.ctx(), size)).color(pal.text));
+                    let question = trn(n, tr("Delete 1 task?"), tr("Delete {} tasks?"));
+                    ui.label(RichText::new(question).font(ternarygrid_ui::style::medium(ui.ctx(), size)).color(pal.text));
                     for n in names.iter().take(10) {
                         ui.label(format!("• {n}"));
                     }
@@ -1414,7 +1452,7 @@ impl TasksTab {
                 },
                 |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Delete"), false).clicked() {
+                        if kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), &action, false).clicked() {
                             delete.set(true);
                         }
                         if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -1431,7 +1469,8 @@ impl TasksTab {
             }
         }
         if let Some(mut p) = self.folder_prompt.take() {
-            let title = if p.rename.is_some() { tr("Rename folder") } else { tr("New folder") };
+            let renaming = p.rename.is_some();
+            let title = if renaming { tr("Rename folder") } else { tr("New folder") };
             let name = p.name.trim().trim_matches('/').to_string();
             let ok_enabled = !name.is_empty();
             let (ok, cancel, enter) = (std::cell::Cell::new(false), std::cell::Cell::new(false), std::cell::Cell::new(false));
@@ -1455,7 +1494,8 @@ impl TasksTab {
                 },
                 |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled_ui(ok_enabled, |ui| kit::button_ex(ui, Kind::Primary, None, tr("OK"), false)).inner.clicked() {
+                        let (glyph, label) = if renaming { (None, tr("Rename")) } else { (Some(icon::PLUS), tr("Create")) };
+                        if ui.add_enabled_ui(ok_enabled, |ui| kit::button_ex(ui, Kind::Primary, glyph, label, false)).inner.clicked() {
                             ok.set(true);
                         }
                         if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -1516,7 +1556,7 @@ impl TabView for TasksTab {
         self.banner(ui, cx);
         if cx.services.scheduler.is_none() {
             egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 0 }).show(ui, |ui| {
-                look::callout(ui, Tone::Info, None, tr("Tasks cannot be run: the task scheduler is not available."), |_| {});
+                look::note(ui, Tone::Info, tr("Tasks cannot be run: the task scheduler is not available."));
             });
         }
         self.toolbar(ui, cx);

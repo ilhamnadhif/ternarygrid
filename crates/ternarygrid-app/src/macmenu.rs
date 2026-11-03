@@ -1,5 +1,5 @@
 //! The native macOS menu bar (muda), as in DBeaver: the application menu (About,
-//! Check for Updates…, Settings…, Services, Hide, Quit), then File, Database,
+//! Check for updates…, Settings…, Services, Hide, Quit), then File, Database,
 //! Tools, View, Window and Help; the in-window menu bar is not shown on macOS.
 //! There is no native Edit menu, as it would take ⌘C / ⌘V from egui. ⌘, and ⌘Q
 //! are handled by this menu (it receives them before egui) and run the same
@@ -43,7 +43,7 @@ impl AppMenu {
         };
         let sep = PredefinedMenuItem::separator;
         let about = item(tr("About TernaryGrid"), None, M::About);
-        let updates = item(tr("Check for Updates…"), None, M::CheckForUpdates);
+        let updates = item(tr("Check for updates…"), None, M::CheckForUpdates);
         let settings = item(tr("Settings…"), Some(Accelerator::new(Modifiers::META, Code::Comma)), M::Settings);
         let quit = item(tr("Quit TernaryGrid"), Some(Accelerator::new(Modifiers::META, Code::KeyQ)), M::Quit);
         let app_menu = Submenu::with_items(
@@ -58,8 +58,8 @@ impl AppMenu {
                 &PredefinedMenuItem::services(Some(tr("Services"))),
                 &sep(),
                 &PredefinedMenuItem::hide(Some(tr("Hide TernaryGrid"))),
-                &PredefinedMenuItem::hide_others(Some(tr("Hide Others"))),
-                &PredefinedMenuItem::show_all(Some(tr("Show All"))),
+                &PredefinedMenuItem::hide_others(Some(tr("Hide others"))),
+                &PredefinedMenuItem::show_all(Some(tr("Show all"))),
                 &sep(),
                 &quit,
             ],
@@ -76,6 +76,7 @@ impl AppMenu {
             &[
                 &item(tr("New connection…"), None, M::NewConnection),
                 &item(tr("Import connections…"), None, M::ImportConnections),
+                &item(tr("Export connections…"), None, M::ExportConnections),
                 &sep(),
                 &new_database,
                 &new_schema,
@@ -133,7 +134,7 @@ impl AppMenu {
                 &PredefinedMenuItem::minimize(Some(tr("Minimize"))),
                 &PredefinedMenuItem::maximize(Some(tr("Zoom"))),
                 &sep(),
-                &PredefinedMenuItem::fullscreen(Some(tr("Enter Full Screen"))),
+                &PredefinedMenuItem::fullscreen(Some(tr("Enter full screen"))),
             ],
         )
         .ok()?;

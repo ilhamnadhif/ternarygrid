@@ -8,6 +8,7 @@ pub mod alter_db;
 pub mod connection;
 pub mod create_db;
 pub mod drop;
+pub mod export_conns;
 pub mod import;
 pub mod vault;
 
@@ -40,6 +41,8 @@ struct CredentialPrompt {
 struct DeleteConfirm {
     conn_id: String,
     name: String,
+    /// "Disconnect and delete" was clicked (in this pass): deleted once it is disconnected.
+    disconnecting: Option<u64>,
 }
 
 /// What the folder dialog does.
@@ -84,6 +87,7 @@ pub struct Dialogs {
     pub drivers_open: bool,
     pub vault: vault::VaultDialog,
     pub import: Option<import::ImportDialog>,
+    pub export_conns: Option<export_conns::ExportConnectionsDialog>,
     pub drop: Option<drop::DropDialog>,
     pub create_db: Option<create_db::CreateDatabaseDialog>,
     pub alter_db: Option<alter_db::AlterDatabaseDialog>,
@@ -115,7 +119,7 @@ impl Dialogs {
 
     pub fn confirm_delete_connection(&mut self, id: &str, conns: &ConnectionManager) {
         if let Some(cfg) = conns.config(id) {
-            self.delete = Some(DeleteConfirm { conn_id: id.to_string(), name: cfg.name.clone() });
+            self.delete = Some(DeleteConfirm { conn_id: id.to_string(), name: cfg.name.clone(), disconnecting: None });
         }
     }
 
@@ -155,6 +159,7 @@ impl Dialogs {
             || self.drop.is_some()
             || !self.prompts.is_empty()
             || self.import.is_some()
+            || self.export_conns.is_some()
             || self.create_db.is_some()
             || self.alter_db.is_some()
             || !self.connection.is_empty()
@@ -183,6 +188,11 @@ impl Dialogs {
         {
             self.import = None;
         }
+        if let Some(d) = self.export_conns.as_mut()
+            && !d.show(ctx, cx)
+        {
+            self.export_conns = None;
+        }
         if let Some(d) = self.drop.as_mut()
             && !d.show(ctx, cx)
         {
@@ -200,7 +210,7 @@ impl Dialogs {
         }
         if self.about_open {
             let mut open = true;
-            let (resp, _) = Dialog::new(tr("About TernaryGrid")).width(420.0).body_padding(Margin { left: 24, right: 24, top: 28, bottom: 24 }).show_window(
+            let (resp, _) = Dialog::new(tr("About TernaryGrid")).width(WIDTH_S).body_padding(Margin { left: 24, right: 24, top: 28, bottom: 24 }).show_window(
                 ctx,
                 Id::new("ternarygrid_about"),
                 &mut open,
@@ -213,7 +223,7 @@ impl Dialogs {
         }
         if self.drivers_open {
             let mut open = true;
-            let (resp, _) = Dialog::new(tr("Database drivers")).icon(icon::PLUG).width(900.0).body_padding(Margin::symmetric(20, 16)).show_window(
+            let (resp, _) = Dialog::new(tr("Database drivers")).icon(icon::PLUG).width(WIDTH_L).body_padding(Margin::symmetric(20, 16)).show_window(
                 ctx,
                 Id::new("ternarygrid_drivers"),
                 &mut open,
@@ -229,7 +239,7 @@ impl Dialogs {
             let customize = Cell::new(false);
             let preset = trf("Preset: {}", &[&cx.keymap.preset().label()]);
             let filter = &mut self.shortcuts_filter;
-            let (resp, _) = Dialog::new(tr("Keyboard shortcuts")).icon(icon::KEYBOARD).width(720.0).show_window(
+            let (resp, _) = Dialog::new(tr("Keyboard shortcuts")).icon(icon::KEYBOARD).width(WIDTH_L).show_window(
                 ctx,
                 Id::new("ternarygrid_shortcuts"),
                 &mut open,
@@ -240,7 +250,7 @@ impl Dialogs {
                         customize.set(true);
                     }
                     right(ui, |ui| {
-                        ui.label(RichText::new(&preset).size(12.0).color(style::pal(ui).text_faint));
+                        ui.label(RichText::new(&preset).size(12.0).color(style::pal(ui).text_muted));
                     });
                 }),
             );
@@ -266,7 +276,7 @@ impl Dialogs {
             let cancel = Cell::new(false);
             let title = trf("Connect to {}", &[&p.conn_name]);
             let target = p.target.clone();
-            let (resp, _) = Dialog::new(&title).icon(icon::KEY).subtitle(&target).width(460.0).body_padding(BODY).show_window(
+            let (resp, _) = Dialog::new(&title).icon(icon::KEY).subtitle(&target).width(WIDTH_S).body_padding(BODY).show_window(
                 ctx,
                 Id::new(("cred_prompt", &p.conn_id)),
                 &mut open,
@@ -293,7 +303,8 @@ impl Dialogs {
                             first = false;
                         }
                     }
-                    form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut p.save, tr("Save password")));
+                    let save = if p.fields.len() > 1 { tr("Save passwords") } else { tr("Save password") };
+                    form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut p.save, save));
                 },
                 Some(&mut |ui: &mut Ui| {
                     right(ui, |ui| {
@@ -368,14 +379,21 @@ impl Dialogs {
                 let inside = |f: &Option<String>| f.as_deref().is_some_and(|f| f == path || f.starts_with(&format!("{path}/")));
                 let n = cx.conns.configs().iter().filter(|c| inside(&c.folder)).count();
                 let target = split_folder(&path).0.map(str::to_string).unwrap_or_else(|| tr("the top level").to_string());
-                let title = trf("Delete the folder \"{}\"?", &[&split_folder(&path).1]);
+                let question = trf("Delete the folder \"{}\"?", &[&split_folder(&path).1]);
+                let moved = match n {
+                    0 => trf("Its subfolders move to {}.", &[&target]),
+                    1 => trf("Its connection and subfolders move to {}.", &[&target]),
+                    n => trf("Its {} connections and subfolders move to {}.", &[&n, &target]),
+                };
+                let text = format!("{question} {moved} {}", tr("No connection is deleted."));
+                let place = path.replace('/', " › ");
                 let error = d.error.clone();
-                let (resp, _) = Dialog::new(&title).icon(icon::FOLDER).width(480.0).body_padding(BODY).show_modal(
+                let (resp, _) = Dialog::new(tr("Delete folder")).icon(icon::TRASH).tone(Tone::Error).subtitle(&place).width(WIDTH_S).body_padding(BODY).show_modal(
                     ctx,
                     Id::new("ternarygrid_folder"),
                     |ui| {
                         ui.spacing_mut().item_spacing.y = 10.0;
-                        body_text_lh(ui, &trf("Its {} connection(s) and its subfolders move to {}. No connection is deleted.", &[&n, &target]), 1.5);
+                        body_text_lh(ui, &text, 1.5);
                         if let Some(e) = &error {
                             crate::dialogs::error_note(ui, e);
                         }
@@ -417,37 +435,45 @@ impl Dialogs {
                 let problem_of = |name: &str| {
                     let path = path_of(name);
                     if name.is_empty() {
-                        Some(tr("Type a name"))
+                        Some(tr("Type a name."))
                     } else if name.contains('/') {
-                        Some(tr("The name cannot contain \"/\""))
+                        Some(tr("The name cannot contain \"/\"."))
                     } else if folders.iter().any(|f| f == &path) && action != FolderAction::Rename(path.clone()) {
-                        Some(tr("A folder with this name already exists"))
+                        Some(tr("A folder with this name already exists."))
                     } else {
                         None
                     }
                 };
                 let enter = Cell::new(false);
                 let valid = Cell::new(false);
-                let label = if matches!(action, FolderAction::New { .. }) { tr("Create") } else { tr("Rename") };
-                let (resp, _) = Dialog::new(title).icon(icon::FOLDER).width(420.0).body_padding(BODY).show_modal(
+                let (label, glyph) = if matches!(action, FolderAction::New { .. }) { (tr("Create"), icon::PLUS) } else { (tr("Rename"), icon::CHECK) };
+                let place = parent.as_deref().map(|p| trf("In {}", &[&p.replace('/', " › ")]));
+                let mut dialog = Dialog::new(title).icon(icon::FOLDER).width(WIDTH_S).body_padding(BODY);
+                if let Some(place) = &place {
+                    dialog = dialog.subtitle(place);
+                }
+                let (resp, _) = dialog.show_modal(
                     ctx,
                     Id::new("ternarygrid_folder"),
                     |ui| {
                         form_spacing(ui, 10.0);
-                        if let Some(p) = &parent {
-                            ui.label(RichText::new(trf("In {}", &[p])).size(12.5).color(style::pal(ui).text_muted));
-                        }
-                        let edit = add_field(ui, text_field(&mut d.name, f32::INFINITY).hint_text(hint(ui, tr("Folder name"))));
+                        // A problem is said once there is a name (an empty field only disables Create).
+                        let shown_of = |name: &str| problem_of(name).filter(|_| !name.is_empty());
+                        let outlined = shown_of(d.name.trim()).is_some();
+                        let edit = add_field_ex(ui, text_field(&mut d.name, f32::INFINITY).hint_text(hint(ui, tr("Folder name"))), outlined);
                         if !d.focused {
                             edit.request_focus();
                             d.focused = true;
                         }
                         enter.set(edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                         let name = d.name.trim().to_string();
-                        let problem = problem_of(&name);
+                        let (problem, shown) = (problem_of(&name), shown_of(&name));
+                        if shown.is_some() != outlined {
+                            ui.ctx().request_repaint();
+                        }
                         valid.set(problem.is_none());
-                        if let Some(p) = problem.filter(|_| !name.is_empty()) {
-                            error_text(ui, p);
+                        if let Some(p) = shown {
+                            field_error_at(ui, p, 0.0);
                         }
                         if let Some(e) = &d.error {
                             crate::dialogs::error_note(ui, e);
@@ -455,7 +481,7 @@ impl Dialogs {
                     },
                     |ui| {
                         right(ui, |ui| {
-                            if ui.add_enabled_ui(valid.get(), |ui| kit::primary_icon(ui, icon::CHECK, label)).inner.clicked() {
+                            if ui.add_enabled_ui(valid.get(), |ui| kit::primary_icon(ui, glyph, label)).inner.clicked() {
                                 ok.set(true);
                             }
                             if cancel_button(ui).clicked() {
@@ -493,29 +519,30 @@ impl Dialogs {
     }
 
     fn show_delete(&mut self, ctx: &egui::Context, cx: &mut AppContext) {
-        let Some(d) = &self.delete else { return };
+        let Some(d) = &mut self.delete else { return };
         // Disconnected first, the usual way: open transactions are asked about, the
         // editors' sessions close and the after-disconnect command runs.
         let connected = cx.conns.is_connected(&d.conn_id) || cx.conns.status(&d.conn_id) == crate::conn::ConnStatus::Connecting;
-        let disconnect = Cell::new(false);
         let delete = Cell::new(false);
         let cancel = Cell::new(false);
-        let (resp, _) = Dialog::new(tr("Delete connection")).icon(icon::TRASH).width(480.0).body_padding(BODY).show_modal(
+        let waiting = d.disconnecting.is_some() && connected;
+        let (resp, _) = Dialog::new(tr("Delete connection")).icon(icon::TRASH).tone(Tone::Error).subtitle(&d.name).width(WIDTH_S).body_padding(BODY).show_modal(
             ctx,
             Id::new("delete_conn"),
             |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
-                body_text(ui, &trf("Delete the connection \"{}\" and its saved passwords?", &[&d.name]));
+                body_text_lh(ui, &trf("Delete the connection \"{}\" and its saved passwords? This cannot be undone.", &[&d.name]), 1.5);
                 if connected {
-                    note(ui, Tone::Warning, tr("It is connected: disconnect it first."));
+                    note(ui, Tone::Warning, &trf("{} is connected; it will be disconnected first.", &[&d.name]));
                 }
             },
             |ui| {
-                if connected && kit::secondary(ui, None, tr("Disconnect")).clicked() {
-                    disconnect.set(true);
+                if waiting {
+                    parts::spinner_label(ui, tr("Disconnecting…"));
                 }
                 right(ui, |ui| {
-                    if ui.add_enabled_ui(!connected, |ui| kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Delete"), false)).inner.clicked() {
+                    let label = if connected { tr("Disconnect and delete") } else { tr("Delete connection") };
+                    if ui.add_enabled_ui(!waiting, |ui| kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), label, false)).inner.clicked() {
                         delete.set(true);
                     }
                     if cancel_button(ui).clicked() {
@@ -524,14 +551,23 @@ impl Dialogs {
                 });
             },
         );
-        if disconnect.get() {
-            cx.push(AppCommand::Disconnect(d.conn_id.clone()));
-        }
         let mut close = cancel.get() || resp.close;
-        if delete.get() && !connected {
+        let now = ctx.cumulative_pass_nr();
+        if delete.get() && connected {
+            cx.push(AppCommand::Disconnect(d.conn_id.clone()));
+            d.disconnecting = Some(now);
+        } else if (delete.get() || d.disconnecting.is_some()) && !connected {
             cx.conns.remove(cx.backend, &d.conn_id);
             cx.push(AppCommand::SaveConnections);
             close = true;
+        } else if let Some(asked) = d.disconnecting {
+            // Still connected once the question about its transactions is gone (this dialog is
+            // the top modal again): the disconnect was cancelled, and so is the delete.
+            let top = ctx.memory(|m| m.top_modal_layer());
+            if now > asked + 3 && top.is_some() && top == resp.layer {
+                d.disconnecting = None;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if close {
             self.delete = None;
@@ -564,8 +600,8 @@ fn about_body(ui: &mut Ui) {
         kit::semibold_label(ui, "TernaryGrid", 22.0, p.text);
         ui.label(RichText::new(format!("{} {}", tr("Version"), env!("CARGO_PKG_VERSION"))).size(12.5).color(p.text_muted));
         ui.label(RichText::new(tr("A fast, lightweight database client, written in Rust.")).color(p.text));
-        ui.label(RichText::new(tr("License: MIT OR Apache-2.0")).size(12.0).color(p.text_faint));
-        ui.label(RichText::new(tr("No telemetry. Only connects to the servers you configure.")).size(12.0).color(p.text_faint));
+        ui.label(RichText::new(tr("License: MIT OR Apache-2.0")).size(12.0).color(p.text_muted));
+        ui.label(RichText::new(tr("No telemetry. Only connects to the servers you configure.")).size(12.0).color(p.text_muted));
     });
 }
 
@@ -624,7 +660,14 @@ fn drivers_body(ui: &mut Ui, cx: &mut AppContext) {
             _ => yes(ui, c.cancel),
         }
     });
-    ui.label(RichText::new(tr("Not available: Oracle, Db2, Firebird, H2 and Trino (no Rust network driver yet).")).size(12.0).color(p.text_faint));
+    // The database types without a built-in driver, and the well-known ones TernaryGrid has no type for.
+    let mut missing: Vec<&str> = ternarygrid_core::DbKind::ALL.into_iter().filter(|k| cx.conns.registry.get(*k).is_none()).map(|k| k.display_name()).collect();
+    missing.extend(["Db2", "Firebird", "H2", "Trino"]);
+    let list = match missing.split_last() {
+        Some((last, rest)) if !rest.is_empty() => trf("{} and {}", &[&rest.join(", "), last]),
+        _ => missing.join(""),
+    };
+    muted(ui, &trf("Not available yet: {}.", &[&list]));
 }
 
 /// The Rust library (or protocol) a built-in driver speaks through.
@@ -683,36 +726,61 @@ fn shortcuts_body(ui: &mut Ui, cx: &mut AppContext, filter: &mut String) {
     let full = ui.available_rect_before_wrap();
     let mut area = ui.new_child(UiBuilder::new().max_rect(full.with_max_x(full.right() + 14.0)).layout(Layout::top_down(Align::Min)));
     egui::ScrollArea::vertical().id_salt("shortcuts_scroll").max_height(max_h).auto_shrink([false, true]).show(&mut area, |ui| {
+        const COLUMNS: usize = 3;
         let gap = 28.0;
-        let col_w = ((full.width() - gap) / 2.0).floor();
-        ui.spacing_mut().item_spacing.y = 0.0;
-        for (i, pair) in groups.chunks(2).enumerate() {
-            if i > 0 {
-                ui.add_space(18.0);
-            }
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                for (group, rows) in pair {
-                    ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                        ui.set_width(col_w);
+        let col_w = ((full.width() - gap * (COLUMNS - 1) as f32) / COLUMNS as f32).floor();
+        // Each group under the shortest column so far (masonry): the columns end about level.
+        let heights: Vec<usize> = groups.iter().map(|(_, rows)| rows.len() + 2).collect();
+        let columns = masonry(&heights, COLUMNS);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for column in columns {
+                ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(col_w);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (i, (group, rows)) in column.into_iter().map(|g| &groups[g]).enumerate() {
+                        if i > 0 {
+                            ui.add_space(18.0);
+                        }
                         // The design's rows: 28 points and a hairline, 4 apart.
                         ui.spacing_mut().item_spacing.y = 4.0;
-                        kit::semibold_label(ui, group, 12.0, p.text_faint);
+                        kit::semibold_label(ui, group, 12.0, p.text_muted);
                         for (label, keys) in rows {
-                            let (rect, _) = ui.allocate_exact_size(vec2(col_w, 29.0), Sense::hover());
+                            let (rect, resp) = ui.allocate_exact_size(vec2(col_w, 29.0), Sense::hover());
                             ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, p.line));
-                            ui.painter().text(egui::pos2(rect.left(), rect.center().y - 0.5), Align2::LEFT_CENTER, *label, egui::FontId::proportional(13.0), p.text);
                             let mut x = rect.right();
                             for k in keys.iter().rev() {
                                 x = kit::paint_kbd_text(ui.painter(), ui.ctx(), k, x, rect.center().y - 0.5, &p).left() - 6.0;
                             }
+                            // The name in what the keys leave, cut with … (the whole name in the tooltip).
+                            let mut job = egui::text::LayoutJob::single_section(label.to_string(), egui::TextFormat::simple(egui::FontId::proportional(13.0), p.text));
+                            job.wrap = egui::text::TextWrapping::truncate_at_width((x - rect.left() - 6.0).max(20.0));
+                            let galley = ui.painter().layout_job(job);
+                            let cut = galley.elided;
+                            ui.painter().galley(egui::pos2(rect.left(), rect.center().y - 0.5 - galley.size().y / 2.0), galley, p.text);
+                            if cut {
+                                resp.on_hover_text(*label);
+                            }
                         }
-                    });
-                }
-            });
-        }
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                    }
+                });
+            }
+        });
     });
     ui.allocate_exact_size(vec2(full.width(), area.min_rect().height()), Sense::hover());
+}
+
+/// The items of `heights` in `n` columns, each (in order) under the shortest column so far
+/// (the leftmost of equal ones): their indexes, column by column.
+fn masonry(heights: &[usize], n: usize) -> Vec<Vec<usize>> {
+    let mut columns: Vec<(usize, Vec<usize>)> = vec![(0, Vec::new()); n.max(1)];
+    for (i, &h) in heights.iter().enumerate() {
+        let shortest = columns.iter_mut().min_by_key(|(total, _)| *total).expect("a column");
+        shortest.0 += h;
+        shortest.1.push(i);
+    }
+    columns.into_iter().map(|(_, items)| items).filter(|c| !c.is_empty()).collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -721,6 +789,12 @@ fn shortcuts_body(ui: &mut Ui, cx: &mut AppContext, filter: &mut String) {
 
 /// Width of the label column in the dialogs' forms.
 pub const LABEL_W: f32 = 150.0;
+
+/// The widths of dialogs: small (a question, a name, a password, a progress), medium (a form,
+/// an SQL preview, notes) and large (a table, a list beside a form).
+pub const WIDTH_S: f32 = 440.0;
+pub const WIDTH_M: f32 = 600.0;
+pub const WIDTH_L: f32 = 900.0;
 
 /// The padding of a dialog's body (the design's `18px 20px`).
 pub const BODY: Margin = Margin { left: 20, right: 20, top: 18, bottom: 18 };
@@ -731,8 +805,9 @@ pub fn form_spacing(ui: &mut Ui, gap: f32) {
     ui.spacing_mut().item_spacing.y = gap;
 }
 
-/// A form row as in the design: the label (muted) in a column of [`LABEL_W`], 6 points
-/// below the top of the row, then the controls 16 points to its right, side by side.
+/// A form row: the label (muted) in a column of [`LABEL_W`], centred on the first line of the
+/// controls (an input, a row of check boxes or radio buttons, a value: see
+/// [`parts::form_row`]), then the controls 16 points to its right, side by side.
 pub fn form_row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     form_row_w(ui, label, LABEL_W, add)
 }
@@ -809,6 +884,12 @@ pub fn dim_topmost(ctx: &egui::Context) {
 /// Lay out `add` from the right edge (the main actions of a footer: primary first).
 pub fn right<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.with_layout(Layout::right_to_left(Align::Center), add).inner
+}
+
+/// "Review transactions…" under the list of a question about uncommitted transactions (it
+/// opens the pending transactions); true when clicked.
+pub fn review_button(ui: &mut Ui, enabled: bool) -> bool {
+    ui.add_enabled_ui(enabled, |ui| kit::button_ex(ui, Kind::Ghost, None, tr("Review transactions…"), true)).inner.clicked()
 }
 
 /// The quiet Cancel of a footer.
@@ -938,20 +1019,42 @@ pub fn semibold_text(ui: &mut Ui, text: &str, size: f32, color: Color32, factor:
     resp
 }
 
-/// A value shown read-only in a form row: as the design's text in a row, 3 points down (its
-/// line level with the label's), semibold or not.
+/// A value shown read-only in a form row (the row's label is centred on its line), semibold or
+/// not; in the text colour, so it does not read as disabled.
 pub fn value_text(ui: &mut Ui, text: &str, color: Color32, semibold: bool) -> Response {
-    ui.vertical(|ui| {
-        ui.add_space(3.0);
-        if semibold { semibold_text(ui, text, 13.0, color, None, true) } else { ui.label(RichText::new(text).color(color)) }
+    if semibold { semibold_text(ui, text, 13.0, color, None, true) } else { ui.label(RichText::new(text).color(color)) }
+}
+
+/// A validation message under the field of the form row above it (in the controls' column, 4
+/// points under the control): [`kit::field_error`]. Mark the field with [`add_field_ex`].
+pub fn field_error(ui: &mut Ui, text: &str) -> Response {
+    field_error_at(ui, text, LABEL_W + 16.0)
+}
+
+/// [`field_error`] `indent` points from the left (a form without labels: 0).
+pub fn field_error_at(ui: &mut Ui, text: &str, indent: f32) -> Response {
+    ui.add_space(4.0 - ui.spacing().item_spacing.y);
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        kit::field_error(ui, text)
     })
     .inner
 }
 
-/// A validation message under a field.
-pub fn error_text(ui: &mut Ui, text: &str) -> Response {
+/// [`add_field`], outlined in the error colour while `invalid` (its value was refused: see
+/// [`field_error`]).
+pub fn add_field_ex(ui: &mut Ui, edit: egui::TextEdit<'_>, invalid: bool) -> Response {
+    if !invalid {
+        return add_field(ui, edit);
+    }
+    let r = ui.add(edit);
     let p = style::pal(ui);
-    ui.add(egui::Label::new(RichText::new(text).size(12.5).color(p.err)).wrap())
+    if r.has_focus() {
+        let halo = style::soft(p.err, if ui.visuals().dark_mode { 0.30 } else { 0.22 });
+        ui.painter().rect_stroke(r.rect, CornerRadius::same(RADIUS), Stroke::new(3.0, halo), egui::StrokeKind::Outside);
+    }
+    kit::error_outline(ui, r.rect);
+    r
 }
 
 /// One bullet line per item.
@@ -988,26 +1091,6 @@ pub fn note(ui: &mut Ui, tone: Tone, text: &str) -> Response {
 /// An error in a dialog's body.
 pub fn error_note(ui: &mut Ui, text: &str) -> Response {
     note(ui, Tone::Error, text)
-}
-
-/// A status line (test result, error) in a footer: its icon and text in at
-/// most two lines of `max_w`, the whole text in its tooltip.
-pub fn status_line(ui: &mut Ui, tone: Tone, text: &str, max_w: f32) -> Response {
-    let p = style::pal(ui);
-    let c = tone.color(&p);
-    ui.allocate_ui_with_layout(vec2(max_w.max(60.0), CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(RichText::new(tone.icon()).font(style::icon_font(15.0)).color(c));
-        let first = text.lines().next().unwrap_or_default().to_string();
-        let mut job = egui::text::LayoutJob::single_section(first, egui::TextFormat { font_id: egui::FontId::proportional(12.5), color: c, ..Default::default() });
-        job.wrap = egui::text::TextWrapping { max_width: ui.available_width(), max_rows: 2, break_anywhere: false, overflow_character: Some('…') };
-        let galley = ui.painter().layout_job(job);
-        let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
-        ui.painter().galley(rect.min, galley, c);
-        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
-        resp.on_hover_text(text)
-    })
-    .inner
 }
 
 /// A row that opens and closes what follows it (a chevron and a muted label);
@@ -1247,6 +1330,14 @@ fn table_dyn(ui: &mut Ui, id: Id, cols: &[Column<'_>], rows: usize, row_h: f32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_columns() {
+        // SQL, Editor, Data, Navigation, View, Tools, Application, Help.
+        assert_eq!(masonry(&[12, 17, 3, 7, 8, 4, 4, 3], 3), [vec![0, 5, 6], vec![1, 7], vec![2, 3, 4]]);
+        assert_eq!(masonry(&[5, 5], 3), [vec![0], vec![1]]);
+        assert!(masonry(&[], 3).is_empty());
+    }
 
     #[test]
     fn folder_paths() {

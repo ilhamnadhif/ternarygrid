@@ -121,8 +121,8 @@ fn find<'a>(items: &'a [DiffItem], k: &str) -> Option<&'a DiffItem> {
 }
 
 /// Width of the source and target connection pickers.
-const CONN_W: f32 = 170.0;
-const SCHEMA_W: f32 = 130.0;
+const CONN_W: f32 = 190.0;
+const SCHEMA_W: f32 = 150.0;
 
 impl SchemaCompareTab {
     pub fn new(conn: Option<String>, schema: Option<SchemaRef>) -> Self {
@@ -137,7 +137,7 @@ impl SchemaCompareTab {
             excluded: BTreeSet::new(),
             compared: None,
             show_unchanged: false,
-            drop_removed: true,
+            drop_removed: false,
             cascade: false,
             script: None,
             script_lang: None,
@@ -148,28 +148,31 @@ impl SchemaCompareTab {
         }
     }
 
-    /// The logo, the connection and the schema of one side.
+    /// The connection (its logo inside the picker) and the schema of one side.
     fn side_ui(ui: &mut Ui, cx: &mut AppContext, id: &str, side: &mut Side) {
         ui.spacing_mut().item_spacing.x = 6.0;
+        let p = style::pal(ui);
         let names: Vec<(String, String)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
-        let current = side.conn.as_ref().and_then(|c| names.iter().find(|(i, _)| i == c)).map(|(_, n)| n.clone()).unwrap_or_else(|| tr("Choose…").to_string());
-        if let Some(kind) = side.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.kind) {
-            look::logo(ui, kind, 15.0);
-            // 8 from the connection (the schema is 6 from it).
-            ui.add_space(2.0);
-        }
-        egui::ComboBox::from_id_salt((id, "conn")).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(CONN_W).show_ui(
-            ui,
-            |ui| {
-                kit::menu_look(ui, CONN_W);
-                for (cid, name) in &names {
-                    if choice(ui, side.conn.as_deref() == Some(cid), name) {
-                        side.conn = Some(cid.clone());
-                        side.schema = None;
+        let current = side.conn.as_ref().and_then(|c| names.iter().find(|(i, _)| i == c)).map(|(_, n)| n.clone());
+        let kind = side.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.kind);
+        let text = match &current {
+            Some(n) => look::logo_text(ui, n, kind, p.text),
+            None => look::logo_text(ui, tr("Choose a connection…"), None, p.text_faint),
+        };
+        let combo =
+            egui::ComboBox::from_id_salt((id, "conn")).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(text).width(CONN_W).show_ui(
+                ui,
+                |ui| {
+                    kit::menu_look(ui, CONN_W);
+                    for (cid, name) in &names {
+                        if choice(ui, side.conn.as_deref() == Some(cid), name) {
+                            side.conn = Some(cid.clone());
+                            side.schema = None;
+                        }
                     }
-                }
-            },
-        );
+                },
+            );
+        look::paint_combo_logo(ui, &combo.response, kind);
         let Some(conn) = side.conn.clone() else { return };
         if !cx.conns.is_connected(&conn) {
             if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUGS_CONNECTED), tr("Connect"), true).clicked() {
@@ -183,7 +186,10 @@ impl SchemaCompareTab {
         live.meta.request_schemas(backend, &main, None);
         let schemas: Vec<String> = live.meta.schemas_of(None).get().map(|v| v.iter().map(|s| s.name.clone()).collect()).unwrap_or_default();
         let db = live.current_database.clone();
-        let label = side.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
+        let label = match side.schema.as_ref().and_then(|s| s.schema.clone()) {
+            Some(s) => RichText::new(s).color(p.text),
+            None => RichText::new(tr("Choose a schema…")).color(p.text_faint),
+        };
         egui::ComboBox::from_id_salt((id, "schema")).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(label).width(SCHEMA_W).show_ui(
             ui,
             |ui| {
@@ -262,7 +268,10 @@ impl SchemaCompareTab {
         let mut row = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
         row.spacing_mut().item_spacing.x = 8.0;
         row.add_space(10.0 + depth as f32 * 16.0);
-        if depth == 0 {
+        if depth > 0 {
+            // The check box's room: a part's status sits right of its object's.
+            row.add_space(15.0 + row.spacing().item_spacing.x);
+        } else {
             let mut on = !self.excluded.contains(&k);
             if look::cell_check(&mut row, &mut on, tr("Include in the script")).on_hover_text(tr("Include in the script")).changed() {
                 if on {
@@ -333,12 +342,11 @@ impl SchemaCompareTab {
         .on_hover_text(trf("{} added, {} removed, {} modified, {} unchanged", &[&t.added, &t.removed, &t.modified, &t.unchanged]));
     }
 
-    /// The script actions: SQL editor, apply, diagram, report, changelog.
+    /// The script actions: SQL editor, apply; diagram, report and changelog in the ⋯ menu.
     fn actions_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, diff: &SchemaDiff, script: &[String]) {
-        let target = self.target.conn.clone();
-        if look::small(ui, kit::Kind::Secondary, icon::FILE_SQL, tr("Open script in SQL editor")).clicked() {
+        if look::small(ui, kit::Kind::Secondary, icon::FILE_SQL, tr("Open in SQL editor")).clicked() {
             let text = script.iter().map(|s| format!("{s};\n")).collect::<String>();
-            cx.push(AppCommand::NewSqlEditor { connection: target.clone(), schema: self.target.schema.clone(), text: Some(text) });
+            cx.push(AppCommand::NewSqlEditor { connection: self.target.conn.clone(), schema: self.target.schema.clone(), text: Some(text) });
         }
         let can_apply = !script.is_empty() && self.apply_job.is_none();
         if ui.add_enabled_ui(can_apply, |ui| look::small(ui, kit::Kind::Danger, icon::PLAY, tr("Apply to target…"))).inner.clicked() {
@@ -347,9 +355,31 @@ impl SchemaCompareTab {
         if self.apply_job.is_some() {
             parts::spinner_label(ui, tr("Applying…"));
         }
-        if look::small(ui, kit::Kind::Ghost, icon::GRAPH, tr("Diff diagram")).on_hover_text(tr("ER diagram of the target with the differences highlighted")).clicked()
-            && let (Some((a, b)), Some(tc)) = (self.snapshots.clone(), self.target.conn.clone())
-        {
+        let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More actions"), false, 26.0);
+        let mut pick = None;
+        egui::Popup::menu(&more).show(|ui| {
+            kit::menu_look(ui, 240.0);
+            if kit::menu_item(ui, Some(icon::GRAPH), tr("Diff diagram"), "").on_hover_text(tr("ER diagram of the target with the differences highlighted")).clicked() {
+                pick = Some(0);
+            }
+            if kit::menu_item(ui, Some(icon::EXPORT), tr("HTML report…"), "").clicked() {
+                pick = Some(1);
+            }
+            if kit::menu_item(ui, Some(icon::FILE), tr("Liquibase changelog…"), "").clicked() {
+                pick = Some(2);
+            }
+        });
+        match pick {
+            Some(0) => self.open_diff_diagram(cx),
+            Some(1) => self.write_report(cx, diff),
+            Some(2) => self.write_changelog(cx),
+            _ => {}
+        }
+    }
+
+    /// The ER diagram of the target with the differences highlighted, in a new tab.
+    fn open_diff_diagram(&mut self, cx: &mut AppContext) {
+        if let (Some((a, b)), Some(tc)) = (self.snapshots.clone(), self.target.conn.clone()) {
             let old = ternarygrid_visual::er::ErModel::from_snapshot(&b, None);
             let new = ternarygrid_visual::er::ErModel::from_snapshot(&a, None);
             let model = ternarygrid_visual::er::ErModel::diff(&old, &new);
@@ -358,9 +388,11 @@ impl SchemaCompareTab {
             let schema = self.target.schema.clone().unwrap_or_else(|| SchemaRef::new(None, None));
             cx.push(AppCommand::OpenTab(Box::new(crate::tabs::er::ErTab::from_saved(tc, schema, name, diagram))));
         }
-        if look::small(ui, kit::Kind::Ghost, icon::EXPORT, tr("HTML report…")).clicked()
-            && let Some(path) = rfd::FileDialog::new().set_file_name("schema-compare.html").save_file()
-        {
+    }
+
+    /// The HTML report of the differences, to a file the user picks.
+    fn write_report(&mut self, cx: &mut AppContext, diff: &SchemaDiff) {
+        if let Some(path) = rfd::FileDialog::new().set_file_name("schema-compare.html").save_file() {
             let src = self.source.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_default();
             let dst = self.target.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_default();
             let html = ternarygrid_compare::html_report(diff, &src, &dst);
@@ -368,8 +400,12 @@ impl SchemaCompareTab {
                 cx.toasts.error(tr("Cannot write the file"), Some(e.to_string()));
             }
         }
-        if look::small(ui, kit::Kind::Ghost, icon::FILE, tr("Liquibase changelog…")).clicked()
-            && let (Some(d), Some((a, b))) = (self.selected_diff(), self.snapshots.clone())
+    }
+
+    /// The Liquibase changelog of the selected differences, to a file the user picks.
+    fn write_changelog(&mut self, cx: &mut AppContext) {
+        let target = self.target.conn.clone();
+        if let (Some(d), Some((a, b))) = (self.selected_diff(), self.snapshots.clone())
             && let Some(path) = rfd::FileDialog::new().set_file_name("changelog.xml").save_file()
         {
             let opts = LiquibaseOptions { script: self.script_options(), dialect: target.as_ref().and_then(|t| cx.conns.live(t)).map(|l| l.dialect.clone()), ..Default::default() };
@@ -380,6 +416,14 @@ impl SchemaCompareTab {
         }
     }
 
+    /// How many objects of the target the script drops (removed ones, when they are dropped).
+    fn dropped(&self) -> usize {
+        if !self.drop_removed {
+            return 0;
+        }
+        self.diff.as_ref().map(|d| d.items.iter().filter(|i| i.status == DiffStatus::Removed && !self.excluded.contains(&key(i))).count()).unwrap_or(0)
+    }
+
     /// "Apply the migration" confirmation.
     fn apply_modal(&mut self, ui: &mut Ui, cx: &mut AppContext, script: &[String]) {
         if !self.confirm_apply {
@@ -387,30 +431,47 @@ impl SchemaCompareTab {
         }
         let target_name = self.target.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_default();
         let production = self.target.conn.as_ref().is_some_and(|c| cx.conns.type_of(c).is_production());
-        let question = trf("Run {} statement(s) on \"{}\"?", &[&script.len(), &target_name]);
-        let warning = trf("{} is a Production connection: the schema changes reach the live database.", &[&target_name]);
+        let statements = ternarygrid_core::trn(script.len(), tr("1 statement"), tr("{} statements"));
+        let question = trf("Run {} on \"{}\"?", &[&statements, &target_name]);
+        let warning = trf("{} is a Production connection: the schema changes will reach the live database.", &[&target_name]);
+        let dropped = self.dropped();
+        // Dropping objects or changing production is destructive; else a change to review.
+        let destructive = production || dropped > 0;
         let (mut run, mut cancel) = (false, false);
-        let (resp, _) = parts::Dialog::new(tr("Apply the migration")).icon(icon::PLAY).width(520.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
-            ui.ctx(),
-            egui::Id::new(("cmp_apply", self.uid)),
-            |ui| {
-                ui.spacing_mut().item_spacing.y = 10.0;
-                ui.label(RichText::new(&question).size(13.5));
-                if production {
-                    look::note(ui, parts::Tone::Warning, None, &warning);
-                }
-            },
-            |ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::PLAY), tr("Run"), false).clicked() {
-                        run = true;
+        let (resp, _) = parts::Dialog::new(tr("Apply the migration"))
+            .icon(icon::WARNING)
+            .tone(if destructive { parts::Tone::Error } else { parts::Tone::Warning })
+            .width(520.0)
+            .body_padding(egui::Margin::symmetric(20, 18))
+            .show_modal(
+                ui.ctx(),
+                egui::Id::new(("cmp_apply", self.uid)),
+                |ui| {
+                    let p = style::pal(ui);
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    ui.label(RichText::new(&question).size(13.5));
+                    if dropped > 0 {
+                        ui.label(
+                            RichText::new(ternarygrid_core::trn(dropped, tr("1 object of the target will be dropped."), tr("{} objects of the target will be dropped.")))
+                                .color(p.err),
+                        );
                     }
-                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
-                        cancel = true;
+                    if production {
+                        look::note(ui, parts::Tone::Warning, None, &warning);
                     }
-                });
-            },
-        );
+                },
+                |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let kind = if destructive { kit::Kind::DangerFilled } else { kit::Kind::Primary };
+                        if kit::button_ex(ui, kind, Some(icon::PLAY), tr("Apply"), false).clicked() {
+                            run = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
         if run {
             let read_only = self.target.conn.as_ref().and_then(|c| cx.conns.config(c)).filter(|c| c.read_only).map(|c| c.name.clone());
             if let Some(name) = read_only {
@@ -499,7 +560,7 @@ impl TabView for SchemaCompareTab {
             self.apply_job = None;
             match r {
                 Ok(n) => {
-                    cx.toasts.success(trf("{} statement(s) executed on the target", &[&n]));
+                    cx.toasts.success(ternarygrid_core::trn(n, tr("1 statement executed on the target"), tr("{} statements executed on the target")));
                     if let (Some(tc), Some(ts)) = (&self.target.conn, &self.target.schema)
                         && let Some(l) = cx.conns.live_mut(tc)
                     {
@@ -525,10 +586,15 @@ impl TabView for SchemaCompareTab {
             });
         });
         let diff = self.diff.clone();
+        let ready = [&self.source, &self.target].iter().all(|s| s.schema.is_some() && s.conn.as_ref().is_some_and(|c| cx.conns.is_connected(c)));
         parts::toolbar(ui, |ui| {
             let busy = self.job.is_some();
-            if ui.add_enabled_ui(!busy, |ui| look::small(ui, kit::Kind::Primary, icon::ARROWS_DOWN_UP, tr("Compare"))).inner.clicked() {
+            let compare = ui.add_enabled_ui(!busy && ready, |ui| look::small(ui, kit::Kind::Primary, icon::ARROWS_DOWN_UP, tr("Compare"))).inner;
+            if compare.clicked() {
                 self.start(cx);
+            }
+            if !ready {
+                compare.on_disabled_hover_text(tr("Choose the source and the target schema first."));
             }
             if look::small(ui, kit::Kind::Ghost, icon::REPEAT, tr("Swap")).clicked() {
                 std::mem::swap(&mut self.source, &mut self.target);
@@ -542,6 +608,11 @@ impl TabView for SchemaCompareTab {
             look::checkbox(ui, &mut self.show_unchanged, tr("Show unchanged"));
             if look::checkbox(ui, &mut self.drop_removed, tr("Drop objects missing in the source")).changed() {
                 self.script = None;
+            }
+            // What that option does to this target: its objects that will be dropped.
+            let dropped = self.dropped();
+            if dropped > 0 {
+                ui.label(RichText::new(ternarygrid_core::trn(dropped, tr("1 will be dropped"), tr("{} will be dropped"))).size(12.5).color(p.err));
             }
             if look::checkbox(ui, &mut self.cascade, tr("Cascade")).changed() {
                 self.script = None;

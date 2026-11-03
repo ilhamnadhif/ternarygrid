@@ -4,7 +4,7 @@ use super::frame::GridFrame;
 use super::{selection_copy_data_limited, sql_table_name};
 use crate::copy::{CopyFormat, QuoteMode, render};
 use crate::expr::Expr;
-use egui::{ComboBox, Key, ScrollArea, TextEdit, Ui};
+use egui::{ComboBox, Key, TextEdit, Ui};
 use ternarygrid_core::{tr, trf};
 use ternarygrid_ui::parts::{Dialog, form_row};
 
@@ -53,30 +53,66 @@ fn sql_job(line: &str, font: &egui::FontId, dark: bool, text: egui::Color32) -> 
     job
 }
 
-/// Code as the mockups' blocks: a bordered box, monospace 12.5 on lines of 20 (numbered
-/// in a faint gutter when `gutter`), SQL coloured when `sql`; it scrolls past `max_height`.
-fn code_block(ui: &mut Ui, id: egui::Id, text: &str, gutter: bool, sql: bool, max_height: f32) {
+/// Code in the kit's code block: SQL coloured when `sql`, numbered when `gutter`, long
+/// lines wrapped when `wrap`.
+fn code_block(ui: &mut Ui, id: egui::Id, text: &str, gutter: bool, sql: bool, wrap: bool, max_height: f32) {
     let pal = ternarygrid_ui::pal(ui);
     let dark = ui.visuals().dark_mode;
     let font = egui::FontId::monospace(12.5);
-    let lines: Vec<&str> = text.lines().collect();
-    let left = if gutter { 46.0 } else { 12.0 };
-    let width = lines.iter().map(|l| ui.fonts_mut(|f| f.layout_no_wrap(l.to_string(), font.clone(), pal.text).size().x)).fold(0.0, f32::max);
-    ternarygrid_ui::parts::bordered(ui).inner_margin(egui::Margin::symmetric(0, 10)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ScrollArea::both().id_salt(id).max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(left + width + 12.0, lines.len().max(1) as f32 * 20.0), egui::Sense::hover());
-            for (i, line) in lines.iter().enumerate() {
-                let y = rect.top() + i as f32 * 20.0;
-                if gutter {
-                    ui.painter().text(egui::pos2(rect.left() + 32.0, y + 10.0), egui::Align2::RIGHT_CENTER, (i + 1).to_string(), font.clone(), pal.text_faint);
-                }
-                let job = if sql { sql_job(line, &font, dark, pal.text) } else { egui::text::LayoutJob::simple_singleline(line.to_string(), font.clone(), pal.text) };
-                let g = ui.fonts_mut(|f| f.layout_job(job));
-                ui.painter().galley(egui::pos2(rect.left() + left, y + 10.0 - g.size().y / 2.0), g, pal.text);
-            }
-        });
-    });
+    let mut job = egui::text::LayoutJob::default();
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            job.append("\n", 0.0, egui::TextFormat::simple(font.clone(), pal.text));
+        }
+        if sql {
+            let offset = job.text.len();
+            let part = sql_job(line, &font, dark, pal.text);
+            job.text.push_str(&part.text);
+            job.sections.extend(part.sections.into_iter().map(|mut s| {
+                s.byte_range = s.byte_range.start + offset..s.byte_range.end + offset;
+                s
+            }));
+        } else {
+            job.append(line, 0.0, egui::TextFormat::simple(font.clone(), pal.text));
+        }
+    }
+    ternarygrid_ui::parts::code_block(ui, id, job, gutter, wrap, max_height);
+}
+
+/// A single-line field as the kit's inputs: 30 points high, 8 points of padding at the sides.
+fn field(ui: &mut Ui, text: &mut String, width: f32, hint: &str, mono: bool) -> egui::Response {
+    let faint = ternarygrid_ui::pal(ui).text_faint;
+    let mut edit = TextEdit::singleline(text)
+        .desired_width(width)
+        .min_size(egui::vec2(0.0, ternarygrid_ui::style::CONTROL_H))
+        .vertical_align(egui::Align::Center)
+        .margin(egui::Margin::symmetric(8, 0))
+        .hint_text(egui::RichText::new(hint).color(faint));
+    if mono {
+        edit = edit.font(egui::TextStyle::Monospace);
+    }
+    ui.add(edit)
+}
+
+/// A disclosure row: the kit's caret and `title` (muted); its body below while open.
+fn disclosure(ui: &mut Ui, id: egui::Id, title: &str, body: impl FnOnce(&mut Ui)) {
+    let p = ternarygrid_ui::pal(ui);
+    let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let font = egui::FontId::proportional(13.0);
+    let g = ui.painter().layout_no_wrap(title.to_string(), font, p.text_muted);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0 + g.size().x, 22.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::CollapsingHeader, true, open, title));
+    if resp.clicked() {
+        open = !open;
+        ui.data_mut(|d| d.insert_temp(id, open));
+    }
+    let color = if resp.hovered() { p.text } else { p.text_muted };
+    let caret = if open { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT };
+    ui.painter().text(egui::pos2(rect.left() + 6.0, rect.center().y), egui::Align2::CENTER_CENTER, caret, ternarygrid_ui::style::icon_font(11.0), p.text_faint);
+    ui.painter().galley(egui::pos2(rect.left() + 18.0, rect.center().y - g.size().y / 2.0), g, color);
+    if open {
+        body(ui);
+    }
 }
 
 impl GridFrame<'_> {
@@ -105,14 +141,16 @@ impl GridFrame<'_> {
             Err(e) => e,
         };
         let id = self.id;
-        let lw = 110.0;
+        let lw = 100.0;
         let rows = self.state.rt.selection.rows(self.geo.nrows, usize::MAX).len();
         let cols = self.state.selected_columns().len();
         let subtitle = trf("{} rows × {} columns selected", &[&rows, &cols]);
-        let (resp, ()) = Dialog::new(tr("Advanced copy")).icon(egui_phosphor::regular::COPY).subtitle(&subtitle).width(520.0).show_modal(
+        let (resp, ()) = Dialog::new(tr("Advanced copy")).icon(egui_phosphor::regular::COPY).subtitle(&subtitle).width(580.0).show_modal(
             ui.ctx(),
             id.with("copy_dialog"),
             |ui| {
+                // Combo boxes and fields as tall as the kit's inputs.
+                ui.spacing_mut().interact_size.y = ternarygrid_ui::style::CONTROL_H;
                 form_row(ui, tr("Format"), lw, |ui| {
                     ComboBox::from_id_salt(id.with("copy_format")).icon(ternarygrid_ui::kit::combo_caret).width(220.0).selected_text(opts.format.label()).show_ui(ui, |ui| {
                         ternarygrid_ui::kit::menu_look(ui, 220.0);
@@ -124,7 +162,7 @@ impl GridFrame<'_> {
                     });
                 });
                 form_row(ui, tr("Options"), lw, |ui| {
-                    ui.spacing_mut().item_spacing.x = 18.0;
+                    ui.spacing_mut().item_spacing.x = 16.0;
                     ternarygrid_ui::kit::checkbox(ui, &mut opts.include_header, tr("Column names"));
                     ternarygrid_ui::kit::checkbox(ui, &mut opts.include_row_numbers, tr("Row numbers"));
                     ternarygrid_ui::kit::checkbox(ui, &mut opts.formatted, tr("Formatted values"));
@@ -132,7 +170,7 @@ impl GridFrame<'_> {
                 if opts.format.is_delimited() {
                     form_row(ui, tr("Delimiter"), lw, |ui| {
                         let default = if opts.format == CopyFormat::Csv { "," } else { "\\t" };
-                        ui.add(TextEdit::singleline(&mut opts.delimiter).desired_width(70.0).hint_text(default).font(egui::TextStyle::Monospace));
+                        field(ui, &mut opts.delimiter, 70.0, default, true);
                     });
                     form_row(ui, tr("Quote"), lw, |ui| {
                         ternarygrid_ui::parts::segmented(
@@ -143,16 +181,16 @@ impl GridFrame<'_> {
                     });
                 }
                 form_row(ui, tr("NULL as"), lw, |ui| {
-                    ui.add(TextEdit::singleline(&mut opts.null_text).desired_width(140.0).hint_text(tr("(empty)")));
+                    field(ui, &mut opts.null_text, 140.0, tr("(empty)"), false);
                 });
                 if opts.format == CopyFormat::SqlInsert {
                     form_row(ui, tr("Table"), lw, |ui| {
-                        ui.add(TextEdit::singleline(&mut opts.sql_table).desired_width(260.0));
+                        field(ui, &mut opts.sql_table, 260.0, "", true);
                     });
                 }
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(tr("Preview")).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)));
-                code_block(ui, id.with("copy_preview"), &preview, false, opts.format == CopyFormat::SqlInsert, 160.0);
+                code_block(ui, id.with("copy_preview"), &preview, false, opts.format == CopyFormat::SqlInsert, false, 160.0);
             },
             |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -195,10 +233,19 @@ impl GridFrame<'_> {
             None,
             |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
-                if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy"), true, false).clicked() {
-                    copy = true;
-                }
-                code_block(ui, id.with("code"), &sql, true, true, 340.0);
+                let wrap_id = id.with("wrap");
+                let mut wrap = ui.data(|d| d.get_temp::<bool>(wrap_id)).unwrap_or(false);
+                ui.horizontal(|ui| {
+                    if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy"), true, false).clicked() {
+                        copy = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ternarygrid_ui::kit::checkbox(ui, &mut wrap, tr("Wrap lines")).changed() {
+                            ui.data_mut(|d| d.insert_temp(wrap_id, wrap));
+                        }
+                    });
+                });
+                code_block(ui, id.with("code"), &sql, true, true, wrap, 340.0);
             },
             None,
         );
@@ -214,6 +261,12 @@ impl GridFrame<'_> {
     fn virtual_dialog(&mut self, ui: &mut Ui) {
         let Some(mut dlg) = self.state.rt.virtual_dialog.take() else { return };
         let names: Vec<String> = self.model.columns().iter().map(|c| c.name.clone()).collect();
+        // The hint from one of this table's own amounts (not a key), else a plain example.
+        let measure = self.model.columns().iter().enumerate().find(|(i, c)| c.is_numeric() && !crate::format::is_identifier_column(self.model, *i)).map(|(_, c)| c.name.clone());
+        let hint = match &measure {
+            Some(m) => format!("{m} * 1.1"),
+            None => "upper(name)".to_string(),
+        };
         let check = if dlg.expression.trim().is_empty() { None } else { Some(Expr::compile(&dlg.expression, &names).map_err(|e| e.display_with_position(&dlg.expression))) };
         let mut apply = false;
         let mut close = false;
@@ -224,11 +277,21 @@ impl GridFrame<'_> {
             ui.ctx(),
             self.id.with("virtual_dialog"),
             |ui| {
+                // Both fields to the body's right edge.
+                let field_w = ui.available_width() - lw - 16.0;
                 form_row(ui, tr("Name"), lw, |ui| {
-                    ui.add(TextEdit::singleline(&mut dlg.name).desired_width(300.0));
+                    field(ui, &mut dlg.name, field_w, "", false);
                 });
                 form_row(ui, tr("Expression"), lw, |ui| {
-                    ui.add(TextEdit::multiline(&mut dlg.expression).code_editor().desired_rows(3).desired_width(360.0).hint_text("price * quantity"));
+                    let faint = ternarygrid_ui::pal(ui).text_faint;
+                    ui.add(
+                        TextEdit::multiline(&mut dlg.expression)
+                            .code_editor()
+                            .desired_rows(3)
+                            .desired_width(field_w)
+                            .margin(egui::Margin::symmetric(8, 6))
+                            .hint_text(egui::RichText::new(&hint).color(faint)),
+                    );
                 });
                 match &check {
                     Some(Err(e)) => {
@@ -242,9 +305,10 @@ impl GridFrame<'_> {
                 if let Some(e) = &dlg.error {
                     ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Error, e);
                 }
-                ui.collapsing(tr("Expression help"), |ui| {
-                    ui.label(crate::expr::help_text());
-                    ui.label(trf("Columns: {}", &[&names.join(", ")]));
+                disclosure(ui, self.id.with("virtual_help"), tr("Expression help"), |ui| {
+                    let muted = ternarygrid_ui::pal(ui).text_muted;
+                    ui.label(egui::RichText::new(crate::expr::help_text()).color(muted));
+                    ui.label(egui::RichText::new(trf("Columns: {}", &[&names.join(", ")])).color(muted));
                 });
             },
             |ui| {

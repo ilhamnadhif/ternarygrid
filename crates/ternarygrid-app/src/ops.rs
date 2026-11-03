@@ -144,6 +144,11 @@ impl Operations {
         self.list.iter().filter(|o| o.is_running()).count()
     }
 
+    /// The titles of the running operations ("Export orders").
+    pub fn running_titles(&self) -> Vec<String> {
+        self.list.iter().filter(|o| o.is_running()).map(|o| o.title.clone()).collect()
+    }
+
     pub fn cancel_all(&self) {
         for o in &self.list {
             if o.is_running() {
@@ -167,7 +172,7 @@ impl Operations {
             .frame(crate::dialogs::window_frame(ctx))
             .pivot(egui::Align2::LEFT_BOTTOM)
             .default_pos(at)
-            .show(ctx, |ui| Dialog::new(title).icon(icon::CLOCK_COUNTER_CLOCKWISE).width(420.0).body_padding(egui::Margin::ZERO).contents(ui, |ui| self.ui(ui), None).0);
+            .show(ctx, |ui| Dialog::new(title).icon(icon::ACTIVITY).width(crate::dialogs::WIDTH_S).body_padding(egui::Margin::ZERO).contents(ui, |ui| self.ui(ui), None).0);
         let closed = shown.as_ref().and_then(|s| s.inner).unwrap_or(false);
         if closed || crate::widgets::escape_closes(ctx, shown.map(|s| s.response.layer_id)) {
             self.panel_open = false;
@@ -206,17 +211,22 @@ impl Operations {
                 let op = &self.list[i];
                 let running = matches!(op.state, OpState::Running);
                 let (glyph, color, txt) = match &op.state {
-                    OpState::Running => (icon::CLOCK_COUNTER_CLOCKWISE, p.accent_text, String::new()),
+                    OpState::Running => ("", p.accent_text, String::new()),
                     OpState::Succeeded(m) => (icon::CHECK_CIRCLE, p.ok, m.clone()),
                     OpState::Failed(m) => (icon::X_CIRCLE, p.err, m.clone()),
-                    OpState::Cancelled => (icon::PROHIBIT, p.text_faint, tr("Cancelled").to_string()),
+                    OpState::Cancelled => (icon::PROHIBIT, p.text_muted, tr("Cancelled").to_string()),
                 };
                 let row = egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
                         let (r, _) = ui.allocate_exact_size(egui::vec2(16.0, 17.0), egui::Sense::hover());
-                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, style::icon_font(16.0), color);
+                        if running {
+                            // Turning while it runs (a static icon would read as done).
+                            egui::Spinner::new().size(14.0).color(p.accent_text).paint_at(ui, egui::Rect::from_center_size(r.center(), egui::vec2(14.0, 14.0)));
+                        } else {
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, style::icon_font(16.0), color);
+                        }
                         let cancel_w = if running { 34.0 } else { 0.0 };
                         let w = (ui.available_width() - cancel_w).max(80.0);
                         ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -234,9 +244,9 @@ impl Operations {
                                     ui.set_min_width(title_w);
                                     crate::dialogs::semibold_text(ui, &op.title, 13.0, p.text, None, true);
                                 });
-                                ui.label(RichText::new(time).size(11.5).color(p.text_faint));
+                                ui.label(RichText::new(time).size(11.5).color(p.text_muted));
                             });
-                            let faint = |ui: &mut Ui, s: &str| ui.add(egui::Label::new(RichText::new(s).size(11.5).color(p.text_faint)).wrap());
+                            let detail_line = |ui: &mut Ui, s: &str| ui.add(egui::Label::new(RichText::new(s).size(11.5).color(p.text_muted)).wrap());
                             if running {
                                 let done = op.progress.done.load(Ordering::Relaxed);
                                 let total = op.progress.total.load(Ordering::Relaxed);
@@ -254,22 +264,20 @@ impl Operations {
                                     }
                                     detail.push_str(&msg);
                                 }
-                                // The bar takes what the detail leaves (empty while the total is unknown).
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 8.0;
-                                    let g = ui.painter().layout_no_wrap(detail.clone(), egui::FontId::proportional(11.5), p.text_faint);
-                                    let bar_w = (ui.available_width() - g.size().x - 8.0).max(60.0);
-                                    let frac = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
-                                    parts::progress(ui, frac, bar_w);
-                                    if !detail.is_empty() {
-                                        ui.add(egui::Label::new(RichText::new(detail).size(11.5).color(p.text_faint)).truncate());
-                                    }
-                                });
+                                // The bar across the row (only when the total is known: an empty
+                                // bar would read as stuck), the detail under it.
+                                if total > 0 {
+                                    ui.add_space(2.0);
+                                    parts::progress(ui, (done as f32 / total as f32).clamp(0.0, 1.0), ui.available_width());
+                                }
+                                if !detail.is_empty() {
+                                    ui.add(egui::Label::new(RichText::new(detail).size(11.5).color(p.text_muted)).truncate());
+                                }
                             } else if !txt.is_empty() {
-                                faint(ui, &txt);
+                                detail_line(ui, &txt);
                             }
                         });
-                        if running && kit::icon_button_sized(ui, icon::STOP, tr("Cancel"), false, 24.0, 12.0).clicked() {
+                        if running && kit::icon_button_sized(ui, icon::STOP_CIRCLE, tr("Cancel"), false, 24.0, 16.0).clicked() {
                             op.cancel.cancel();
                         }
                     });

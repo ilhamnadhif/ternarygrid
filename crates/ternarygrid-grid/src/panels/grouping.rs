@@ -30,14 +30,6 @@ impl Default for GroupingPanelState {
     }
 }
 
-/// A sum or an average as in the mockups: two decimals, thousands grouped (`1,572.56`).
-fn amount(v: f64) -> String {
-    let text = format!("{v:.2}");
-    let (int, frac) = text.split_once('.').unwrap_or((&text, "00"));
-    let (sign, digits) = int.strip_prefix('-').map_or(("", int), |d| ("-", d));
-    format!("{sign}{}.{frac}", crate::format::group_thousands(digits))
-}
-
 impl GroupingPanelState {
     /// The last computed grouping.
     pub fn result(&self) -> Option<&GroupResult> {
@@ -105,20 +97,30 @@ impl<'a> GroupingPanel<'a> {
         let mut changed = false;
         let pal = ternarygrid_ui::pal(ui);
         ui.spacing_mut().item_spacing.y = 8.0;
+        // The combo boxes as tall as the Refresh button (the kit's small controls).
+        ui.spacing_mut().interact_size.y = ternarygrid_ui::style::SMALL_H;
+        let label_w =
+            ["Group by", "Measure"].iter().map(|l| ui.painter().layout_no_wrap(tr(l).to_string(), egui::FontId::proportional(12.5), pal.text).size().x).fold(0.0, f32::max);
+        let label = |ui: &mut Ui, text: &str| {
+            ui.allocate_ui_with_layout(egui::vec2(label_w, ternarygrid_ui::style::SMALL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_size(egui::vec2(label_w, ternarygrid_ui::style::SMALL_H));
+                ui.label(RichText::new(text).size(12.5).color(pal.text_muted));
+            });
+        };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(RichText::new(tr("Group by")).size(12.5).color(pal.text_muted));
+            label(ui, tr("Group by"));
             let mut remove = None;
             for (i, c) in state.spec.columns.iter().enumerate() {
-                // A chip per grouping column ("status ✕"); a click removes it.
+                // A chip per grouping column ("status ✕"), in the controls' text size; a click removes it.
                 let label = format!("{} ✕", names.get(*c).map_or("?", String::as_str));
                 let mut job = egui::text::LayoutJob::default();
-                job.append(names.get(*c).map_or("?", String::as_str), 0.0, egui::TextFormat::simple(ternarygrid_ui::style::semibold(ui.ctx(), 11.0), pal.text));
-                job.append(egui_phosphor::regular::X, 4.0, egui::TextFormat::simple(ternarygrid_ui::style::icon_font(11.0), pal.text));
+                job.append(names.get(*c).map_or("?", String::as_str), 0.0, egui::TextFormat::simple(ternarygrid_ui::style::medium(ui.ctx(), 12.5), pal.text));
+                job.append(egui_phosphor::regular::X, 6.0, egui::TextFormat::simple(ternarygrid_ui::style::icon_font(12.0), pal.text_muted));
                 let g = ui.fonts_mut(|f| f.layout_job(job));
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 14.0, 18.0), egui::Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 20.0, ternarygrid_ui::style::SMALL_H), egui::Sense::click());
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
-                ui.painter().rect_filled(rect, 9, if resp.hovered() { pal.border_strong } else { pal.subtle });
+                ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, if resp.hovered() { pal.border_strong } else { pal.subtle });
                 ui.painter().galley(rect.center() - g.size() / 2.0, g, pal.text);
                 if resp.on_hover_text(tr("Remove from the grouping")).clicked() {
                     remove = Some(i);
@@ -140,11 +142,11 @@ impl<'a> GroupingPanel<'a> {
         });
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(RichText::new(tr("Measure")).size(12.5).color(pal.text_muted));
-            let current = state.spec.measure.and_then(|m| names.get(m)).cloned().unwrap_or_else(|| tr("(none)").to_string());
+            label(ui, tr("Measure"));
+            let current = state.spec.measure.and_then(|m| names.get(m)).cloned().unwrap_or_else(|| tr("None").to_string());
             ComboBox::from_id_salt("ternarygrid_group_measure").width(120.0).icon(ternarygrid_ui::kit::combo_caret).selected_text(current).show_ui(ui, |ui| {
                 ternarygrid_ui::kit::menu_look(ui, 120.0);
-                if ternarygrid_ui::kit::menu_check(ui, &mut state.spec.measure.is_none(), tr("(none)")).clicked() {
+                if ternarygrid_ui::kit::menu_check(ui, &mut state.spec.measure.is_none(), tr("None")).clicked() {
                     state.spec.measure = None;
                     changed = true;
                 }
@@ -156,8 +158,13 @@ impl<'a> GroupingPanel<'a> {
                     }
                 }
             });
-            ternarygrid_ui::kit::checkbox(ui, &mut state.live, tr("Live"));
-            if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, None, tr("Refresh"), true, false).clicked() {
+            ternarygrid_ui::kit::checkbox(ui, &mut state.live, tr("Live")).on_hover_text(tr("Group again when the rows change"));
+            // Live groups again by itself: Refresh only without it.
+            let refresh = ui
+                .add_enabled_ui(!state.live, |ui| ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, None, tr("Refresh"), true, false))
+                .inner
+                .on_disabled_hover_text(tr("Live groups again when the rows change"));
+            if refresh.clicked() {
                 changed = true;
             }
         });
@@ -175,10 +182,17 @@ impl<'a> GroupingPanel<'a> {
             ternarygrid_ui::parts::spinner_label(ui, tr("Grouping…"));
         }
         let Some(result) = &state.result else { return None };
-        ui.label(RichText::new(trf("{} groups in {} rows", &[&result.groups.len(), &crate::format::group_thousands(&result.rows.to_string())])).size(12.0).color(pal.text_faint));
+        let count = |n: usize, one: &str, many: &str| trf(if n == 1 { one } else { many }, &[&crate::format::display_count(n)]);
+        let groups = count(result.groups.len(), tr("{} group"), tr("{} groups"));
+        let rows = count(result.rows, tr("{} row"), tr("{} rows"));
+        ui.label(RichText::new(trf("{} in {}", &[&groups, &rows])).size(12.0).color(pal.text_muted));
         ui.add_space(2.0);
         if result.truncated {
-            ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Warning, &trf("More than {} groups; the rest were dropped", &[&MAX_GROUPS]));
+            ternarygrid_ui::parts::status(
+                ui,
+                ternarygrid_ui::parts::Tone::Warning,
+                &trf("More than {} groups; the rest were dropped.", &[&crate::format::display_count(MAX_GROUPS)]),
+            );
         }
         let spec = state.spec.clone();
         let has_measure = spec.measure.is_some();
@@ -239,20 +253,24 @@ impl<'a> GroupingPanel<'a> {
                     let resp = ui.interact(r, ui.id().with(("group_key", i, j)), egui::Sense::click()).on_hover_text(tr("Filter the grid to this group"));
                     let text = if k.is_null() { "NULL".to_string() } else { k.to_text().chars().take(60).collect::<String>() };
                     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, true, &text));
+                    // Links in the accent colour, underlined while hovered (as the app's other links).
                     if k.is_null() {
                         cell(ui, r, &text, &link_font, pal.text_faint, false, false);
                     } else {
-                        cell(ui, r, &text, &link_font, pal.accent_text, false, true);
+                        cell(ui, r, &text, &link_font, pal.accent_text, false, resp.hovered());
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                     if resp.clicked() {
                         clicked = Some(i);
                     }
                     x += widths[j];
                 }
-                let mut numbers = vec![crate::format::group_thousands(&g.count.to_string())];
+                let mut numbers = vec![crate::format::display_count(g.count)];
                 if has_measure {
-                    numbers.push(g.sum.map(amount).unwrap_or_default());
-                    numbers.push(g.avg.map(amount).unwrap_or_default());
+                    numbers.push(g.sum.map(crate::format::display_number).unwrap_or_default());
+                    numbers.push(g.avg.map(crate::format::display_number).unwrap_or_default());
                 }
                 for (j, n) in numbers.iter().enumerate() {
                     let w = widths[nkeys + j];

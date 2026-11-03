@@ -6,6 +6,7 @@
 
 pub mod dbeaver;
 pub mod pgpass;
+pub mod ternarygrid;
 pub mod url;
 
 pub use dbeaver::{
@@ -132,6 +133,15 @@ pub fn merge_into_store(
     }
     for p in result.network_profiles {
         if store.network_profile(&p.id).is_none() {
+            // A profile added with its secrets (a TernaryGrid export with passwords).
+            let prefix = format!("profile:{}:", p.id);
+            summary.secrets.extend(
+                result
+                    .secrets
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .cloned(),
+            );
             store.set_network_profile(p);
         }
     }

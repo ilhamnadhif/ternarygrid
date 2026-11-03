@@ -353,7 +353,7 @@ impl ToolStep {
             text.push('\n');
             text.push_str(&r.join("\t"));
         }
-        let summary = if more { trf("first {} rows", &[&rows.len()]) } else { trf("{} row(s)", &[&rows.len()]) };
+        let summary = if more { trf("first {} rows", &[&rows.len()]) } else { ternarygrid_core::trn(rows.len(), "1 row", "{} rows") };
         text.push_str(&if more { format!("\n({} rows shown; there are more)", rows.len()) } else { format!("\n({} rows)", rows.len()) });
         ToolStep { sql, ok: true, summary, for_model: text, columns, rows }
     }

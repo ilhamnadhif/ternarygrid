@@ -2,10 +2,10 @@
 //! export format with its options, output folder and file name pattern,
 //! parallel workers; runs with progress and can be saved as a task.
 
-use super::wizard::{self, Clicked, Form, W, col, line};
+use super::wizard::{self, Clicked, Form, LABEL_W, W, col, fact, line};
 use super::{
-    MessageLog, Running, TaskSaver, char_edit, combo, combo_w, connection_name, current_schema, default_output_folder, delimiter_choice, error_text, next_uid, not_connected,
-    opt_char_edit, opt_number, opt_text, opt_text_h, progress_ui, schema_combo, schema_tables, section,
+    MessageLog, ProgressKind, Running, TaskSaver, char_edit, close_wizard, combo, combo_w, connection_name, current_schema, default_output_folder, delimiter_choice, error_text,
+    next_uid, not_connected, opt_char_edit, opt_number, opt_text, opt_text_h, progress_ui, schema_combo, schema_tables, section,
 };
 use crate::cx::AppContext;
 use crate::tabs::TabView;
@@ -15,7 +15,7 @@ use egui_phosphor::regular as icon;
 use std::path::PathBuf;
 use std::sync::Arc;
 use ternarygrid_core::meta::{ObjectKind, ObjectRef, SchemaRef};
-use ternarygrid_core::{ColumnMeta, DbError, DbKind, DbResult, Dialect, SharedRowStore, tr, trf};
+use ternarygrid_core::{ColumnMeta, DbError, DbKind, DbResult, Dialect, SharedRowStore, tr, trf, trn};
 use ternarygrid_tasks::TaskKind;
 use ternarygrid_transfer::{
     BinaryEncoding, CancellationToken, CsvOptions, DbUnitOptions, EscapeStyle, ExportFormat, ExportItem, ExportItemSummary, ExportJob, ExportJobSummary, ExportOptions,
@@ -23,7 +23,7 @@ use ternarygrid_transfer::{
     Progress, QuoteMode, RowStoreSource, SessionFactory, SqlInsertMode, SqlOptions, TxtOptions, ValueFormat, XlsxOptions, XmlNullMode, XmlOptions, create_sink, expand_file_name,
     run_export_batched, run_export_job_with,
 };
-use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::kit;
 use ternarygrid_ui::parts::{self, Tone};
 
 const PAGE_SOURCE: usize = 0;
@@ -503,7 +503,7 @@ impl ExportTab {
         match enabled.as_slice() {
             [] => String::new(),
             [one] => one.item.name(),
-            many => trf("{} objects", &[&many.len()]),
+            many => trn(many.len(), "1 object", "{} objects"),
         }
     }
 
@@ -521,7 +521,8 @@ impl ExportTab {
             match result {
                 Ok(summary) => {
                     if summary.failed() > 0 {
-                        cx.toasts.warning(trf("Export finished, {} object(s) failed", &[&summary.failed()]), summary.first_error().map(str::to_string));
+                        let failed = trn(summary.failed(), "1 object failed", "{} objects failed");
+                        cx.toasts.warning(trf("Export finished, {}", &[&failed]), summary.first_error().map(str::to_string));
                     } else {
                         // One file: its name and "Show in Finder" (the pop-up closes).
                         let files: Vec<&std::path::PathBuf> = summary.items.iter().filter_map(|i| i.file.as_ref()).collect();
@@ -566,18 +567,19 @@ impl ExportTab {
         });
         match self.result_source {
             ResultSource::Query => {
-                wizard::faint(ui, tr("The query runs on a new connection and every row is exported, with all its columns."));
+                wizard::muted(ui, tr("The query runs on a new connection and every row is exported, with all its columns."));
                 if let Some(SourceItem { item: ExportItem::Query { name, .. }, .. }) = self.items.first_mut() {
-                    wizard::form(ui, ("exp_rows_name", self.uid), 1, 80.0, |f| {
+                    wizard::form(ui, ("exp_rows_name", self.uid), 1, LABEL_W, |f| {
                         f.row(tr("Name"), |ui| opt_text(ui, name, tr("name used for ${table}"), f32::INFINITY));
                     });
                 }
                 // The query, highlighted in the connection's dialect (read-only, selectable).
                 let lang = cx.conns.live(&self.conn).map(|l| crate::sqllang::SqlLanguage::new(l.dialect.clone()));
-                crate::tabs::dbtools::look::code_block(ui, lang.as_ref(), &sql, false);
+                read_only_sql(ui, lang.as_ref(), &sql);
             }
             _ => {
-                wizard::faint(ui, &trf("{} column(s); the rows are written from memory, without running the query again.", &[&columns]));
+                let columns = trn(columns, "1 column", "{} columns");
+                wizard::muted(ui, &trf("{}; the rows are written from memory, without running the query again.", &[&columns]));
             }
         }
     }
@@ -590,7 +592,7 @@ impl ExportTab {
         let p = ternarygrid_ui::pal(ui);
         section(ui, tr("Objects to export"));
         if self.items.is_empty() {
-            wizard::faint(ui, tr("Nothing selected yet: add tables or views below, or a query."));
+            wizard::muted(ui, tr("Nothing selected yet: add tables or views below, or a query."));
         } else {
             let mut remove = None;
             let mut toggle = None;
@@ -634,7 +636,7 @@ impl ExportTab {
                             ExportItem::Query { name: qname, .. } => {
                                 opt_text_h(ui, qname, tr("name used for ${table}"), 172.0, 26.0);
                                 let label = if expanded == Some(i) { tr("Hide SQL") } else { tr("Edit SQL") };
-                                if wizard::ghost(ui, None, label).clicked() {
+                                if wizard::action(ui, Some(icon::CODE), label).clicked() {
                                     toggle = Some(i);
                                 }
                             }
@@ -671,15 +673,15 @@ impl ExportTab {
             );
         }
         wizard::tight_row(ui, |ui| {
-            if wizard::ghost(ui, Some(icon::PLUS), tr("Add query")).clicked() {
+            if wizard::action(ui, Some(icon::PLUS), tr("Add query")).clicked() {
                 self.items.push(SourceItem { enabled: true, item: ExportItem::Query { sql: String::new(), name: None } });
                 self.expanded = Some(self.items.len() - 1);
             }
             if !self.items.is_empty() {
-                if wizard::ghost(ui, None, tr("Select all")).clicked() {
+                if wizard::action(ui, None, tr("Select all")).clicked() {
                     self.items.iter_mut().for_each(|i| i.enabled = true);
                 }
-                if wizard::ghost(ui, None, tr("Select none")).clicked() {
+                if wizard::action(ui, None, tr("Select none")).clicked() {
                     self.items.iter_mut().for_each(|i| i.enabled = false);
                 }
             }
@@ -689,7 +691,7 @@ impl ExportTab {
         let conn = self.conn.clone();
         if cx.conns.live(&conn).is_none() {
             ui.horizontal(|ui| {
-                wizard::faint(ui, tr("Connect to list the tables."));
+                wizard::muted(ui, tr("Connect to list the tables."));
                 if kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Connect")).clicked() {
                     cx.push(crate::command::AppCommand::Connect(conn.clone()));
                 }
@@ -715,12 +717,12 @@ impl ExportTab {
                 wizard::check(ui, &mut self.picker_views, tr("Views"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(shown) = &shown {
-                        if !shown.is_empty() && wizard::ghost(ui, None, tr("Add all shown")).clicked() {
+                        if !shown.is_empty() && wizard::action(ui, None, tr("Add all shown")).clicked() {
                             for o in shown {
                                 self.add_table(o.clone());
                             }
                         }
-                        wizard::faint(ui, &trf("{} objects", &[&shown.len()]));
+                        wizard::faint(ui, &trn(shown.len(), "1 object", "{} objects"));
                     }
                 });
             });
@@ -769,40 +771,47 @@ impl ExportTab {
             ExportFormat::Php => php_ui(ui, id, &mut o.php),
             ExportFormat::Parquet => parquet_ui(ui, id, &mut o.parquet),
         }
-        // The value formatting and the file options fold away under two cards.
+        // The value formatting and the file options fold away under two cards, one above the
+        // other across the page (an opened card stays where it was clicked).
         let values = uses_value_format(format);
         let batch = trf("{} rows per batch", &[&super::group(o.fetch_size as u64)]);
         let reading = if format.is_binary() { batch } else { format!("{} · {batch}", o.encoding) };
         let (mut values_open, mut common_open) = (self.values_open && values, self.common_open);
-        let fill = values_open || common_open;
-        let mut cards = |ui: &mut Ui| {
-            if values {
-                wizard::fold_card(ui, egui::Id::new(("exp_values", id)), &mut values_open, tr("Value formatting"), Some(tr("dates, numbers, NULL, booleans")), fill, |ui| {
-                    values_ui(ui, id, &mut o.values, format)
-                });
-            }
-            wizard::fold_card(ui, egui::Id::new(("exp_common", id)), &mut common_open, tr("File and reading"), Some(&reading), fill, |ui| common_ui(ui, id, o, format));
-        };
         ui.add_space(16.0 - wizard::GAP);
-        if fill {
-            cards(ui);
-        } else {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                cards(ui)
-            });
+        if values {
+            let what = if values_null_text(format) { tr("dates, numbers, NULL, booleans") } else { tr("dates, numbers, booleans") };
+            wizard::fold_card(ui, egui::Id::new(("exp_values", id)), &mut values_open, tr("Value formatting"), Some(what), true, |ui| values_ui(ui, id, &mut o.values, format));
         }
+        wizard::fold_card(ui, egui::Id::new(("exp_common", id)), &mut common_open, tr("File and reading"), Some(&reading), true, |ui| common_ui(ui, id, o, format));
         if values {
             self.values_open = values_open;
         }
         self.common_open = common_open;
     }
 
+    /// The files the export would write now (full paths, at most `n`) and how many more.
+    fn planned_files(&self, n: usize) -> (Vec<String>, usize) {
+        let now = chrono::Local::now().naive_local();
+        if self.fetched_mode() {
+            let name = expand_file_name(&self.settings.file_name_pattern, &self.fetched_item(), &self.settings.source, 1, self.settings.format, now);
+            return (vec![self.settings.output_folder.join(name).display().to_string()], 0);
+        }
+        let job = self.job();
+        let files = job
+            .items
+            .iter()
+            .enumerate()
+            .take(n)
+            .map(|(i, item)| job.output_folder.join(expand_file_name(&job.file_name_pattern, item, &job.source, i + 1, job.format, now)).display().to_string())
+            .collect();
+        (files, job.items.len().saturating_sub(n))
+    }
+
     fn output_page(&mut self, ui: &mut Ui) {
         section(ui, tr("Output"));
         let id = self.uid;
         let open_new = self.settings.open_new_connections;
-        wizard::form_gap(ui, ("exp_out", id), 1, 130.0, 12.0, |f| {
+        wizard::form_gap(ui, ("exp_out", id), 1, LABEL_W, 12.0, |f| {
             f.row(tr("Folder"), |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if kit::secondary(ui, Some(icon::FOLDER_OPEN), tr("Browse…")).clicked() {
@@ -838,27 +847,14 @@ impl ExportTab {
 
         section(ui, tr("Files"));
         let p = ternarygrid_ui::pal(ui);
-        let now = chrono::Local::now().naive_local();
-        let files: Vec<String> = if self.fetched_mode() {
-            let name = expand_file_name(&self.settings.file_name_pattern, &self.fetched_item(), &self.settings.source, 1, self.settings.format, now);
-            vec![self.settings.output_folder.join(name).display().to_string()]
-        } else {
-            let job = self.job();
-            job.items
-                .iter()
-                .enumerate()
-                .take(50)
-                .map(|(i, item)| job.output_folder.join(expand_file_name(&job.file_name_pattern, item, &job.source, i + 1, job.format, now)).display().to_string())
-                .collect()
-        };
-        let more = if self.fetched_mode() { 0 } else { self.items.iter().filter(|i| i.enabled).count().saturating_sub(50) };
+        let (files, more) = self.planned_files(50);
         wizard::card(ui, 12, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             if files.is_empty() {
-                wizard::faint(ui, tr("No object selected."));
+                wizard::muted(ui, tr("No object selected."));
             }
             for f in &files {
-                wizard::mono(ui, &home_relative(f), p.text, 12.0).on_hover_text(f);
+                wizard::mono(ui, &wizard::home_relative(f), p.text, 12.0).on_hover_text(f);
             }
             if more > 0 {
                 wizard::faint(ui, &trf("… and {} more", &[&more]));
@@ -869,10 +865,8 @@ impl ExportTab {
     fn run_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if let Some(run) = &self.run {
             wizard::title(ui, tr("Exporting…"));
-            if progress_ui(ui, &run.progress, run.is_cancelling()) {
-                run.cancel();
-            }
-            self.log.ui(ui, ("exp_log", self.uid), 260.0);
+            progress_ui(ui, &run.progress, ProgressKind { label: tr("Objects"), items: (tr("object"), tr("objects")), files: true });
+            self.log.ui(ui, ("exp_log", self.uid), 260.0, false);
             return;
         }
         match &self.result {
@@ -883,44 +877,71 @@ impl ExportTab {
             Some(Err(e)) => {
                 wizard::outcome(ui, Tone::Error, tr("The export failed"), None);
                 crate::widgets::error_box(ui, e);
+                if kit::secondary(ui, Some(icon::PENCIL_SIMPLE), tr("Change settings")).clicked() {
+                    self.result = None;
+                    self.page = PAGE_SOURCE;
+                }
             }
             None => self.summary_ui(ui, cx),
         }
         if self.result.is_some() {
-            self.log.ui(ui, ("exp_log", self.uid), 220.0);
+            // The table above lists every object: the log is folded away.
+            let folded = matches!(self.result, Some(Ok(_)));
+            self.log.ui(ui, ("exp_log", self.uid), 220.0, folded);
+        }
+    }
+
+    /// The tone of a finished run (the outcome's icon, the stepper's last step).
+    fn outcome(&self) -> Option<Tone> {
+        match &self.result {
+            Some(Ok(s)) => Some(export_tone(s)),
+            Some(Err(_)) => Some(Tone::Error),
+            None => None,
         }
     }
 
     fn summary_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         section(ui, tr("Summary"));
         let job = self.job();
+        let names = job.items.iter().map(ExportItem::name).collect::<Vec<_>>().join(", ");
         let objects = if self.fetched_mode() {
-            trf("{} rows of {}", &[&self.fetched_rows(), &self.subject()])
+            trf("{} of {}", &[&super::rows_text(self.fetched_rows() as u64), &self.subject()])
         } else {
-            format!("{} ({})", job.items.len(), job.items.iter().map(ExportItem::name).collect::<Vec<_>>().join(", "))
+            format!("{}: {names}", trn(job.items.len(), "1 object", "{} objects"))
         };
         let workers = if job.open_new_connections { job.threads.to_string() } else { "1".to_string() };
-        wizard::facts(
-            ui,
-            ("exp_sum", self.uid),
-            120.0,
-            8.0,
-            &[
-                (tr("Connection"), connection_name(cx, &self.conn), None),
-                (tr("Objects"), objects, None),
-                (tr("Format"), tr(job.format.label()).to_string(), None),
-                (tr("Folder"), job.output_folder.display().to_string(), None),
-                (tr("Workers"), workers, None),
-            ],
-        );
+        // The filters of the tables that have one.
+        let filters: Vec<String> = job
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ExportItem::Table { table, where_clause: Some(w) } => Some(format!("{}: WHERE {w}", table.name)),
+                _ => None,
+            })
+            .collect();
+        let (files, more) = self.planned_files(3);
+        let mut file_names: Vec<String> = files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+        if more > 0 {
+            file_names.push(trf("… and {} more", &[&more]));
+        }
+        let mut rows = vec![fact(tr("Connection"), connection_name(cx, &self.conn)), fact(tr("Objects"), objects)];
+        if !filters.is_empty() && !self.fetched_mode() {
+            rows.push(fact(tr("Filters"), filters.join("\n")));
+        }
+        rows.push(fact(tr("Format"), tr(job.format.label())));
+        rows.push(fact(tr("Folder"), wizard::home_relative(&job.output_folder.display().to_string())));
+        rows.push(fact(if file_names.len() == 1 { tr("File") } else { tr("Files") }, file_names.join("\n")));
+        if !self.fetched_mode() {
+            rows.push(fact(tr("Workers"), workers));
+        }
+        wizard::facts(ui, ("exp_sum", self.uid), 8.0, &rows);
         if let Some(e) = self.items_error().or_else(|| self.output_error()) {
             crate::widgets::error_box(ui, &e);
         }
     }
 
     fn result_ui(&mut self, ui: &mut Ui, summary: &ExportJobSummary) {
-        let tone = if summary.failed() > 0 { Tone::Warning } else { Tone::Success };
-        wizard::outcome(ui, tone, &describe(summary), None);
+        wizard::outcome(ui, export_tone(summary), &describe(summary), None);
         let cols = [
             col(tr("Object"), W::Fr(1.1)),
             col(tr("File"), W::Fr(2.0)),
@@ -945,6 +966,11 @@ impl ExportTab {
                         ui.add(egui::Label::new(&item.name).truncate());
                     }
                     1 => match &item.file {
+                        // A failed object: its error where its file would be (all of it on hover).
+                        _ if item.error.is_some() => {
+                            let e = item.error.as_deref().unwrap_or_default();
+                            ui.add(egui::Label::new(RichText::new(e).color(ternarygrid_ui::pal(ui).text_muted)).truncate()).on_hover_text(e);
+                        }
                         Some(f) => {
                             let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                             let link = egui::Label::new(RichText::new(name).underline().color(ternarygrid_ui::pal(ui).accent_text)).truncate().sense(egui::Sense::click());
@@ -970,13 +996,13 @@ impl ExportTab {
                     }
                     _ => match &item.error {
                         Some(e) => {
-                            wizard::tone_text(ui, Tone::Error, e).on_hover_text(e);
+                            wizard::tone_text(ui, Tone::Error, tr("Failed")).on_hover_text(e);
                         }
                         None if !item.warnings.is_empty() => {
-                            wizard::tone_text(ui, Tone::Warning, &trf("{} warning(s)", &[&item.warnings.len()])).on_hover_text(item.warnings.join("\n"));
+                            wizard::tone_text(ui, Tone::Warning, &trn(item.warnings.len(), "1 warning", "{} warnings")).on_hover_text(item.warnings.join("\n"));
                         }
                         None => {
-                            wizard::tone_text(ui, Tone::Success, tr("OK"));
+                            wizard::tone_text(ui, Tone::Success, tr("Done"));
                         }
                     },
                 }
@@ -985,13 +1011,13 @@ impl ExportTab {
         if open_error.is_some() {
             self.error = open_error;
         }
-        ui.horizontal(|ui| {
+        wizard::tight_row(ui, |ui| {
             if kit::secondary(ui, Some(icon::FOLDER_OPEN), tr("Open folder")).clicked()
                 && let Err(e) = open::that_detached(&self.settings.output_folder)
             {
                 self.error = Some(e.to_string());
             }
-            if kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked() {
+            if kit::secondary(ui, Some(icon::PENCIL_SIMPLE), tr("Change settings")).clicked() {
                 self.result = None;
                 self.page = PAGE_SOURCE;
             }
@@ -1007,55 +1033,82 @@ impl ExportTab {
         let ok = self.validate().is_ok() && !running;
         let fetched = self.fetched_mode();
         let savable = ok && !self.saver.is_saving() && !fetched;
+        // Saving as a task is offered with the summary (the whole configuration) and after a run.
+        let why = if fetched { Some(tr("Exports of fetched rows cannot be saved as tasks.")) } else { None };
+        let invalid = self.validate().err();
         let footer = wizard::Footer {
             back: (self.page > PAGE_SOURCE).then_some(!running),
             next: (self.page < PAGE_RUN).then_some(self.page < reachable),
             run: (tr("Run export"), ok),
-            save: Some((savable, fetched.then_some(tr("Exports of fetched rows cannot be saved as tasks.")))),
+            save: (self.page == PAGE_RUN).then_some((savable, why.or(invalid.as_deref()))),
             error: self.error.as_deref(),
+            running: self.run.as_ref().map(|r| r.is_cancelling()),
+            finished: self.page == PAGE_RUN && self.result.is_some(),
         };
         match wizard::footer(ui, &footer) {
             Some(Clicked::Back) => self.page -= 1,
             Some(Clicked::Next) => self.page += 1,
             Some(Clicked::Run) => self.start(cx),
             Some(Clicked::Save) => self.saver.open(trf("Export {}", &[&self.subject()])),
+            Some(Clicked::Cancel) => self.cancel(),
+            Some(Clicked::Close) => close_wizard(cx, &mut self.done),
             None => {}
         }
     }
 }
 
-/// A path with the home folder shown as `~` (file lists only; fields keep the real path).
-fn home_relative(path: &str) -> String {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
-    match path.strip_prefix(home.as_str()) {
-        Some(rest) if !home.is_empty() && (rest.starts_with('/') || rest.starts_with('\\')) => format!("~{rest}"),
-        _ => path.to_string(),
-    }
-}
-
-/// The list of tables and views to add: a + button, the icon and the name (faint once added).
+/// The list of tables and views to add: a + button, the icon and the name; one already added
+/// shows an accent check instead of the + and "Added" at its right. As high as the body has
+/// room for (at most 8 rows; it scrolls beyond).
 pub(crate) fn picker_list(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, shown: &[ObjectRef], added: impl Fn(&ObjectRef) -> bool, mut add: impl FnMut(ObjectRef)) {
     let p = ternarygrid_ui::pal(ui);
+    // Rows 28 high with a hairline under each (29 apart).
+    let max_h = wizard::fit_height(ui, 29.0 * 8.0, 29.0 * 4.0, 2.0);
     wizard::boxed(ui, Margin::ZERO, |ui| {
-        // Rows 28 high with a hairline under each (29 apart).
-        egui::ScrollArea::vertical().id_salt(egui::Id::new(id)).max_height(29.0 * 8.0).auto_shrink([false, true]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(egui::Id::new(id)).max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let line = p.line;
             for (i, o) in shown.iter().enumerate() {
                 let already = added(o);
                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 29.0), egui::Sense::hover());
-                let inner = egui::Rect::from_min_max(rect.min + vec2(10.0, 0.0), rect.max - vec2(10.0, 1.0));
+                // 16 at the right: clear of the scroll bar.
+                let inner = egui::Rect::from_min_max(rect.min + vec2(10.0, 0.0), rect.max - vec2(16.0, 1.0));
                 let mut row = ui.new_child(egui::UiBuilder::new().id_salt(("pick", i)).max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)));
                 row.spacing_mut().item_spacing.x = 8.0;
-                if row.add_enabled_ui(!already, |ui| wizard::icon_button(ui, icon::PLUS, tr("Add"), 22.0)).inner.clicked() {
+                if already {
+                    let (r, _) = row.allocate_exact_size(vec2(22.0, 22.0), egui::Sense::hover());
+                    row.painter().text(r.center(), egui::Align2::CENTER_CENTER, icon::CHECK, ternarygrid_ui::style::icon_font(14.0), p.accent_text);
+                } else if wizard::icon_button(&mut row, icon::PLUS, tr("Add"), 22.0).clicked() {
                     add(o.clone());
                 }
                 let glyph = if o.kind == ObjectKind::View { icon::EYE } else { icon::TABLE };
                 row.label(RichText::new(glyph).font(ternarygrid_ui::style::icon_font(13.0)).color(p.text_muted));
-                row.label(RichText::new(&o.name).color(if already { p.text_faint } else { p.text }));
+                row.label(RichText::new(&o.name).color(if already { p.text_muted } else { p.text }));
+                if already {
+                    row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(tr("Added")).size(12.0).color(p.text_faint));
+                    });
+                }
                 ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, line));
             }
         });
+    });
+}
+
+/// A read-only SQL text, highlighted and selectable, on the chrome colour without a field's
+/// border (it is not an input).
+fn read_only_sql(ui: &mut Ui, lang: Option<&crate::sqllang::SqlLanguage>, text: &str) {
+    use ternarygrid_editor::EditorLanguage;
+    let p = ternarygrid_ui::pal(ui);
+    let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
+    let tokens = lang.map(|l| l.highlight(text)).unwrap_or_default();
+    let mut job = crate::sqllang::highlight_job(text, &tokens, &theme, egui::FontId::monospace(12.5));
+    for s in &mut job.sections {
+        s.format.line_height = Some(20.0);
+    }
+    egui::Frame::new().fill(p.chrome).corner_radius(egui::CornerRadius::same(8)).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.add(egui::Label::new(job).wrap().selectable(true));
     });
 }
 
@@ -1097,10 +1150,19 @@ async fn export_fetched(
 }
 
 fn describe(s: &ExportJobSummary) -> String {
-    let files = s.items.iter().filter(|i| i.error.is_none() && i.file.is_some()).count();
+    let files = trn(s.items.iter().filter(|i| i.error.is_none() && i.file.is_some()).count(), "1 file", "{} files");
     match s.failed() {
-        0 => trf("{} rows exported to {} file(s)", &[&super::group(s.rows), &files]),
-        n => trf("{} rows exported to {} file(s), {} failed", &[&super::group(s.rows), &files, &n]),
+        0 => trf("{} exported to {}", &[&super::rows_text(s.rows), &files]),
+        n => trf("{} exported to {}, {} failed", &[&super::rows_text(s.rows), &files, &n]),
+    }
+}
+
+/// Warning when some objects failed, an error when all did.
+fn export_tone(s: &ExportJobSummary) -> Tone {
+    match s.failed() {
+        0 => Tone::Success,
+        n if n == s.items.len() => Tone::Error,
+        _ => Tone::Warning,
     }
 }
 
@@ -1108,22 +1170,28 @@ fn uses_value_format(f: ExportFormat) -> bool {
     !matches!(f, ExportFormat::Sql | ExportFormat::Php | ExportFormat::Parquet | ExportFormat::Xlsx)
 }
 
-// ------------------------------------------------------------ option editors
+/// The value formatting's NULL text is used by the format (CSV has its own, TXT and DbUnit
+/// theirs, JSON writes `null`).
+fn values_null_text(f: ExportFormat) -> bool {
+    matches!(f, ExportFormat::Markdown | ExportFormat::Html | ExportFormat::Xml)
+}
 
-/// Width of the label column of the format options.
-const LABEL_W: f32 = 170.0;
+// ------------------------------------------------------------ option editors
 
 fn opts<R>(ui: &mut Ui, id: u64, name: &str, add: impl FnOnce(&mut Form<'_>) -> R) -> R {
     wizard::form(ui, ("exp_opts", id, name.to_string()), 1, LABEL_W, add)
 }
 
+/// [`opts`] inside a folding card: its controls where the page's start (the card's border and
+/// padding in).
+fn card_opts<R>(ui: &mut Ui, id: u64, name: &str, add: impl FnOnce(&mut Form<'_>) -> R) -> R {
+    wizard::form(ui, ("exp_opts", id, name.to_string()), 1, wizard::CARD_LABEL_W, add)
+}
+
 fn csv_ui(ui: &mut Ui, id: u64, o: &mut CsvOptions, tsv: bool) {
     opts(ui, id, "csv", |f| {
         if !tsv {
-            f.row(tr("Delimiter"), |ui| {
-                ui.add(line(&mut o.delimiter).font(egui::TextStyle::Monospace).desired_width(60.0));
-                delimiter_choice(ui, &mut o.delimiter);
-            });
+            f.row(tr("Delimiter"), |ui| delimiter_choice(ui, ("exp_delim", id), &mut o.delimiter));
         }
         f.row(tr("Quote character"), |ui| char_edit(ui, &mut o.quote_char));
         f.seg_row(tr("Quote values"), |ui| {
@@ -1152,7 +1220,7 @@ fn csv_ui(ui: &mut Ui, id: u64, o: &mut CsvOptions, tsv: bool) {
                 );
             });
         });
-        f.row(tr("NULL written as"), |ui| ui.add(line(&mut o.null_string).hint_text(tr("nothing")).desired_width(160.0)));
+        f.row(tr("NULL as"), |ui| ui.add(line(&mut o.null_string).hint_text(tr("(empty string)")).desired_width(160.0)));
         f.seg_row(tr("Line ending"), |ui| {
             parts::segmented(ui, &mut o.line_ending, &[(LineEnding::Lf, tr("LF (macOS, Linux)")), (LineEnding::CrLf, tr("CRLF (Windows)")), (LineEnding::Cr, tr("CR"))])
         });
@@ -1274,7 +1342,7 @@ fn xml_ui(ui: &mut Ui, id: u64, o: &mut XmlOptions) {
                     (XmlNullMode::NullAttribute, tr("Element with null=\"true\"").to_string()),
                     (XmlNullMode::Omit, tr("Leave the element out").to_string()),
                     (XmlNullMode::Empty, tr("Empty element").to_string()),
-                    (XmlNullMode::Text, tr("NULL text of the value formatting").to_string()),
+                    (XmlNullMode::Text, tr("Text (\"NULL as\" of the value formatting)").to_string()),
                 ],
             )
         });
@@ -1298,7 +1366,10 @@ fn txt_ui(ui: &mut Ui, id: u64, o: &mut TxtOptions) {
             ui.add_enabled(o.show_nulls, line(&mut o.null_text).desired_width(100.0));
         });
         f.check_row(tr("Numbers"), |ui| wizard::check(ui, &mut o.right_align_numbers, tr("Align right")));
-        f.row(tr("Rows measured for widths"), |ui| ui.add(egui::DragValue::new(&mut o.width_sample_rows).range(1..=100_000)));
+        f.row(tr("Rows to measure"), |ui| {
+            ui.add(egui::DragValue::new(&mut o.width_sample_rows).range(1..=100_000));
+            wizard::faint(ui, tr("for the column widths"));
+        });
     });
 }
 
@@ -1339,14 +1410,18 @@ fn parquet_ui(ui: &mut Ui, id: u64, o: &mut ParquetOptions) {
 
 fn values_ui(ui: &mut Ui, id: u64, v: &mut ValueFormat, format: ExportFormat) {
     if matches!(format, ExportFormat::Json | ExportFormat::JsonLines) {
-        wizard::faint(ui, tr("JSON uses the date formats only with \"Use the date formats of the value formatting\"."));
+        wizard::muted(ui, tr("JSON uses the date formats only with \"Use the date formats of the value formatting\"."));
     }
-    opts(ui, id, "values", |f| {
-        f.row(tr("NULL text"), |ui| ui.add(wizard::mono_line(&mut v.null_text, 120.0).hint_text(tr("empty"))));
+    card_opts(ui, id, "values", |f| {
+        // The one NULL setting of the formats that use it (CSV, TXT and DbUnit have their own).
+        if values_null_text(format) {
+            let hint = if format == ExportFormat::Html { "NULL" } else { tr("(empty string)") };
+            f.row(tr("NULL as"), |ui| ui.add(wizard::mono_line(&mut v.null_text, 140.0).hint_text(hint)));
+        }
         f.row(tr("Date format"), |ui| opt_text(ui, &mut v.date_format, tr("ISO, e.g. %d.%m.%Y"), 220.0));
         f.row(tr("Time format"), |ui| opt_text(ui, &mut v.time_format, tr("ISO, e.g. %H:%M"), 220.0));
         f.row(tr("Timestamp format"), |ui| opt_text(ui, &mut v.datetime_format, tr("ISO, e.g. %d.%m.%Y %H:%M:%S"), 220.0));
-        f.row(tr("Timestamp with time zone"), |ui| opt_text(ui, &mut v.timestamptz_format, tr("ISO, e.g. %Y-%m-%d %H:%M %z"), 220.0));
+        f.row(tr("Timestamp with zone"), |ui| opt_text(ui, &mut v.timestamptz_format, tr("ISO, e.g. %Y-%m-%d %H:%M %z"), 220.0));
         f.row(tr("Decimal separator"), |ui| opt_char_edit(ui, &mut v.decimal_separator, "."));
         f.row(tr("Thousands separator"), |ui| opt_char_edit(ui, &mut v.thousands_separator, ""));
         f.row(tr("Fraction digits"), |ui| opt_number(ui, &mut v.float_decimals, tr("all")));
@@ -1367,7 +1442,7 @@ fn values_ui(ui: &mut Ui, id: u64, v: &mut ValueFormat, format: ExportFormat) {
 }
 
 fn common_ui(ui: &mut Ui, id: u64, o: &mut ExportOptions, format: ExportFormat) {
-    opts(ui, id, "common", |f| {
+    card_opts(ui, id, "common", |f| {
         if !format.is_binary() {
             f.row(tr("Encoding"), |ui| {
                 super::import::encoding_combo(ui, ("exp_enc", id), &mut o.encoding, &ENCODINGS);
@@ -1375,7 +1450,10 @@ fn common_ui(ui: &mut Ui, id: u64, o: &mut ExportOptions, format: ExportFormat) 
                 ui.add_enabled_ui(bom, |ui| wizard::check(ui, &mut o.insert_bom, tr("Byte order mark (BOM)")));
             });
         }
-        f.row(tr("Rows fetched per batch"), |ui| ui.add(egui::DragValue::new(&mut o.fetch_size).range(1..=100_000)));
+        f.row(tr("Rows per batch"), |ui| {
+            ui.add(egui::DragValue::new(&mut o.fetch_size).range(1..=100_000));
+            wizard::faint(ui, tr("rows fetched at a time"));
+        });
         f.check_row(tr("After a failure"), |ui| wizard::check(ui, &mut o.keep_partial_file, tr("Keep the partially written file")));
     });
 }
@@ -1419,8 +1497,8 @@ impl TabView for ExportTab {
             }
             let steps = [tr("Source"), tr("Format"), tr("Output"), tr("Run")];
             let reachable = if self.run.is_some() { PAGE_RUN } else { self.reachable().max(PAGE_FORMAT.min(self.reachable())) };
-            let finished = self.page == PAGE_RUN && matches!(self.result, Some(Ok(_)));
-            if let Some(p) = wizard::steps(ui, &steps, self.page, reachable.max(self.page), finished)
+            let outcome = if self.page == PAGE_RUN { self.outcome() } else { None };
+            if let Some(p) = wizard::steps(ui, &steps, self.page, reachable.max(self.page), outcome)
                 && self.run.is_none()
             {
                 self.page = p;

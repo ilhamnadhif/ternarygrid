@@ -1,6 +1,7 @@
 //! Calc panel: statistics of the selected cells (FR-D5).
 
 use crate::calc::{CalcStats, compute_stats, format_number};
+use crate::format::{display_count, display_number};
 use crate::grid::{DataGridState, Selection};
 use crate::model::ResultModel;
 use egui::{RichText, Ui};
@@ -94,36 +95,61 @@ impl<'a> CalcPanel<'a> {
         }
         let s = &self.state.stats;
         if s.count == 0 {
-            ui.weak(tr("Select cells to calculate statistics"));
+            ui.label(RichText::new(tr("Select cells to calculate their statistics.")).color(ternarygrid_ui::pal(ui).text_muted));
             return;
         }
         let s = s.clone();
-        // What is counted: "14 cells of total selected".
+        // What is counted: "14 cells selected in “total”" (the column's name in monospace).
         let cols = self.grid.selected_columns();
-        let faint = ternarygrid_ui::pal(ui).text_faint;
-        let what = match cols.as_slice() {
-            [c] => trf("{} cells of {} selected", &[&crate::format::group_thousands(&s.count.to_string()), &self.model.column_name(*c)]),
-            _ => trf("{} cells selected", &[&crate::format::group_thousands(&s.count.to_string())]),
-        };
-        ui.label(RichText::new(what).size(12.0).color(faint));
+        let p = ternarygrid_ui::pal(ui);
+        let cells = trf(if s.count == 1 { tr("{} cell selected") } else { tr("{} cells selected") }, &[&display_count(s.count)]);
+        match cols.as_slice() {
+            [c] => {
+                let mut job = egui::text::LayoutJob::default();
+                let body = egui::TextFormat::simple(egui::FontId::proportional(12.0), p.text_muted);
+                job.append(&format!("{cells} {} “", tr("in")), 0.0, body.clone());
+                job.append(self.model.column_name(*c), 0.0, egui::TextFormat::simple(egui::FontId::monospace(11.5), p.text));
+                job.append("”", 0.0, body);
+                ui.label(job);
+            }
+            _ => {
+                ui.label(RichText::new(cells).size(12.0).color(p.text_muted));
+            }
+        }
         ui.add_space(6.0);
-        let count = |name: &'static str, v: usize| StatRow { name, shown: crate::format::group_thousands(&v.to_string()), copy: v.to_string() };
-        let plain = |name: &'static str, v: String| StatRow { name, shown: v.clone(), copy: v };
-        let fmt_v = |v: &Option<Value>| v.as_ref().map(|v| v.to_text().into_owned()).unwrap_or_default();
+        // Identifiers (keys, `*_id`) without thousands separators, as the grid shows them.
+        let ids = !cols.is_empty() && cols.iter().all(|c| crate::format::is_identifier_column(self.model, *c));
+        let count = |name: &'static str, v: usize| StatRow { name, shown: display_count(v), copy: v.to_string() };
+        let number = |name: &'static str, v: f64| StatRow { name, shown: display_number(v), copy: format_number(v) };
+        let fmt_v = |name: &'static str, v: &Option<Value>| {
+            let text = v.as_ref().map(|v| v.to_text().into_owned()).unwrap_or_default();
+            let numeric = matches!(v, Some(Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Decimal(_)));
+            let shown = if numeric && !ids { crate::format::group_thousands(&text) } else { text.clone() };
+            StatRow { name, shown, copy: text }
+        };
         let mut rows = vec![count(tr("Count"), s.count), count(tr("Distinct"), s.distinct), count(tr("NULLs"), s.nulls)];
         if s.numeric_count > 0 {
             rows.push(count(tr("Numbers"), s.numeric_count));
-            rows.push(plain(tr("Sum"), s.sum_text().unwrap_or_default()));
-            rows.push(plain(tr("Average"), s.avg.map(format_number).unwrap_or_default()));
-            rows.push(plain(tr("Median"), s.median.map(format_number).unwrap_or_default()));
+            let sum = s.sum_text().unwrap_or_default();
+            let shown = match s.int_sum {
+                Some(_) => crate::format::group_thousands(&sum),
+                None => s.sum.map(display_number).unwrap_or_default(),
+            };
+            rows.push(StatRow { name: tr("Sum"), shown, copy: sum });
+            if let Some(v) = s.avg {
+                rows.push(number(tr("Average"), v));
+            }
+            if let Some(v) = s.median {
+                rows.push(number(tr("Median"), v));
+            }
         }
         // The most frequent value, when one repeats.
         if let Some((value, times)) = s.mode.as_ref().filter(|(_, t)| *t > 1) {
-            let shown = trf("{} (×{})", &[value, &crate::format::group_thousands(&times.to_string())]);
+            let shown = trf("{} (×{})", &[value, &display_count(*times)]);
             rows.push(StatRow { name: tr("Mode"), shown, copy: value.clone() });
         }
-        rows.push(plain(tr("Min"), fmt_v(&s.min)));
-        rows.push(plain(tr("Max"), fmt_v(&s.max)));
+        rows.push(fmt_v(tr("Min"), &s.min));
+        rows.push(fmt_v(tr("Max"), &s.max));
         if let (Some(a), Some(b)) = (s.min_len, s.max_len) {
             rows.push(count(tr("Min length"), a));
             rows.push(count(tr("Max length"), b));
@@ -132,10 +158,10 @@ impl<'a> CalcPanel<'a> {
             stats_table(ui, &rows, self.state);
             ui.add_space(10.0);
             let keys = if cfg!(target_os = "macos") { "⌘C" } else { "Ctrl+C" };
-            ui.add(egui::Label::new(RichText::new(trf("Copy: click a row and press {}, or the copy button at its end, or right-click.", &[&keys])).size(11.5).color(faint)).wrap());
+            ui.add(egui::Label::new(RichText::new(trf("Click a row and press {}, or right-click to copy.", &[&keys])).size(11.5).color(p.text_faint)).wrap());
             if s.truncated {
                 ui.add_space(4.0);
-                ui.weak(trf("Only the first {} cells were analysed", &[&crate::format::group_thousands(&MAX_CALC_CELLS.to_string())]));
+                ui.label(RichText::new(trf("Only the first {} cells were analysed.", &[&display_count(MAX_CALC_CELLS)])).size(12.0).color(p.text_muted));
             }
         });
     }
@@ -172,7 +198,8 @@ fn stats_table(ui: &mut Ui, rows: &[StatRow], state: &mut CalcPanelState) {
     painter.rect_filled(header, egui::CornerRadius { nw: 8, ne: 8, ..Default::default() }, theme.header_bg);
     painter.hline(header.x_range(), header.bottom() - 0.5, Stroke::new(1.0, pal.border));
     painter.text(pos2(header.left() + 10.0, header.center().y - 0.5), Align2::LEFT_CENTER, tr("Function"), head_font.clone(), pal.text_muted);
-    painter.text(pos2(header.left() + name_w + 10.0, header.center().y - 0.5), Align2::LEFT_CENTER, tr("Value"), head_font, pal.text_muted);
+    // Values right-aligned (numbers line up), their header over them.
+    painter.text(pos2(header.right() - 10.0, header.center().y - 0.5), Align2::RIGHT_CENTER, tr("Value"), head_font, pal.text_muted);
     let all_text = || rows.iter().map(|r| format!("{}\t{}", r.name, r.copy)).collect::<Vec<_>>().join("\n");
     for (i, row) in rows.iter().enumerate() {
         let r = egui::Rect::from_min_size(pos2(rect.left(), rect.top() + head_h + row_h * i as f32), vec2(width, row_h));
@@ -198,9 +225,12 @@ fn stats_table(ui: &mut Ui, rows: &[StatRow], state: &mut CalcPanelState) {
         // The copy button at the end of the hovered and the selected rows.
         let show_button = hovered || selected;
         let value_right = if show_button || just_copied { button.left() - 4.0 } else { r.right() - 4.0 };
+        let value_right = if show_button || just_copied { value_right } else { r.right() - 10.0 };
         let value_rect = egui::Rect::from_min_max(pos2(r.left() + name_w + 10.0, r.top()), pos2(value_right, r.bottom()));
         let galley = painter.layout(row.shown.clone(), mono.clone(), theme.text, f32::INFINITY);
-        painter.with_clip_rect(value_rect).galley(pos2(value_rect.left(), r.center().y - galley.size().y / 2.0), galley, theme.text);
+        // Right-aligned; a value wider than its cell starts at the cell's left (cut at the right).
+        let x = (value_rect.right() - galley.size().x).max(value_rect.left());
+        painter.with_clip_rect(value_rect).galley(pos2(x, r.center().y - galley.size().y / 2.0), galley, theme.text);
         if just_copied {
             let ok = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
             painter.text(pos2(r.right() - 6.0, r.center().y), Align2::RIGHT_CENTER, format!("{} {}", icon::CHECK, tr("Copied")), font.clone(), ok);

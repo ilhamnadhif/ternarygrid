@@ -623,6 +623,30 @@ fn reopen_with_key(bytes: &[u8], opened: &Opened) -> DbResult<BTreeMap<String, S
     })
 }
 
+/// Encrypts `entries` with `password` in the vault's format (Argon2id, XChaCha20-Poly1305, a
+/// fresh salt and nonce): the passwords of an exported connections file.
+pub fn seal_with_password(
+    entries: &BTreeMap<String, Secret>,
+    password: &Secret,
+) -> DbResult<Vec<u8>> {
+    if password.is_empty() {
+        return Err(DbError::config("The password must not be empty"));
+    }
+    let params = KdfParams::default();
+    let mut salt = vec![0u8; SALT_LEN];
+    random_bytes(&mut salt)?;
+    let key = derive_key(password, &salt, params)?;
+    seal(&key, params, &salt, entries)
+}
+
+/// Decrypts what [`seal_with_password`] wrote. A wrong password is an auth error.
+pub fn open_with_password(bytes: &[u8], password: &Secret) -> DbResult<BTreeMap<String, Secret>> {
+    let (header, header_len) = VaultHeader::decode(bytes)?;
+    let key = derive_key(password, &header.salt, header.params)?;
+    decrypt_entries(&key, &header, bytes, header_len)?
+        .ok_or_else(|| DbError::auth("Wrong password (or the file was modified)"))
+}
+
 /// Encrypted file store protected by a master password.
 ///
 /// File format (`vault.bin`): `"TGRIDVLT"`, version byte, KDF id (1 =

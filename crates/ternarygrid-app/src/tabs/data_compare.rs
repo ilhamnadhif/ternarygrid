@@ -45,36 +45,62 @@ pub(crate) fn connection_combo_ex(
     width: f32,
     glyph: bool,
 ) -> bool {
+    connection_combo_impl(ui, cx, id, conn, none, width, glyph, false)
+}
+
+/// [`connection_combo_ex`] with the connection's logo inside the picker, before its name (as
+/// the navigator shows it); a faint "Choose a connection…" until one is chosen.
+pub(crate) fn connection_combo_logo(ui: &mut Ui, cx: &mut AppContext, id: impl Hash + std::fmt::Debug, conn: &mut Option<String>, width: f32) -> bool {
+    connection_combo_impl(ui, cx, id, conn, None, width, false, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connection_combo_impl(
+    ui: &mut Ui,
+    cx: &mut AppContext,
+    id: impl Hash + std::fmt::Debug,
+    conn: &mut Option<String>,
+    none: Option<&str>,
+    width: f32,
+    glyph: bool,
+    logo: bool,
+) -> bool {
     let names: Vec<(String, String, bool)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone(), cx.conns.is_connected(&c.id))).collect();
-    let current = conn
-        .as_ref()
-        .and_then(|c| names.iter().find(|(i, _, _)| i == c))
-        .map(|(_, n, _)| n.clone())
-        .or_else(|| if conn.is_none() { none.map(str::to_string) } else { None })
-        .unwrap_or_else(|| tr("Choose a connection…").to_string());
+    let named = conn.as_ref().and_then(|c| names.iter().find(|(i, _, _)| i == c)).map(|(_, n, _)| n.clone());
+    let placeholder = named.is_none() && !(conn.is_none() && none.is_some());
+    let current = named.or_else(|| if conn.is_none() { none.map(str::to_string) } else { None }).unwrap_or_else(|| tr("Choose a connection…").to_string());
+    let kind = conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.kind).filter(|_| logo);
+    let p = ternarygrid_ui::pal(ui);
+    let text = if logo {
+        look::logo_text(ui, &current, kind, if placeholder { p.text_faint } else { p.text })
+    } else if glyph {
+        format!("{} {current}", icon::PLUGS).into()
+    } else {
+        current.into()
+    };
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id)
-        .icon(ternarygrid_ui::kit::combo_caret)
-        .popup_style(egui::containers::menu::menu_style.into())
-        .selected_text(if glyph { format!("{} {current}", icon::PLUGS) } else { current })
-        .width(width)
-        .show_ui(ui, |ui| {
-            kit::menu_look(ui, width);
-            if let Some(n) = none
-                && choice(ui, conn.is_none(), n)
-                && conn.is_some()
-            {
-                *conn = None;
-                changed = true;
-            }
-            for (cid, name, connected) in &names {
-                let st = if *connected { icon::PLUGS_CONNECTED } else { icon::PLUGS };
-                if choice(ui, conn.as_deref() == Some(cid), &format!("{st} {name}")) && conn.as_deref() != Some(cid) {
-                    *conn = Some(cid.clone());
+    let combo =
+        egui::ComboBox::from_id_salt(id).icon(ternarygrid_ui::kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(text).width(width).show_ui(
+            ui,
+            |ui| {
+                kit::menu_look(ui, width);
+                if let Some(n) = none
+                    && choice(ui, conn.is_none(), n)
+                    && conn.is_some()
+                {
+                    *conn = None;
                     changed = true;
                 }
-            }
-        });
+                for (cid, name, connected) in &names {
+                    let st = if *connected { icon::PLUGS_CONNECTED } else { icon::PLUGS };
+                    if choice(ui, conn.as_deref() == Some(cid), &format!("{st} {name}")) && conn.as_deref() != Some(cid) {
+                        *conn = Some(cid.clone());
+                        changed = true;
+                    }
+                }
+            },
+        );
+    look::paint_combo_logo(ui, &combo.response, kind);
     if changed
         && let Some(c) = conn.as_ref()
         && !cx.conns.is_connected(c)
@@ -497,14 +523,10 @@ impl DataCompareTab {
         let side = if target { &mut self.target } else { &mut self.source };
         let before = side.clone();
         let tag = if target { "dst" } else { "src" };
-        // As in the design: the logo 8 from the connection, the schema 6 from it, the table 8.
+        // The connection (its logo inside), the schema 6 from it, the table 8.
         ui.spacing_mut().item_spacing.x = 6.0;
-        if let Some(kind) = side.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.kind) {
-            look::logo(ui, kind, 15.0);
-            ui.add_space(2.0);
-        }
         let mut conn = side.conn.clone();
-        if connection_combo_ex(ui, cx, ("dc_conn", uid, tag), &mut conn, None, 170.0, false) {
+        if connection_combo_logo(ui, cx, ("dc_conn", uid, tag), &mut conn, 190.0) {
             side.conn = conn;
             side.schema = None;
             side.table = None;
@@ -558,13 +580,11 @@ impl DataCompareTab {
     }
 
     fn columns_ui(&mut self, ui: &mut Ui, src: &TableDef, dst: Option<&TableDef>) {
-        let title = trf(
-            "Keys and columns ({} key, {} compared)",
-            &[&self.keys.len(), &src.columns.iter().filter(|c| !self.keys.contains(&c.name) && !self.excluded.contains(&c.name)).count()],
-        );
+        let compared = src.columns.iter().filter(|c| !self.keys.contains(&c.name) && !self.excluded.contains(&c.name)).count();
+        let summary = format!("{}, {}", ternarygrid_core::trn(self.keys.len(), tr("1 key"), tr("{} keys")), trf("{} compared", &[&compared]));
         let mut open = self.columns_open.unwrap_or(self.keys.is_empty());
         let p = ternarygrid_ui::pal(ui);
-        look::collapsible_card(ui, &mut open, &title, None, |ui| {
+        look::collapsible_card(ui, &mut open, tr("Keys and columns"), Some(&summary), |ui| {
             ui.horizontal(|ui| {
                 if kit::ghost(ui, Some(icon::KEY), tr("Primary key")).clicked() {
                     self.keys = src.row_key().map(|k| k.columns.clone()).unwrap_or_default();
@@ -664,7 +684,12 @@ impl DataCompareTab {
                 look::checkbox(ui, &mut o.trim_text, tr("Ignore trailing spaces"));
                 ui.horizontal(|ui| {
                     look::muted(ui, tr("Numeric tolerance"));
-                    ui.add(egui::DragValue::new(&mut o.numeric_tolerance).range(0.0..=1e12).speed(0.001));
+                    // Typed (a drag would be too coarse for 0.001).
+                    crate::tabs::transfer::parsed_line(ui, o.numeric_tolerance.to_string(), 80.0, 28.0, |t| {
+                        if let Ok(v) = t.trim().parse::<f64>() {
+                            o.numeric_tolerance = v.clamp(0.0, 1e12);
+                        }
+                    });
                 });
             });
             ui.horizontal_wrapped(|ui| {
@@ -687,7 +712,12 @@ impl DataCompareTab {
                 });
                 ui.horizontal(|ui| {
                     look::muted(ui, tr("Differing rows to show"));
-                    ui.add(egui::DragValue::new(&mut o.max_samples).range(1..=1_000_000));
+                    crate::tabs::transfer::parsed_line(ui, o.max_samples.to_string(), 80.0, 28.0, |t| {
+                        if let Ok(v) = t.trim().parse() {
+                            o.max_samples = v;
+                            o.max_samples = o.max_samples.clamp(1, 1_000_000);
+                        }
+                    });
                 });
                 look::checkbox(ui, &mut o.generate_sync, tr("Generate the sync script"));
             });
@@ -796,7 +826,7 @@ impl DataCompareTab {
             self.apply_job = None;
             match res {
                 Ok(n) => {
-                    cx.toasts.success(trf("{} statement(s) applied to the target", &[&n]));
+                    cx.toasts.success(ternarygrid_core::trn(n as usize, tr("1 statement applied to the target"), tr("{} statements applied to the target")));
                     if let (Some(c), Some(t)) = (&self.target.conn, &self.target.table) {
                         cx.push(AppCommand::RefreshMetadata { connection: c.clone(), object: Some(t.clone()), schema: None });
                     }
@@ -868,22 +898,16 @@ impl DataCompareTab {
         format!("{} · {strategy}", trf("{} source rows, {} target rows, {}", &[&d.source_rows, &d.target_rows, &crate::widgets::format_duration(o.elapsed)]))
     }
 
+    /// "The data is identical", the warnings of the run, how many differing rows are shown (the
+    /// counts are in the filter's segments).
     fn summary_ui(ui: &mut Ui, o: &Outcome) {
         let d = &o.diff;
-        let p = ternarygrid_ui::pal(ui);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 16.0;
-            if d.is_identical() {
-                ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Success, tr("The data is identical."));
-            }
-            ui.label(trf("{} equal", &[&d.identical]));
-            look::tone(ui, &trf("{} different", &[&d.different]), p.warn, true);
-            look::tone(ui, &trf("{} only in source", &[&d.only_in_source]), p.ok, true);
-            look::tone(ui, &trf("{} only in target", &[&d.only_in_target]), p.err, true);
-        });
+        if d.is_identical() {
+            ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Success, tr("The data is identical."));
+        }
         let mut notes: Vec<String> = d.warnings.clone();
         if d.skipped_null_keys > 0 {
-            notes.push(trf("{} rows with a NULL key were skipped", &[&d.skipped_null_keys]));
+            notes.push(ternarygrid_core::trn(d.skipped_null_keys as usize, tr("1 row with a NULL key was skipped"), tr("{} rows with a NULL key were skipped")));
         }
         if !o.layout.missing_in_target.is_empty() {
             notes.push(trf("Not compared (missing in the target): {}", &[&o.layout.missing_in_target.join(", ")]));
@@ -908,12 +932,19 @@ impl DataCompareTab {
             return;
         }
         let nk = o.layout.keys.len();
-        let text_of = |v: Option<&Value>| -> String {
+        // Keys and ids as the sync script writes them: no thousands separators.
+        let id_fmt = ternarygrid_core::value::FormatOptions { thousands_separator: false, ..fmt.clone() };
+        let is_id = |name: &str| {
+            let n = name.to_ascii_lowercase();
+            n == "id" || n.ends_with("_id")
+        };
+        let text_in = |v: Option<&Value>, f: &ternarygrid_core::value::FormatOptions| -> String {
             match v {
-                Some(v) => v.display(&fmt).chars().take(200).collect(),
+                Some(v) => v.display(f).chars().take(200).collect(),
                 None => String::new(),
             }
         };
+        let text_of = |v: Option<&Value>| text_in(v, &fmt);
         let is_null = |v: Option<&Value>| v.is_some_and(|v| v.is_null());
         // The design's widths: the difference 120, the keys 70, the values by their length.
         let mut widths = vec![W::Px(120.0)];
@@ -936,16 +967,18 @@ impl DataCompareTab {
             .iter()
             .map(|s| {
                 let mut row = vec![Cell::new(kind_label(s.kind)).color(kind_color(s.kind, &p))];
-                row.extend((0..nk).map(|i| Cell::new(text_of(s.key.get(i)))));
+                row.extend((0..nk).map(|i| Cell::new(text_in(s.key.get(i), &id_fmt))));
                 for (j, name) in o.layout.columns.iter().enumerate() {
                     let src = s.source.as_ref().and_then(|r| r.get(nk + j));
                     let tgt = s.target.as_ref().and_then(|r| r.get(nk + j));
-                    let value = |v: Option<&Value>| if is_null(v) { look::null_cell(ui, text_of(v)) } else { Cell::new(text_of(v)) };
+                    let f = if is_id(name) { &id_fmt } else { &fmt };
+                    let value = |v: Option<&Value>| if is_null(v) { look::null_cell(ui, text_in(v, f)) } else { Cell::new(text_in(v, f)) };
                     row.push(match s.kind {
+                        // What the sync does to the target: its value now (struck) → the source's.
                         RowDiffKind::Different if s.columns.iter().any(|c| c == name) => {
-                            let (a, b) = (text_of(src), text_of(tgt));
-                            let hover = format!("{}: {a}\n{}: {b}", tr("Source"), tr("Target"));
-                            Cell::new(format!("{a} → {b}")).job(look::change_job(ui, &a, &b)).hover(hover)
+                            let (now, after) = (text_in(tgt, f), text_in(src, f));
+                            let hover = format!("{}: {now}\n{}: {after}", tr("Target now"), tr("After the sync (source)"));
+                            Cell::new(format!("{now} → {after}")).job(look::change_job(ui, &now, &after)).hover(hover)
                         }
                         RowDiffKind::OnlyInTarget => value(tgt),
                         _ => value(src),
@@ -1005,7 +1038,7 @@ impl DataCompareTab {
             ternarygrid_ui::parts::spinner_label(ui, tr("Applying…"));
         }
         let p = ternarygrid_ui::pal(ui);
-        ui.label(RichText::new(trf("{} statement(s)", &[&n])).size(12.0).color(p.text_faint));
+        ui.label(RichText::new(ternarygrid_core::trn(n, tr("1 statement"), tr("{} statements"))).size(12.0).color(p.text_faint));
     }
 
     fn apply_modal(&mut self, ui: &mut Ui, cx: &mut AppContext) {
@@ -1019,32 +1052,38 @@ impl DataCompareTab {
         let target_conn = cx.conns.config(&o.target_conn).map(|c| c.name.clone()).unwrap_or_default();
         let production = cx.conns.type_of(&o.target_conn).is_production();
         let (n, name) = (o.diff.sync_statements.len(), o.target_name.clone());
-        let question = trf("Run {} statement(s) on {} (\"{}\") in one transaction?", &[&n, &name, &target_conn]);
-        let warning = trf("{} is a Production connection: the rows of the live database are changed.", &[&target_conn]);
+        let statements = ternarygrid_core::trn(n, tr("1 statement"), tr("{} statements"));
+        let question = trf("Run {} on {} (\"{}\") in one transaction?", &[&statements, &name, &target_conn]);
+        let warning = trf("{} is a Production connection: the rows of the live database will be changed.", &[&target_conn]);
         let (mut run, mut cancel) = (false, false);
-        let (resp, _) = ternarygrid_ui::parts::Dialog::new(tr("Apply the sync script")).icon(icon::PLAY).width(520.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
-            ui.ctx(),
-            egui::Id::new(("dc_apply", self.uid)),
-            |ui| {
-                let p = ternarygrid_ui::pal(ui);
-                ui.spacing_mut().item_spacing.y = 8.0;
-                ui.label(RichText::new(&question).size(13.5));
-                ui.label(RichText::new(tr("Rows of the target are inserted, updated and deleted to match the source.")).color(p.text_muted));
-                if production {
-                    look::note(ui, ternarygrid_ui::parts::Tone::Warning, None, &warning);
-                }
-            },
-            |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::PLAY), tr("Apply"), false).clicked() {
-                        run = true;
+        let (resp, _) = ternarygrid_ui::parts::Dialog::new(tr("Apply the sync script"))
+            .icon(icon::WARNING)
+            .tone(ternarygrid_ui::parts::Tone::Error)
+            .width(520.0)
+            .body_padding(egui::Margin::symmetric(20, 18))
+            .show_modal(
+                ui.ctx(),
+                egui::Id::new(("dc_apply", self.uid)),
+                |ui| {
+                    let p = ternarygrid_ui::pal(ui);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.label(RichText::new(&question).size(13.5));
+                    ui.label(RichText::new(tr("Rows of the target will be inserted, updated and deleted to match the source.")).color(p.text_muted));
+                    if production {
+                        look::note(ui, ternarygrid_ui::parts::Tone::Warning, None, &warning);
                     }
-                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
-                        cancel = true;
-                    }
-                });
-            },
-        );
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::PLAY), tr("Apply"), false).clicked() {
+                            run = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
         if run {
             self.apply(cx);
         }
@@ -1139,22 +1178,16 @@ impl TabView for DataCompareTab {
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll(cx);
         ui.spacing_mut().item_spacing.y = 0.0;
-        // As in the design, the sync script takes the whole tab: the pickers, the cards and the
-        // toolbar are back with the differences.
-        let script_mode = self.view == ResultView::Script && self.result.is_some();
-        if !script_mode {
-            self.sides_ui(ui, cx);
-        }
+        // The pickers, the cards and the toolbar stay in both views: the switch below does not move.
+        self.sides_ui(ui, cx);
         let src = Self::def_of(cx, &self.source.clone());
         let dst = Self::def_of(cx, &self.target.clone());
         let errors: Vec<String> = [src.as_ref().err(), dst.as_ref().err()].into_iter().flatten().cloned().collect();
         let (src, dst) = (src.ok().flatten(), dst.ok().flatten());
         let busy = self.run.is_some() || self.apply_job.is_some();
-        if !script_mode {
-            self.cards_ui(ui, &errors, src.as_deref(), dst.as_deref());
-            let ready = src.is_some() && dst.is_some() && !self.keys.is_empty();
-            self.toolbar_ui(ui, ready, self.keys.is_empty() && src.is_some(), busy);
-        }
+        self.cards_ui(ui, &errors, src.as_deref(), dst.as_deref());
+        let ready = src.is_some() && dst.is_some() && !self.keys.is_empty();
+        self.toolbar_ui(ui, ready, self.keys.is_empty() && src.is_some(), busy);
         if self.start_requested {
             self.try_start(cx, src.as_ref(), dst.as_ref());
         }
@@ -1169,20 +1202,30 @@ impl TabView for DataCompareTab {
             }
             let Some(o) = &self.result else { return };
             Self::summary_ui(ui, o);
+            let counts = (o.diff.different, o.diff.only_in_source, o.diff.only_in_target, o.diff.identical);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 ternarygrid_ui::parts::segmented(ui, &mut self.view, &[(ResultView::Rows, tr("Differences")), (ResultView::Script, tr("Sync script"))]);
                 match self.view {
                     ResultView::Rows => {
+                        // The counts in the filter: "Different 2", "Only in source 2" …
+                        let (different, only_source, only_target, identical) = counts;
                         ui.add_space(2.0);
                         look::muted(ui, tr("Show"));
+                        let labels = [
+                            format!("{} {}", tr("All"), different + only_source + only_target),
+                            format!("{} {}", kind_label(RowDiffKind::Different), different),
+                            format!("{} {}", kind_label(RowDiffKind::OnlyInSource), only_source),
+                            format!("{} {}", kind_label(RowDiffKind::OnlyInTarget), only_target),
+                        ];
                         let items = [
-                            (None, tr("All")),
-                            (Some(RowDiffKind::Different), kind_label(RowDiffKind::Different)),
-                            (Some(RowDiffKind::OnlyInSource), kind_label(RowDiffKind::OnlyInSource)),
-                            (Some(RowDiffKind::OnlyInTarget), kind_label(RowDiffKind::OnlyInTarget)),
+                            (None, labels[0].as_str()),
+                            (Some(RowDiffKind::Different), labels[1].as_str()),
+                            (Some(RowDiffKind::OnlyInSource), labels[2].as_str()),
+                            (Some(RowDiffKind::OnlyInTarget), labels[3].as_str()),
                         ];
                         ternarygrid_ui::parts::segmented_small(ui, &mut self.filter, &items);
+                        look::faint(ui, &ternarygrid_core::trn(identical as usize, tr("1 row equal"), tr("{} rows equal")));
                     }
                     ResultView::Script => self.script_actions(ui, cx),
                 }

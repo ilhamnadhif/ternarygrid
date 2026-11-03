@@ -51,6 +51,9 @@ pub struct Palette {
     pub prod_soft: Color32,
     /// Every other row of tables and the grid.
     pub stripe: Color32,
+    /// The selected segment of a segmented control, raised above its `subtle` track (lighter
+    /// than the track in both themes: the surface in light, a lifted grey in dark).
+    pub thumb: Color32,
 }
 
 const fn rgb(c: u32) -> Color32 {
@@ -83,6 +86,7 @@ pub const LIGHT: Palette = Palette {
     modified: rgb(0xf3ead6),
     prod_soft: rgb(0xfbe9e7),
     stripe: rgb(0xfafafb),
+    thumb: rgb(0xffffff),
 };
 
 pub const DARK: Palette = Palette {
@@ -113,6 +117,7 @@ pub const DARK: Palette = Palette {
     modified: rgb(0x4b443b),
     prod_soft: rgb(0x4a3a40),
     stripe: rgb(0x262830),
+    thumb: rgb(0x4a4d59),
 };
 
 impl Palette {
@@ -261,6 +266,20 @@ pub fn luminance(c: Color32) -> f32 {
 pub fn contrast(a: Color32, b: Color32) -> f32 {
     let (la, lb) = (luminance(a), luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `a` over `b` at `t` (0: `b`, 1: `a`), opaque.
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let m = |x: u8, y: u8| (y as f32 + (x as f32 - y as f32) * t).round() as u8;
+    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+/// `fg`, darkened (light theme) or lightened (dark theme) just enough to be read on `bg`
+/// (4.5:1): a user's light marker colour as text on its own tint.
+pub fn readable_on(fg: Color32, bg: Color32, dark: bool) -> Color32 {
+    let toward = if dark { Color32::WHITE } else { Color32::BLACK };
+    let fg = Color32::from_rgb(fg.r(), fg.g(), fg.b());
+    (0..=10).map(|i| mix(toward, fg, i as f32 / 10.0)).find(|c| contrast(*c, bg) >= 4.5).unwrap_or(toward)
 }
 
 #[cfg(test)]

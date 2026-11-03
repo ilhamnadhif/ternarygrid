@@ -3,10 +3,10 @@
 //! preparation, indexes and foreign keys; runs with per-table progress and
 //! can be saved as a task.
 
-use super::wizard::{self, Clicked, W, col, line};
+use super::wizard::{self, Clicked, LABEL_W, W, col, fact, line};
 use super::{
-    MessageLog, Running, TaskSaver, combo_w, connection_combo, connection_name, current_schema, error_text, next_uid, not_connected, on_error_options, progress_ui, schema_combo,
-    schema_tables, section, table_def_of,
+    MessageLog, ProgressKind, Running, TaskSaver, close_wizard, combo_w, connection_combo, connection_name, current_schema, error_text, next_uid, not_connected, on_error_options,
+    progress_ui, schema_combo, schema_tables, section, table_def_of,
 };
 use crate::cx::AppContext;
 use crate::tabs::TabView;
@@ -16,7 +16,7 @@ use egui_phosphor::regular as icon;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use ternarygrid_core::meta::{ObjectRef, SchemaRef};
-use ternarygrid_core::{DbError, DbKind, DbResult, tr, trf};
+use ternarygrid_core::{DbError, DbKind, DbResult, tr, trf, trn};
 use ternarygrid_tasks::TaskKind;
 use ternarygrid_transfer::{MessageLevel, MigrationJob, MigrationMode, MigrationSummary, NameCase, SessionFactory, run_migration};
 use ternarygrid_ui::kit::{self, Kind};
@@ -238,7 +238,7 @@ impl MigrationTab {
         self.result = None;
         self.log.clear();
         self.page = PAGE_RUN;
-        let title = trf("Migrate {} table(s) to {}", &[&job.tables.len(), &connection_name(cx, &target)]);
+        let title = trf("Migrate {} to {}", &[&trn(job.tables.len(), "1 table", "{} tables"), &connection_name(cx, &target)]);
         self.run = Some(Running::spawn(cx, title, move |progress, cancel| async move { run_migration(job, src, dst, &progress, &cancel).await }));
     }
 
@@ -339,30 +339,42 @@ impl MigrationTab {
     fn poll(&mut self, cx: &mut AppContext) {
         let mut finished = None;
         if let Some(run) = &mut self.run {
-            let messages = run.progress.take_messages();
-            let active = run.progress.active_items();
+            // The messages first: a table that finished between two frames was never seen
+            // running, its "N rows copied" (or its error) says it is done and how many rows.
             let rows = run.progress.rows();
+            let messages = run.progress.take_messages();
+            for m in &messages {
+                let Some(t) = m.item.as_ref().and_then(|item| self.table_runs.iter_mut().find(|t| &t.name == item)) else { continue };
+                match m.level {
+                    MessageLevel::Error => {
+                        if t.state == TableState::Running {
+                            t.rows = rows.saturating_sub(t.base);
+                        }
+                        t.state = TableState::Failed;
+                    }
+                    MessageLevel::Info if t.state != TableState::Failed => {
+                        if let Some(n) = m.text.strip_suffix(" rows copied").and_then(|n| n.trim().parse::<u64>().ok()) {
+                            t.state = TableState::Done;
+                            t.rows = n;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let active = run.progress.active_items();
+            // The rows of the tables finished so far: the counter's rows beyond them are the running one's.
+            let finished_rows: u64 = self.table_runs.iter().filter(|t| matches!(t.state, TableState::Done | TableState::Failed)).map(|t| t.rows).sum();
             for t in &mut self.table_runs {
                 let is_active = active.contains(&t.name);
                 match t.state {
                     TableState::Pending if is_active => {
                         t.state = TableState::Running;
-                        t.base = rows;
-                    }
-                    TableState::Running if is_active => t.rows = rows.saturating_sub(t.base),
-                    TableState::Running => {
-                        t.state = TableState::Done;
+                        t.base = finished_rows.min(rows);
                         t.rows = rows.saturating_sub(t.base);
                     }
+                    // Still running until its message comes (indexes are created after the rows).
+                    TableState::Running => t.rows = t.rows.max(rows.saturating_sub(t.base)),
                     _ => {}
-                }
-            }
-            for m in &messages {
-                if m.level == MessageLevel::Error
-                    && let Some(item) = &m.item
-                    && let Some(t) = self.table_runs.iter_mut().find(|t| &t.name == item)
-                {
-                    t.state = TableState::Failed;
                 }
             }
             self.log.push(messages);
@@ -377,7 +389,8 @@ impl MigrationTab {
                 Ok(summary) => {
                     let failed = summary.tables.iter().filter(|t| t.error.is_some()).count();
                     if failed > 0 {
-                        cx.toasts.warning(trf("Migration finished, {} table(s) failed", &[&failed]), None);
+                        let first = summary.tables.iter().find_map(|t| t.error.clone());
+                        cx.toasts.warning(trf("Migration finished, {}", &[&trn(failed, "1 table failed", "{} tables failed")]), first);
                     } else {
                         cx.toasts.success(describe(&summary));
                         self.done = true;
@@ -405,7 +418,7 @@ impl MigrationTab {
         let p = ternarygrid_ui::pal(ui);
         section(ui, tr("Tables to migrate"));
         if self.tables.is_empty() {
-            wizard::faint(ui, tr("No table selected yet: add tables below."));
+            wizard::muted(ui, tr("No table selected yet: add tables below."));
         } else {
             let mut remove = None;
             let mut set_all = None;
@@ -455,7 +468,7 @@ impl MigrationTab {
         let conn = self.conn.clone();
         if cx.conns.live(&conn).is_none() {
             ui.horizontal(|ui| {
-                wizard::faint(ui, tr("Connect to list the tables."));
+                wizard::muted(ui, tr("Connect to list the tables."));
                 if kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Connect")).clicked() {
                     cx.push(crate::command::AppCommand::Connect(conn.clone()));
                 }
@@ -471,18 +484,20 @@ impl MigrationTab {
             }
             _ => None,
         };
-        ui.horizontal(|ui| {
+        // The bar and its list, 8 apart (as the export's).
+        ui.spacing_mut().item_spacing.y = 8.0;
+        wizard::picker_bar(ui, |ui| {
             wizard::muted(ui, tr("Schema"));
             schema_combo(ui, cx, &conn, ("mig_schema", self.uid), &mut self.picker_schema, 160.0);
             kit::search_field(ui, egui::Id::new(("mig_filter", self.uid)), &mut self.picker_filter, tr("Filter…"), 220.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(shown) = &shown {
-                    if !shown.is_empty() && wizard::ghost(ui, None, tr("Add all shown")).clicked() {
+                    if !shown.is_empty() && wizard::action(ui, None, tr("Add all shown")).clicked() {
                         for o in shown {
                             self.add_table(o.clone());
                         }
                     }
-                    wizard::faint(ui, &trf("{} tables", &[&shown.len()]));
+                    wizard::faint(ui, &trn(shown.len(), "1 table", "{} tables"));
                 }
             });
         });
@@ -508,12 +523,9 @@ impl MigrationTab {
     fn target_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         section(ui, tr("Target"));
         let id = self.uid;
-        wizard::form(ui, ("mig_target", id), 1, 120.0, |f| {
+        wizard::form(ui, ("mig_target", id), 1, LABEL_W, |f| {
             f.row(tr("Connection"), |ui| {
-                let kind = self.target_conn.as_ref().and_then(|t| cx.conns.config(t)).map(|c| c.kind);
-                if let Some(k) = kind {
-                    crate::tabs::dbtools::look::logo(ui, k, 15.0);
-                }
+                // The database's logo inside the select, so it lines up with the schema's below.
                 if connection_combo(ui, cx, ("mig_conn", id), &mut self.target_conn, 260.0) {
                     self.target_schema = None;
                 }
@@ -566,7 +578,7 @@ impl MigrationTab {
         let case = self.options.name_case;
         let conn = self.conn.clone();
         let p = ternarygrid_ui::pal(ui);
-        wizard::faint(ui, tr("Leave a field empty to keep the default shown in grey."));
+        wizard::muted(ui, tr("Leave a field empty to keep the default shown in grey."));
         let mut first = true;
         for (i, t) in self.tables.iter_mut().enumerate().filter(|(_, t)| t.enabled) {
             let default_name = apply_case(case, &t.source.name);
@@ -579,7 +591,7 @@ impl MigrationTab {
             let mut open = wizard::remembered_open(ui, key, first);
             first = false;
             let toggled = wizard::fold_card(ui, key, &mut open, &title, None, true, |ui| {
-                wizard::form(ui, ("mig_map_name", id, i), 1, 110.0, |f| {
+                wizard::form(ui, ("mig_map_name", id, i), 1, wizard::CARD_LABEL_W, |f| {
                     f.row(tr("Target table"), |ui| ui.add(line(&mut t.target_name).hint_text(default_name.clone()).desired_width(260.0)));
                 });
                 match table_def_of(cx, &conn, &t.source) {
@@ -642,19 +654,14 @@ impl MigrationTab {
         section(ui, tr("Options"));
         let id = self.uid;
         let o = &mut self.options;
-        wizard::form(ui, ("mig_opts", id), 1, 150.0, |f| {
+        wizard::form(ui, ("mig_opts", id), 1, LABEL_W, |f| {
             f.check_row(tr("Target tables"), |ui| wizard::check(ui, &mut o.create_tables, tr("Create the tables that do not exist")));
             f.row(tr("Existing rows"), |ui| {
                 combo_w(
                     ui,
                     ("mig_mode", id),
                     &mut o.mode,
-                    &[
-                        (MigrationMode::Append, tr("Keep them and add the new rows").to_string()),
-                        (MigrationMode::Truncate, tr("Delete them first").to_string()),
-                        (MigrationMode::Replace, tr("Insert or replace rows by primary key").to_string()),
-                        (MigrationMode::DropAndCreate, tr("Drop and create the tables again").to_string()),
-                    ],
+                    &[MigrationMode::Append, MigrationMode::Truncate, MigrationMode::Replace, MigrationMode::DropAndCreate].map(|m| (m, Self::mode_label(m).to_string())),
                     320.0,
                 )
             });
@@ -677,9 +684,7 @@ impl MigrationTab {
         let p = ternarygrid_ui::pal(ui);
         if let Some(run) = &self.run {
             wizard::title(ui, tr("Migrating…"));
-            if progress_ui(ui, &run.progress, run.is_cancelling()) {
-                run.cancel();
-            }
+            progress_ui(ui, &run.progress, ProgressKind { label: tr("Tables"), items: (tr("table"), tr("tables")), files: false });
             let cols = [col(tr("Table"), W::Fr(1.4)), col(tr("Status"), W::Fr(1.0)), col(tr("Rows"), W::Fr(0.6)).right()];
             let runs = &self.table_runs;
             wizard::table(
@@ -698,27 +703,31 @@ impl MigrationTab {
                         }
                         1 => match t.state {
                             TableState::Pending => {
-                                wizard::faint(ui, tr("waiting"));
+                                wizard::faint(ui, tr("Waiting"));
                             }
                             TableState::Running => {
                                 ui.spacing_mut().item_spacing.x = 8.0;
-                                ui.label(RichText::new(icon::CLOCK_COUNTER_CLOCKWISE).font(ternarygrid_ui::style::icon_font(13.0)).color(p.accent_text));
-                                ui.label(RichText::new(tr("copying")).size(12.5).color(p.accent_text));
+                                ui.add(egui::Spinner::new().size(12.0).color(p.accent_text));
+                                ui.label(RichText::new(tr("Copying")).size(12.5).color(p.accent_text));
                             }
                             TableState::Done => {
-                                wizard::tone_text(ui, Tone::Success, tr("done"));
+                                wizard::tone_text(ui, Tone::Success, tr("Done"));
                             }
                             TableState::Failed => {
-                                wizard::tone_text(ui, Tone::Error, tr("failed"));
+                                wizard::tone_text(ui, Tone::Error, tr("Failed"));
                             }
                         },
                         _ => {
-                            ui.label(if t.state == TableState::Pending { "—".to_string() } else { super::group(t.rows) });
+                            if t.state == TableState::Pending {
+                                wizard::faint(ui, "—");
+                            } else {
+                                ui.label(super::group(t.rows));
+                            }
                         }
                     }
                 },
             );
-            self.log.ui(ui, ("mig_log", self.uid), 220.0);
+            self.log.ui(ui, ("mig_log", self.uid), 220.0, false);
             return;
         }
         match &self.result {
@@ -729,7 +738,7 @@ impl MigrationTab {
             Some(Err(e)) => {
                 wizard::outcome(ui, Tone::Error, tr("The migration failed"), None);
                 crate::widgets::error_box(ui, e);
-                if kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked() {
+                if kit::secondary(ui, Some(icon::PENCIL_SIMPLE), tr("Change settings")).clicked() {
                     self.result = None;
                     self.page = PAGE_SOURCE;
                 }
@@ -737,26 +746,88 @@ impl MigrationTab {
             None => self.summary_ui(ui, cx),
         }
         if self.result.is_some() {
-            self.log.ui(ui, ("mig_log", self.uid), 220.0);
+            // The table above lists every table: the log is folded away.
+            let folded = matches!(self.result, Some(Ok(_)));
+            self.log.ui(ui, ("mig_log", self.uid), 220.0, folded);
+        }
+    }
+
+    /// The tone of a finished run (the outcome's icon, the stepper's last step).
+    fn outcome(&self) -> Option<Tone> {
+        match &self.result {
+            Some(Ok(s)) => {
+                let failed = s.tables.iter().filter(|t| t.error.is_some()).count();
+                let rows_failed: u64 = s.tables.iter().map(|t| t.rows_failed).sum();
+                Some(match failed {
+                    n if n > 0 && n == s.tables.len() => Tone::Error,
+                    n if n > 0 || rows_failed > 0 => Tone::Warning,
+                    _ => Tone::Success,
+                })
+            }
+            Some(Err(_)) => Some(Tone::Error),
+            None => None,
+        }
+    }
+
+    /// The target name of every enabled table, as the run will name it.
+    fn target_names(&self) -> Vec<(String, String)> {
+        self.tables
+            .iter()
+            .filter(|t| t.enabled)
+            .map(|t| {
+                let target = if t.target_name.trim().is_empty() { apply_case(self.options.name_case, &t.source.name) } else { t.target_name.trim().to_string() };
+                (t.source.name.clone(), target)
+            })
+            .collect()
+    }
+
+    fn mode_label(mode: MigrationMode) -> &'static str {
+        match mode {
+            MigrationMode::Append => tr("Keep them and add the new rows"),
+            MigrationMode::Truncate => tr("Delete them first"),
+            MigrationMode::Replace => tr("Insert or replace rows by primary key"),
+            MigrationMode::DropAndCreate => tr("Drop and create the tables again"),
         }
     }
 
     fn summary_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         section(ui, tr("Summary"));
+        let p = ternarygrid_ui::pal(ui);
         let job = self.job();
         let target = self.target_conn.as_ref().map(|t| connection_name(cx, t)).unwrap_or_else(|| "—".into());
         let schema = job.target_schema.clone().unwrap_or_else(|| tr("(default)").to_string());
-        wizard::facts(
-            ui,
-            ("mig_sum", self.uid),
-            120.0,
-            8.0,
-            &[
-                (tr("Source"), connection_name(cx, &self.conn), None),
-                (tr("Target"), format!("{target} / {schema}"), None),
-                (tr("Tables"), job.tables.iter().map(|t| t.display_path()).collect::<Vec<_>>().join(", "), None),
-            ],
-        );
+        let o = &self.options;
+        // Each table with the name it gets ("orders → orders_copy"), one per line.
+        let tables = self.target_names().into_iter().map(|(s, t)| if s == t { s } else { format!("{s} → {t}") }).collect::<Vec<_>>().join("\n");
+        let mut create = Vec::new();
+        if o.create_tables || o.mode == MigrationMode::DropAndCreate {
+            create.push(tr("missing tables"));
+        }
+        if o.copy_indexes {
+            create.push(tr("indexes"));
+        }
+        if o.copy_foreign_keys {
+            create.push(tr("foreign keys"));
+        }
+        // "Missing tables, indexes, foreign keys".
+        let create = create.join(", ");
+        let mut chars = create.chars();
+        let create = match chars.next() {
+            Some(c) => c.to_uppercase().chain(chars).collect(),
+            None => tr("Nothing").to_string(),
+        };
+        let on_error = on_error_options().into_iter().find(|(v, _)| *v == o.on_error).map(|(_, l)| l).unwrap_or_default();
+        let on_error = if o.continue_on_table_error { trf("{}; a failed table does not stop the others", &[&on_error]) } else { on_error };
+        let rows = [
+            fact(tr("Source"), connection_name(cx, &self.conn)),
+            fact(tr("Target"), format!("{target} / {schema}")),
+            fact(tr("Tables"), tables),
+            // Deleting or dropping the target's data: in the warning colour.
+            fact(tr("Existing rows"), Self::mode_label(o.mode)).color(self.destructive().then_some(p.warn)),
+            fact(tr("Create"), create),
+            fact(tr("On error"), on_error),
+        ];
+        wizard::facts(ui, ("mig_sum", self.uid), 8.0, &rows);
         if let Err(e) = self.validate(cx) {
             crate::widgets::error_box(ui, &e);
         }
@@ -764,8 +835,7 @@ impl MigrationTab {
 
     fn result_ui(&mut self, ui: &mut Ui, s: &MigrationSummary) {
         let p = ternarygrid_ui::pal(ui);
-        let failed = s.tables.iter().any(|t| t.error.is_some());
-        wizard::outcome(ui, if failed { Tone::Warning } else { Tone::Success }, &describe(s), None);
+        wizard::outcome(ui, self.outcome().unwrap_or(Tone::Success), &describe(s), None);
         let cols = [
             col(tr("Table"), W::Fr(1.2)),
             col(tr("Target"), W::Fr(1.3)),
@@ -806,10 +876,11 @@ impl MigrationTab {
                     }
                     _ => match &t.error {
                         Some(e) => {
-                            wizard::tone_text(ui, Tone::Error, e).on_hover_text(e);
+                            wizard::tone_text(ui, Tone::Error, tr("Failed")).on_hover_text(e);
                         }
                         None => {
-                            let text = if t.indexes_created > 0 { trf("OK, {} index(es)", &[&t.indexes_created]) } else { tr("OK").to_string() };
+                            let n = t.indexes_created as usize;
+                            let text = if n > 0 { format!("{} · {}", tr("Done"), trn(n, "1 index", "{} indexes")) } else { tr("Done").to_string() };
                             wizard::tone_text(ui, Tone::Success, &text);
                         }
                     },
@@ -817,29 +888,27 @@ impl MigrationTab {
             },
         );
         if s.foreign_keys_created > 0 {
-            wizard::muted(ui, &trf("{} foreign key(s) created", &[&s.foreign_keys_created]));
+            wizard::muted(ui, &trn(s.foreign_keys_created as usize, "1 foreign key created", "{} foreign keys created"));
         }
         for w in &s.warnings {
             ui.label(RichText::new(format!("{} {w}", icon::WARNING)).color(p.warn));
         }
-        let failed_rows: Vec<String> = s
-            .tables
-            .iter()
-            .flat_map(|t| {
-                let name = t.source.as_ref().map(ObjectRef::display_path).unwrap_or_default();
-                t.errors.iter().take(20).map(move |e| trf("{}, row {}: {}", &[&name, &e.row, &e.message]))
-            })
-            .collect();
-        if !failed_rows.is_empty() {
-            section(ui, tr("Failed rows"));
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-                for f in failed_rows {
-                    ui.add(egui::Label::new(RichText::new(f).monospace().size(11.5).color(p.err)).wrap());
-                }
-            });
+        // One table of what failed: the tables' errors and their failed rows (grouped).
+        let mut failures = Vec::new();
+        for t in &s.tables {
+            let name = t.source.as_ref().map(ObjectRef::display_path).unwrap_or_default();
+            if let Some(e) = &t.error {
+                failures.push(wizard::Failure { object: Some(name.clone()), row: None, column: None, message: e.clone() });
+            }
+            for e in t.errors.iter().take(100) {
+                failures.push(wizard::Failure { object: Some(name.clone()), row: Some(e.row), column: e.column.clone(), message: e.message.clone() });
+            }
         }
-        if kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked() {
+        if !failures.is_empty() {
+            section(ui, tr("Failures"));
+            wizard::failures_table(ui, ("mig_failures", self.uid), &failures, 200.0);
+        }
+        if kit::secondary(ui, Some(icon::PENCIL_SIMPLE), tr("Change settings")).clicked() {
             self.result = None;
             self.page = PAGE_SOURCE;
         }
@@ -849,12 +918,16 @@ impl MigrationTab {
         let running = self.run.is_some();
         let reachable = self.reachable(cx);
         let ok = reachable == PAGE_RUN && !running;
+        // Saving as a task is offered with the summary (the whole configuration) and after a run.
+        let invalid = self.validate(cx).err();
         let footer = wizard::Footer {
             back: (self.page > PAGE_SOURCE).then_some(!running),
             next: (self.page < PAGE_RUN).then_some(self.page < reachable && !running),
             run: (tr("Run migration"), ok),
-            save: Some((ok && !self.saver.is_saving(), None)),
+            save: (self.page == PAGE_RUN).then_some((ok && !self.saver.is_saving(), invalid.as_deref())),
             error: self.error.as_deref(),
+            running: self.run.as_ref().map(|r| r.is_cancelling()),
+            finished: self.page == PAGE_RUN && self.result.is_some(),
         };
         match wizard::footer(ui, &footer) {
             Some(Clicked::Back) => self.page -= 1,
@@ -870,30 +943,62 @@ impl MigrationTab {
                 let target = self.target_conn.as_ref().map(|t| connection_name(cx, t)).unwrap_or_default();
                 self.saver.open(trf("Migrate to {}", &[&target]));
             }
+            Some(Clicked::Cancel) => self.cancel(),
+            Some(Clicked::Close) => close_wizard(cx, &mut self.done),
             None => {}
         }
     }
 
+    /// The confirmation of a run that deletes the target's data (drop and create, or delete
+    /// the rows first): what happens, to which tables, and a button that says it.
     fn confirm_ui(&mut self, ctx: &egui::Context, cx: &mut AppContext) {
         if !self.confirm {
             return;
         }
         let target = self.target_conn.as_ref().map(|t| connection_name(cx, t)).unwrap_or_default();
-        let text = if self.options.mode == MigrationMode::DropAndCreate {
-            trf("Existing target tables on \"{}\" are dropped and created again.", &[&target])
+        let names: Vec<String> = self.target_names().into_iter().map(|(_, t)| t).collect();
+        let n = names.len();
+        let drop = self.options.mode == MigrationMode::DropAndCreate;
+        let (title, text, button, glyph) = if drop {
+            (
+                trn(n, "Drop and recreate 1 table?", "Drop and recreate {} tables?"),
+                trf("These tables on \"{}\" are dropped, with all their rows, and created again from the source:", &[&target]),
+                trn(n, "Drop and recreate 1 table", "Drop and recreate {} tables"),
+                icon::TRASH,
+            )
         } else {
-            trf("All rows of the existing target tables on \"{}\" are deleted first.", &[&target])
+            (
+                trn(n, "Delete the rows of 1 table?", "Delete the rows of {} tables?"),
+                trf("All rows of these tables on \"{}\" are deleted before the rows are copied:", &[&target]),
+                trn(n, "Delete rows in 1 table", "Delete rows in {} tables"),
+                icon::ERASER,
+            )
         };
         let (mut run, mut cancel) = (false, false);
-        let (resp, _) = parts::Dialog::new(tr("Replace the target data?")).icon(icon::WARNING).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
+        let (resp, _) = parts::Dialog::new(&title).icon(glyph).tone(Tone::Error).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
             ctx,
             egui::Id::new(("mig_confirm", self.uid)),
             |ui| {
+                let p = ternarygrid_ui::pal(ui);
+                ui.spacing_mut().item_spacing.y = 10.0;
                 ui.add(egui::Label::new(RichText::new(&text).size(13.5)).wrap());
+                // The tables, at most 8 (the others counted).
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    for name in names.iter().take(8) {
+                        ui.label(RichText::new(format!("•  {name}")).monospace().size(12.5).color(p.text));
+                    }
+                    if n > 8 {
+                        wizard::muted(ui, &trf("… and {} more", &[&(n - 8)]));
+                    }
+                });
+                if !drop && self.target_conn.as_deref().is_some_and(|c| !super::has_transactions(cx, c)) {
+                    wizard::muted(ui, tr("This database has no transactions: the rows cannot be brought back if the copy fails."));
+                }
             },
             |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if kit::button_ex(ui, Kind::DangerFilled, Some(icon::PLAY), tr("Run"), false).clicked() {
+                    if kit::button_ex(ui, Kind::DangerFilled, Some(glyph), &button, false).clicked() {
                         run = true;
                     }
                     if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -913,10 +1018,11 @@ impl MigrationTab {
 
 fn describe(s: &MigrationSummary) -> String {
     let failed = s.tables.iter().filter(|t| t.error.is_some()).count();
+    let rows = super::rows_text(s.rows);
     if failed > 0 {
-        trf("{} rows copied, {} of {} table(s) failed", &[&super::group(s.rows), &failed, &s.tables.len()])
+        trf("{} copied, {} of {} failed", &[&rows, &failed, &trn(s.tables.len(), "1 table", "{} tables")])
     } else {
-        trf("{} rows copied into {} table(s)", &[&super::group(s.rows), &s.tables.len()])
+        trf("{} copied into {}", &[&rows, &trn(s.tables.len(), "1 table", "{} tables")])
     }
 }
 
@@ -962,8 +1068,8 @@ impl TabView for MigrationTab {
             }
             let steps = [tr("Source"), tr("Target"), tr("Mapping"), tr("Options"), tr("Run")];
             let reachable = if self.run.is_some() { self.page } else { self.reachable(cx) };
-            let finished = self.page == PAGE_RUN && matches!(self.result, Some(Ok(_)));
-            if let Some(p) = wizard::steps(ui, &steps, self.page, reachable.max(self.page), finished)
+            let outcome = if self.page == PAGE_RUN { self.outcome() } else { None };
+            if let Some(p) = wizard::steps(ui, &steps, self.page, reachable.max(self.page), outcome)
                 && self.run.is_none()
             {
                 self.page = p;

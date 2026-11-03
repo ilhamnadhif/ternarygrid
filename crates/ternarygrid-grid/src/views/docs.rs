@@ -99,7 +99,8 @@ impl<'a> DocumentView<'a> {
             }
             ternarygrid_ui::kit::checkbox(ui, &mut state.selected_only, tr("Selected rows only"));
             if state.truncated {
-                ui.weak(trf("Showing the first {} rows", &[&crate::format::group_thousands(&MAX_DOCUMENT_ROWS.to_string())]));
+                let text = trf("Showing the first {} rows", &[&crate::format::group_thousands(&MAX_DOCUMENT_ROWS.to_string())]);
+                ui.label(egui::RichText::new(text).color(ternarygrid_ui::pal(ui).text_muted));
             }
         });
         let salt = match kind {

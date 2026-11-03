@@ -35,12 +35,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use ternarygrid_core::ddl::TableDef;
 use ternarygrid_core::meta::{ObjectInfo, ObjectKind, ObjectRef, SchemaRef};
-use ternarygrid_core::{DataKind, DbError, DbResult, ErrorKind, tr, trf};
+use ternarygrid_core::{DataKind, DbError, DbResult, ErrorKind, tr, trf, trn};
 use ternarygrid_tasks::{TaskDef, TaskKind};
 use ternarygrid_transfer::{CancellationToken, MessageLevel, OnError, Progress, ProgressMessage, TransactionScope};
 use ternarygrid_ui::kit::{self, Kind};
 use ternarygrid_ui::parts;
-use wizard::{Form, line};
+use wizard::{Form, fact, line};
 
 pub(crate) use wizard::section;
 
@@ -147,28 +147,44 @@ fn copy_progress(progress: &Progress, op: &OpProgress) {
 
 // ----------------------------------------------------------------- progress
 
-/// Live counters of a running transfer: the bar with the row count, the counters in two
-/// columns and Cancel. Returns true when Cancel was clicked.
-pub(crate) fn progress_ui(ui: &mut Ui, progress: &Progress, cancelling: bool) -> bool {
+/// What a running transfer goes through: the label of its objects' counter ("Tables") and
+/// their noun ("table", "tables"), and whether it writes files (its "Written" counter).
+#[derive(Clone, Copy)]
+pub(crate) struct ProgressKind {
+    pub label: &'static str,
+    pub items: (&'static str, &'static str),
+    pub files: bool,
+}
+
+/// Live counters of a running transfer: the bar with the row count and the counters in two
+/// columns (Cancel is the footer's).
+pub(crate) fn progress_ui(ui: &mut Ui, progress: &Progress, kind: ProgressKind) {
     let p = ternarygrid_ui::pal(ui);
     let s = progress.snapshot();
-    let rows_text = match s.total_rows {
-        Some(t) => trf("{} of {} rows", &[&group(s.rows), &group(t)]),
-        None => trf("{} rows", &[&group(s.rows)]),
+    let items = |done: u64, total: u64| {
+        let noun = if total == 1 { kind.items.0 } else { kind.items.1 };
+        format!("{} {noun}", trf("{} of {}", &[&done, &total]))
     };
-    let written = if s.bytes > 0 { crate::widgets::format_bytes(s.bytes.min(i64::MAX as u64) as i64) } else { "—".to_string() };
-    let mut facts: Vec<(&str, String, Option<egui::Color32>)> =
-        vec![(tr("Speed"), trf("{} rows/s", &[&group(s.rows_per_second.max(0.0).round() as u64)]), None), (tr("Written"), written, None)];
+    // The bar fills by rows when their total is known, else by objects: the label says which.
+    let rows_label = match s.total_rows {
+        Some(t) if t > 0 => trf("{} of {} rows", &[&group(s.rows), &group(t)]),
+        _ if s.items_total > 0 => format!("{} · {}", items(s.items_done, s.items_total), rows_text(s.rows)),
+        _ => rows_text(s.rows),
+    };
+    let mut facts = vec![fact(tr("Speed"), trf("{} rows/s", &[&group(s.rows_per_second.max(0.0).round() as u64)]))];
+    if kind.files {
+        let written = if s.bytes > 0 { crate::widgets::format_bytes(s.bytes.min(i64::MAX as u64) as i64) } else { "—".to_string() };
+        facts.push(fact(tr("Written"), written));
+    }
     if s.items_total > 0 {
-        facts.push((tr("Objects"), trf("{} of {}", &[&s.items_done, &s.items_total]), None));
+        facts.push(fact(kind.label, items(s.items_done, s.items_total)));
     }
     if !s.active_items.is_empty() {
-        facts.push((tr("Current"), s.active_items.join(", "), None));
+        facts.push(fact(tr("Current"), s.active_items.join(", ")));
     }
-    facts.push((tr("Errors"), s.errors.to_string(), (s.errors > 0).then_some(p.err)));
-    facts.push((tr("Elapsed"), crate::widgets::format_duration(Duration::from_secs_f64(s.elapsed_secs.max(0.0))), None));
-    let mut clicked = false;
-    // The bar, the counters and Cancel, 12 apart.
+    facts.push(fact(tr("Errors"), s.errors.to_string()).color((s.errors > 0).then_some(p.err)));
+    facts.push(fact(tr("Elapsed"), crate::widgets::format_duration(Duration::from_secs_f64(s.elapsed_secs.max(0.0)))));
+    // The bar and the counters, 12 apart.
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 12.0;
         wizard::tight_row(ui, |ui| {
@@ -176,22 +192,24 @@ pub(crate) fn progress_ui(ui: &mut Ui, progress: &Progress, cancelling: bool) ->
             match s.fraction {
                 Some(f) => {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(&rows_text).size(12.5).color(p.text_muted));
+                        ui.label(RichText::new(&rows_label).size(12.5).color(p.text_muted));
                         wizard::bar(ui, f as f32, 8.0);
                     });
                 }
                 None => {
                     ui.add(egui::Spinner::new().size(14.0).color(p.accent_text));
-                    ui.label(RichText::new(&rows_text).size(12.5).color(p.text_muted));
+                    ui.label(RichText::new(&rows_label).size(12.5).color(p.text_muted));
                 }
             }
         });
         wizard::fact_grid(ui, &facts);
-        let label = if cancelling { tr("Cancelling…") } else { tr("Cancel") };
-        clicked = ui.add_enabled_ui(!cancelling, |ui| kit::button_ex(ui, Kind::Danger, Some(icon::STOP), label, true)).inner.clicked();
     });
     ui.ctx().request_repaint_after(Duration::from_millis(100));
-    clicked
+}
+
+/// The rows count of a summary ("1 row", "2,464 rows").
+pub(crate) fn rows_text(n: u64) -> String {
+    if n == 1 { tr("1 row").to_string() } else { trf("{} rows", &[&group(n)]) }
 }
 
 /// Messages of a transfer, drained from its [`Progress`] every frame.
@@ -225,19 +243,49 @@ impl MessageLog {
         self.messages.iter().map(format_message).collect::<Vec<_>>().join("\n")
     }
 
-    pub fn ui(&self, ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, max_height: f32) {
+    /// The log under a section title (while running); with `folded` a card that is closed until
+    /// clicked (result pages, whose table already lists what happened).
+    pub fn ui(&self, ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, max_height: f32, folded: bool) {
         if self.messages.is_empty() {
             return;
         }
+        let id = egui::Id::new(id);
+        if !folded {
+            wizard::section_with(ui, tr("Messages"), |ui| self.copy_ui(ui));
+            self.lines_ui(ui, id, max_height);
+            return;
+        }
+        let key = id.with("fold");
+        let mut open = wizard::remembered_open(ui, key, false);
+        let errors = self.messages.iter().filter(|m| m.level == MessageLevel::Error).count();
+        let warnings = self.messages.iter().filter(|m| m.level == MessageLevel::Warning).count();
+        let mut summary = vec![trn(self.messages.len() + self.dropped, "1 message", "{} messages")];
+        if errors > 0 {
+            summary.push(trn(errors, "1 error", "{} errors"));
+        }
+        if warnings > 0 {
+            summary.push(trn(warnings, "1 warning", "{} warnings"));
+        }
+        ui.add_space(16.0 - wizard::GAP);
+        if wizard::fold_card(ui, key, &mut open, tr("Messages"), Some(&summary.join(" · ")), true, |ui| {
+            wizard::tight_row(ui, |ui| self.copy_ui(ui));
+            self.lines_ui(ui, id, max_height);
+        }) {
+            wizard::remember_open(ui, key, open);
+        }
+    }
+
+    fn copy_ui(&self, ui: &mut Ui) {
+        if wizard::action(ui, Some(icon::COPY), tr("Copy")).clicked() {
+            ui.ctx().copy_text(self.text());
+        }
+        if self.dropped > 0 {
+            wizard::faint(ui, &trf("({} older messages not shown)", &[&self.dropped]));
+        }
+    }
+
+    fn lines_ui(&self, ui: &mut Ui, id: egui::Id, max_height: f32) {
         let p = ternarygrid_ui::pal(ui);
-        wizard::section_with(ui, tr("Messages"), |ui| {
-            if wizard::ghost(ui, Some(icon::COPY), tr("Copy")).clicked() {
-                ui.ctx().copy_text(self.text());
-            }
-            if self.dropped > 0 {
-                wizard::faint(ui, &trf("({} older messages not shown)", &[&self.dropped]));
-            }
-        });
         // Lines 22 high, each on one line (the whole text in its tooltip).
         wizard::boxed(ui, Margin::symmetric(12, 8), |ui| {
             egui::ScrollArea::vertical().id_salt(id).max_height(max_height).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
@@ -309,13 +357,18 @@ impl TaskSaver {
                 let p = ternarygrid_ui::pal(ui);
                 ternarygrid_ui::style::form_spacing(ui);
                 ui.spacing_mut().item_spacing.y = 12.0;
-                let text = RichText::new(tr("The task runs the same transfer from the Tasks view, on a schedule or with ternarygrid --run-task."))
-                    .color(p.text_muted)
-                    .line_height(Some(19.5));
+                // The command in the monospace font.
+                let size = ternarygrid_ui::style::body_size(ui.ctx());
+                let format = |font: egui::FontId| egui::TextFormat { font_id: font, color: p.text_muted, line_height: Some(19.5), ..Default::default() };
+                let mut text = egui::text::LayoutJob::default();
+                text.append(tr("The task runs the same transfer from the Tasks view, on a schedule or with "), 0.0, format(egui::FontId::proportional(size)));
+                text.append("ternarygrid --run-task", 0.0, format(egui::FontId::monospace(size - 1.0)));
+                text.append(".", 0.0, format(egui::FontId::proportional(size)));
                 ui.add(egui::Label::new(text).wrap());
-                wizard::form_gap(ui, id.with("grid"), 1, 80.0, 12.0, |f| {
+                wizard::form_gap(ui, id.with("grid"), 1, 90.0, 12.0, |f| {
                     f.row(tr("Name"), |ui| ui.add(line(name).desired_width(f32::INFINITY)));
-                    f.row(tr("Folder"), |ui| ui.add(line(folder).hint_text(tr("optional, e.g. exports/nightly")).desired_width(f32::INFINITY)));
+                    // The task's folder in the Tasks view (not where an export writes its files).
+                    f.row(tr("Task folder"), |ui| ui.add(line(folder).hint_text(tr("optional, e.g. exports/nightly")).desired_width(f32::INFINITY)));
                 });
                 if let Some(e) = error {
                     crate::widgets::error_box(ui, e);
@@ -324,7 +377,7 @@ impl TaskSaver {
             },
             |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled_ui(can_save.get(), |ui| kit::primary_icon(ui, icon::FLOPPY_DISK, tr("Save"))).inner.clicked() {
+                    if ui.add_enabled_ui(can_save.get(), |ui| kit::primary_icon(ui, icon::CHECK, tr("Save task"))).inner.clicked() {
                         save = true;
                     }
                     if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -528,17 +581,22 @@ pub(crate) fn number_edit<T: std::str::FromStr + ToString>(ui: &mut Ui, value: &
     })
 }
 
-/// The delimiter choices of CSV files next to the delimiter field.
-pub(crate) fn delimiter_choice(ui: &mut Ui, delimiter: &mut String) {
-    let mut current: &str = match delimiter.as_str() {
-        "," => ",",
-        ";" => ";",
-        "\t" => "\t",
-        "|" => "|",
-        _ => "",
-    };
-    if parts::segmented(ui, &mut current, &[(",", ","), (";", ";"), ("\t", tr("Tab")), ("|", "|")]) {
-        *delimiter = current.to_string();
+/// The delimiter of CSV files: the common ones, or "Other…" with a field for any other.
+pub(crate) fn delimiter_choice(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, delimiter: &mut String) {
+    const PRESETS: [&str; 4] = [",", ";", "\t", "|"];
+    let other_key = ui.id().with(("delimiter_other", id));
+    let preset = PRESETS.iter().copied().find(|p| *p == delimiter.as_str());
+    let other = ui.data(|d| d.get_temp::<bool>(other_key)).unwrap_or(false) || preset.is_none();
+    let mut current: &'static str = if other { "" } else { preset.unwrap_or("") };
+    let items = [(",", ","), (";", ";"), ("\t", tr("Tab")), ("|", tr("Pipe (|)")), ("", tr("Other…"))];
+    if parts::segmented(ui, &mut current, &items) {
+        if !current.is_empty() {
+            *delimiter = current.to_string();
+        }
+        ui.data_mut(|d| d.insert_temp(other_key, current.is_empty()));
+    }
+    if current.is_empty() {
+        ui.add(wizard::mono_line(delimiter, 60.0)).on_hover_text(tr("Any other delimiter"));
     }
 }
 
@@ -752,12 +810,28 @@ pub(crate) fn reload_table_def(cx: &mut AppContext, conn: &str, table: &ObjectRe
     }
 }
 
-/// Connection picker over all configured connections.
+/// Connection picker over all configured connections; the chosen one's database logo leads its
+/// text inside the box ("Choose…" in the faint colour until one is chosen).
 pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash::Hash + std::fmt::Debug, value: &mut Option<String>, width: f32) -> bool {
+    let p = ternarygrid_ui::pal(ui);
     let conns: Vec<(String, String)> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
-    let current = value.as_ref().and_then(|v| conns.iter().find(|(i, _)| i == v)).map(|(_, n)| n.clone()).unwrap_or_else(|| tr("Choose…").to_string());
+    let chosen = value.as_ref().and_then(|v| conns.iter().find(|(i, _)| i == v)).map(|(_, n)| n.clone());
+    let kind = value.as_ref().and_then(|v| cx.conns.config(v)).map(|c| c.kind);
+    const LOGO: f32 = 16.0;
+    let size = ternarygrid_ui::style::body_size(ui.ctx());
+    let mut text = egui::text::LayoutJob::default();
+    match &chosen {
+        Some(name) => {
+            if kind.is_some() {
+                // Room for the logo, painted over it below.
+                text.append(" ", LOGO + 4.0, egui::TextFormat::simple(egui::FontId::proportional(size), egui::Color32::TRANSPARENT));
+            }
+            text.append(name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), p.text));
+        }
+        None => text.append(tr("Choose…"), 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), p.text_faint)),
+    }
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(current).width(width).show_ui(ui, |ui| {
+    let shown = egui::ComboBox::from_id_salt(id).icon(kit::combo_caret).popup_style(egui::containers::menu::menu_style.into()).selected_text(text).width(width).show_ui(ui, |ui| {
         kit::menu_look(ui, width);
         for (cid, name) in &conns {
             let glyph = if cx.conns.is_connected(cid) { icon::PLUGS_CONNECTED } else { icon::PLUGS };
@@ -768,7 +842,35 @@ pub(crate) fn connection_combo(ui: &mut Ui, cx: &AppContext, id: impl std::hash:
             }
         }
     });
+    if let (Some(kind), Some(_)) = (kind, &chosen) {
+        let r = shown.response.rect;
+        let at = egui::Rect::from_min_size(egui::pos2(r.left() + ui.spacing().button_padding.x, r.center().y - LOGO / 2.0), egui::vec2(LOGO, LOGO));
+        let mut logo = ui.new_child(egui::UiBuilder::new().max_rect(at));
+        crate::tabs::dbtools::look::logo(&mut logo, kind, LOGO);
+    }
     changed
+}
+
+/// Close the wizard (its Close button after a run): a pop-up through `done`, a tab by
+/// closing it.
+pub(crate) fn close_wizard(cx: &mut AppContext, done: &mut bool) {
+    if cx.popup {
+        *done = true;
+    } else if let Some(id) = cx.current_tab {
+        cx.push(AppCommand::CloseTab(id));
+    }
+}
+
+/// The tone of a run's outcome: an error when nothing was written though rows failed, a
+/// warning when some failed (or nothing was written), else a success.
+pub(crate) fn outcome_tone(written: u64, failed: u64) -> parts::Tone {
+    use parts::Tone;
+    match (written, failed) {
+        (0, f) if f > 0 => Tone::Error,
+        (_, f) if f > 0 => Tone::Warning,
+        (0, _) => Tone::Warning,
+        _ => Tone::Success,
+    }
 }
 
 /// The error of a failed run, for the summary page.

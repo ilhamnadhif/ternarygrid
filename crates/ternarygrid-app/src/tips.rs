@@ -49,7 +49,7 @@ impl TipWindow {
         let (close, step) = (Cell::new(false), Cell::new(0i32));
         let tip = tr(TIPS[self.index % n]);
         let position = format!("{}/{n}", self.index % n + 1);
-        let (resp, _) = Dialog::new(tr("Tip of the day")).icon(icon::LIGHTBULB).width(480.0).body_padding(Margin::symmetric(22, 20)).show_window(
+        let (resp, _) = Dialog::new(tr("Tip of the day")).icon(icon::LIGHTBULB).width(crate::dialogs::WIDTH_S).body_padding(Margin::symmetric(22, 20)).show_window(
             ctx,
             Id::new("tip_of_the_day"),
             &mut open,

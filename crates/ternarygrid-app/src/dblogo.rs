@@ -26,16 +26,33 @@ fn svg(kind: DbKind) -> Option<(&'static str, bool)> {
     })
 }
 
+/// Colours of a coloured logo that vanish on the dark theme's canvas, and their light
+/// stand-ins (SQLite's navy feather, Redis's darkest red).
+fn dark_variant(kind: DbKind) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        DbKind::Sqlite => &[("#003956", "#d4ecf9")],
+        DbKind::Redis => &[("#7A0C00", "#e0574b")],
+        _ => &[],
+    }
+}
+
 /// True when the logo of `kind` is drawn in its own colours (not tinted).
 fn colored(kind: DbKind) -> bool {
     svg(kind).is_some_and(|(_, c)| c)
 }
 
-/// The logo as a `px`×`px` image: in its colours, or as a white mask.
-fn rasterize(kind: DbKind, px: u32) -> Option<egui::ColorImage> {
+/// The logo as a `px`×`px` image: in its colours (for the dark theme with its dark parts made
+/// light, see [`dark_variant`]), or as a white mask.
+fn rasterize(kind: DbKind, px: u32, dark: bool) -> Option<egui::ColorImage> {
     use resvg::{tiny_skia, usvg};
     let (svg, colored) = svg(kind)?;
-    let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).ok()?;
+    let mut svg = svg.to_string();
+    if dark {
+        for (from, to) in dark_variant(kind) {
+            svg = svg.replace(from, to);
+        }
+    }
+    let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).ok()?;
     let mut pixmap = tiny_skia::Pixmap::new(px, px)?;
     let size = tree.size();
     let scale = px as f32 / size.width().max(size.height());
@@ -48,13 +65,14 @@ fn rasterize(kind: DbKind, px: u32) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_unmultiplied(size, &rgba))
 }
 
-/// The logo texture at `px` pixels (cached in the context).
-fn texture(ctx: &Context, kind: DbKind, px: u32) -> Option<TextureHandle> {
-    let id = egui::Id::new(("ternarygrid_db_logo", kind, px));
+/// The logo texture at `px` pixels for the light or the `dark` theme (cached in the context).
+fn texture(ctx: &Context, kind: DbKind, px: u32, dark: bool) -> Option<TextureHandle> {
+    let dark = dark && !dark_variant(kind).is_empty();
+    let id = egui::Id::new(("ternarygrid_db_logo", kind, px, dark));
     if let Some(t) = ctx.data(|d| d.get_temp::<Option<TextureHandle>>(id)) {
         return t;
     }
-    let t = rasterize(kind, px).map(|img| ctx.load_texture(format!("db-logo-{kind:?}-{px}"), img, egui::TextureOptions::LINEAR));
+    let t = rasterize(kind, px, dark).map(|img| ctx.load_texture(format!("db-logo-{kind:?}-{px}-{dark}"), img, egui::TextureOptions::LINEAR));
     ctx.data_mut(|d| d.insert_temp(id, t.clone()));
     t
 }
@@ -71,14 +89,14 @@ fn tint(kind: DbKind, color: Color32) -> Color32 {
 
 /// Paint the logo of `kind` in `rect` (one-colour logos in `color`); false when it has none.
 pub fn paint(ui: &egui::Ui, kind: DbKind, rect: Rect, color: Color32) -> bool {
-    let Some(tex) = texture(ui.ctx(), kind, pixels(ui.ctx(), rect.width().max(rect.height()))) else { return false };
+    let Some(tex) = texture(ui.ctx(), kind, pixels(ui.ctx(), rect.width().max(rect.height())), ui.visuals().dark_mode) else { return false };
     ui.painter().image(tex.id(), rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint(kind, color));
     true
 }
 
 /// The logo as an image `points` square (for buttons and labels).
 pub fn image(ctx: &Context, kind: DbKind, points: f32, color: Color32) -> Option<egui::Image<'static>> {
-    let tex = texture(ctx, kind, pixels(ctx, points))?;
+    let tex = texture(ctx, kind, pixels(ctx, points), ctx.theme() == egui::Theme::Dark)?;
     Some(egui::Image::new((tex.id(), egui::vec2(points, points))).tint(tint(kind, color)))
 }
 
@@ -89,12 +107,19 @@ mod tests {
     #[test]
     fn every_logo_renders() {
         for kind in DbKind::ALL {
-            let img = rasterize(kind, 32).unwrap_or_else(|| panic!("{kind:?} has no logo"));
+            let img = rasterize(kind, 32, false).unwrap_or_else(|| panic!("{kind:?} has no logo"));
+            assert!(rasterize(kind, 32, true).is_some(), "{kind:?} has no dark logo");
             assert!(img.pixels.iter().filter(|p| p.a() > 0).count() > 50, "{kind:?} is empty");
             // Coloured logos keep their colours; masks are white.
             let tinted = img.pixels.iter().any(|p| p.a() > 200 && (p.r() != p.g() || p.g() != p.b()));
             assert_eq!(tinted, colored(kind), "{kind:?}");
         }
         assert!(colored(DbKind::Postgres) && !colored(DbKind::MySql));
+        // Every dark stand-in replaces a colour the logo has.
+        for kind in DbKind::ALL {
+            for (from, _) in dark_variant(kind) {
+                assert!(svg(kind).is_some_and(|(s, _)| s.contains(from)), "{kind:?} has no {from}");
+            }
+        }
     }
 }

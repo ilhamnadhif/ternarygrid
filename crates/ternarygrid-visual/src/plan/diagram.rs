@@ -2,9 +2,7 @@
 //! the time (or cost), edges as thick as the number of rows flowing through
 //! them, a details panel for the selected node, pan/zoom and fit.
 
-use super::analysis::{
-    FlatPlanNode, PlanMetric, PlanNodePath, flatten_plan, plan_summary, summary_line,
-};
+use super::analysis::{FlatPlanNode, PlanMetric, PlanNodePath, flatten_plan, plan_summary};
 use crate::common::colors;
 use crate::common::format::{compact, duration_ms, grouped};
 use crate::common::paint::{self, font_px};
@@ -71,8 +69,13 @@ pub struct PlanViewState {
     pub show_toolbar: bool,
     /// Zoom to fit on the next frame.
     pub fit_pending: bool,
+    /// The direction was picked by hand: fitting keeps it (else it takes the one that shows
+    /// the plan largest).
+    pub orientation_chosen: bool,
     last_canvas: Rect,
     last_orientation: PlanOrientation,
+    /// The warning "N warnings" selected last (a click selects the next one).
+    warning_at: usize,
 }
 
 impl Default for PlanViewState {
@@ -88,8 +91,10 @@ impl Default for PlanViewState {
             show_details: true,
             show_toolbar: true,
             fit_pending: true,
+            orientation_chosen: false,
             last_canvas: Rect::NOTHING,
             last_orientation: PlanOrientation::TopDown,
+            warning_at: 0,
         }
     }
 }
@@ -287,17 +292,23 @@ pub fn show_plan_diagram(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewStat
         state.last_orientation = state.orientation;
         state.fit_pending = true;
     }
-    let boxes = layout_plan(&flat, state.orientation);
+    let mut boxes = layout_plan(&flat, state.orientation);
 
     if state.show_details
         && let Some(sel) = state.selected.clone()
         && let Some(f) = flat.iter().find(|f| f.path == sel)
     {
+        let warnings: Vec<String> = plan_summary(plan)
+            .warnings
+            .into_iter()
+            .filter(|w| w.path == sel)
+            .map(|w| w.message)
+            .collect();
         egui::Panel::right(id.with("details"))
             .resizable(true)
             .default_size(300.0)
             .show(ui, |ui| {
-                details_panel(ui, f, metric, state);
+                details_panel(ui, f, metric, state, &warnings);
             });
     }
 
@@ -324,13 +335,43 @@ pub fn show_plan_diagram(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewStat
             };
         }
         let mut view = ViewTransform::new(state.zoom, state.pan);
+        // Unless picked by hand, the direction that shows the whole plan largest (a deep plan
+        // in a short, wide results panel: left to right).
+        let fit_zoom = |b: Rect| {
+            let avail = (rect.size() - Vec2::splat(48.0)).max(Vec2::splat(10.0));
+            (avail.x / b.width().max(1.0))
+                .min(avail.y / b.height().max(1.0))
+                .min(1.0)
+        };
+        let mut bounds = bounds;
+        if !state.orientation_chosen
+            && let Some(b) = bounds
+        {
+            let other = match state.orientation {
+                PlanOrientation::TopDown => PlanOrientation::LeftRight,
+                PlanOrientation::LeftRight => PlanOrientation::TopDown,
+            };
+            let other_boxes = layout_plan(&flat, other);
+            if let Some(ob) = other_boxes.iter().map(|b| b.rect).reduce(|a, b| a.union(b))
+                && fit_zoom(ob) > fit_zoom(b) + 0.01
+            {
+                state.orientation = other;
+                state.last_orientation = other;
+                boxes = other_boxes;
+                bounds = Some(ob);
+            }
+        }
         match bounds {
-            // Readable boxes (at least 75 %): a plan taller than the area starts at its top
-            // (the rest is a scroll away), as the mockups show it.
+            // The whole plan when its boxes stay readable (at least 60 %); else readable boxes
+            // (75 %), a plan taller than the area starting at its top (the rest a scroll away).
+            Some(b) if fit_zoom(b) >= 0.6 => view.fit(rect.size(), b, 24.0, 0.6, 1.0),
             Some(b) => {
                 view.fit(rect.size(), b, 24.0, 0.75, 1.0);
                 if b.height() * view.zoom > rect.height() - 48.0 {
                     view.pan.y = 20.0 - b.top() * view.zoom;
+                }
+                if b.width() * view.zoom > rect.width() - 48.0 {
+                    view.pan.x = 20.0 - b.left() * view.zoom;
                 }
             }
             None => view = ViewTransform::default(),
@@ -427,7 +468,9 @@ pub fn show_plan_diagram(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewStat
             } else {
                 Align2::RIGHT_CENTER
             };
-            paint::text(
+            // On the canvas colour: legible where it crosses a line (a branch's elbow).
+            let bg = painter.add(egui::Shape::Noop);
+            let r = paint::text(
                 &painter,
                 label_pos,
                 align,
@@ -436,6 +479,10 @@ pub fn show_plan_diagram(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewStat
                 v.weak_text_color(),
                 false,
                 f32::INFINITY,
+            );
+            painter.set(
+                bg,
+                egui::Shape::rect_filled(r.expand2(vec2(3.0, 1.0)), 3.0, v.extreme_bg_color),
             );
         }
     }
@@ -487,6 +534,7 @@ fn plan_toolbar(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) {
         .clicked()
         {
             state.orientation = PlanOrientation::TopDown;
+            state.orientation_chosen = true;
         }
         if kit::icon_button_ex(
             ui,
@@ -498,6 +546,7 @@ fn plan_toolbar(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) {
         .clicked()
         {
             state.orientation = PlanOrientation::LeftRight;
+            state.orientation_chosen = true;
         }
         kit::vdivider(ui, 16.0);
         ui.label(egui::RichText::new(tr("Color by")).color(ternarygrid_ui::pal(ui).text_muted));
@@ -517,10 +566,50 @@ fn plan_toolbar(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) {
             state.show_details = !state.show_details;
         }
         kit::vdivider(ui, 16.0);
-        ui.label(
-            egui::RichText::new(summary_line(&plan_summary(plan)))
-                .color(ternarygrid_ui::pal(ui).text_faint),
-        );
+        // The plan's facts the results bar does not show (it has the execution time and the
+        // cost); its warnings a click away: each click selects the next node they flag.
+        let s = plan_summary(plan);
+        let pal = ternarygrid_ui::pal(ui);
+        let mut facts = Vec::new();
+        if let Some(p) = s.planning_ms {
+            facts.push(trf(
+                "Planning {}",
+                &[&crate::common::format::duration_ms(p)],
+            ));
+        }
+        facts.push(if s.node_count == 1 {
+            tr("1 node").to_string()
+        } else {
+            trf("{} nodes", &[&s.node_count])
+        });
+        ui.label(egui::RichText::new(facts.join(" · ")).color(pal.text_muted));
+        if !s.warnings.is_empty() {
+            ui.label(egui::RichText::new("·").color(pal.text_muted));
+            let n = s.warnings.len();
+            let label = if n == 1 {
+                tr("1 warning").to_string()
+            } else {
+                trf("{} warnings", &[&n])
+            };
+            let resp = ui.add(
+                egui::Button::new(
+                    egui::RichText::new(format!("{}  {label}", icon::WARNING)).color(pal.warn),
+                )
+                .frame(false),
+            );
+            let tip = s
+                .warnings
+                .iter()
+                .map(|w| format!("• {}", w.message))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if resp.on_hover_text(tip).clicked() {
+                let i = state.warning_at % n;
+                state.selected = Some(s.warnings[i].path.clone());
+                state.show_details = true;
+                state.warning_at = i + 1;
+            }
+        }
     });
 }
 
@@ -651,7 +740,13 @@ fn node_tooltip(ui: &mut Ui, f: &FlatPlanNode<'_>, metric: PlanMetric) {
     metric_lines(ui, f, metric);
 }
 
-fn details_panel(ui: &mut Ui, f: &FlatPlanNode<'_>, metric: PlanMetric, state: &mut PlanViewState) {
+fn details_panel(
+    ui: &mut Ui,
+    f: &FlatPlanNode<'_>,
+    metric: PlanMetric,
+    state: &mut PlanViewState,
+    warnings: &[String],
+) {
     ui.horizontal(|ui| {
         ui.strong(f.node.node_type.as_str());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -668,6 +763,10 @@ fn details_panel(ui: &mut Ui, f: &FlatPlanNode<'_>, metric: PlanMetric, state: &
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
+            // What the plan's warnings say about this node.
+            for w in warnings {
+                ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Warning, w);
+            }
             metric_lines(ui, f, metric);
             ui.add_space(4.0);
             let node = f.node;

@@ -17,6 +17,12 @@ pub(crate) const WINDOW: Vec2 = vec2(940.0, 643.0);
 
 /// Space between the parts of a section.
 pub(crate) const GAP: f32 = 10.0;
+/// The label column of every form of the wizards (one width, so the controls start at the same
+/// place on every page).
+pub(crate) const LABEL_W: f32 = 150.0;
+/// [`LABEL_W`] of a form inside a folding card (its 1 point border and 12 padding in): the
+/// controls start where the page's do.
+pub(crate) const CARD_LABEL_W: f32 = LABEL_W - 13.0;
 /// Padding of multi-line text fields.
 pub(crate) const INPUT_MARGIN: Margin = Margin::symmetric(10, 6);
 
@@ -66,8 +72,8 @@ fn bottom_panel_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
         });
 }
 
-/// The scrolling body on the surface colour, padded 22 × 18 (4 at the bottom: the design's body
-/// is a fixed 470 high and its longest pages, the export formats, reach 4 above the footer).
+/// The scrolling body on the surface colour, padded 22 × 18 and 16 at the bottom (long pages
+/// end above the footer, not against it).
 pub(crate) fn body(ui: &mut Ui, id: Id, add: impl FnOnce(&mut Ui)) {
     body_dyn(ui, id, &mut once(add));
 }
@@ -76,8 +82,11 @@ fn body_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
     let p = style::pal(ui);
     egui::CentralPanel::default().frame(Frame::new().fill(p.surface)).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
-            Frame::new().inner_margin(Margin { left: 22, right: 22, top: 18, bottom: 4 }).show(ui, |ui| {
+            let view_h = ui.clip_rect().height();
+            Frame::new().inner_margin(Margin { left: 22, right: 22, top: 18, bottom: 16 }).show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                let top = ui.max_rect().top();
+                ui.data_mut(|d| d.insert_temp(body_key(), (top, view_h)));
                 style::form_spacing(ui);
                 ui.spacing_mut().item_spacing.y = GAP;
                 add(ui);
@@ -86,10 +95,26 @@ fn body_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
     });
 }
 
-/// The wizard's steps; returns the step clicked. A finished run shows every step done.
-pub(crate) fn steps(ui: &mut Ui, steps: &[&str], current: usize, reachable: usize, finished: bool) -> Option<usize> {
-    let active = if finished { steps.len() } else { current };
-    parts::stepper(ui, steps, active, reachable)
+/// The wizard's steps; returns the step clicked. After a run (`outcome`) every step is done; a
+/// run with failures marks its last step with an amber (warning) or red (error) "!" ring.
+pub(crate) fn steps(ui: &mut Ui, steps: &[&str], current: usize, reachable: usize, outcome: Option<Tone>) -> Option<usize> {
+    let active = if outcome.is_some() { steps.len() } else { current };
+    let shown = ui.scope(|ui| parts::stepper(ui, steps, active, reachable));
+    if let (Some(tone @ (Tone::Warning | Tone::Error)), Some(last)) = (outcome, steps.last()) {
+        // The kit draws the last step done (a filled check): paint its mark over it. The row of
+        // steps ends with the last one: its 22 point circle, 8, its label.
+        let p = style::pal(ui);
+        let size = style::body_size(ui.ctx());
+        let label_w = ui.painter().layout_no_wrap(last.to_string(), style::medium(ui.ctx(), size), Color32::PLACEHOLDER).size().x;
+        let row = shown.response.rect;
+        let c = pos2(row.right() - label_w - 30.0 + 11.0, row.center().y);
+        let color = tone.color(&p);
+        let painter = ui.painter();
+        painter.circle_filled(c, 11.5, p.surface);
+        painter.circle_stroke(c, 10.0, Stroke::new(2.0, color));
+        painter.text(c, egui::Align2::CENTER_CENTER, icon::EXCLAMATION_MARK, style::icon_font(14.0), color);
+    }
+    shown.inner
 }
 
 /// What a footer shows.
@@ -103,6 +128,11 @@ pub(crate) struct Footer<'a> {
     /// "Save as task…" (enabled, the reason shown when disabled); `None`: not offered.
     pub save: Option<(bool, Option<&'a str>)>,
     pub error: Option<&'a str>,
+    /// A run is going (`true`: it is being cancelled): Cancel takes the run button's place and
+    /// nothing else is offered.
+    pub running: Option<bool>,
+    /// A run has finished: Close (the primary) and Run again, no Back.
+    pub finished: bool,
 }
 
 /// The footer button clicked.
@@ -110,35 +140,30 @@ pub(crate) struct Footer<'a> {
 pub(crate) enum Clicked {
     Back,
     Next,
+    /// The run button, or Run again after a run.
     Run,
     Save,
+    /// Cancel the running job.
+    Cancel,
+    /// Close the wizard (after a run).
+    Close,
 }
 
 fn enabled_button(ui: &mut Ui, enabled: bool, add: impl FnOnce(&mut Ui) -> Response) -> Response {
     ui.add_enabled_ui(enabled, add).inner
 }
 
-/// Back · (error) · Save as task… · Next, and the run button instead of Next on the last page.
+/// Back · Save as task… at the left; (error) · Next, the primary, at the right (the run button
+/// on the last page); only Cancel while running; Run again · Close after a run.
 pub(crate) fn footer(ui: &mut Ui, f: &Footer) -> Option<Clicked> {
     let p = style::pal(ui);
     let mut clicked = None;
-    if let Some(ok) = f.back
-        && enabled_button(ui, ok, |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::ARROW_LEFT), tr("Back"), false)).clicked()
-    {
-        clicked = Some(Clicked::Back);
-    }
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        match f.next {
-            Some(next_ok) => {
-                if enabled_button(ui, next_ok, |ui| kit::button_ex(ui, Kind::Secondary, Some(icon::ARROW_RIGHT), tr("Next"), false)).clicked() {
-                    clicked = Some(Clicked::Next);
-                }
-            }
-            None => {
-                if enabled_button(ui, f.run.1, |ui| kit::primary_icon(ui, icon::PLAY, f.run.0)).clicked() {
-                    clicked = Some(Clicked::Run);
-                }
-            }
+    if f.running.is_none() {
+        if !f.finished
+            && let Some(ok) = f.back
+            && enabled_button(ui, ok, |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::ARROW_LEFT), tr("Back"), false)).clicked()
+        {
+            clicked = Some(Clicked::Back);
         }
         if let Some((ok, why)) = f.save {
             let mut r = enabled_button(ui, ok, |ui| kit::button_ex(ui, Kind::Ghost, Some(icon::FLOPPY_DISK), tr("Save as task…"), false));
@@ -147,6 +172,34 @@ pub(crate) fn footer(ui: &mut Ui, f: &Footer) -> Option<Clicked> {
             }
             if r.clicked() {
                 clicked = Some(Clicked::Save);
+            }
+        }
+    }
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if let Some(cancelling) = f.running {
+            let label = if cancelling { tr("Cancelling…") } else { tr("Cancel") };
+            if enabled_button(ui, !cancelling, |ui| kit::button_ex(ui, Kind::Danger, Some(icon::STOP_CIRCLE), label, false)).clicked() {
+                clicked = Some(Clicked::Cancel);
+            }
+        } else if f.finished {
+            if kit::primary(ui, tr("Close")).clicked() {
+                clicked = Some(Clicked::Close);
+            }
+            if enabled_button(ui, f.run.1, |ui| kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Run again"))).clicked() {
+                clicked = Some(Clicked::Run);
+            }
+        } else {
+            match f.next {
+                Some(next_ok) => {
+                    if enabled_button(ui, next_ok, |ui| kit::primary_icon(ui, icon::ARROW_RIGHT, tr("Next"))).clicked() {
+                        clicked = Some(Clicked::Next);
+                    }
+                }
+                None => {
+                    if enabled_button(ui, f.run.1, |ui| kit::primary_icon(ui, icon::PLAY, f.run.0)).clicked() {
+                        clicked = Some(Clicked::Run);
+                    }
+                }
             }
         }
         if let Some(e) = f.error {
@@ -252,29 +305,156 @@ pub(crate) fn bar(ui: &mut Ui, frac: f32, h: f32) {
     }
 }
 
-/// The counters of a run in two columns (24 apart): a muted label 100 wide, rows 6 apart.
-pub(crate) fn fact_grid(ui: &mut Ui, facts: &[(&str, String, Option<Color32>)]) {
-    fact_rows(ui, facts, 2, 100.0, 6.0);
+/// A read-only row of a summary or a result: a muted label and its value.
+pub(crate) struct Fact<'a> {
+    pub label: &'a str,
+    pub value: String,
+    /// The value's colour (the text colour when `None`).
+    pub color: Option<Color32>,
+    /// The value is a file path: its file name, then its folder (muted, shortened in the middle).
+    pub path: bool,
 }
 
-/// Read-only form rows in `cols` columns (24 apart): a muted label `label_w` wide, 16 from its
-/// value; rows 21.5 high and `gap` apart, as the design's form rows whose control is plain text
-/// (there the text sits on the 16 px line of the page's font: 4 below the row's top, the label 7).
-fn fact_rows(ui: &mut Ui, facts: &[(&str, String, Option<Color32>)], cols: usize, label_w: f32, gap: f32) {
+pub(crate) fn fact(label: &str, value: impl Into<String>) -> Fact<'_> {
+    Fact { label, value: value.into(), color: None, path: false }
+}
+
+impl Fact<'_> {
+    pub fn color(mut self, color: Option<Color32>) -> Self {
+        self.color = color;
+        self
+    }
+
+    pub fn path(mut self) -> Self {
+        self.path = true;
+        self
+    }
+}
+
+/// The counters of a run in two columns (24 apart): a muted label 100 wide, rows 6 apart.
+pub(crate) fn fact_grid(ui: &mut Ui, facts: &[Fact]) {
     let p = style::pal(ui);
+    let (cols, label_w, gap) = (2, 100.0, 6.0);
     let (left, top, w) = (ui.cursor().left(), ui.cursor().top(), ui.available_width());
     let col_w = (w - 24.0 * (cols - 1) as f32) / cols as f32;
-    let row_h = 21.5;
+    // Rows 22 high; the label and the value on one line, centred in the row.
+    let (row_h, text_y) = (22.0, 3.0);
     let pitch = row_h + gap;
-    for (i, (label, value, color)) in facts.iter().enumerate() {
+    for (i, f) in facts.iter().enumerate() {
         let x = left + (i % cols) as f32 * (col_w + 24.0);
         let y = top + (i / cols) as f32 * pitch;
-        put_left(ui, Rect::from_min_size(pos2(x, y + 7.0), vec2(label_w, 16.0)), egui::Label::new(RichText::new(*label).color(p.text_muted)).truncate());
-        let shown = egui::Label::new(RichText::new(value).color(color.unwrap_or(p.text))).truncate();
-        put_left(ui, Rect::from_min_size(pos2(x + label_w + 16.0, y + 4.0), vec2(col_w - label_w - 16.0, 16.0)), shown);
+        put_left(ui, Rect::from_min_size(pos2(x, y + text_y), vec2(label_w, 16.0)), egui::Label::new(RichText::new(f.label).color(p.text_muted)).truncate());
+        let shown = egui::Label::new(RichText::new(&f.value).color(f.color.unwrap_or(p.text))).truncate();
+        put_left(ui, Rect::from_min_size(pos2(x + label_w + 16.0, y + text_y), vec2(col_w - label_w - 16.0, 16.0)), shown);
     }
     let h = (facts.len().div_ceil(cols) as f32 * pitch - gap).max(0.0);
     ui.advance_cursor_after_rect(Rect::from_min_size(pos2(left, top), vec2(w, h)));
+}
+
+/// Read-only form rows: a muted label `label_w` wide, 16 from its value, both on one baseline;
+/// rows `gap` apart. A long value wraps under itself (a path is shortened in the middle).
+fn fact_rows(ui: &mut Ui, facts: &[Fact], label_w: f32, gap: f32) {
+    let p = style::pal(ui);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = gap;
+        for f in facts {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.allocate_ui_with_layout(vec2(label_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(label_w);
+                    ui.add(egui::Label::new(RichText::new(f.label).color(p.text_muted)).truncate());
+                });
+                ui.add_space(16.0);
+                let w = ui.available_width();
+                if f.path {
+                    let job = path_job(ui, &f.value, w, None);
+                    ui.add(egui::Label::new(job)).on_hover_text(&f.value);
+                } else {
+                    ui.add(egui::Label::new(RichText::new(&f.value).color(f.color.unwrap_or(p.text))).wrap());
+                }
+            });
+        }
+    });
+}
+
+/// A file path on one line at most `max_w` wide: the file name in the text colour (medium),
+/// after its folder in the muted colour, home-relative (`~/…`) and shortened in the middle
+/// when it does not fit. `size` is the font size (the body's when `None`).
+pub(crate) fn path_job(ui: &Ui, path: &str, max_w: f32, size: Option<f32>) -> egui::text::LayoutJob {
+    let p = style::pal(ui);
+    let size = size.unwrap_or_else(|| style::body_size(ui.ctx()));
+    let shown = home_relative(path);
+    let cut = shown.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    let (folder, name) = shown.split_at(cut);
+    let regular = egui::FontId::proportional(size);
+    let medium = style::medium(ui.ctx(), size);
+    let width = |s: &str, font: &egui::FontId| ui.painter().layout_no_wrap(s.to_string(), font.clone(), Color32::PLACEHOLDER).size().x;
+    let name_w = width(name, &medium);
+    // The folder, its middle left out until it fits beside the name.
+    let mut folder = folder.to_string();
+    if width(&folder, &regular) + name_w > max_w {
+        let chars: Vec<char> = folder.chars().collect();
+        let elided = |keep: usize| -> String {
+            let (head, tail) = (keep / 2, keep - keep / 2);
+            chars[..head].iter().chain(std::iter::once(&'…')).chain(chars[chars.len() - tail..].iter()).collect()
+        };
+        // The most characters kept that fit (a binary search: the width grows with them).
+        let (mut lo, mut hi) = (0, chars.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if width(&elided(mid), &regular) + name_w <= max_w { lo = mid } else { hi = mid - 1 }
+        }
+        folder = if lo == 0 && width(&elided(0), &regular) + name_w > max_w { String::new() } else { elided(lo) };
+    }
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&folder, 0.0, egui::TextFormat::simple(regular, p.text_muted));
+    job.append(name, 0.0, egui::TextFormat::simple(medium, p.text));
+    // A name that is too long on its own ends in "…".
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
+    job
+}
+
+/// A path with the home folder shown as `~` (lists and summaries; fields keep the real path).
+pub(crate) fn home_relative(path: &str) -> String {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+    match path.strip_prefix(home.as_str()) {
+        Some(rest) if !home.is_empty() && (rest.starts_with('/') || rest.starts_with('\\')) => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// The field of a file path: while it is not being edited it shows the path as [`path_job`]
+/// (the file name always visible); a click edits the path itself. True when the text changed.
+pub(crate) fn path_field(ui: &mut Ui, id: Id, path: &mut String, hint: &str) -> bool {
+    let edit_id = id.with("edit");
+    let editing = ui.memory(|m| m.has_focus(edit_id));
+    if editing || path.trim().is_empty() {
+        let r = ui.add(line(path).id(edit_id).hint_text(hint).desired_width(f32::INFINITY));
+        return r.changed();
+    }
+    let p = style::pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), style::CONTROL_H), Sense::click());
+    let resp = resp.on_hover_text(path.as_str()).on_hover_cursor(egui::CursorIcon::Text);
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, path.as_str()));
+    if ui.is_rect_visible(rect) {
+        let visuals = if resp.hovered() { ui.visuals().widgets.hovered } else { ui.visuals().widgets.inactive };
+        let fill = ui.visuals().text_edit_bg_color();
+        ui.painter().rect(rect, visuals.corner_radius, fill, visuals.bg_stroke, egui::StrokeKind::Inside);
+        let inner = rect.shrink2(vec2(13.0, 0.0));
+        let galley = ui.painter().layout_job(path_job(ui, path, inner.width(), None));
+        let pos = pos2(inner.left(), rect.center().y - galley.size().y / 2.0);
+        ui.painter().with_clip_rect(inner.intersect(ui.clip_rect())).galley(pos, galley, p.text);
+    }
+    if resp.clicked() {
+        // Edit with the cursor at the end (the file name).
+        let mut state = egui::TextEdit::load_state(ui.ctx(), edit_id).unwrap_or_default();
+        let end = egui::text::CCursor::new(path.chars().count());
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+        state.store(ui.ctx(), edit_id);
+        ui.memory_mut(|m| m.request_focus(edit_id));
+        ui.ctx().request_repaint();
+    }
+    false
 }
 
 /// `label` at the left of `rect`, without moving the cursor (`Ui::put` centres it and moves
@@ -380,9 +560,26 @@ pub(crate) fn icon_button(ui: &mut Ui, glyph: &str, tooltip: &str, side: f32) ->
     kit::icon_button_ex(ui, glyph, tooltip, false, side)
 }
 
-/// A quiet small button with an optional icon.
-pub(crate) fn ghost(ui: &mut Ui, glyph: Option<&str>, text: &str) -> Response {
-    kit::button_ex(ui, Kind::Ghost, glyph, text, true)
+/// An action inside a page's content (Add query, Select all, Copy…): a small outlined button,
+/// so it reads as a button and not as a label beside the fields.
+pub(crate) fn action(ui: &mut Ui, glyph: Option<&str>, text: &str) -> Response {
+    kit::button_ex(ui, Kind::Secondary, glyph, text, true)
+}
+
+/// The height a list or table inside the scrolling body may take so that it ends above the
+/// footer: what is left of the visible body under the cursor (less `reserve` for the parts
+/// under it), between `least` and `wanted`.
+pub(crate) fn fit_height(ui: &Ui, wanted: f32, least: f32, reserve: f32) -> f32 {
+    // Measured from the top of the body's content, not from the scrolled view: the height does
+    // not change while the body scrolls.
+    let Some((top, view_h)) = ui.data(|d| d.get_temp::<(f32, f32)>(body_key())) else { return wanted };
+    let left = view_h - 18.0 - (ui.cursor().top() - top) - reserve - 16.0;
+    left.clamp(least.min(wanted), wanted)
+}
+
+/// Where [`body`] keeps the top of its content and the height of its view for [`fit_height`].
+fn body_key() -> Id {
+    Id::new("ternarygrid_wizard_body")
 }
 
 /// A field with a prefix drawn inside it (`WHERE` before a filter) over an optional text.
@@ -423,8 +620,8 @@ pub(crate) struct Form<'u> {
     height: f32,
 }
 
-/// The height of `parts::segmented`.
-pub(crate) const SEGMENTED_H: f32 = 28.0;
+/// The height of `parts::segmented` (as the other controls).
+pub(crate) const SEGMENTED_H: f32 = style::CONTROL_H;
 
 /// Space between the columns of a form with several rows per line.
 const FORM_COLUMN_GAP: f32 = 28.0;
@@ -453,41 +650,19 @@ fn form_dyn(ui: &mut Ui, id: Id, per_row: usize, label_w: f32, gap: f32, add: &m
     });
 }
 
-/// A label of `label_w` (wrapped when longer) and the control(s) `add` draws on its right, as
-/// the design's form rows: the label 6 below the top, the controls centred on a row as high as
-/// the ui's controls (`interact_size.y`).
+/// A label of `label_w` and the control(s) `add` draws on its right: the kit's form row (the
+/// label centred on the controls' first line, 16 from them).
 pub(crate) fn form_row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.horizontal_top(|ui| {
-        row_label(ui, label, label_w);
-        ui.horizontal(add).inner
-    })
-    .inner
+    parts::form_row(ui, label, label_w, add)
 }
 
-/// See [`Form::check_row`]: a row 22 high, the check boxes 16 apart at its top.
+/// See [`Form::check_row`]: a row as high as its check boxes, 16 apart, the label on their line.
 fn check_row_dyn(ui: &mut Ui, label: &str, label_w: f32, add: &mut dyn FnMut(&mut Ui)) {
-    let p = style::pal(ui);
     ui.scope(|ui| {
         ui.spacing_mut().interact_size.y = 0.0;
-        ui.horizontal_top(|ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(label_w, 22.0), Sense::hover());
-            put_left(ui, Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(label_w, 16.0)), egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
-            ui.add_space(16.0 - ui.spacing().item_spacing.x);
-            ui.spacing_mut().item_spacing.x = 16.0;
-            add(ui);
-        });
+        ui.spacing_mut().item_spacing.x = 16.0;
+        parts::form_row(ui, label, label_w, |ui| add(ui));
     });
-}
-
-/// The label column of a form row (the label 6 below its top) and the gap after it.
-fn row_label(ui: &mut Ui, label: &str, label_w: f32) {
-    let p = style::pal(ui);
-    ui.allocate_ui_with_layout(vec2(label_w, 0.0), Layout::top_down(Align::Min), |ui| {
-        ui.set_min_width(label_w);
-        ui.add_space(6.0);
-        ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).wrap());
-    });
-    ui.add_space(16.0 - ui.spacing().item_spacing.x);
 }
 
 impl Form<'_> {
@@ -502,7 +677,7 @@ impl Form<'_> {
         r
     }
 
-    /// A row whose only control is a segmented one: 28 high, as in the design.
+    /// A row whose only control is a segmented one (as high as the other controls).
     pub fn seg_row<R>(&mut self, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
         let h = self.ui.spacing().interact_size.y;
         self.ui.spacing_mut().interact_size.y = SEGMENTED_H;
@@ -511,7 +686,7 @@ impl Form<'_> {
         r
     }
 
-    /// A row of check boxes: as in the design they sit at its top, the label 6 lower.
+    /// A row of check boxes, 16 apart, the label on their line.
     pub fn check_row<R>(&mut self, label: &str, add: impl FnOnce(&mut Ui) -> R) {
         let label_w = self.label_w;
         if self.per_row == 1 {
@@ -575,10 +750,11 @@ pub(crate) fn card<R>(ui: &mut Ui, pad: i8, add: impl FnOnce(&mut Ui) -> R) -> R
         .inner
 }
 
-/// A card of read-only form rows (summaries).
-pub(crate) fn facts(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, label_w: f32, gap: f32, rows: &[(&str, String, Option<Color32>)]) {
+/// A card of read-only form rows (summaries, results), the labels [`LABEL_W`] wide.
+pub(crate) fn facts(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, gap: f32, rows: &[Fact]) {
     card(ui, 14, |ui| {
-        ui.push_id(Id::new(id), |ui| fact_rows(ui, rows, 1, label_w, gap));
+        // The values where the other pages' controls start (the card's border and padding in).
+        ui.push_id(Id::new(id), |ui| fact_rows(ui, rows, LABEL_W - 15.0, gap));
     });
 }
 
@@ -593,7 +769,7 @@ pub(crate) fn fold_card(ui: &mut Ui, id: Id, open: &mut bool, title: &str, summa
 fn fold_card_dyn(ui: &mut Ui, id: Id, open: &mut bool, title: &str, summary: Option<&str>, fill: bool, body: &mut dyn FnMut(&mut Ui)) -> bool {
     let p = style::pal(ui);
     let mut toggled = false;
-    kit::card(ui).corner_radius(CornerRadius::same(style::RADIUS_LG)).inner_margin(Margin::same(12)).show(ui, |ui| {
+    let shown = kit::card(ui).corner_radius(CornerRadius::same(style::RADIUS_LG)).inner_margin(Margin::same(12)).show(ui, |ui| {
         if fill {
             ui.set_width(ui.available_width());
         }
@@ -632,6 +808,10 @@ fn fold_card_dyn(ui: &mut Ui, id: Id, open: &mut bool, title: &str, summary: Opt
             body(ui);
         }
     });
+    // Opened: the scrolling body brings it into view (as much of it as fits).
+    if toggled && *open && fill {
+        ui.scroll_to_rect(shown.response.rect, None);
+    }
     toggled
 }
 
@@ -803,6 +983,92 @@ fn table_dyn(ui: &mut Ui, id: Id, cols: &[Col], row_h: f32, max_h: Option<f32>, 
     });
 }
 
+/// A row (or an object) that failed in a run.
+pub(crate) struct Failure {
+    /// The table it belongs to (migrations of several tables).
+    pub object: Option<String>,
+    pub row: Option<u64>,
+    pub column: Option<String>,
+    pub message: String,
+}
+
+/// The failures of a run in one table: identical errors grouped ("5 × …") with their rows, the
+/// whole text on hover; the Table and Column columns only when some failure has one.
+pub(crate) fn failures_table(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, failures: &[Failure], max_h: f32) {
+    let p = style::pal(ui);
+    // (object, column, message) → rows, in the order of their first failure.
+    let mut groups: Vec<(&Option<String>, &Option<String>, &str, Vec<u64>, usize)> = Vec::new();
+    for f in failures {
+        match groups.iter_mut().find(|g| g.0 == &f.object && g.1 == &f.column && g.2 == f.message) {
+            Some(g) => {
+                g.3.extend(f.row);
+                g.4 += 1;
+            }
+            None => groups.push((&f.object, &f.column, &f.message, f.row.into_iter().collect(), 1)),
+        }
+    }
+    let objects = failures.iter().any(|f| f.object.is_some());
+    let columns = failures.iter().any(|f| f.column.is_some());
+    let mut cols = Vec::new();
+    if objects {
+        cols.push(col(tr("Table"), W::Fr(0.8)));
+    }
+    cols.push(col(tr("Row"), W::Px(110.0)));
+    if columns {
+        cols.push(col(tr("Column"), W::Px(120.0)));
+    }
+    cols.push(col(tr("Error"), W::Fr(2.0)));
+    let kinds: Vec<u8> = [(objects, 0), (true, 1), (columns, 2), (true, 3)].iter().filter(|(on, _)| *on).map(|(_, k)| *k).collect();
+    table(
+        ui,
+        id,
+        &cols,
+        30.0,
+        Some(max_h),
+        groups.len(),
+        |_, _| {},
+        |ui, r, c| {
+            let (object, column, message, rows, n) = &groups[r];
+            match kinds[c] {
+                0 => {
+                    ui.add(egui::Label::new(object.as_deref().unwrap_or_default()).truncate());
+                }
+                1 => {
+                    let all = row_ranges(rows);
+                    let shown = if all.len() > 3 { format!("{} …", all[..3].join(", ")) } else { all.join(", ") };
+                    let r = ui.add(egui::Label::new(if shown.is_empty() { "—".to_string() } else { shown }).truncate());
+                    if all.len() > 3 {
+                        r.on_hover_text(all.join(", "));
+                    }
+                }
+                2 => {
+                    ui.add(egui::Label::new(RichText::new(column.as_deref().unwrap_or_default()).color(p.text_muted)).truncate());
+                }
+                _ => {
+                    ui.label(RichText::new(icon::X_CIRCLE).font(style::icon_font(13.0)).color(p.err));
+                    let text = if *n > 1 { format!("{n} × {message}") } else { message.to_string() };
+                    ui.add(egui::Label::new(text).truncate()).on_hover_text(*message);
+                }
+            }
+        },
+    );
+}
+
+/// Row numbers as ranges: `[1, 2, 3, 7, 9, 10]` → `1–3`, `7`, `9–10`.
+fn row_ranges(rows: &[u64]) -> Vec<String> {
+    let mut rows = rows.to_vec();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for r in rows {
+        match out.last_mut() {
+            Some((_, end)) if *end + 1 == r => *end = r,
+            _ => out.push((r, r)),
+        }
+    }
+    out.into_iter().map(|(a, b)| if a == b { a.to_string() } else { format!("{a}–{b}") }).collect()
+}
+
 /// A check box in a table's header that turns every row on or off: `states` are the rows'.
 pub(crate) fn check_all(ui: &mut Ui, states: &[bool]) -> Option<bool> {
     let mut all = !states.is_empty() && states.iter().all(|s| *s);
@@ -825,4 +1091,29 @@ pub(crate) fn boxed<R>(ui: &mut Ui, margin: Margin, add: impl FnOnce(&mut Ui) ->
             add(ui)
         })
         .inner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_as_ranges() {
+        assert_eq!(row_ranges(&[3, 1, 2, 7, 9, 10, 2]), vec!["1–3", "7", "9–10"]);
+        assert!(row_ranges(&[]).is_empty());
+    }
+
+    #[test]
+    fn paths_keep_their_file_name() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let path = "/var/folders/rm/a_very_long_folder_name_of_the_system/T/customers_october.csv";
+            let job = path_job(ui, path, 260.0, Some(13.0));
+            let text = job.text.clone();
+            assert!(text.ends_with("customers_october.csv"), "{text}");
+            assert!(text.contains('…') && text.starts_with("/var"), "{text}");
+            assert!(ui.painter().layout_job(job).size().x <= 260.5);
+        });
+        out.textures_delta.clear();
+    }
 }

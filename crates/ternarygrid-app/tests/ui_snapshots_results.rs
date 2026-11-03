@@ -100,15 +100,34 @@ impl Raster {
                 if area.abs() < 1e-9 {
                     continue;
                 }
+                // Each edge's pixels belong to one triangle only (a top-left style rule on the
+                // edge's direction, both triangles of a shared edge see it reversed): else a
+                // translucent quad's diagonal (a modal backdrop) is blended twice, a dotted seam.
+                let owns = |a: (f32, f32), b: (f32, f32)| {
+                    let (dx, dy) = ((b.0 - a.0) * area.signum(), (b.1 - a.1) * area.signum());
+                    dy > 0.0 || (dy == 0.0 && dx > 0.0)
+                };
+                let edge = [owns(pts[1], pts[2]), owns(pts[2], pts[0]), owns(pts[0], pts[1])];
+                // The edge function of a→b at p, computed from the edge's endpoints in one fixed
+                // order: the two triangles of a shared edge get exactly opposite values, so a
+                // pixel on it is neither lost (a dark speck) nor drawn twice.
+                let side = |a: (f32, f32), b: (f32, f32), p: (f32, f32)| {
+                    let (a, b, flip) = if (a.0, a.1) <= (b.0, b.1) { (a, b, 1.0) } else { (b, a, -1.0) };
+                    flip * ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0))
+                };
                 for y in miny..maxy {
                     for x in minx..maxx {
-                        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                        let w0 = ((pts[1].0 - px) * (pts[2].1 - py) - (pts[2].0 - px) * (pts[1].1 - py)) / area;
-                        let w1 = ((pts[2].0 - px) * (pts[0].1 - py) - (pts[0].0 - px) * (pts[2].1 - py)) / area;
-                        let w2 = 1.0 - w0 - w1;
-                        if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
+                        let p = (x as f32 + 0.5, y as f32 + 0.5);
+                        let e = [side(pts[1], pts[2], p), side(pts[2], pts[0], p), side(pts[0], pts[1], p)];
+                        let inside = |i: usize| {
+                            let s = e[i] * area.signum();
+                            s > 0.0 || (s == 0.0 && edge[i])
+                        };
+                        if !(inside(0) && inside(1) && inside(2)) {
                             continue;
                         }
+                        let (w0, w1) = (e[0] / area, e[1] / area);
+                        let w2 = 1.0 - w0 - w1;
                         let u = w0 * v[0].uv.x + w1 * v[1].uv.x + w2 * v[2].uv.x;
                         let vv = w0 * v[0].uv.y + w1 * v[1].uv.y + w2 * v[2].uv.y;
                         let tx = ((u * tex.size[0] as f32) as usize).min(tex.size[0] - 1);
@@ -224,7 +243,7 @@ impl Shots {
             return;
         }
         self.h.state_mut().toasts.clear();
-        self.frames(8);
+        self.frames(30);
         let out = self.h.output();
         let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
         let size = self.h.ctx.content_rect().size() * ppp();
@@ -721,11 +740,15 @@ fn result_screens(s: &mut Shots, conn: &str) {
     s.shot("res_copy");
     s.escape();
     s.frames(20);
-    // The fetch error over the rows.
-    s.data().model.fetch.error = Some("canceling statement due to statement timeout (the query ran longer than the connection's 30 s query timeout)".into());
+    // The fetch error over the rows (the result's source: the panel copies it every frame).
+    s.data().src.error = Some(ternarygrid_core::DbError::new(
+        ternarygrid_core::ErrorKind::Timeout,
+        "canceling statement due to statement timeout (the query ran longer than the connection's 30 s query timeout)",
+    ));
     s.park();
     s.shot("res_fetch_err");
-    s.data().model.fetch.error = None;
+    s.data().src.error = None;
+    s.frames(2);
     // Reload with changes.
     {
         let p = s.data();
@@ -754,9 +777,12 @@ fn result_screens(s: &mut Shots, conn: &str) {
     s.click_contains("UPDATE");
     s.frames(20);
     s.shot("res_gen_sql");
-    if has(&s.h, "Close window") {
-        s.click("Close window");
+    // Its × (the lowest "Close": the tabs' are above it), so the next shots are without it.
+    s.pause();
+    if let Some(close) = s.h.query_all_by_label("Close").max_by(|a, b| a.rect().top().total_cmp(&b.rect().top())) {
+        close.click();
     }
+    s.frames(10);
     // Add a virtual column.
     let at = cell_at(s, 1, 1);
     s.context_click(at);
@@ -810,7 +836,8 @@ fn object_pages(s: &mut Shots, conn: &str) {
         s.park();
         s.shot(name);
     }
-    s.click("Indexes");
+    // The page's own Indexes pill (the navigator has an "Indexes" folder too, at the left).
+    s.click_rightmost("Indexes");
     s.frames(6);
     s.park();
     s.shot("obj_indexes");

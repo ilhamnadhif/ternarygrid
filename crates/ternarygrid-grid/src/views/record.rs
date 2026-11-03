@@ -138,14 +138,14 @@ fn is_empty_value(v: &Value) -> bool {
     v.is_null() || matches!(v, Value::Text(s) if s.is_empty())
 }
 
-/// The keyboard hint at the right of the toolbar: cut short with "…" when the toolbar is narrow
-/// (the full text is in the tooltip), never drawn over the controls.
+/// The keyboard keys at the right of the toolbar: an ⓘ whose tooltip lists them.
 fn keys_hint(ui: &mut Ui, text: &str, more: &str) {
-    if ui.available_width() < 40.0 {
+    if ui.available_width() < 30.0 {
         return;
     }
-    let label = egui::Label::new(RichText::new(text).size(11.5).color(ternarygrid_ui::pal(ui).text_faint)).truncate();
-    ui.add(label).on_hover_text(format!("{text}\n\n{more}"));
+    let tip = format!("{}\n\n{more}", text.replace(" · ", "\n"));
+    let faint = ternarygrid_ui::pal(ui).text_faint;
+    ui.add(egui::Label::new(RichText::new(icon::INFO).font(ternarygrid_ui::style::icon_font(15.0)).color(faint)).sense(egui::Sense::hover())).on_hover_text(tip);
 }
 
 /// The "Hide empty" toggle; true when it changed.
@@ -248,7 +248,7 @@ impl<'a> RecordView<'a> {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 let pal = ternarygrid_ui::pal(ui);
                 let nav = |ui: &mut Ui, on: bool, glyph: &str, tip: &str| ui.add_enabled_ui(on, |ui| kit::icon_button_ex(ui, glyph, tip, false, 26.0).clicked()).inner;
-                if nav(ui, row > 0, icon::ARROW_LEFT, tr("First row")) {
+                if nav(ui, row > 0, icon::CARET_LINE_LEFT, tr("First row")) {
                     go_to = Some(0);
                 }
                 if nav(ui, row > 0, icon::CARET_LEFT, tr("Previous row (←)")) {
@@ -269,7 +269,7 @@ impl<'a> RecordView<'a> {
                 if nav(ui, row + 1 < nrows, icon::CARET_RIGHT, tr("Next row (→)")) {
                     go_to = Some(row + 1);
                 }
-                if nav(ui, row + 1 < nrows, icon::ARROW_RIGHT, tr("Last row")) {
+                if nav(ui, row + 1 < nrows, icon::CARET_LINE_RIGHT, tr("Last row")) {
                     go_to = Some(nrows - 1);
                 }
                 let state_label = match model.row_state(row) {
@@ -615,18 +615,32 @@ fn rows_table(
                             ui.painter().rect_filled(lead_rect, 0.0, hover(if current { theme.header_selected_bg } else { theme.header_bg }));
                             let p = ui.painter();
                             let mut x = lead_rect.left() + 12.0;
-                            // A key, a link (a foreign key), else a text mark: 13 points, faint.
+                            // A key or a link (a foreign key), 13 points, in a slot every name
+                            // leaves (the names line up); the type at the right, as the grid's header.
                             let icon_font = ternarygrid_ui::style::icon_font(13.0);
-                            let (glyph, color) = if key_cols.contains(&c) {
-                                (icon::KEY, theme.warn)
+                            let mark = if key_cols.contains(&c) {
+                                Some((icon::KEY, theme.warn))
                             } else if model.foreign_key_for_column(c).is_some() {
-                                (icon::LINK_SIMPLE, theme.weak)
+                                Some((icon::LINK_SIMPLE, theme.weak))
                             } else {
-                                (icon::TEXT_AA, theme.weak)
+                                None
                             };
-                            p.text(egui::pos2(x + 6.5, lead_rect.center().y), egui::Align2::CENTER_CENTER, glyph, icon_font, color);
+                            if let Some((glyph, color)) = mark {
+                                p.text(egui::pos2(x + 6.5, lead_rect.center().y), egui::Align2::CENTER_CENTER, glyph, icon_font, color);
+                            }
                             x += 21.0;
-                            let name_rect = egui::Rect::from_min_max(egui::pos2(x, lead_rect.top()), egui::pos2(lead_rect.right() - 6.0, lead_rect.bottom()));
+                            let mut right = lead_rect.right() - 10.0;
+                            let ty = model.column_meta(c).map(|m| m.type_name.to_ascii_lowercase()).unwrap_or_default();
+                            if !ty.is_empty() {
+                                let g = p.layout_no_wrap(ty, egui::FontId::monospace(11.0), theme.weak);
+                                let name_need = measure(ui, name.clone(), name_font.clone());
+                                // Only while the name fits beside it.
+                                if x + name_need + 8.0 + g.size().x <= right {
+                                    p.galley(egui::pos2(right - g.size().x, lead_rect.center().y - g.size().y / 2.0), g.clone(), theme.weak);
+                                    right -= g.size().x + 8.0;
+                                }
+                            }
+                            let name_rect = egui::Rect::from_min_max(egui::pos2(x, lead_rect.top()), egui::pos2(right.max(x + 4.0), lead_rect.bottom()));
                             let mut name_text = RichText::new(&name).font(name_font.clone()).color(theme.header_text);
                             if model.is_virtual_column(c) {
                                 name_text = name_text.italics();
@@ -905,7 +919,7 @@ fn rows_table(
                 picked_text(&shown, rows, &order, names.then_some(|c: usize| model.column_name(c).to_string()), text_of)
             };
             ui.ctx().copy_text(text);
-            let message = if shown.len() == 1 { tr("Value copied").to_string() } else { trf("Copied {} cell(s)", &[&shown.len()]) };
+            let message = if shown.len() == 1 { tr("Value copied").to_string() } else { ternarygrid_core::trn(shown.len(), tr("Copied 1 cell"), tr("Copied {} cells")) };
             actions.push(GridAction::Notify { message, error: false });
         }
     }

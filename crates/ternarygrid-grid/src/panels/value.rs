@@ -85,24 +85,27 @@ pub struct ValuePanel<'a> {
     state: &'a mut ValuePanelState,
 }
 
-/// Colours of the JSON tree: text, faint (counts), strings and other values.
+/// Colours of the JSON tree, the JSON view's tokens: keys, strings, numbers, and the
+/// constants (`true`, `false`, `null`) and counts faint.
 struct TreeColors {
     text: egui::Color32,
     faint: egui::Color32,
-    value: egui::Color32,
+    key: egui::Color32,
+    string: egui::Color32,
+    number: egui::Color32,
 }
 
 impl TreeColors {
     fn new(ui: &Ui) -> Self {
         let p = ternarygrid_ui::pal(ui);
-        let value = if ui.visuals().dark_mode { egui::Color32::from_rgb(0xe6, 0xa9, 0x6b) } else { egui::Color32::from_rgb(0xa5, 0x53, 0x1a) };
-        TreeColors { text: p.text, faint: p.text_faint, value }
+        let (key, string, number) = crate::views::json_token_colors(ui.visuals().dark_mode);
+        TreeColors { text: p.text, faint: p.text_faint, key, string, number }
     }
 }
 
 /// One node of the JSON tree and its children: lines of 22 in monospace 12, 16 more
-/// in per level; objects and arrays open and close with their arrow (the first two
-/// levels open), their size faint after them.
+/// in per level; objects and arrays open and close with the kit's caret (the first two
+/// levels open), their size faint after them ("6 keys", "2 items").
 #[allow(clippy::too_many_arguments)]
 fn json_tree(ui: &mut Ui, open: &mut std::collections::HashMap<String, bool>, c: &TreeColors, path: &str, key: &str, v: &serde_json::Value, budget: &mut usize, depth: usize) {
     if *budget == 0 {
@@ -110,39 +113,46 @@ fn json_tree(ui: &mut Ui, open: &mut std::collections::HashMap<String, bool>, c:
     }
     *budget -= 1;
     let font = egui::FontId::monospace(12.0);
+    // The caret's column, then the text.
     let indent = depth as f32 * 16.0;
+    let caret_w = 14.0;
     let mut job = egui::text::LayoutJob::default();
     let mut add = |s: &str, color: egui::Color32| job.append(s, 0.0, egui::TextFormat::simple(font.clone(), color));
-    let (children, summary, brackets) = match v {
-        serde_json::Value::Object(map) => (Some(map.len()), trf("{} keys", &[&map.len()]), "{}"),
-        serde_json::Value::Array(items) => (Some(items.len()), items.len().to_string(), "[ ]"),
-        _ => (None, String::new(), ""),
+    let (children, summary) = match v {
+        serde_json::Value::Object(map) => (Some(map.len()), if map.len() == 1 { tr("1 key").to_string() } else { trf("{} keys", &[&map.len()]) }),
+        serde_json::Value::Array(items) => (Some(items.len()), if items.len() == 1 { tr("1 item").to_string() } else { trf("{} items", &[&items.len()]) }),
+        _ => (None, String::new()),
     };
     let is_open = children.is_some() && *open.get(path).unwrap_or(&(depth < 2));
+    // Object keys in the key colour, array indexes faint.
+    let key_color = if key.parse::<usize>().is_ok() { c.faint } else { c.key };
     match children {
         Some(_) => {
-            add(if is_open { "▾ " } else { "▸ " }, c.text);
-            if key.is_empty() {
-                add(brackets, c.text);
-            } else if matches!(v, serde_json::Value::Array(_)) {
-                add(&format!("{key} {brackets}"), c.text);
-            } else {
-                add(key, c.text);
+            if !key.is_empty() {
+                add(key, key_color);
+                add("  ", c.text);
             }
-            add(&format!(" {summary}"), c.faint);
+            add(&summary, c.faint);
         }
         None => {
-            add(&format!("{key}: "), c.text);
-            let text = match v {
-                serde_json::Value::String(s) => format!("\"{s}\""),
-                o => o.to_string(),
-            };
-            add(&text, c.value);
+            add(key, key_color);
+            add(": ", c.text);
+            match v {
+                serde_json::Value::String(s) => add(&format!("\"{s}\""), c.string),
+                serde_json::Value::Number(n) => add(&n.to_string(), c.number),
+                o => add(&o.to_string(), c.faint),
+            }
         }
     }
     let galley = ui.fonts_mut(|f| f.layout_job(job));
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(indent + galley.size().x + 8.0, 22.0), if children.is_some() { egui::Sense::click() } else { egui::Sense::hover() });
-    ui.painter().galley(egui::pos2(rect.left() + indent, rect.center().y - galley.size().y / 2.0), galley, c.text);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(indent + caret_w + galley.size().x + 8.0, 22.0), if children.is_some() { egui::Sense::click() } else { egui::Sense::hover() });
+    if children.is_some() {
+        let caret = if is_open { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT };
+        let color = if resp.hovered() { c.text } else { c.faint };
+        ui.painter().text(egui::pos2(rect.left() + indent + 5.0, rect.center().y), egui::Align2::CENTER_CENTER, caret, ternarygrid_ui::style::icon_font(11.0), color);
+    }
+    ui.painter().galley(egui::pos2(rect.left() + indent + caret_w, rect.center().y - galley.size().y / 2.0), galley, c.text);
     if resp.clicked() {
         open.insert(path.to_string(), !is_open);
     }
@@ -175,7 +185,7 @@ impl<'a> ValuePanel<'a> {
         let ValuePanel { model, grid, options, state } = self;
         let mut actions = Vec::new();
         let Some((row, col)) = grid.active_cell().filter(|(r, _)| *r < model.row_count()) else {
-            ui.weak(tr("Select a cell to see its value"));
+            ui.label(RichText::new(tr("Select a cell to see its value.")).color(ternarygrid_ui::pal(ui).text_muted));
             return actions;
         };
         let kind = model.column_kind(col);
@@ -231,13 +241,7 @@ impl<'a> ValuePanel<'a> {
         if !modes.iter().any(|(m, _)| *m == state.mode) {
             state.mode = ValueMode::Auto;
         }
-        ui.horizontal(|ui| {
-            ternarygrid_ui::parts::segmented_small(ui, &mut state.mode, &modes);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ternarygrid_ui::kit::checkbox(ui, &mut state.wrap, tr("Wrap"));
-            });
-        });
-        let mode = match state.mode {
+        let shown_mode = |m: ValueMode| match m {
             // NULL has nothing to parse or decode: show the (empty) text editor.
             _ if value.is_null() => ValueMode::Text,
             ValueMode::Auto => match &value {
@@ -250,6 +254,16 @@ impl<'a> ValuePanel<'a> {
             },
             m => m,
         };
+        ui.horizontal(|ui| {
+            ternarygrid_ui::parts::segmented_small(ui, &mut state.mode, &modes);
+            // Wrapping is for text: not for an image, a hex dump or a tree.
+            if matches!(shown_mode(state.mode), ValueMode::Text | ValueMode::Json | ValueMode::Xml) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ternarygrid_ui::kit::checkbox(ui, &mut state.wrap, tr("Wrap"));
+                });
+            }
+        });
+        let mode = shown_mode(state.mode);
         if value.is_null() {
             ui.weak(&options.format.null_text);
         }
@@ -324,7 +338,9 @@ impl<'a> ValuePanel<'a> {
                         ui.label(RichText::new(format!("{} {}", egui_phosphor::regular::LOCK_SIMPLE, r.short_label())).color(pal.warn));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(trf("{} chars", &[&state.edit_text.chars().count()])).color(pal.text_faint));
+                        let n = state.edit_text.chars().count();
+                        let count = if n == 1 { tr("1 character").to_string() } else { trf("{} characters", &[&n]) };
+                        ui.label(RichText::new(count).color(pal.text_faint));
                     });
                 });
                 if let Some(e) = &state.error {
@@ -350,7 +366,7 @@ impl<'a> ValuePanel<'a> {
                             let colors = TreeColors::new(ui);
                             json_tree(ui, &mut state.tree_open, &colors, "", "", &j, &mut budget, 0);
                             if budget == 0 {
-                                ui.weak(tr("(tree truncated)"));
+                                ui.label(RichText::new(tr("The rest of the tree is not shown.")).color(ternarygrid_ui::pal(ui).text_muted));
                             }
                         });
                     });
@@ -371,7 +387,7 @@ impl<'a> ValuePanel<'a> {
             }
             ValueMode::Hex => {
                 if let Value::Bytes(b) = &value {
-                    size_row(ui, &mut actions, row, col, b);
+                    size_row(ui, &mut actions, row, col, b, None);
                     readonly_text(ui, &hex_dump(b, 64 * 1024), false);
                 }
             }
@@ -380,33 +396,35 @@ impl<'a> ValuePanel<'a> {
                     if state.image_key != key {
                         state.image_key = key;
                         state.image = Some(decode_image(b, 2048).map(|d| {
-                            let tex = ui.ctx().load_texture(format!("ternarygrid-value-{row}-{col}"), d.image, TextureOptions::LINEAR);
+                            // Small images are shown enlarged: their pixels sharp, not blurred.
+                            let small = d.image.size[0].max(d.image.size[1]) <= 256;
+                            let filter = if small { TextureOptions::NEAREST } else { TextureOptions::LINEAR };
+                            let tex = ui.ctx().load_texture(format!("ternarygrid-value-{row}-{col}"), d.image, filter);
                             (tex, d.original_size, d.kind.label())
                         }));
                     }
-                    size_row(ui, &mut actions, row, col, b);
+                    // "74 B · PNG 8 × 6" on one line.
+                    let detail = match &state.image {
+                        Some(Ok((_, size, label))) => Some(format!("{label} {} × {}", size[0], size[1])),
+                        _ => None,
+                    };
+                    size_row(ui, &mut actions, row, col, b, detail.as_deref());
                     match &state.image {
-                        Some(Ok((tex, size, label))) => {
-                            ui.label(RichText::new(format!("{label} {} × {}", size[0], size[1])).size(12.5).color(pal.text_muted));
-                            // In a 220 high box, on a soft accent wash, scaled down to fit.
+                        Some(Ok((tex, _, _))) => {
+                            // In a 220 high box on a checkerboard (transparency shows), scaled to
+                            // fit: larger ones down, small ones up (whole steps, at most 8 times).
                             let w = ui.available_width();
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 220.0), egui::Sense::hover());
-                            let mut mesh = egui::Mesh::default();
-                            let r = rect.shrink(2.0);
-                            let (a, z) = (pal.accent_soft, pal.subtle);
-                            mesh.colored_vertex(r.left_top(), a);
-                            mesh.colored_vertex(r.right_top(), crate::theme::mix(a, z, 0.5));
-                            mesh.colored_vertex(r.right_bottom(), z);
-                            mesh.colored_vertex(r.left_bottom(), crate::theme::mix(a, z, 0.5));
-                            mesh.add_triangle(0, 1, 2);
-                            mesh.add_triangle(0, 2, 3);
-                            ui.painter().add(mesh);
-                            ui.painter().rect_stroke(rect, 8, egui::Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
                             let s = tex.size_vec2();
-                            let inner = rect.shrink(8.0);
-                            let scale = (inner.width() / s.x).min(inner.height() / s.y).clamp(0.05, 1.0);
-                            let img = egui::Rect::from_center_size(rect.center(), s * scale);
-                            ui.painter().image(tex.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                            let inner = rect.shrink(12.0);
+                            let fit = (inner.width() / s.x).min(inner.height() / s.y);
+                            let scale = if fit >= 2.0 { fit.floor().min(8.0) } else { fit.clamp(0.05, 1.0) };
+                            let img = egui::emath::GuiRounding::round_to_pixels(egui::Rect::from_center_size(rect.center(), s * scale), ui.pixels_per_point());
+                            let painter = ui.painter().with_clip_rect(rect.shrink(1.0));
+                            painter.rect_filled(rect, 8, pal.surface);
+                            checkerboard(&painter, img, pal.subtle, pal.surface);
+                            painter.image(tex.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                            ui.painter().rect_stroke(rect, 8, egui::Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
                         }
                         Some(Err(e)) => {
                             ui.colored_label(ui.visuals().error_fg_color, e);
@@ -447,12 +465,33 @@ impl<'a> ValuePanel<'a> {
     }
 }
 
-/// The value's size (faint) and, at the right, Save to file….
-fn size_row(ui: &mut Ui, actions: &mut Vec<GridAction>, row: usize, col: usize, bytes: &[u8]) {
+/// Squares of 8 points in two colours over `rect` (behind an image: its transparency shows).
+fn checkerboard(painter: &egui::Painter, rect: egui::Rect, a: egui::Color32, b: egui::Color32) {
+    const SQ: f32 = 8.0;
+    painter.rect_filled(rect, 0.0, b);
+    let (cols, rows) = ((rect.width() / SQ).ceil() as usize, (rect.height() / SQ).ceil() as usize);
+    for r in 0..rows.min(64) {
+        for c in 0..cols.min(128) {
+            if (r + c) % 2 == 0 {
+                let min = rect.min + egui::vec2(c as f32 * SQ, r as f32 * SQ);
+                let sq = egui::Rect::from_min_size(min, egui::vec2(SQ, SQ)).intersect(rect);
+                painter.rect_filled(sq, 0.0, a);
+            }
+        }
+    }
+}
+
+/// The value's size (and `detail`: the image's format and size) muted and, at the right,
+/// Save to file….
+fn size_row(ui: &mut Ui, actions: &mut Vec<GridAction>, row: usize, col: usize, bytes: &[u8], detail: Option<&str>) {
     let ext = detect_image(bytes).map_or("bin", |k| k.extension());
-    let faint = ternarygrid_ui::pal(ui).text_faint;
+    let muted = ternarygrid_ui::pal(ui).text_muted;
+    let text = match detail {
+        Some(d) => format!("{} · {d}", byte_size_text(bytes.len())),
+        None => byte_size_text(bytes.len()),
+    };
     ui.horizontal(|ui| {
-        ui.label(RichText::new(byte_size_text(bytes.len())).size(12.0).color(faint));
+        ui.label(RichText::new(text).size(12.0).color(muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Ghost, Some(egui_phosphor::regular::DOWNLOAD_SIMPLE), tr("Save to file…"), true, false).clicked() {
                 actions.push(GridAction::SaveValueToFile { row, col, extension: ext.to_string() });

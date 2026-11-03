@@ -12,6 +12,7 @@ pub enum MenuAction {
     Quit,
     NewConnection,
     ImportConnections,
+    ExportConnections,
     NewDatabase,
     NewSchema,
     DisconnectAll,

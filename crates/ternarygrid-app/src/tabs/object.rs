@@ -33,8 +33,6 @@ pub struct ObjectEditorTab {
     pub obj: ObjectRef,
     pub page: ObjectPage,
     table_page: TablePage,
-    /// The page tab that opened the properties (Columns, Indexes), underlined instead of Properties.
-    via: Option<TablePage>,
     props: Loadable<Vec<Property>>,
     table: Loadable<Arc<TableDef>>,
     ddl: Loadable<String>,
@@ -59,7 +57,6 @@ impl ObjectEditorTab {
             obj,
             page,
             table_page: TablePage::Columns,
-            via: None,
             props: Loadable::NotLoaded,
             table: Loadable::NotLoaded,
             ddl: Loadable::NotLoaded,
@@ -149,7 +146,6 @@ impl ObjectEditorTab {
             for (page, label, n) in sub_pages {
                 if pill_tab(ui, label, n.as_deref(), self.table_page == page).clicked() {
                     self.table_page = page;
-                    self.via = None;
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -185,15 +181,26 @@ impl ObjectEditorTab {
         }
         let Some(t) = self.table.get().cloned() else { return };
         let fmt_cols = |c: &[String]| c.join(", ");
+        // A name some rows lack: "(unnamed)", faint (a page where none has one drops the column).
+        let some_names = |names: &[Option<String>]| names.iter().any(|n| n.as_deref().is_some_and(|n| !n.is_empty()));
+        let name_or_unset = |n: &Option<String>| n.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| widgets::unset(tr("(unnamed)")));
         match self.table_page {
             TablePage::Columns => {
+                let fk_columns: Vec<&str> = t.foreign_keys.iter().flat_map(|fk| fk.columns.iter().map(String::as_str)).collect();
                 let rows: Vec<Vec<String>> = t
                     .columns
                     .iter()
                     .map(|c| {
                         vec![
                             c.ordinal.to_string(),
-                            if t.is_pk_column(&c.name) { format!("{} {}", icon::KEY, c.name) } else { c.name.clone() },
+                            // The key of primary key columns, the link of foreign key ones (as the grid's header).
+                            if t.is_pk_column(&c.name) {
+                                format!("{} {}", icon::KEY, c.name)
+                            } else if fk_columns.contains(&c.name.as_str()) {
+                                format!("{} {}", icon::LINK_SIMPLE, c.name)
+                            } else {
+                                c.name.clone()
+                            },
                             // In lower case, as the mockups (and the grid's header) write types.
                             c.data_type.to_lowercase(),
                             if c.nullable { String::new() } else { "NOT NULL".into() },
@@ -205,43 +212,60 @@ impl ObjectEditorTab {
                     })
                     .collect();
                 use widgets::CellStyle as S;
-                let r = widgets::styled_table_widths(
-                    ui,
-                    "obj_cols",
+                // The columns empty in every row (no collations, no comments) are left out.
+                let (headers, rows, styles, widths) = drop_empty_columns(
                     &["#", tr("Name"), tr("Type"), tr("Null"), tr("Default"), tr("Auto"), tr("Collation"), tr("Comment")],
-                    &rows,
-                    self.selected_row,
+                    rows,
                     &[S::Faint, S::Plain, S::Mono, S::Muted, S::MonoMuted, S::Ok, S::Muted, S::Muted],
                     &[-40.0, 1.2, 1.0, 0.8, 1.4, 0.4, 0.6, 1.6],
+                    3,
                 );
+                let r = widgets::styled_table_widths(ui, "obj_cols", &headers, &rows, self.selected_row, &styles, &widths);
                 if let Some(i) = r.clicked {
                     self.selected_row = Some(i);
                 }
             }
             TablePage::Constraints => {
+                let names: Vec<Option<String>> =
+                    t.primary_key.iter().map(|k| k.name.clone()).chain(t.unique_keys.iter().map(|u| u.name.clone())).chain(t.checks.iter().map(|c| c.name.clone())).collect();
+                let named = some_names(&names);
                 let mut rows = Vec::new();
                 if let Some(pk) = &t.primary_key {
-                    rows.push(vec![pk.name.clone().unwrap_or_default(), "PRIMARY KEY".into(), fmt_cols(&pk.columns)]);
+                    rows.push(vec![name_or_unset(&pk.name), "PRIMARY KEY".into(), fmt_cols(&pk.columns)]);
                 }
                 for u in &t.unique_keys {
-                    rows.push(vec![u.name.clone().unwrap_or_default(), "UNIQUE".into(), fmt_cols(&u.columns)]);
+                    rows.push(vec![name_or_unset(&u.name), "UNIQUE".into(), fmt_cols(&u.columns)]);
                 }
                 for c in &t.checks {
-                    rows.push(vec![c.name.clone().unwrap_or_default(), "CHECK".into(), c.expression.clone()]);
+                    rows.push(vec![name_or_unset(&c.name), "CHECK".into(), c.expression.clone()]);
                 }
                 use widgets::CellStyle as S;
-                widgets::styled_table_widths(ui, "obj_cons", &[tr("Name"), tr("Type"), tr("Definition")], &rows, None, &[S::Plain, S::Chip, S::Mono], &[1.0, 0.7, 3.0]);
+                if named {
+                    widgets::styled_table_widths(ui, "obj_cons", &[tr("Name"), tr("Type"), tr("Definition")], &rows, None, &[S::Plain, S::Chip, S::Mono], &[1.0, 0.7, 3.0]);
+                } else {
+                    // No constraint has a name (SQLite's): the kind and the definition only.
+                    let rows: Vec<Vec<String>> = rows.into_iter().map(|r| r[1..].to_vec()).collect();
+                    widgets::styled_table_widths(ui, "obj_cons", &[tr("Type"), tr("Definition")], &rows, None, &[S::Chip, S::Mono], &[-140.0, 1.0]);
+                }
             }
             TablePage::ForeignKeys | TablePage::References => {
                 let list = if self.table_page == TablePage::ForeignKeys { &t.foreign_keys } else { &t.referenced_by };
+                let incoming = self.table_page == TablePage::References;
+                let names: Vec<Option<String>> = list.iter().map(|fk| fk.name.clone()).collect();
+                let named = some_names(&names);
                 let rows: Vec<Vec<String>> = list
                     .iter()
                     .map(|fk| {
                         vec![
-                            fk.name.clone().unwrap_or_default(),
-                            if self.table_page == TablePage::References { format!("{}.{}", fk.schema.clone().unwrap_or_default(), fk.table) } else { String::new() },
+                            if named { name_or_unset(&fk.name) } else { String::new() },
+                            // The referencing table (References), the referenced one (Foreign keys):
+                            // the other one is this table, said once by the page.
+                            if incoming {
+                                format!("{}{}", fk.schema.as_ref().map(|s| format!("{s}.")).unwrap_or_default(), fk.table)
+                            } else {
+                                format!("{}{}", fk.ref_schema.as_ref().map(|s| format!("{s}.")).unwrap_or_default(), fk.ref_table)
+                            },
                             fmt_cols(&fk.columns),
-                            format!("{}{}", fk.ref_schema.as_ref().map(|s| format!("{s}.")).unwrap_or_default(), fk.ref_table),
                             fmt_cols(&fk.ref_columns),
                             fk.on_update.sql().to_string(),
                             fk.on_delete.sql().to_string(),
@@ -249,15 +273,15 @@ impl ObjectEditorTab {
                     })
                     .collect();
                 use widgets::CellStyle as S;
-                let r = widgets::styled_table_widths(
-                    ui,
-                    "obj_fks",
-                    &[tr("Name"), tr("Table"), tr("Columns"), tr("References"), tr("Referenced columns"), tr("On update"), tr("On delete")],
-                    &rows,
-                    None,
-                    &[S::Plain, S::Plain, S::Mono, S::Plain, S::Mono, S::Plain, S::Plain],
-                    &[1.6, 1.0, 1.0, 1.1, 1.0, 0.8, 0.8],
+                let table_label = if incoming { tr("Table") } else { tr("References") };
+                let (headers, rows, styles, widths) = drop_empty_columns(
+                    &[tr("Name"), table_label, tr("Columns"), tr("Referenced columns"), tr("On update"), tr("On delete")],
+                    rows,
+                    &[S::Plain, S::Plain, S::Mono, S::Mono, S::Plain, S::Plain],
+                    &[1.6, 1.1, 1.0, 1.0, 0.8, 0.8],
+                    0,
                 );
+                let r = widgets::styled_table_widths(ui, "obj_fks", &headers, &rows, None, &styles, &widths);
                 if let Some(i) = r.double_clicked
                     && let Some(fk) = list.get(i)
                 {
@@ -292,15 +316,15 @@ impl ObjectEditorTab {
                     })
                     .collect();
                 use widgets::CellStyle as S;
-                widgets::styled_table_widths(
-                    ui,
-                    "obj_idx",
+                // Without the columns no index fills (SQLite's methods).
+                let (headers, rows, styles, widths) = drop_empty_columns(
                     &[tr("Name"), tr("Kind"), tr("Method"), tr("Columns"), tr("Predicate"), tr("Definition")],
-                    &rows,
-                    None,
+                    rows,
                     &[S::Plain, S::Chip, S::Plain, S::Mono, S::Mono, S::MonoMuted],
                     &[1.2, 0.7, 0.5, 1.0, 1.0, 2.6],
+                    1,
                 );
+                widgets::styled_table_widths(ui, "obj_idx", &headers, &rows, None, &styles, &widths);
             }
             TablePage::Triggers => {
                 let rows: Vec<Vec<String>> = t
@@ -318,15 +342,14 @@ impl ObjectEditorTab {
                     })
                     .collect();
                 use widgets::CellStyle as S;
-                widgets::styled_table_widths(
-                    ui,
-                    "obj_trg",
+                let (headers, rows, styles, widths) = drop_empty_columns(
                     &[tr("Name"), tr("Timing"), tr("Events"), tr("Level"), tr("Enabled"), tr("Definition")],
-                    &rows,
-                    None,
+                    rows,
                     &[S::Plain, S::Plain, S::Plain, S::Plain, S::Ok, S::MonoMuted],
                     &[1.3, 0.6, 0.8, 0.6, 0.6, 2.4],
+                    1,
                 );
+                widgets::styled_table_widths(ui, "obj_trg", &headers, &rows, None, &styles, &widths);
             }
             TablePage::VirtualModel => {
                 let key = ternarygrid_config::project::VirtualTableKey::of(&self.obj);
@@ -341,6 +364,8 @@ impl ObjectEditorTab {
                 ui.add_space(4.0);
                 group(ui, Some(tr("Virtual key")), Some(tr("Columns that identify a row when the table has no primary or unique key.")), |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        // 20 between the check boxes: each one's box with its own name.
+                        ui.spacing_mut().item_spacing.x = 20.0;
                         let mut keys = vt.virtual_key.clone().unwrap_or_default();
                         for c in &t.columns {
                             let mut on = keys.contains(&c.name);
@@ -358,6 +383,7 @@ impl ObjectEditorTab {
                 ui.add_space(8.0);
                 group(ui, Some(tr("Dictionary")), Some(tr("When other tables reference this one, show these columns next to the key.")), |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 20.0;
                         let mut cols = vt.dictionary.clone().map(|d| d.description_columns).unwrap_or_default();
                         for c in &t.columns {
                             let mut on = cols.contains(&c.name);
@@ -375,20 +401,38 @@ impl ObjectEditorTab {
                 ui.add_space(8.0);
                 let mut remove = None;
                 let new_vcol = &mut self.new_vcol;
-                group(ui, Some(tr("Virtual columns")), None, |ui| {
-                    egui::Grid::new("vcols").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
-                        for (i, c) in vt.virtual_columns.iter_mut().enumerate() {
-                            ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(140.0));
-                            ui.add(egui::TextEdit::singleline(&mut c.expression).desired_width(320.0).code_editor());
-                            if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, 24.0).clicked() {
+                // A numeric column of this table for the expression's example.
+                let measure = t.columns.iter().find(|c| is_amount_type(&c.data_type) && !ternarygrid_grid::format::is_identifier_name(&c.name)).map(|c| c.name.clone());
+                let hint = match &measure {
+                    Some(m) => ternarygrid_core::trf("Expression, e.g. {} * 1.1", &[m]),
+                    None => tr("Expression, e.g. upper(name)").to_string(),
+                };
+                group(ui, Some(tr("Virtual columns")), Some(tr("Computed on the client from each row's values.")), |ui| {
+                    // Fields of fixed widths (not egui's grid, whose cells keep the last frame's width).
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    let (name_w, expr_w, h) = (180.0, 380.0, ternarygrid_ui::style::SMALL_H);
+                    let faint = ternarygrid_ui::pal(ui).text_faint;
+                    fn field<'t>(text: &'t mut String, hint: &str, mono: bool, faint: egui::Color32) -> egui::TextEdit<'t> {
+                        let te =
+                            egui::TextEdit::singleline(text).vertical_align(egui::Align::Center).margin(egui::Margin::symmetric(8, 0)).hint_text(RichText::new(hint).color(faint));
+                        if mono { te.font(egui::TextStyle::Monospace) } else { te }
+                    }
+                    for (i, c) in vt.virtual_columns.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.add_sized([name_w, h], field(&mut c.name, "", false, faint));
+                            ui.add_sized([expr_w, h], field(&mut c.expression, "", true, faint));
+                            if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, h).clicked() {
                                 remove = Some(i);
                             }
-                            ui.end_row();
-                        }
-                        ui.add(egui::TextEdit::singleline(&mut new_vcol.0).hint_text(tr("name")).desired_width(180.0));
-                        ui.add(egui::TextEdit::singleline(&mut new_vcol.1).hint_text(tr("expression, e.g. price * quantity")).desired_width(380.0).code_editor());
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.add_sized([name_w, h], field(&mut new_vcol.0, tr("Name"), false, faint));
+                        ui.add_sized([expr_w, h], field(&mut new_vcol.1, &hint, true, faint));
                         let ready = !new_vcol.0.trim().is_empty() && !new_vcol.1.trim().is_empty();
-                        if ui.add_enabled_ui(ready, |ui| kit::icon_button_ex(ui, icon::PLUS, tr("Add"), false, 24.0).clicked()).inner {
+                        if ui.add_enabled_ui(ready, |ui| kit::button_full(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add column"), true, false).clicked()).inner {
                             vt.virtual_columns.push(ternarygrid_config::project::VirtualColumn {
                                 name: new_vcol.0.trim().to_string(),
                                 expression: new_vcol.1.trim().to_string(),
@@ -396,14 +440,13 @@ impl ObjectEditorTab {
                             });
                             *new_vcol = (String::new(), String::new());
                         }
-                        ui.end_row();
-                    })
+                    });
                 });
                 if let Some(i) = remove {
                     vt.virtual_columns.remove(i);
                 }
                 ui.add_space(10.0);
-                if kit::primary_icon(ui, icon::FLOPPY_DISK, tr("Save virtual model")).clicked()
+                if kit::primary_icon(ui, icon::CHECK, tr("Save virtual model")).clicked()
                     && let Some(p) = projects
                 {
                     let mut vm = p.virtual_model(&self.conn).unwrap_or_default();
@@ -439,8 +482,9 @@ impl ObjectEditorTab {
         let mut retry = false;
         if widgets::load_state(ui, &self.ddl, &mut retry) {
             // Formatted or as the database returns it (SQLite: as typed), shared by all tabs.
+            // Formatted by default (a CREATE TABLE on one line is unreadable); off shows it as stored.
             let format_id = egui::Id::new("ddl_formatted");
-            let mut formatted = ui.data(|d| d.get_temp::<bool>(format_id)).unwrap_or(false);
+            let mut formatted = ui.data(|d| d.get_temp::<bool>(format_id)).unwrap_or(true);
             let raw = self.ddl.get().cloned().unwrap_or_default();
             let text = match cx.conns.live(&self.conn).filter(|_| formatted) {
                 Some(live) => {
@@ -469,8 +513,12 @@ impl ObjectEditorTab {
                     if kit::button_full(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), true, false).clicked() {
                         ui.ctx().copy_text(text.clone());
                     }
-                    if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TEXT_AA), tr("Format"), true, formatted)
-                        .on_hover_text(tr("Show the DDL formatted with the SQL editor's formatter settings"))
+                    if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TEXT_INDENT), tr("Format"), true, formatted)
+                        .on_hover_text(if formatted {
+                            tr("Formatted with the SQL editor's formatter settings: click to see the DDL as the database stores it")
+                        } else {
+                            tr("Show the DDL formatted with the SQL editor's formatter settings")
+                        })
                         .clicked()
                     {
                         formatted = !formatted;
@@ -607,37 +655,25 @@ impl ObjectEditorTab {
     }
 
     /// The pages of the header, 20 apart as in the mockups' table data page.
+    /// Columns, indexes … are the Properties page's own sub pages (with their counts), not pages
+    /// of the header too: one route to each.
     fn pages_ui(&mut self, ui: &mut Ui) {
         ui.spacing_mut().item_spacing.x = 20.0;
-        let def = self.table.get().cloned();
-        let count = |n: Option<usize>| n.filter(|n| *n > 0).map(|n| n.to_string());
-        let mut pages: Vec<(ObjectPage, Option<TablePage>, &str, Option<String>)> = vec![(ObjectPage::Properties, None, tr("Properties"), None)];
+        let mut pages: Vec<(ObjectPage, &str)> = vec![(ObjectPage::Properties, tr("Properties"))];
         if self.obj.kind.has_data() {
-            pages.push((ObjectPage::Data, None, tr("Data"), None));
+            pages.push((ObjectPage::Data, tr("Data")));
         }
-        pages.push((ObjectPage::Ddl, None, tr("DDL"), None));
-        if def.is_some() {
-            pages.push((ObjectPage::Properties, Some(TablePage::Columns), tr("Columns"), count(def.as_ref().map(|t| t.columns.len()))));
-            if self.obj.kind.is_table_like() {
-                pages.push((ObjectPage::Properties, Some(TablePage::Indexes), tr("Indexes"), count(def.as_ref().map(|t| t.indexes.len()))));
-            }
-        }
-        pages.push((ObjectPage::Dependencies, None, tr("Dependencies"), None));
+        pages.push((ObjectPage::Ddl, tr("DDL")));
+        pages.push((ObjectPage::Dependencies, tr("Dependencies")));
         if self.obj.kind.has_data() {
-            pages.push((ObjectPage::Statistics, None, tr("Statistics"), None));
+            pages.push((ObjectPage::Statistics, tr("Statistics")));
         }
         if self.obj.kind.is_table_like() {
-            pages.push((ObjectPage::Diagram, None, tr("ER diagram"), None));
+            pages.push((ObjectPage::Diagram, tr("ER diagram")));
         }
-        for (page, sub, label, n) in pages {
-            // Columns and Indexes are the property pages of those names, one click away.
-            let selected = self.page == page && (page != ObjectPage::Properties || self.via == sub && sub.is_none_or(|s| s == self.table_page));
-            if kit::underline_tab(ui, None, label, n.as_deref(), selected, HEADER_H).clicked() {
+        for (page, label) in pages {
+            if kit::underline_tab(ui, None, label, None, self.page == page, HEADER_H).clicked() {
                 self.page = page;
-                self.via = sub;
-                if let Some(s) = sub {
-                    self.table_page = s;
-                }
             }
         }
     }
@@ -754,6 +790,27 @@ impl TabView for ObjectEditorTab {
     }
 
     crate::impl_tab_any!();
+}
+
+/// A numeric column type (`numeric(10,2)`, `real`, `int4` …), for an expression's example.
+fn is_amount_type(data_type: &str) -> bool {
+    let t = data_type.to_ascii_lowercase();
+    ["numeric", "decimal", "real", "float", "double", "money", "int"].iter().any(|k| t.contains(k))
+}
+
+/// A table's columns without those empty in every row (from `keep` on: the first `keep` stay).
+type Table<'a> = (Vec<&'a str>, Vec<Vec<String>>, Vec<widgets::CellStyle>, Vec<f32>);
+fn drop_empty_columns<'a>(headers: &[&'a str], rows: Vec<Vec<String>>, styles: &[widgets::CellStyle], widths: &[f32], keep: usize) -> Table<'a> {
+    let used: Vec<bool> = (0..headers.len()).map(|i| i < keep || rows.iter().any(|r| r.get(i).is_some_and(|c| !c.is_empty()))).collect();
+    let pick = |i: &usize| used[*i];
+    let idx: Vec<usize> = (0..headers.len()).filter(pick).collect();
+    let rows = rows.into_iter().map(|r| idx.iter().map(|&i| r.get(i).cloned().unwrap_or_default()).collect()).collect();
+    (
+        idx.iter().map(|&i| headers[i]).collect(),
+        rows,
+        idx.iter().map(|&i| styles.get(i).copied().unwrap_or_default()).collect(),
+        idx.iter().filter_map(|&i| widths.get(i).copied()).collect(),
+    )
 }
 
 /// The SQL colours of a DDL text, worked out once per text.

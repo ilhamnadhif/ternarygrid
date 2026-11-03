@@ -25,7 +25,13 @@ pub(crate) fn note_with(ui: &mut Ui, tone: parts::Tone, title: Option<&str>, bod
 
 /// [`note_with`] without extra content.
 pub(crate) fn note(ui: &mut Ui, tone: parts::Tone, title: Option<&str>, body: &str) -> Response {
-    parts::callout(ui, tone, title, body, |_| {})
+    // Without actions the kit's callout still spaces them (10 points past the row's end):
+    // laid out 10 narrower, it ends where the fields above it end.
+    ui.scope(|ui| {
+        ui.set_max_width((ui.available_width() - 10.0).max(0.0));
+        parts::callout(ui, tone, title, body, |_| {})
+    })
+    .inner
 }
 
 /// An error note.
@@ -158,31 +164,39 @@ pub(crate) fn chip(ui: &mut Ui, text: &str) -> Response {
     resp
 }
 
-/// The two-letter logo of a database kind on its brand colour.
+/// The logo of a database kind, as the navigator shows it.
 pub(crate) fn logo(ui: &mut Ui, kind: ternarygrid_core::DbKind, size: f32) -> Response {
-    use ternarygrid_core::DbKind as K;
-    let label = match kind {
-        K::Postgres => "Pg",
-        K::CockroachDb => "Cr",
-        K::MySql => "My",
-        K::MariaDb => "Ma",
-        K::Sqlite => "Lt",
-        K::SqlServer => "Ms",
-        K::ClickHouse => "Ch",
-        K::Oracle => "Or",
-        K::Cassandra => "Ca",
-        K::Redis => "Rd",
-        K::MongoDb => "Mg",
-        K::Elasticsearch => "Es",
-        K::Neo4j => "N4",
-        K::Generic => "Db",
-    };
-    let bg = crate::theme::brand_color(kind);
-    let fg = crate::theme::legible_on(Color32::WHITE, bg);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(4), bg);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, style::semibold(ui.ctx(), (size * 0.5).round()), fg);
-    resp
+    crate::dialogs::db_logo(ui, kind, size)
+}
+
+/// Size of the logo inside a connection picker, and the room it takes before the name.
+const COMBO_LOGO: f32 = 15.0;
+const COMBO_LOGO_GAP: f32 = 7.0;
+
+/// The selected text of a connection picker with room for its logo before it (see
+/// [`paint_combo_logo`]); without a logo the text as it is.
+pub(crate) fn logo_text(ui: &Ui, text: &str, kind: Option<ternarygrid_core::DbKind>, color: Color32) -> egui::WidgetText {
+    let format = egui::TextFormat { font_id: FontId::proportional(style::body_size(ui.ctx())), color, ..Default::default() };
+    let lead = if kind.is_some() { COMBO_LOGO + COMBO_LOGO_GAP } else { 0.0 };
+    let mut job = LayoutJob::default();
+    job.append(text, lead, format);
+    job.into()
+}
+
+/// The logo of `kind` inside the picker `combo` (a combo box's button), where [`logo_text`]
+/// left room for it.
+pub(crate) fn paint_combo_logo(ui: &Ui, combo: &Response, kind: Option<ternarygrid_core::DbKind>) {
+    let Some(kind) = kind else { return };
+    let r = combo.rect;
+    let at = Rect::from_center_size(pos2(r.left() + ui.spacing().button_padding.x + COMBO_LOGO / 2.0, r.center().y), Vec2::splat(COMBO_LOGO));
+    let color = crate::theme::logo_color(kind, ui.visuals().dark_mode);
+    let painter = ui.painter();
+    match crate::dblogo::image(ui.ctx(), kind, COMBO_LOGO, color) {
+        Some(img) => img.paint_at(ui, at),
+        None => {
+            painter.text(at.center(), Align2::CENTER_CENTER, crate::nav::db_icon(kind), FontId::proportional(COMBO_LOGO), color);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -227,15 +241,27 @@ pub(crate) fn code_block(ui: &mut Ui, lang: Option<&crate::sqllang::SqlLanguage>
         ui.set_width(ui.available_width());
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
+            let number_w = if gutter { 32.0 + 14.0 } else { 0.0 };
+            ui.add_space(number_w);
+            // Wrapped at the frame's width; a long line wraps under itself, its number once.
+            job.wrap.max_width = ui.available_width();
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            let label = ui.add(egui::Label::new(galley.clone()).selectable(true));
             if gutter {
-                let numbers = (1..=text.lines().count().max(1)).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
-                ui.allocate_ui_with_layout(vec2(32.0, 0.0), Layout::top_down(Align::Max), |ui| {
-                    ui.set_width(32.0);
-                    ui.label(RichText::new(numbers).font(mono(12.5)).line_height(Some(20.0)).color(p.text_faint));
-                });
-                ui.add_space(14.0);
+                let mut new_line = true;
+                let mut n = 0;
+                for row in &galley.rows {
+                    if new_line {
+                        n += 1;
+                        // In the text's font on its 20 point lines: on the row's baseline.
+                        let format = egui::TextFormat { font_id: mono(12.5), color: p.text_faint, line_height: Some(20.0), ..Default::default() };
+                        let number = ui.fonts_mut(|f| f.layout_job(LayoutJob::single_section(n.to_string(), format)));
+                        let at = pos2(label.rect.left() - 14.0 - number.size().x, label.rect.top() + row.pos.y);
+                        ui.painter().galley(at, number, p.text_faint);
+                    }
+                    new_line = row.ends_with_newline;
+                }
             }
-            ui.add(egui::Label::new(job).wrap().selectable(true));
         });
     });
 }
@@ -337,13 +363,36 @@ pub(crate) fn body<R>(ui: &mut Ui, id: impl Hash + std::fmt::Debug, add: impl Fn
 
 fn body_dyn(ui: &mut Ui, id: Id, add: &mut dyn FnMut(&mut Ui)) {
     egui::CentralPanel::default().frame(Frame::new()).show(ui, |ui| {
-        egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
+        // In a child of exactly the panel's size: content a little too wide is clipped instead
+        // of widening the window (which would widen it again the next frame).
+        let rect = ui.available_rect_before_wrap();
+        let mut body = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
+        body.set_clip_rect(rect.intersect(ui.clip_rect()));
+        let out = egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(&mut body, |ui| {
             Frame::new().inner_margin(BODY).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
                 add(ui);
             });
         });
+        ui.advance_cursor_after_rect(rect);
+        // In a tool window: how much taller (or shorter) the body wants to be; the window fits
+        // its content (`take_fit`).
+        let layer = ui.layer_id();
+        if layer.order != egui::Order::Background {
+            let delta = out.content_size.y - out.inner_rect.height();
+            ui.ctx().data_mut(|d| d.insert_temp(fit_key(layer), delta));
+        }
     });
+}
+
+fn fit_key(layer: egui::LayerId) -> Id {
+    Id::new(("ternarygrid_tool_fit", layer))
+}
+
+/// How many points the body of the tool window on `layer` lacked (positive) or had to spare
+/// (negative) in the frame just drawn; `None` when the window has no [`body`].
+pub(crate) fn take_fit(ctx: &egui::Context, layer: egui::LayerId) -> Option<f32> {
+    ctx.data_mut(|d| d.remove_temp::<f32>(fit_key(layer)))
 }
 
 /// A hairline across `ui`, as far from the parts above and below as they are from each other
@@ -392,29 +441,6 @@ pub(crate) fn row_top<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnc
     out
 }
 
-/// A level from 0 to `max` as the design's 6 pt progress bar, `width` wide: a click or a drag
-/// sets it (and `on`), a double click turns it off (the bar then shows faint). True on a change.
-pub(crate) fn level_bar(ui: &mut Ui, label: &str, on: &mut bool, value: &mut u8, max: u8, width: f32) -> bool {
-    let p = style::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 14.0), Sense::click_and_drag());
-    let mut changed = false;
-    if resp.double_clicked() {
-        *on = false;
-        changed = true;
-    } else if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
-        let v = (((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * max as f32).round() as u8;
-        changed = !*on || v != *value;
-        (*on, *value) = (true, v);
-    }
-    resp.widget_info(|| WidgetInfo::slider(ui.is_enabled(), *value as f64, label));
-    let track = Rect::from_center_size(rect.center(), vec2(width, 6.0));
-    ui.painter().rect_filled(track, CornerRadius::same(3), p.subtle);
-    let fill = Rect::from_min_size(track.min, vec2(width * *value as f32 / max.max(1) as f32, 6.0));
-    let color = if *on && ui.is_enabled() { p.accent } else { p.border_strong };
-    ui.painter().rect_filled(fill, CornerRadius::same(3), color);
-    changed
-}
-
 /// A single-line text field filling `width` (`f32::INFINITY`: the rest of the row).
 pub(crate) fn field(ui: &mut Ui, value: &mut String, hint: &str, width: f32, mono_font: bool) -> Response {
     let p = style::pal(ui);
@@ -444,6 +470,8 @@ pub(crate) struct Cell {
     pub glyph: Option<(&'static str, Color32)>,
     pub job: Option<LayoutJob>,
     pub hover: Option<String>,
+    /// Drawn as a pill in this colour (states: granted, waiting).
+    pub pill: Option<Color32>,
 }
 
 impl Cell {
@@ -470,6 +498,10 @@ impl Cell {
         self.hover = Some(text.into());
         self
     }
+    pub(crate) fn pill(mut self, c: Color32) -> Self {
+        self.pill = Some(c);
+        self
+    }
 }
 
 const CELL_PAD: f32 = 10.0;
@@ -482,7 +514,7 @@ fn cell_width(ui: &Ui, c: &Cell) -> f32 {
         Some(j) => ui.fonts_mut(|f| f.layout_job(j.clone()).size().x),
         None => ui.painter().layout_no_wrap(first.chars().take(120).collect(), font, Color32::PLACEHOLDER).size().x,
     };
-    w + c.glyph.map_or(0.0, |_| 18.0)
+    w + c.glyph.map_or(0.0, |_| 18.0) + c.pill.map_or(0.0, |_| 14.0)
 }
 
 fn paint_cell(ui: &mut Ui, c: &Cell, header: bool) {
@@ -496,6 +528,8 @@ fn paint_cell(ui: &mut Ui, c: &Cell, header: bool) {
     // Headers and strong cells in the design's semibold (clipped by the cell).
     let resp = if let Some(j) = &c.job {
         ui.add(egui::Label::new(j.clone()).truncate().selectable(false))
+    } else if let Some(color) = c.pill {
+        kit::pill(ui, &first, color)
     } else if header {
         kit::semibold_label(ui, &first, 12.0, c.color.unwrap_or(p.text_muted))
     } else if c.strong {
@@ -702,14 +736,15 @@ pub(crate) fn null_cell(ui: &Ui, text: String) -> Cell {
     Cell::new(text.clone()).job(LayoutJob::single_section(text, format))
 }
 
-/// A "before → after" text: both semibold, the arrow faint.
+/// A "now → after" text: the current value muted and struck through, the arrow faint, the
+/// value it becomes in semibold (a cell a sync script changes).
 pub(crate) fn change_job(ui: &Ui, before: &str, after: &str) -> LayoutJob {
     let p = style::pal(ui);
-    let font = style::semibold(ui.ctx(), style::body_size(ui.ctx()));
+    let size = style::body_size(ui.ctx());
     let mut job = LayoutJob::default();
-    let fmt = |c: Color32| egui::TextFormat { font_id: font.clone(), color: c, ..Default::default() };
-    job.append(before, 0.0, fmt(p.text));
-    job.append(" → ", 0.0, fmt(p.text_faint));
-    job.append(after, 0.0, fmt(p.text));
+    let now = egui::TextFormat { font_id: FontId::proportional(size), color: p.text_muted, strikethrough: Stroke::new(1.0, p.text_muted), ..Default::default() };
+    job.append(before, 0.0, now);
+    job.append(" → ", 0.0, egui::TextFormat { font_id: FontId::proportional(size), color: p.text_faint, ..Default::default() });
+    job.append(after, 0.0, egui::TextFormat { font_id: style::semibold(ui.ctx(), size), color: p.text, ..Default::default() });
     job
 }

@@ -1,6 +1,6 @@
 //! Master password dialog of the encrypted secret vault (FR-C4).
 
-use super::{add_field, text_field};
+use super::{add_field_ex, field_error, text_field};
 use crate::backend::Job;
 use crate::cx::AppContext;
 use egui::{Id, RichText};
@@ -8,7 +8,7 @@ use egui_phosphor::regular as icon;
 use std::cell::Cell;
 use ternarygrid_core::{DbError, DbResult, Secret, tr};
 use ternarygrid_ui::kit::{self, Kind};
-use ternarygrid_ui::parts::{self, Dialog};
+use ternarygrid_ui::parts::{self, Dialog, Tone};
 use ternarygrid_ui::style;
 
 /// A secret could not be written because the vault locked itself (its master
@@ -28,7 +28,8 @@ pub struct VaultDialog {
     password: String,
     confirm: String,
     job: Option<Job<DbResult<()>>>,
-    error: Option<String>,
+    /// Why the password was refused, under the master password (`false`) or its repetition.
+    error: Option<(bool, String)>,
     /// "Skip" (or closed): connections ask for their passwords instead of the vault.
     pub skipped: bool,
 }
@@ -54,7 +55,7 @@ impl VaultDialog {
                     *open = false;
                     return;
                 }
-                Err(e) => self.error = Some(e.message),
+                Err(e) => self.error = Some((false, e.message)),
             }
         }
         let create = !vault.exists();
@@ -63,19 +64,16 @@ impl VaultDialog {
         let skip = Cell::new(false);
         let title = if create { tr("Create the password vault") } else { tr("Unlock saved passwords") };
         let error = self.error.clone();
-        let (resp, _) = Dialog::new(title).icon(icon::LOCK_SIMPLE).width(if create { 460.0 } else { 440.0 }).body_padding(super::BODY).show_modal(
+        let on_repeat = error.as_ref().is_some_and(|(repeat, _)| *repeat);
+        let (resp, _) = Dialog::new(title).icon(icon::LOCK_SIMPLE).width(super::WIDTH_S).body_padding(super::BODY).show_modal(
             ctx,
             Id::new("vault_unlock"),
             |ui| {
-                super::form_spacing(ui, if create { 12.0 } else { 14.0 });
+                super::form_spacing(ui, 14.0);
                 let text = RichText::new(tr("Saved passwords are kept in a file encrypted with your master password.")).color(style::pal(ui).text_muted);
-                if create {
-                    ui.add(egui::Label::new(text).wrap());
-                } else {
-                    super::label_lh(ui, text, egui::FontId::proportional(13.0), 1.45, false);
-                }
+                super::label_lh(ui, text, egui::FontId::proportional(13.0), 1.45, false);
                 let r = super::form_row(ui, tr("Master password"), |ui| {
-                    ui.add_enabled_ui(!busy, |ui| add_field(ui, text_field(&mut self.password, f32::INFINITY).password(true))).inner
+                    ui.add_enabled_ui(!busy, |ui| add_field_ex(ui, text_field(&mut self.password, f32::INFINITY).password(true), error.is_some() && !on_repeat)).inner
                 });
                 if !busy && self.password.is_empty() {
                     r.request_focus();
@@ -83,16 +81,20 @@ impl VaultDialog {
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !create {
                     submit.set(true);
                 }
+                if let Some((false, e)) = &error {
+                    field_error(ui, e);
+                }
                 if create {
                     let r = super::form_row(ui, tr("Repeat password"), |ui| {
-                        ui.add_enabled_ui(!busy, |ui| add_field(ui, text_field(&mut self.confirm, f32::INFINITY).password(true))).inner
+                        ui.add_enabled_ui(!busy, |ui| add_field_ex(ui, text_field(&mut self.confirm, f32::INFINITY).password(true), on_repeat)).inner
                     });
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         submit.set(true);
                     }
-                }
-                if let Some(e) = &error {
-                    crate::dialogs::error_note(ui, e);
+                    if let Some((true, e)) = &error {
+                        field_error(ui, e);
+                    }
+                    super::note(ui, Tone::Warning, tr("If you forget it, the saved passwords cannot be recovered."));
                 }
             },
             |ui| {
@@ -104,8 +106,8 @@ impl VaultDialog {
                     skip.set(true);
                 }
                 super::right(ui, |ui| {
-                    let label = if create { tr("Create") } else { tr("Unlock") };
-                    if kit::primary_icon(ui, icon::LOCK_SIMPLE, label).clicked() {
+                    let (label, glyph) = if create { (tr("Create"), icon::PLUS) } else { (tr("Unlock"), icon::LOCK_SIMPLE_OPEN) };
+                    if kit::primary_icon(ui, glyph, label).clicked() {
                         submit.set(true);
                     }
                 });
@@ -113,9 +115,9 @@ impl VaultDialog {
         );
         if submit.get() && !busy {
             if self.password.is_empty() {
-                self.error = Some(tr("Enter the master password.").to_string());
+                self.error = Some((false, tr("Enter the master password.").to_string()));
             } else if create && self.password != self.confirm {
-                self.error = Some(tr("The passwords do not match.").to_string());
+                self.error = Some((true, tr("The passwords do not match.").to_string()));
             } else {
                 let master = Secret::new(std::mem::take(&mut self.password));
                 self.confirm.clear();

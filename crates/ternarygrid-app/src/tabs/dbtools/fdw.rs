@@ -159,6 +159,8 @@ pub fn fdw_script(spec: &FdwSpec) -> Result<String, String> {
 
 /// The configurator tab of a PostgreSQL connection.
 pub struct FdwConfigTab {
+    /// Closed by Cancel (a pop-up).
+    done: bool,
     conn: String,
     source: Option<String>,
     spec: FdwSpec,
@@ -169,7 +171,7 @@ pub struct FdwConfigTab {
 
 impl FdwConfigTab {
     pub fn new(conn: String) -> Self {
-        FdwConfigTab { conn, source: None, spec: FdwSpec::default(), tables: String::new(), lang: None }
+        FdwConfigTab { done: false, conn, source: None, spec: FdwSpec::default(), tables: String::new(), lang: None }
     }
 
     /// Choose the source connection (fills the defaults).
@@ -182,11 +184,40 @@ impl FdwConfigTab {
     pub fn script(&self) -> Result<String, String> {
         fdw_script(&FdwSpec { tables: self.tables.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(), ..self.spec.clone() })
     }
+
+    /// The source connection picker across the row, its logo inside as in the navigator.
+    fn source_combo(&mut self, ui: &mut Ui, sources: &[ConnectionConfig], current: Option<&ConnectionConfig>) {
+        let p = ternarygrid_ui::pal(ui);
+        let width = ui.available_width();
+        let (text, color) = match current {
+            Some(c) => (format!("{} ({})", c.name, c.kind.display_name()), p.text),
+            None => (tr("Choose a connection…").to_string(), p.text_faint),
+        };
+        let kind = current.map(|c| c.kind);
+        let combo = egui::ComboBox::from_id_salt(("fdw_source", &self.conn))
+            .icon(ternarygrid_ui::kit::combo_caret)
+            .popup_style(egui::containers::menu::menu_style.into())
+            .selected_text(look::logo_text(ui, &text, kind, color))
+            .width(width)
+            .show_ui(ui, |ui| {
+                ternarygrid_ui::kit::menu_look(ui, width);
+                for c in sources {
+                    if crate::tabs::transfer::wizard::choice(ui, self.source.as_deref() == Some(&c.id), &format!("{} ({})", c.name, c.kind.display_name())) {
+                        self.set_source(c);
+                    }
+                }
+            });
+        look::paint_combo_logo(ui, &combo.response, kind);
+    }
 }
 
 impl TabView for FdwConfigTab {
+    fn take_done(&mut self) -> bool {
+        std::mem::take(&mut self.done)
+    }
+
     fn popup_size(&self) -> Option<egui::Vec2> {
-        // The design's window inside its border.
+        // The design's window inside its border (it then fits its content).
         Some(egui::vec2(860.0, 628.0))
     }
 
@@ -208,14 +239,33 @@ impl TabView for FdwConfigTab {
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let conn = self.conn.clone();
-        let p = ternarygrid_ui::pal(ui);
         if self.lang.is_none() {
             let dialect =
                 cx.conns.live(&self.conn).map(|l| l.dialect.clone()).or_else(|| cx.conns.config(&self.conn).and_then(|c| cx.conns.registry.get(c.kind)).map(|d| d.dialect()));
             self.lang = dialect.map(SqlLanguage::new);
         }
-        egui::Frame::new().inner_margin(look::BODY).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 12.0;
+        let script = self.script();
+        // Copy at the left; the script is opened in a SQL editor to run it (it asks for the password there).
+        look::footer(ui, ("fdw_footer", &conn), |ui| {
+            if ui.add_enabled_ui(script.is_ok(), |ui| kit::button_ex(ui, kit::Kind::Ghost, Some(icon::COPY), tr("Copy"), false)).inner.clicked()
+                && let Ok(s) = &script
+            {
+                ui.ctx().copy_text(s.clone());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled_ui(script.is_ok(), |ui| kit::primary_icon(ui, icon::FILE_SQL, tr("Open in SQL editor"))).inner.clicked()
+                    && let Ok(s) = &script
+                {
+                    let schema = cx.conns.config(&self.conn).and_then(|c| c.database.clone()).map(|d| SchemaRef { database: Some(d), schema: None });
+                    cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema, text: Some(s.clone()) });
+                    self.done = true;
+                }
+                if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                    self.done = true;
+                }
+            });
+        });
+        look::body(ui, ("fdw_body", &conn), |ui| {
             if !cx.popup {
                 look::title(ui, tr("Foreign data wrapper"));
             }
@@ -223,66 +273,20 @@ impl TabView for FdwConfigTab {
             let sources: Vec<ConnectionConfig> = cx.conns.configs().iter().filter(|c| c.id != self.conn && wrapper_of(c.kind).is_some()).cloned().collect();
             let current = self.source.as_ref().and_then(|id| sources.iter().find(|c| &c.id == id)).cloned();
             let lw = 150.0;
-            // The design's select box is 30 high, as the fields (the logo centred on it).
+            // Every control as high as the fields and as wide as the row.
             ui.spacing_mut().interact_size.y = ternarygrid_ui::style::CONTROL_H;
-            look::row(ui, tr("Source connection"), lw, |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                if let Some(c) = &current {
-                    look::logo(ui, c.kind, 15.0);
-                }
-                egui::ComboBox::from_id_salt(("fdw_source", &self.conn))
-                    .icon(ternarygrid_ui::kit::combo_caret)
-                    .popup_style(egui::containers::menu::menu_style.into())
-                    .selected_text(current.as_ref().map(|c| format!("{} ({})", c.name, c.kind.display_name())).unwrap_or_else(|| tr("(choose)").to_string()))
-                    .width(260.0)
-                    .show_ui(ui, |ui| {
-                        ternarygrid_ui::kit::menu_look(ui, 260.0);
-                        for c in &sources {
-                            if crate::tabs::transfer::wizard::choice(ui, self.source.as_deref() == Some(&c.id), &format!("{} ({})", c.name, c.kind.display_name())) {
-                                self.set_source(c);
-                            }
-                        }
-                    });
-            });
-            look::row(ui, tr("Server name"), lw, |ui| look::field(ui, &mut self.spec.server, "", 260.0, false));
-            look::row(ui, tr("Remote schema"), lw, |ui| look::field(ui, &mut self.spec.remote_schema, "", 200.0, false));
-            look::row(ui, tr("Local schema"), lw, |ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                look::field(ui, &mut self.spec.local_schema, "", 200.0, false);
-                look::checkbox(ui, &mut self.spec.create_local_schema, tr("Create it"));
-            });
+            look::row(ui, tr("Source connection"), lw, |ui| self.source_combo(ui, &sources, current.as_ref()));
+            look::row(ui, tr("Server name"), lw, |ui| look::field(ui, &mut self.spec.server, "", f32::INFINITY, false));
+            look::row(ui, tr("Remote schema"), lw, |ui| look::field(ui, &mut self.spec.remote_schema, "", f32::INFINITY, false));
+            look::row(ui, tr("Local schema"), lw, |ui| look::field(ui, &mut self.spec.local_schema, "", f32::INFINITY, false));
+            look::row_top(ui, "", lw, |ui| look::checkbox(ui, &mut self.spec.create_local_schema, tr("Create the local schema if it does not exist")));
             look::row(ui, tr("Tables"), lw, |ui| look::field(ui, &mut self.tables, tr("comma separated; empty = all"), f32::INFINITY, false));
-            ui.add_space(4.0);
-            // The buttons' row as high as they are (26).
-            ui.spacing_mut().interact_size.y = ternarygrid_ui::style::SMALL_H;
-            match self.script() {
-                Ok(script) => {
-                    ui.horizontal(|ui| {
-                        if look::small(ui, kit::Kind::Secondary, icon::FILE_SQL, tr("Open in SQL editor")).clicked() {
-                            let schema = cx.conns.config(&self.conn).and_then(|c| c.database.clone()).map(|d| SchemaRef { database: Some(d), schema: None });
-                            cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema, text: Some(script.clone()) });
-                        }
-                        if look::small(ui, kit::Kind::Ghost, icon::COPY, tr("Copy")).clicked() {
-                            ui.ctx().copy_text(script.clone());
-                        }
-                    });
-                    // 250 high as in the design (more when the window is made taller).
-                    let h = (ui.available_height() - 18.0).max(250.0);
-                    egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(8).show(ui, |ui| {
-                        ui.allocate_ui(egui::vec2(ui.available_width(), h - 2.0), |ui| match &self.lang {
-                            Some(lang) => {
-                                let theme = ternarygrid_editor::EditorTheme::from_visuals(ui.visuals());
-                                let options = look::code_options(13.0, 21.0);
-                                ternarygrid_editor::CodeView::new(&script, lang, &theme).options(&options).id_salt(("fdw_script", &conn)).show(ui);
-                            }
-                            None => {
-                                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| crate::tabs::code(ui, cx, &conn, ("fdw_script", &conn), &script));
-                            }
-                        });
-                    });
-                }
+            look::divider(ui);
+            look::title(ui, tr("Script"));
+            match &script {
+                Ok(s) => look::code_block(ui, self.lang.as_ref(), s.trim_end(), true),
                 Err(e) => {
-                    look::muted(ui, &e);
+                    look::muted(ui, e);
                 }
             }
         });

@@ -7,8 +7,7 @@ use crate::common::colors;
 use crate::common::format::{compact, grouped};
 use egui::{Align2, Color32, FontId, Mesh, Pos2, RichText, Sense, Shape, Stroke, Ui, Vec2, vec2};
 use egui_plot::{
-    Bar, BarChart, Corner, FilledArea, GridInput, GridMark, HoverPosition, Legend, Line, Plot,
-    PlotPoints, Points,
+    Bar, BarChart, FilledArea, GridInput, GridMark, HoverPosition, Line, Plot, PlotPoints, Points,
 };
 use std::f32::consts::TAU;
 use std::sync::Arc;
@@ -125,20 +124,33 @@ fn show_plot(ui: &mut Ui, data: &ChartData, config: &ChartConfig, state: &mut Ch
     let xf = XFormat::new(data);
     let id = ui.id().with("ternarygrid_chart_plot");
     let multi = data.series.len() > 1;
+    let pal = ternarygrid_ui::pal(ui);
+    // The legend above the plot (never over its points), in the series' order.
+    if multi {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(16.0, 4.0);
+            for (i, s) in data.series.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ternarygrid_ui::kit::dot(ui, series_color(i, s.is_other, dark), 4.0);
+                    ui.label(
+                        egui::RichText::new(&s.name)
+                            .size(12.5)
+                            .color(pal.text_muted),
+                    );
+                });
+            }
+        });
+        ui.add_space(6.0);
+    }
     let mut plot = Plot::new(id)
         .x_axis_label(data.x_label.clone())
         .y_axis_label(data.y_label.clone())
         .allow_scroll(false)
-        // Horizontal lines only, as the mockups' charts.
+        // Horizontal lines only, as the mockups' charts, in the lines' colour (not the text's).
         .show_grid([false, true])
+        .grid_color(pal.border)
         .y_axis_formatter(|m: GridMark, _r: &std::ops::RangeInclusive<f64>| compact(m.value, 2));
-    if multi {
-        plot = plot.legend(
-            Legend::default()
-                .position(Corner::RightTop)
-                .background_alpha(0.85),
-        );
-    }
     if state.reset_view {
         plot = plot.reset();
         state.reset_view = false;
@@ -219,7 +231,23 @@ fn show_plot(ui: &mut Ui, data: &ChartData, config: &ChartConfig, state: &mut Ch
 
     let stacked = config.stacked && config.kind.can_stack() && multi;
     let layers = if stacked { data.stacked() } else { Vec::new() };
+    // Values on both sides of zero: the zero line a little stronger than the grid.
+    let ys = data
+        .series
+        .iter()
+        .flat_map(|s| s.points.iter().map(|p| p[1]));
+    let (lo, hi) = ys.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), y| {
+        (lo.min(y), hi.max(y))
+    });
+    let zero_line = lo < 0.0 && hi > 0.0;
     plot.show(ui, |plot_ui| {
+        if zero_line {
+            plot_ui.hline(
+                egui_plot::HLine::new("", 0.0)
+                    .color(pal.border_strong)
+                    .width(1.0),
+            );
+        }
         for (i, s) in data.series.iter().enumerate() {
             let color = series_color(i, s.is_other, dark);
             let name = s.name.clone();
@@ -622,8 +650,9 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
         config.kind = ChartKind::ALL[i];
     }
 
-    // The mockup's rows: labels 60 wide, 16 from drop-downs 28 high that take the rest.
-    let lw = 60.0;
+    // The rows: labels 84 wide (the longest, "Max points" and "Aggregate", whole), 16 from
+    // drop-downs 28 high that take the rest.
+    let lw = 84.0;
     ui.spacing_mut().interact_size.y = 28.0;
     let width = (ui.available_width() - lw - 16.0).max(80.0);
     parts::form_row(ui, tr("X"), lw, |ui| {
@@ -706,7 +735,7 @@ pub fn chart_config_ui(ui: &mut Ui, columns: &[ColumnMeta], config: &mut ChartCo
     if config.kind == ChartKind::Pie {
         ternarygrid_ui::kit::checkbox(ui, &mut config.donut, tr("Donut"));
     }
-    parts::form_row(ui, tr("Max points"), 80.0, |ui| {
+    parts::form_row(ui, tr("Max points"), lw, |ui| {
         ui.add(
             egui::DragValue::new(&mut config.max_points)
                 .range(10..=1_000_000)

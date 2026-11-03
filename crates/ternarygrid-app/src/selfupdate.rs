@@ -15,7 +15,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 pub use crate::updates::{Asset, archive_name};
@@ -113,17 +113,20 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Downloads and checks the archive of `version`.
-pub fn download(version: &str, asset: &Asset, stage: &Arc<Mutex<Stage>>) -> Result<Prepared, String> {
+/// What [`download`] answers when `cancel` was set.
+pub const CANCELLED: &str = "the download was cancelled";
+
+/// Downloads and checks the archive of `version`; stops (and cleans up) when `cancel` is set.
+pub fn download(version: &str, asset: &Asset, stage: &Arc<Mutex<Stage>>, cancel: &AtomicBool) -> Result<Prepared, String> {
     let dir = new_download_dir()?;
-    let result = download_into(version, asset, &dir, stage);
+    let result = download_into(version, asset, &dir, stage, cancel);
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&dir);
     }
     result
 }
 
-fn download_into(version: &str, asset: &Asset, dir: &Path, stage: &Arc<Mutex<Stage>>) -> Result<Prepared, String> {
+fn download_into(version: &str, asset: &Asset, dir: &Path, stage: &Arc<Mutex<Stage>>, cancel: &AtomicBool) -> Result<Prepared, String> {
     let archive = dir.join(&asset.name);
     *stage.lock() = Stage::Downloading { done: 0, total: asset.size };
     let mut child = Command::new("/usr/bin/curl")
@@ -139,6 +142,11 @@ fn download_into(version: &str, asset: &Asset, dir: &Path, stage: &Arc<Mutex<Sta
         .spawn()
         .map_err(|e| e.to_string())?;
     let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CANCELLED.to_string());
+        }
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             break status;
         }
@@ -549,14 +557,17 @@ mod tests {
         let sha = sha256_file(&zip).unwrap();
         let asset = Asset { name: archive_name("9.9.9"), url: format!("file://{}", zip.display()), size, sha256: Some(sha) };
         let stage = Arc::new(Mutex::new(Stage::Starting));
-        let prepared = download("9.9.9", &asset, &stage).expect("downloaded and checked");
+        let go = AtomicBool::new(false);
+        let prepared = download("9.9.9", &asset, &stage, &go).expect("downloaded and checked");
         assert_eq!(plist_value(&prepared.app, "CFBundleShortVersionString").as_deref(), Some("9.9.9"));
         assert_eq!(*stage.lock(), Stage::Verifying);
         std::fs::remove_dir_all(&prepared.dir).unwrap();
         // A wrong checksum, a wrong version.
         let bad = Asset { sha256: Some("00".repeat(32)), ..asset.clone() };
-        assert_eq!(download("9.9.9", &bad, &stage).unwrap_err(), "the download does not match its published checksum");
-        assert_eq!(download("9.9.8", &asset, &stage).unwrap_err(), "the downloaded version does not match the release");
+        assert_eq!(download("9.9.9", &bad, &stage, &go).unwrap_err(), "the download does not match its published checksum");
+        assert_eq!(download("9.9.8", &asset, &stage, &go).unwrap_err(), "the downloaded version does not match the release");
+        // Cancelled: stopped, nothing left.
+        assert_eq!(download("9.9.9", &asset, &stage, &AtomicBool::new(true)).unwrap_err(), CANCELLED);
     }
 
     /// The administrator variant can't run in a test; the same AppleScript
