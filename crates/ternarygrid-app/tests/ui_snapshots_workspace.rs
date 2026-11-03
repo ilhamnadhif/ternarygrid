@@ -102,16 +102,26 @@ impl Raster {
                     dy > 0.0 || (dy == 0.0 && dx > 0.0)
                 };
                 let edge = [owns(pts[1], pts[2]), owns(pts[2], pts[0]), owns(pts[0], pts[1])];
+                // The edge function of a→b at p, computed from the edge's endpoints in one fixed
+                // order: the two triangles of a shared edge get exactly opposite values, so a
+                // pixel on it is neither lost (a dark speck) nor drawn twice.
+                let side = |a: (f32, f32), b: (f32, f32), p: (f32, f32)| {
+                    let (a, b, flip) = if (a.0, a.1) <= (b.0, b.1) { (a, b, 1.0) } else { (b, a, -1.0) };
+                    flip * ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0))
+                };
                 for y in miny..maxy {
                     for x in minx..maxx {
-                        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                        let w0 = ((pts[1].0 - px) * (pts[2].1 - py) - (pts[2].0 - px) * (pts[1].1 - py)) / area;
-                        let w1 = ((pts[2].0 - px) * (pts[0].1 - py) - (pts[0].0 - px) * (pts[2].1 - py)) / area;
-                        let w2 = 1.0 - w0 - w1;
-                        let outside = |w: f32, own: bool| w < -1e-5 || (w <= 1e-5 && !own);
-                        if outside(w0, edge[0]) || outside(w1, edge[1]) || outside(w2, edge[2]) {
+                        let p = (x as f32 + 0.5, y as f32 + 0.5);
+                        let e = [side(pts[1], pts[2], p), side(pts[2], pts[0], p), side(pts[0], pts[1], p)];
+                        let inside = |i: usize| {
+                            let s = e[i] * area.signum();
+                            s > 0.0 || (s == 0.0 && edge[i])
+                        };
+                        if !(inside(0) && inside(1) && inside(2)) {
                             continue;
                         }
+                        let (w0, w1) = (e[0] / area, e[1] / area);
+                        let w2 = 1.0 - w0 - w1;
                         let u = w0 * v[0].uv.x + w1 * v[1].uv.x + w2 * v[2].uv.x;
                         let vv = w0 * v[0].uv.y + w1 * v[1].uv.y + w2 * v[2].uv.y;
                         let tx = ((u * tex.size[0] as f32) as usize).min(tex.size[0] - 1);

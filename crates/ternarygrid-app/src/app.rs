@@ -388,7 +388,7 @@ impl TernaryGridApp {
             (tr("Uncommitted transaction"), ternarygrid_core::trf("\"{}\" has uncommitted changes; closing it rolls them back.", &[&title]), tr("Roll back and close"))
         };
         let answer = std::cell::Cell::new(None::<bool>);
-        let (resp, _) = Dialog::new(heading).icon(icon::WARNING).width(460.0).body_padding(dialogs::BODY).show_modal(
+        let (resp, _) = Dialog::new(heading).icon(icon::WARNING).tone(ternarygrid_ui::parts::Tone::Warning).width(460.0).body_padding(dialogs::BODY).show_modal(
             ctx,
             egui::Id::new(("confirm_close", id)),
             |ui| dialogs::body_text(ui, &text),
