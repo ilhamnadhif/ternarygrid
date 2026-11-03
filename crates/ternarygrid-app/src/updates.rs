@@ -18,7 +18,7 @@ use std::cell::Cell;
 use std::time::Duration;
 use ternarygrid_core::{tr, trf};
 use ternarygrid_ui::kit::{self, Kind};
-use ternarygrid_ui::parts::{self, Dialog};
+use ternarygrid_ui::parts::Dialog;
 use ternarygrid_ui::style;
 
 /// What the update offer was answered with.
@@ -748,7 +748,7 @@ impl Updates {
                         ),
                         crate::selfupdate::Stage::Verifying => (1.0, tr("Verifying…").to_string()),
                     };
-                    parts::progress_h(ui, fraction, f32::INFINITY, 8.0);
+                    ternarygrid_ui::parts::progress_h(ui, fraction, f32::INFINITY, 8.0);
                     dialogs::muted(ui, &text);
                 }
                 Install::Ready { .. } => {

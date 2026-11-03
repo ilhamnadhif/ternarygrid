@@ -1793,13 +1793,13 @@ fn create_database_from_the_navigator() {
     };
     assert!(preview(&h), "statement preview: {:?}", labels(&h));
     // The dialog keeps its size: the button is where it was a frame ago.
-    let label = format!("{} Create", egui_phosphor::regular::PLUS);
+    let label = "Create".to_string();
     frames(&mut h, 2);
     let before = h.query_all_by_label(&label).next().expect("Create button").rect();
     frames(&mut h, 5);
     assert_eq!(h.query_all_by_label(&label).next().unwrap().rect(), before, "the dialog does not grow");
     pause(&mut h);
-    h.query_all_by_label(&format!("{} Create", egui_phosphor::regular::PLUS)).next().expect("Create button").click();
+    h.query_all_by_label(&label).next().expect("Create button").click();
     frames(&mut h, 2);
     // Created, and listed because "Show all databases" was turned on.
     wait(&mut h, "new database in the navigator", |h| nav_row(h, &name).is_some());
