@@ -177,47 +177,40 @@ fn panel_name(p: PanelKind) -> &'static str {
     crate::toolbar::PANELS.iter().find(|(k, ..)| *k == p).map_or("", |(.., name)| tr(name))
 }
 
-/// A panel tab: 26 high, its icon, and for the shown one its name and × (it closes the
-/// panel). Returns (select, close).
-fn panel_tab(ui: &mut Ui, p: PanelKind, selected: bool) -> (bool, bool) {
-    use egui::{Align2, FontId, Sense, vec2};
+/// A panel's tab in the panel strip: the shown one with its name, the others their icon (the
+/// name in the tooltip). Every panel has its tab, so each is one click away.
+fn panel_tab(ui: &mut Ui, p: PanelKind, selected: bool) -> egui::Response {
+    use egui::{Align2, Sense, vec2};
     let pal = ternarygrid_ui::pal(ui);
     let name = panel_name(p);
-    let galley = selected.then(|| ui.painter().layout_no_wrap(name.to_string(), FontId::proportional(12.5), egui::Color32::PLACEHOLDER));
-    // 8 | icon 13 | 6 name 6 × 18 | 8 (named), 8 | icon | 8 (icon only).
+    let galley = selected.then(|| ui.painter().layout_no_wrap(name.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.5), egui::Color32::PLACEHOLDER));
+    // 8 | icon 14 | 6 name | 10 (named), 6 | icon 14 | 6 (icon only).
     let width = match &galley {
-        Some(g) => 8.0 + 13.0 + 6.0 + g.size().x + 6.0 + 18.0 + 4.0,
-        None => 8.0 + 13.0 + 8.0,
+        Some(g) => 8.0 + 14.0 + 6.0 + g.size().x + 10.0,
+        None => 26.0,
     };
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, name));
     let resp = if selected { resp } else { resp.on_hover_text(name) };
-    let close_rect = egui::Rect::from_center_size(egui::pos2(rect.right() - 4.0 - 9.0, rect.center().y), vec2(18.0, 18.0));
-    let close = selected.then(|| {
-        let c = ui.interact(close_rect, resp.id.with("close"), Sense::click()).on_hover_text(tr("Close panel"));
-        c.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("Close panel")));
-        c
-    });
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, pal.subtle);
+        painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, pal.accent_soft);
     } else if resp.hovered() {
         painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, pal.hover);
     }
-    let icon_color = if selected { pal.accent_text } else { pal.text_muted };
-    painter.text(egui::pos2(rect.left() + 8.0 + 6.5, rect.center().y), Align2::CENTER_CENTER, panel_icon(p), ternarygrid_ui::style::icon_font(13.0), icon_color);
+    let icon_color = if selected {
+        pal.accent_text
+    } else if resp.hovered() {
+        pal.text
+    } else {
+        pal.text_muted
+    };
+    let icon_x = if selected { rect.left() + 8.0 + 7.0 } else { rect.center().x };
+    painter.text(egui::pos2(icon_x, rect.center().y), Align2::CENTER_CENTER, panel_icon(p), ternarygrid_ui::style::icon_font(14.0), icon_color);
     if let Some(g) = galley {
-        painter.galley(egui::pos2(rect.left() + 8.0 + 13.0 + 6.0, rect.center().y - g.size().y / 2.0), g, pal.text);
+        painter.galley(egui::pos2(rect.left() + 8.0 + 14.0 + 6.0, rect.center().y - g.size().y / 2.0), g, pal.accent_text);
     }
-    let mut closed = false;
-    if let Some(c) = &close {
-        if c.hovered() {
-            painter.rect_filled(close_rect, 4, pal.hover);
-        }
-        painter.text(close_rect.center(), Align2::CENTER_CENTER, egui_phosphor::regular::X, ternarygrid_ui::style::icon_font(10.0), pal.text_muted);
-        closed = c.clicked();
-    }
-    (resp.clicked() && !closed, closed)
+    resp
 }
 
 impl<'a> ResultViewer<'a> {
@@ -254,22 +247,19 @@ impl<'a> ResultViewer<'a> {
         let mut actions: Vec<GridAction> = Vec::new();
         let mut grid_response = None;
         let pal = ternarygrid_ui::pal(ui);
-        // The filter bar: 46 high (44 in the full style), 16 / 12 at the sides, a line under it;
-        // the footer a line and 42 (40) under it, 16 / 10 (10 / 8) at the sides.
-        let full = options.full_bars;
-        let (bar_y, foot_y) = if full { (7, 5) } else { (8, 6) };
-        let filter_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 12, top: bar_y, bottom: bar_y + 1 }).fill(pal.canvas);
-        let foot_x = if full { (10, 8) } else { (16, 10) };
-        let footer_frame = Frame::new().inner_margin(egui::Margin { left: foot_x.0, right: foot_x.1, top: foot_y + 1, bottom: foot_y }).fill(pal.canvas);
+        // The filter bar: 46 high, 16 / 12 at the sides, a line under it; the footer a line
+        // and 42 under it, 16 / 10 at the sides.
+        let filter_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 12, top: 8, bottom: 9 }).fill(pal.canvas);
+        let footer_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 10, top: 7, bottom: 6 }).fill(pal.canvas);
         let line = egui::Stroke::new(1.0, pal.border);
         let bar = Panel::top(id.with("filter_bar")).frame(filter_frame).show_separator_line(false).show(ui, |ui| {
-            actions.extend(FilterBar::new(model, &mut state.grid, &mut state.toolbar).dialect(options.dialect.clone()).full(full).show(ui));
+            actions.extend(FilterBar::new(model, &mut state.grid, &mut state.toolbar).dialect(options.dialect.clone()).show(ui));
         });
         ui.painter().hline(bar.response.rect.x_range(), bar.response.rect.bottom() - 0.5, line);
         // "Filter by value" in server mode adds to the WHERE the filter box shows.
         state.grid.set_server_filter(&state.toolbar.filter_text);
         let footer = Panel::bottom(id.with("toolbar")).frame(footer_frame).show_separator_line(false).show(ui, |ui| {
-            actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).fetch_size(options.fetch_more_threshold).full(full).show(ui));
+            actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).fetch_size(options.fetch_more_threshold).show(ui));
         });
         ui.painter().hline(footer.response.rect.x_range(), footer.response.rect.top() + 0.5, line);
         // Errors in a pop-up: a refused edit or a failed save each time, a failed fetch once.
@@ -298,8 +288,7 @@ impl<'a> ResultViewer<'a> {
                 .frame(Frame::new().fill(ui.visuals().panel_fill))
                 .show(ui, |ui| {
                     state.side_width = Some(ui.available_width());
-                    // Tabs of the open panels (the shown one named, with × to close it), and
-                    // Hide for the whole area.
+                    // A tab for each panel (the shown one named), and Hide for the whole area.
                     if state.active_panel.is_none_or(|p| !state.toolbar.is_panel_open(p)) {
                         state.active_panel = state.toolbar.open_panels.last().copied();
                     }
@@ -313,13 +302,10 @@ impl<'a> ResultViewer<'a> {
                                 egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 2.0;
-                                        // In a fixed order (Value, Metadata, Grouping, Calc, References).
-                                        let open: Vec<PanelKind> = crate::toolbar::PANELS.iter().map(|(k, ..)| *k).filter(|k| state.toolbar.is_panel_open(*k)).collect();
-                                        for p in open {
-                                            let (select, close) = panel_tab(ui, p, state.active_panel == Some(p));
-                                            if close {
-                                                state.toolbar.set_panel_open(p, false);
-                                            } else if select {
+                                        // Every panel, in a fixed order (Value, Metadata, Grouping, Calc, References).
+                                        for (p, ..) in crate::toolbar::PANELS {
+                                            if panel_tab(ui, p, state.active_panel == Some(p)).clicked() {
+                                                state.toolbar.set_panel_open(p, true);
                                                 state.active_panel = Some(p);
                                             }
                                         }

@@ -98,13 +98,22 @@ impl Raster {
                 if area.abs() < 1e-9 {
                     continue;
                 }
+                // Each edge's pixels belong to one triangle only (a top-left style rule on the
+                // edge's direction, both triangles of a shared edge see it reversed): else a
+                // translucent quad's diagonal (a modal backdrop) is blended twice, a dotted seam.
+                let owns = |a: (f32, f32), b: (f32, f32)| {
+                    let (dx, dy) = ((b.0 - a.0) * area.signum(), (b.1 - a.1) * area.signum());
+                    dy > 0.0 || (dy == 0.0 && dx > 0.0)
+                };
+                let edge = [owns(pts[1], pts[2]), owns(pts[2], pts[0]), owns(pts[0], pts[1])];
                 for y in miny..maxy {
                     for x in minx..maxx {
                         let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
                         let w0 = ((pts[1].0 - px) * (pts[2].1 - py) - (pts[2].0 - px) * (pts[1].1 - py)) / area;
                         let w1 = ((pts[2].0 - px) * (pts[0].1 - py) - (pts[0].0 - px) * (pts[2].1 - py)) / area;
                         let w2 = 1.0 - w0 - w1;
-                        if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
+                        let outside = |w: f32, own: bool| w < -1e-5 || (w <= 1e-5 && !own);
+                        if outside(w0, edge[0]) || outside(w1, edge[1]) || outside(w2, edge[2]) {
                             continue;
                         }
                         let u = w0 * v[0].uv.x + w1 * v[1].uv.x + w2 * v[2].uv.x;
@@ -248,7 +257,7 @@ impl Shots {
         self.h.state_mut().toasts.clear();
         self.h.event(egui::Event::PointerMoved(pointer.unwrap_or(egui::pos2(1439.0, 899.0))));
         // A submenu opened by the pointer fades in: let it finish.
-        self.frames(if pointer.is_some() { 30 } else { 8 });
+        self.frames(30);
         let out = self.h.output();
         let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
         let size = self.h.ctx.content_rect().size() * ppp();

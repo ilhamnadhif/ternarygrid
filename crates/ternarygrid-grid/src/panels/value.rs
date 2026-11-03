@@ -324,7 +324,9 @@ impl<'a> ValuePanel<'a> {
                         ui.label(RichText::new(format!("{} {}", egui_phosphor::regular::LOCK_SIMPLE, r.short_label())).color(pal.warn));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(trf("{} chars", &[&state.edit_text.chars().count()])).color(pal.text_faint));
+                        let n = state.edit_text.chars().count();
+                        let count = if n == 1 { tr("1 character").to_string() } else { trf("{} characters", &[&n]) };
+                        ui.label(RichText::new(count).color(pal.text_faint));
                     });
                 });
                 if let Some(e) = &state.error {

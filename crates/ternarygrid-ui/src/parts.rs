@@ -21,6 +21,7 @@ pub struct Dialog<'a> {
     width: f32,
     min_height: Option<f32>,
     pad: Margin,
+    tone: Option<Tone>,
 }
 
 /// What a dialog's frame reports.
@@ -36,7 +37,14 @@ pub struct DialogResponse {
 
 impl<'a> Dialog<'a> {
     pub fn new(title: &'a str) -> Self {
-        Dialog { title, icon: None, subtitle: None, width: 560.0, min_height: None, pad: Margin::symmetric(20, 16) }
+        Dialog { title, icon: None, subtitle: None, width: 560.0, min_height: None, pad: Margin::symmetric(20, 16), tone: None }
+    }
+
+    /// The tone of the icon badge: [`Tone::Error`] for destructive confirmations (delete, drop,
+    /// terminate, discard: red on the soft red), [`Tone::Warning`] for risky ones; else the accent.
+    pub fn tone(mut self, tone: Tone) -> Self {
+        self.tone = Some(tone);
+        self
     }
 
     pub fn icon(mut self, icon: &'a str) -> Self {
@@ -98,8 +106,12 @@ impl<'a> Dialog<'a> {
                 ui.set_min_height(28.0);
                 if let Some(icon) = self.icon {
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
-                    ui.painter().rect_filled(r, CornerRadius::same(RADIUS_LG), p.accent_soft);
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, icon, style::icon_font(19.0), p.accent_text);
+                    let (fill, color) = match self.tone {
+                        None | Some(Tone::Info) => (p.accent_soft, p.accent_text),
+                        Some(t) => (t.fill(ui), t.color(&p)),
+                    };
+                    ui.painter().rect_filled(r, CornerRadius::same(RADIUS_LG), fill);
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, icon, style::icon_font(19.0), color);
                 }
                 match self.subtitle {
                     // Title over subtitle; a lone title stays centred on the row.
@@ -362,20 +374,32 @@ fn callout_dyn(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: &m
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 ui.label(RichText::new(tone.icon()).font(style::icon_font(16.0)).color(color));
-                ui.vertical(|ui| {
+                // The actions (buttons) at the right of the text, centred on it, not on a line
+                // of their own; their width is the last frame's.
+                let id = ui.id().with(("callout_actions", body.len(), title.map(str::len)));
+                let actions_w = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+                let text_w = (ui.available_width() - if actions_w > 0.0 { actions_w + 12.0 } else { 0.0 }).max(120.0);
+                let text = ui.allocate_ui_with_layout(vec2(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(text_w);
                     ui.spacing_mut().item_spacing.y = 2.0;
                     if let Some(t) = title {
                         kit::semibold_label(ui, t, 13.0, p.text);
                     }
-                    // The design's body lines: 12.5 points on 1.45.
+                    // Body lines: 12.5 points on 1.45.
                     kit::label_lh(ui, RichText::new(body).color(p.text), egui::FontId::proportional(12.5), 1.45, true);
-                    // Extra content (buttons) under the text at the right; nothing when empty
-                    // (a right-to-left layout beside the text would take the panel's height).
-                    ui.scope(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.allocate_ui_with_layout(vec2(ui.available_width(), 0.0), Layout::right_to_left(Align::Min), add);
-                    });
                 });
+                let h = text.response.rect.height();
+                let actions = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let start = ui.cursor().right();
+                    add(ui);
+                    (start - ui.min_rect().left()).max(0.0)
+                });
+                let w = if actions.response.rect.width() > 0.0 { actions.inner } else { 0.0 };
+                if (w - actions_w).abs() > 0.5 {
+                    ui.data_mut(|d| d.insert_temp(id, w));
+                    ui.ctx().request_discard("callout actions width");
+                }
             });
         })
         .response
@@ -430,14 +454,15 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T,
     pick(current, items, |sel, labels| segmented_idx(ui, sel, labels, false))
 }
 
-/// [`segmented`] at 24 px instead of 28.
+/// [`segmented`] at 24 points instead of the controls' 30.
 pub fn segmented_small<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T, &str)]) -> bool {
     pick(current, items, |sel, labels| segmented_idx(ui, sel, labels, true))
 }
 
 fn segmented_idx(ui: &mut Ui, sel: Option<usize>, labels: &[&str], small: bool) -> Option<usize> {
     let p = style::pal(ui);
-    let h = if small { 24.0 } else { 28.0 };
+    // As tall as the inputs beside it (30), or 24 in dense bars.
+    let h = if small { 24.0 } else { style::CONTROL_H };
     let fs = 12.5;
     let galleys: Vec<_> = labels
         .iter()
@@ -459,7 +484,7 @@ fn segmented_idx(ui: &mut Ui, sel: Option<usize>, labels: &[&str], small: bool) 
         let on = sel == Some(i);
         resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, on, *label));
         if on {
-            kit::raised(ui.painter(), r, CornerRadius::same(5), p.surface);
+            kit::raised(ui.painter(), r, CornerRadius::same(5), p.thumb);
         } else if resp.hovered() {
             ui.painter().rect_filled(r, CornerRadius::same(5), p.hover);
         }
@@ -614,9 +639,10 @@ pub fn stat_tile(ui: &mut Ui, label: &str, value: &str, sub: Option<&str>) -> Re
         .response
 }
 
-/// A form row as in the design: a label column of `label_w` (the design's dialogs use 150, its
-/// settings 168) with the label muted and top-aligned 6 points down, 16 points, then `add`
-/// (laid out in a row, centred on its tallest control); the row is as tall as its controls.
+/// A form row: a label column of `label_w` (dialogs use 150, settings 168) with the label
+/// muted, 16 points, then `add` (laid out in a row, centred on its tallest control); the row is
+/// as tall as its controls. The label is centred on the controls' first line: on a 30 point
+/// input, on a row of check boxes or radio buttons, on a plain value — not always 6 points down.
 pub fn form_row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let mut add = Some(add);
     let mut out = None;
@@ -625,18 +651,31 @@ pub fn form_row<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut
 }
 
 fn form_row_dyn(ui: &mut Ui, label: &str, label_w: f32, add: &mut dyn FnMut(&mut Ui)) {
+    // The controls' height of the last frame (a 30 point input until known): the label is
+    // centred on their first line, at most an input's height.
+    let id = ui.next_auto_id().with(("form_row", label));
+    let line = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(style::CONTROL_H).min(style::CONTROL_H);
     ui.horizontal_top(|ui| {
-        form_label(ui, label, label_w);
-        ui.add_space((16.0 - ui.spacing().item_spacing.x).max(0.0));
-        ui.horizontal(|ui| add(ui));
+        let spacing = ui.spacing().item_spacing.x;
+        // The label, then exactly 16 points, whatever the caller's item spacing.
+        ui.spacing_mut().item_spacing.x = 0.0;
+        form_label(ui, label, label_w, line);
+        ui.add_space(16.0);
+        ui.spacing_mut().item_spacing.x = spacing;
+        let h = ui.horizontal(|ui| add(ui)).response.rect.height();
+        if (h - line).abs() > 0.5 && (h < style::CONTROL_H || line < style::CONTROL_H) {
+            ui.data_mut(|d| d.insert_temp(id, h));
+            ui.ctx().request_discard("form row height");
+        }
     });
 }
 
-fn form_label(ui: &mut Ui, label: &str, label_w: f32) {
+fn form_label(ui: &mut Ui, label: &str, label_w: f32, line: f32) {
     let p = style::pal(ui);
+    let text_h = ui.text_style_height(&egui::TextStyle::Body);
     ui.allocate_ui_with_layout(vec2(label_w, 0.0), Layout::top_down(Align::Min), |ui| {
         ui.set_min_width(label_w);
-        ui.add_space(6.0);
+        ui.add_space(((line - text_h) / 2.0).max(0.0));
         ui.add(egui::Label::new(RichText::new(label).color(p.text_muted)).truncate());
     });
 }

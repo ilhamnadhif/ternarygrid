@@ -785,7 +785,6 @@ impl SqlEditorTab {
                     }
                     let title = result_title(&sql, self.results.len() + 1);
                     let mut panel = ResultPanel::new(self.conn.clone().unwrap_or_default(), title, src, None);
-                    panel.full_bars = true;
                     if self.fetch_all_results {
                         panel.src.fetch_more(cx.backend, usize::MAX, None);
                     }

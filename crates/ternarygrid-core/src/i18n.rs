@@ -10,6 +10,12 @@ pub fn tr(s: &str) -> &str {
     s
 }
 
+/// A count with its noun: `one` for 1, else `many` with `{}` for the number
+/// (`trn(3, "1 file", "{} files")` → "3 files"; never "3 file(s)").
+pub fn trn(n: usize, one: &str, many: &str) -> String {
+    if n == 1 { one.to_string() } else { format_placeholders(many, &[&n]) }
+}
+
 /// Substitute placeholders: `{}` takes arguments in order, `{0}`, `{1}` ...
 /// select by position.
 pub fn trf(s: &str, args: &[&dyn Display]) -> String {

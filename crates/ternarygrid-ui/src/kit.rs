@@ -100,8 +100,12 @@ fn button_impl(ui: &mut Ui, kind: Kind, icon: Option<&str>, text: &str, keys: Op
             Kind::Secondary | Kind::Danger => (quiet(p.surface), Stroke::new(1.0, p.border_strong)),
             Kind::Ghost => (if on { p.accent_soft } else { quiet(Color32::TRANSPARENT) }, Stroke::NONE),
         };
-        // A disabled `ui` fades everything it paints; the design keeps a disabled button's fill
-        // and only turns its text faint (below), so take that fade back for the button.
+        // Disabled: a filled button (Primary, Danger, Soft) turns neutral, its fill the subtle
+        // grey, so its faint text stays legible (faint text on the accent could not be read);
+        // an outlined or ghost one keeps its look with faint text.
+        let (fill, stroke) = if !enabled && matches!(kind, Kind::Primary | Kind::DangerFilled | Kind::Soft) { (p.subtle, Stroke::NONE) } else { (fill, stroke) };
+        // A disabled `ui` fades everything it paints; take that fade back for the button (its
+        // look says it is disabled).
         let mut painter = ui.painter().clone();
         if !enabled {
             painter.set_opacity((painter.opacity() / ui.visuals().disabled_alpha()).min(1.0));
@@ -240,7 +244,7 @@ pub fn button_group(ui: &mut Ui, segments: &[Segment]) -> Vec<Response> {
         let painter = ui.painter();
         let radius = CornerRadius::same(5);
         if seg.on {
-            raised(painter, r, radius, p.surface);
+            raised(painter, r, radius, p.thumb);
         } else if hovered {
             painter.rect_filled(r, radius, p.hover);
         }
@@ -477,7 +481,29 @@ pub fn fade(painter: &egui::Painter, rect: Rect, color: Color32, to_right: bool)
 /// medium text.
 pub fn pill(ui: &mut Ui, text: &str, color: Color32) -> Response {
     let dark = ui.visuals().dark_mode;
-    pill_colors(ui, text, color, style::soft(color, if dark { 0.18 } else { 0.11 }))
+    let alpha = if dark { 0.18 } else { 0.11 };
+    // The text in the colour, made darker (lighter in dark mode) when the colour is too light
+    // to be read on its own tint (a user's pale marker colour).
+    let tint = style::mix(color, style::pal(ui).canvas, alpha);
+    pill_colors(ui, text, style::readable_on(color, tint, dark), style::soft(color, alpha))
+}
+
+/// A field's validation message, under the control: 12 points in the error colour, with an
+/// icon. Pair it with [`error_outline`] on the control.
+pub fn field_error(ui: &mut Ui, message: &str) -> Response {
+    let p = style::pal(ui);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(RichText::new(egui_phosphor::regular::WARNING_CIRCLE).font(style::icon_font(12.5)).color(p.err));
+        ui.add(egui::Label::new(RichText::new(message).size(12.0).color(p.err)).wrap());
+    })
+    .response
+}
+
+/// The red outline of a control whose value was refused (see [`field_error`]).
+pub fn error_outline(ui: &Ui, rect: Rect) {
+    let p = style::pal(ui);
+    ui.painter().rect_stroke(rect, CornerRadius::same(RADIUS), Stroke::new(1.0, p.err), StrokeKind::Inside);
 }
 
 /// A [`pill`] in `fg` on `bg` (the design's chips: muted on subtle; PRODUCTION: err on prod_soft).
