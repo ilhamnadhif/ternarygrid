@@ -113,40 +113,47 @@ impl<'a> ReferencesPanel<'a> {
         let ReferencesPanel { model, grid, state } = self;
         let mut actions = Vec::new();
         if state.relations.is_empty() {
-            ui.weak(tr("No foreign key relations are known for this result"));
+            ui.label(RichText::new(tr("No foreign key relations are known for this result.")).color(ternarygrid_ui::pal(ui).text_muted));
             return actions;
         }
         let pal = ternarygrid_ui::pal(ui);
         ui.spacing_mut().item_spacing.y = 10.0;
-        // The relations as pills on one line (→ references, ← referenced by); the chosen one in the accent.
-        egui::ScrollArea::horizontal().id_salt("ternarygrid_references_chips").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let font = ternarygrid_ui::style::semibold(ui.ctx(), 12.0);
-                for (i, r) in state.relations.iter().enumerate() {
-                    let arrow = match r.direction {
-                        RelationDirection::References => "→",
-                        RelationDirection::ReferencedBy => "←",
-                    };
-                    let label = format!("{arrow} {}", r.table.display_path());
-                    let on = state.selected == Some(i);
-                    let (fg, bg) = if on { (pal.accent_text, pal.accent_soft) } else { (pal.text_muted, pal.subtle) };
-                    let g = ui.painter().layout_no_wrap(label.clone(), font.clone(), fg);
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 14.0, 20.0), egui::Sense::click());
-                    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, &label));
-                    ui.painter().rect_filled(rect, 10, if resp.hovered() && !on { pal.border_strong } else { bg });
-                    ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
-                    if resp.on_hover_text(r.name.clone().unwrap_or_default()).clicked() {
-                        state.selected = Some(i);
-                    }
+        // The relations as pills (→ references, ← referenced by), wrapped onto more lines when
+        // they do not fit; the chosen one in the accent.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+            let font = ternarygrid_ui::style::semibold(ui.ctx(), 12.0);
+            let max_w = ui.available_width();
+            for (i, r) in state.relations.iter().enumerate() {
+                let (arrow, dir) = match r.direction {
+                    RelationDirection::References => ("→", tr("References")),
+                    RelationDirection::ReferencedBy => ("←", tr("Referenced by")),
+                };
+                let label = format!("{arrow} {}", r.table.display_path());
+                let on = state.selected == Some(i);
+                let (fg, bg) = if on { (pal.accent_text, pal.accent_soft) } else { (pal.text_muted, pal.subtle) };
+                // A pill wider than the panel is cut with "…" (its tooltip has the name).
+                let mut job = egui::text::LayoutJob::single_section(label.clone(), egui::TextFormat::simple(font.clone(), fg));
+                job.wrap = egui::text::TextWrapping { max_width: (max_w - 14.0).max(20.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                let g = ui.painter().layout_job(job);
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(g.size().x + 14.0, 20.0), egui::Sense::click());
+                resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, &label));
+                ui.painter().rect_filled(rect, 10, if resp.hovered() && !on { pal.border_strong } else { bg });
+                ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
+                let tip = match &r.name {
+                    Some(n) => format!("{dir} {}\n{n}", r.table.display_path()),
+                    None => format!("{dir} {}", r.table.display_path()),
+                };
+                if resp.on_hover_text(tip).clicked() {
+                    state.selected = Some(i);
                 }
-            });
+            }
         });
         let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
         ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0, pal.border));
         let Some(sel) = state.selected.filter(|s| *s < state.relations.len()) else { return actions };
         let Some((row, _)) = grid.active_cell() else {
-            ui.weak(tr("Select a row to see related rows"));
+            ui.label(RichText::new(tr("Select a row to see related rows.")).color(pal.text_muted));
             return actions;
         };
         let rel = state.relations[sel].clone();
@@ -187,7 +194,7 @@ impl<'a> ReferencesPanel<'a> {
             }
         });
         if key.iter().all(Value::is_null) {
-            ui.weak(tr("The key is NULL; there are no related rows"));
+            ui.label(RichText::new(tr("The key is NULL: there are no related rows.")).color(pal.text_muted));
             return actions;
         }
         let have = state.related.as_ref().is_some_and(|(r, d)| *r == sel && d.key == key);
@@ -199,9 +206,11 @@ impl<'a> ReferencesPanel<'a> {
             Some((r, d)) if *r == sel && d.key == key => {
                 let mut options = state.options.clone();
                 options.show_row_numbers = false;
-                // In a bordered box as tall as its rows (two at least), not the whole panel.
-                let rows = d.model.row_count().max(2) as f32;
-                let height = (33.0 + rows * 29.0 + 19.0).min(ui.available_height());
+                // In a bordered box as tall as its rows (and room for the horizontal scroll bar
+                // under them), not the whole panel.
+                let rows = d.model.row_count().max(1) as f32;
+                let bar = ui.spacing().scroll.bar_width + 4.0;
+                let height = (33.0 + rows * 29.0 + bar + 2.0).min(ui.available_height());
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
                 let resp = ui
                     .scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(1.0)), |ui| {
@@ -209,6 +218,13 @@ impl<'a> ReferencesPanel<'a> {
                         DataGrid::new(&mut d.model, &mut d.grid, &options).id_salt(("ternarygrid_references_grid", sel)).show(ui)
                     })
                     .inner;
+                // More columns at the right: the last visible one fades out.
+                let content_w: f32 = d.grid.visible_columns().iter().map(|&c| d.grid.column_width(c)).sum();
+                if content_w - d.grid.scroll_offset().0 > rect.width() - 2.0 + 1.0 {
+                    let bg = crate::theme::GridTheme::from_visuals(ui.visuals()).bg;
+                    let fade = egui::Rect::from_min_max(egui::pos2(rect.right() - 29.0, rect.top() + 1.0), egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0));
+                    ternarygrid_ui::kit::fade(&ui.painter().with_clip_rect(rect.shrink(1.0)), fade, bg.gamma_multiply(0.9), true);
+                }
                 ui.painter().rect_stroke(rect, 8, egui::Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
                 for a in resp.actions {
                     if let GridAction::NavigateForeignKey { .. } = a {
@@ -217,10 +233,7 @@ impl<'a> ReferencesPanel<'a> {
                 }
             }
             _ => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak(tr("Loading related rows…"));
-                });
+                ternarygrid_ui::parts::spinner_label(ui, tr("Loading related rows…"));
             }
         }
         actions

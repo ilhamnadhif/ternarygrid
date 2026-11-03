@@ -450,14 +450,16 @@ fn check_call(name: &str, args: usize, span: Range<usize>) -> Result<Func, ExprE
     };
     let (min, max) = func.arity();
     if args < min || args > max {
+        // "1 argument", "at least 2 arguments", "1 to 3 arguments".
+        let noun = |n: usize| if n == 1 { tr("argument") } else { tr("arguments") };
         let expected = if min == max {
-            min.to_string()
+            format!("{min} {}", noun(min))
         } else if max == usize::MAX {
-            trf("at least {}", &[&min])
+            trf("at least {} {}", &[&min, &noun(min)])
         } else {
-            trf("{} to {}", &[&min, &max])
+            trf("{} to {} {}", &[&min, &max, &noun(max)])
         };
-        return Err(ExprError::new(trf("{}() takes {} argument(s), got {}", &[&func.name(), &expected, &args]), span));
+        return Err(ExprError::new(trf("{}() takes {}, got {}", &[&func.name(), &expected, &args]), span));
     }
     Ok(func)
 }

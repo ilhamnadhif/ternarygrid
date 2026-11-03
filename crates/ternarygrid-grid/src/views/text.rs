@@ -108,14 +108,15 @@ impl<'a> TextView<'a> {
             state.built_at = ui.input(|i| i.time);
         }
         super::view_bar(ui, &mut |ui| {
-            if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy text"), true, false).clicked() {
+            if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::COPY), tr("Copy"), true, false).clicked() {
                 ui.ctx().copy_text(state.lines.join("\n"));
             }
             if model.row_count() > MAX_TEXT_ROWS {
-                ui.weak(trf(
+                let text = trf(
                     "Showing the first {} of {} rows",
                     &[&crate::format::group_thousands(&MAX_TEXT_ROWS.to_string()), &crate::format::group_thousands(&model.row_count().to_string())],
-                ));
+                );
+                ui.label(egui::RichText::new(text).color(ternarygrid_ui::pal(ui).text_muted));
             }
         });
         super::show_lines(ui, "ternarygrid_text_view", &state.lines, state.max_chars, false);

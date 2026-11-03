@@ -47,10 +47,15 @@ pub(crate) fn view_bar(ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)) {
     ui.add_space(1.0);
 }
 
+/// The colours of JSON's keys, strings and numbers (the JSON view and the value panel's tree).
+pub(crate) fn json_token_colors(dark: bool) -> (egui::Color32, egui::Color32, egui::Color32) {
+    let rgb = |c: u32| egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
+    if dark { (rgb(0x7aa7ff), rgb(0xe6a96b), rgb(0xc39bf2)) } else { (rgb(0x2554c7), rgb(0xa5531a), rgb(0x7a3fc4)) }
+}
+
 /// Colours of a JSON line: keys, strings, numbers (and `null`, `true`, `false` faint).
 fn json_job(line: &str, font: &egui::FontId, dark: bool, text: egui::Color32, faint: egui::Color32) -> egui::text::LayoutJob {
-    let rgb = |c: u32| egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
-    let (key, string, number) = if dark { (rgb(0x7aa7ff), rgb(0xe6a96b), rgb(0xc39bf2)) } else { (rgb(0x2554c7), rgb(0xa5531a), rgb(0x7a3fc4)) };
+    let (key, string, number) = json_token_colors(dark);
     let mut job = egui::text::LayoutJob::default();
     let mut add = |s: &str, c: egui::Color32| job.append(s, 0.0, egui::TextFormat::simple(font.clone(), c));
     let bytes = line.as_bytes();

@@ -1060,10 +1060,30 @@ impl ResultModel {
     /// column's type. Text columns always take the text.
     pub fn parse_cell_for_column(&self, col: usize, text: &str) -> Result<CellValue, String> {
         match self.parse_for_column(col, text) {
+            // A database that gives this column's dates as text (SQLite): the edit stays the
+            // checked text, shown and saved as its neighbours are (`2026-11-02 19:20:00`, not
+            // `2026-11-02 19:20:00.000 +07:00`).
+            Ok(v) if matches!(v, Value::Date(_) | Value::Time(_) | Value::DateTime(_) | Value::DateTimeTz(_)) && self.column_holds_text(col) => {
+                Ok(CellValue::Value(Value::text(text.trim())))
+            }
             Ok(v) => Ok(CellValue::Value(v)),
             Err(_) if ternarygrid_core::value::is_sql_expression(text) => Ok(CellValue::Expr(text.trim().to_string())),
             Err(e) => Err(e),
         }
+    }
+
+    /// True when the first value of column `col` that is not NULL (among the first 50 rows)
+    /// is text: the driver reports the column's values as text, whatever its declared type.
+    fn column_holds_text(&self, col: usize) -> bool {
+        for row in 0..self.row_count().min(50) {
+            let mut v = None;
+            self.visit_rows(row..row + 1, |_, cells| v = cells.value_of(col));
+            match v {
+                Some(Value::Null) | None => continue,
+                Some(v) => return matches!(v, Value::Text(_)),
+            }
+        }
+        false
     }
 
     /// Parse user input for column `col` without changing anything.

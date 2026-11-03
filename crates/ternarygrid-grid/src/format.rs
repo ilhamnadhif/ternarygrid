@@ -52,13 +52,26 @@ impl ColumnFormat {
 /// The format of identifiers: no thousands separators.
 static IDENTIFIER: ColumnFormat = ColumnFormat { decimals: None, thousands_separator: Some(false), date_format: None, time_format: None, datetime_format: None };
 
-/// The format of column `col`'s cells: its own (`own`), else, for a key or a reference
-/// (an identifier, not an amount: `10421`, not `10,421`), no thousands separators.
+/// The format of column `col`'s cells: its own (`own`), else, for an identifier (a key, a
+/// reference, an `id` / `*_id` integer: `10421`, not `10,421`), no thousands separators.
 pub fn cell_format<'a>(model: &crate::model::ResultModel, col: usize, own: Option<&'a ColumnFormat>) -> Option<&'a ColumnFormat> {
-    own.or_else(|| {
-        let key = model.editability().as_ref().is_ok_and(|t| t.key_columns.contains(&col)) || model.foreign_key_for_column(col).is_some();
-        key.then_some(&IDENTIFIER)
-    })
+    own.or_else(|| is_identifier_column(model, col).then_some(&IDENTIFIER))
+}
+
+/// True when column `col` holds identifiers, not amounts: a key or foreign key column, an
+/// auto-increment column, or an integer column named `id`, `*_id` or `*Id` (`order_id` of
+/// a table without keys).
+pub fn is_identifier_column(model: &crate::model::ResultModel, col: usize) -> bool {
+    if model.editability().as_ref().is_ok_and(|t| t.key_columns.contains(&col)) || model.foreign_key_for_column(col).is_some() {
+        return true;
+    }
+    model.columns().get(col).is_some_and(|c| c.auto_increment == Some(true) || (c.kind == ternarygrid_core::value::DataKind::Int && is_identifier_name(&c.name)))
+}
+
+/// `id`, `order_id`, `ORDER_ID`, `orderId` (not `paid`, `valid` or `width`).
+pub fn is_identifier_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "id" || lower.ends_with("_id") || (name.len() > 2 && name.ends_with("Id") && name[..name.len() - 2].chars().last().is_some_and(|c| c.is_ascii_lowercase()))
 }
 
 /// Insert `,` thousands separators into the integer part of a plain number.
@@ -84,6 +97,27 @@ pub fn group_thousands(s: &str) -> String {
     }
     out.push_str(frac);
     out
+}
+
+/// A computed number as the panels and dialogs show it (Calc, Grouping, statistics): thousands
+/// separators, at most 2 decimals from 1 on and 4 significant digits below (trailing zeros
+/// dropped): `8,974.44`, `641.03`, `0.0012`.
+pub fn display_number(f: f64) -> String {
+    if !f.is_finite() {
+        return f.to_string();
+    }
+    if f.fract() == 0.0 && f.abs() < 1e15 {
+        return group_thousands(&format!("{}", f as i64));
+    }
+    let decimals = if f.abs() >= 1.0 { 2 } else { (4 - 1 - f.abs().log10().floor() as i32).clamp(2, 12) as usize };
+    let s = format!("{f:.decimals$}");
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.') } else { &s };
+    group_thousands(s)
+}
+
+/// A count with thousands separators (`1,284`).
+pub fn display_count(n: usize) -> String {
+    group_thousands(&n.to_string())
 }
 
 /// Format a number text with exactly `decimals` fraction digits (half away from zero).
@@ -228,5 +262,19 @@ mod tests {
         assert_eq!(fixed_decimals("1.005", 2).unwrap(), "1.01");
         assert_eq!(fixed_decimals("7", 0).unwrap(), "7");
         assert_eq!(fixed_decimals("x", 2), None);
+        assert_eq!(display_number(8974.44), "8,974.44");
+        assert_eq!(display_number(641.031429), "641.03");
+        assert_eq!(display_number(1572.5625), "1,572.56");
+        assert_eq!(display_number(14.0), "14");
+        assert_eq!(display_number(-2.5), "-2.5");
+        assert_eq!(display_number(0.001234), "0.001234");
+        assert_eq!(display_number(0.5), "0.5");
+        assert_eq!(display_count(100_000), "100,000");
+        for id in ["id", "ID", "order_id", "CUSTOMER_ID", "orderId"] {
+            assert!(is_identifier_name(id), "{id}");
+        }
+        for not in ["paid", "valid", "width", "Id_card", "total", "I"] {
+            assert!(!is_identifier_name(not), "{not}");
+        }
     }
 }

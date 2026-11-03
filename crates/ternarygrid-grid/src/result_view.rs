@@ -313,7 +313,7 @@ impl<'a> ResultViewer<'a> {
                                 });
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ternarygrid_ui::kit::icon_button_ex(ui, egui_phosphor::regular::CARET_RIGHT, tr("Hide panels"), false, 24.0).clicked() {
+                                if ternarygrid_ui::kit::icon_button_ex(ui, egui_phosphor::regular::X, tr("Hide panels"), false, 24.0).clicked() {
                                     state.toolbar.panels_hidden = true;
                                 }
                             });

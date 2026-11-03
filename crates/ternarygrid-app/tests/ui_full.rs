@@ -802,7 +802,15 @@ fn settings_grid_menu_and_editor_helpers() {
     open(&mut h);
     frames(&mut h, 2);
     click(&mut h, "Filter by value");
-    let eq = labels(&h).into_iter().find(|l| l.trim_start_matches(egui_phosphor::regular::SQUARE).trim_start().starts_with("id = ")).unwrap_or_else(|| panic!("{:?}", labels(&h)));
+    // The cell's value (`id = 5`), or for the sweep's new row (its id NULL: Generate UUID is
+    // offered on uuid and text columns only) `id IS NULL`.
+    let eq = labels(&h)
+        .into_iter()
+        .find(|l| {
+            let l = l.trim_start_matches(egui_phosphor::regular::SQUARE).trim_start();
+            l.starts_with("id = ") || l == "id IS NULL"
+        })
+        .unwrap_or_else(|| panic!("{:?}", labels(&h)));
     click(&mut h, &eq);
     // The menu sweep left pending edits: reloading asks first, and discarding them
     // drops the new row the filter may name.

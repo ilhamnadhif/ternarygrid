@@ -428,7 +428,15 @@ fn call<R: RowValues + ?Sized>(func: Func, args: &[Node], row: &R) -> Result<Val
     // directly with `Expr::from_node`.
     let (min, max) = func.arity();
     if args.len() < min || args.len() > max {
-        return Err(EvalError(trf("{}() takes {} argument(s), got {}", &[&func.name(), &min, &args.len()])));
+        let noun = |n: usize| if n == 1 { tr("argument") } else { tr("arguments") };
+        let expected = if min == max {
+            format!("{min} {}", noun(min))
+        } else if max == usize::MAX {
+            trf("at least {} {}", &[&min, &noun(min)])
+        } else {
+            trf("{} to {} {}", &[&min, &max, &noun(max)])
+        };
+        return Err(EvalError(trf("{}() takes {}, got {}", &[&func.name(), &expected, &args.len()])));
     }
     // Lazily evaluated functions first.
     match func {

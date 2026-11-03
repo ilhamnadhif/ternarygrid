@@ -85,6 +85,8 @@ pub struct ResultPanel {
     confirm_discard: Option<Deferred>,
     /// Re-running the statement of this result would change data again: asking first.
     confirm_rerun: Option<Deferred>,
+    /// What runs once the pending changes are saved ("Save and reload").
+    after_save: Option<Deferred>,
     refs_job: Option<(usize, Vec<Value>, Job<DbResult<(Vec<ColumnMeta>, Vec<Row>)>>)>,
     virtual_key_dialog: Option<(ObjectRef, Vec<bool>)>,
     mode: Mode,
@@ -203,6 +205,7 @@ impl ResultPanel {
             saved_in_tx: None,
             confirm_discard: None,
             confirm_rerun: None,
+            after_save: None,
             refs_job: None,
             virtual_key_dialog: None,
             mode: Mode::Grid,
@@ -323,12 +326,19 @@ impl ResultPanel {
                     self.model.apply_saved_with(&inserted, &updated);
                     self.saved_in_tx = (!committed).then(|| self.src.session.rollbacks());
                     if committed {
-                        cx.toasts.success(trf("Saved: {} row(s) changed", &[&n]));
+                        cx.toasts.success(ternarygrid_core::trn(n as usize, tr("Saved: 1 row changed"), tr("Saved: {} rows changed")));
                     } else {
                         cx.toasts.info(tr("Changes applied inside the open transaction — commit to keep them."));
                     }
+                    // "Save and reload": the reload now the changes are kept.
+                    if let Some(d) = self.after_save.take() {
+                        self.run_deferred(d, cx);
+                    }
                 }
-                Err(e) => cx.toasts.error(tr("Cannot save the changes"), Some(e.full_text())),
+                Err(e) => {
+                    self.after_save = None;
+                    cx.toasts.error(tr("Cannot save the changes"), Some(e.full_text()));
+                }
             }
         }
         // Saved inside a transaction that was rolled back since: the rows shown are no
@@ -1003,6 +1013,7 @@ impl ResultPanel {
             },
             tr("Run again"),
             true,
+            None,
             &mut decided,
         );
         if decided.is_none() && modal.close {
@@ -1024,6 +1035,7 @@ impl ResultPanel {
             return;
         }
         let mut decided: Option<bool> = None;
+        let mut save_first = false;
         let n = self.model.pending_counts().total();
         let (modal, ()) = confirm_dialog(
             ui,
@@ -1031,14 +1043,24 @@ impl ResultPanel {
             tr("Unsaved changes"),
             icon::WARNING,
             |ui| {
-                ui.add(egui::Label::new(trf("Reloading the rows discards the {} pending change(s). Save them first to keep them.", &[&n])).wrap());
+                let text = ternarygrid_core::trn(n, tr("Reloading discards 1 unsaved change."), tr("Reloading discards {} unsaved changes."));
+                ui.add(egui::Label::new(RichText::new(text).color(ternarygrid_ui::pal(ui).text_muted)).wrap());
             },
             tr("Discard and reload"),
             true,
+            Some((tr("Save and reload"), &mut save_first)),
             &mut decided,
         );
         if decided.is_none() && modal.close {
             decided = Some(false);
+        }
+        if save_first && let Some(d) = self.confirm_discard.take() {
+            // Saved (or asked about first, as every save), then reloaded.
+            self.handle(GridAction::SaveChanges, cx);
+            if self.save_job.is_some() || self.save_preview.is_some() {
+                self.after_save = Some(d);
+            }
+            return;
         }
         match decided {
             Some(true) => {
@@ -1066,7 +1088,7 @@ impl ResultPanel {
     fn chart_ui(&mut self, ui: &mut Ui) {
         let generation = self.src.generation;
         let cv = self.chart.get_or_insert_with(|| {
-            let config = ternarygrid_visual::chart::ChartConfig::suggest(self.model.columns());
+            let config = ternarygrid_visual::chart::ChartConfig::suggest_with(self.model.columns(), |c| ternarygrid_grid::format::is_identifier_column(&self.model, c));
             ChartView { data: ternarygrid_visual::chart::ChartData::default(), config, state: Default::default(), generation: u64::MAX }
         });
         let mut rebuild = cv.generation != generation;
@@ -1135,6 +1157,8 @@ impl ResultPanel {
             if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TABLE), tr("Back to grid"), true, false).clicked() {
                 self.mode = Mode::Grid;
             }
+            // As tall as the bar's buttons.
+            ui.spacing_mut().interact_size.y = ternarygrid_ui::style::SMALL_H;
             egui::ComboBox::from_id_salt("spatial_col").icon(ternarygrid_ui::kit::combo_caret).selected_text(names.get(sv.column).cloned().unwrap_or_default()).show_ui(ui, |ui| {
                 kit::menu_look(ui, 180.0);
                 for c in &cols {
@@ -1172,13 +1196,14 @@ impl ResultPanel {
                 |ui| {
                     let text = match total {
                         Some(t) => trf("The result has {} rows; fetching them may take a while.", &[&ternarygrid_grid::format::group_thousands(&t.to_string())]),
-                        None => trf("The result may have more than {} rows; fetching them may take a while.", &[&limit]),
+                        None => trf("The result may have more than {} rows; fetching them may take a while.", &[&ternarygrid_grid::format::group_thousands(&limit.to_string())]),
                     };
                     ui.add(egui::Label::new(text).wrap());
                     ui.label(RichText::new(tr("Rows beyond the memory limit are kept in a temporary file.")).color(ternarygrid_ui::pal(ui).text_muted));
                 },
                 tr("Fetch all"),
                 false,
+                None,
                 &mut decided,
             );
             if let Some(go) = decided {
@@ -1199,16 +1224,24 @@ impl ResultPanel {
             use ternarygrid_ui::{kit, parts};
             let pending = self.model.pending_counts().total();
             let table = self.table.as_ref().map(|t| t.display_path()).unwrap_or_default();
-            let subtitle = if table.is_empty() { trf("{} changes", &[&pending]) } else { trf("{} changes in {}", &[&pending, &table]) };
+            let changes = ternarygrid_core::trn(pending, tr("1 change"), tr("{} changes"));
+            let subtitle = if table.is_empty() { changes } else { trf("{} in {}", &[&changes, &table]) };
             let ty = cx.conns.type_of(&self.conn);
             let conn_name = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default();
-            let (modal, ()) = parts::Dialog::new(tr("Save changes")).icon(icon::FLOPPY_DISK).subtitle(&subtitle).width(660.0).show_modal(
+            // On a marked connection (production) the badge warns too.
+            let marked = crate::theme::connection_marker(ty.color).is_some();
+            let mut dialog = parts::Dialog::new(tr("Save changes")).icon(icon::FLOPPY_DISK).subtitle(&subtitle).width(660.0);
+            if marked {
+                dialog = dialog.tone(parts::Tone::Warning);
+            }
+            let (modal, ()) = dialog.show_modal(
                 ui.ctx(),
                 egui::Id::new(("save_preview", &self.conn, &self.title)),
                 |ui| {
                     ui.label(RichText::new(tr("These statements will run in one transaction:")).color(ternarygrid_ui::pal(ui).text_muted));
-                    crate::widgets::code_block(ui, ("save_preview_sql", &self.conn), &sql, &tokens, 320.0);
-                    if crate::theme::connection_marker(ty.color).is_some() {
+                    // Wrapped: every statement read whole, no scrolling sideways.
+                    crate::widgets::code_block_ex(ui, ("save_preview_sql", &self.conn), &sql, &tokens, true, 320.0);
+                    if marked {
                         let note = trf("{} is a {} connection: these changes reach the live database.", &[&conn_name, &ty.name]);
                         parts::callout(ui, parts::Tone::Warning, None, &note, |_| {});
                     }
@@ -1218,7 +1251,7 @@ impl ResultPanel {
                         ui.ctx().copy_text(sql.clone());
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if kit::primary_icon(ui, icon::FLOPPY_DISK, tr("Save")).clicked() {
+                        if kit::primary_icon(ui, icon::CHECK, tr("Save")).clicked() {
                             save = true;
                         }
                         if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -1233,6 +1266,10 @@ impl ResultPanel {
             }
             if close || modal.close {
                 self.save_preview = None;
+                // Not saved: no reload after it either.
+                if self.save_job.is_none() {
+                    self.after_save = None;
+                }
             }
         }
         if let Some((table, selected)) = self.virtual_key_dialog.as_mut() {
@@ -1402,8 +1439,9 @@ fn column_stats_text(v: &[Value]) -> String {
     text
 }
 
-/// A small confirmation dialog: the question as the title, `body`, Cancel and the action
-/// (red when `danger`). Sets `decided` to the choice.
+/// A small confirmation dialog: the question as the title, `body`, Cancel, the `secondary`
+/// action (a Secondary button; its flag set when clicked) and the action (red, with the red
+/// badge, when `danger`). Sets `decided` to the choice.
 #[allow(clippy::too_many_arguments)]
 fn confirm_dialog(
     ui: &Ui,
@@ -1413,25 +1451,24 @@ fn confirm_dialog(
     body: impl FnOnce(&mut Ui),
     action: &str,
     danger: bool,
+    mut secondary: Option<(&str, &mut bool)>,
     decided: &mut Option<bool>,
 ) -> (ternarygrid_ui::parts::DialogResponse, ()) {
-    use ternarygrid_ui::kit;
-    ternarygrid_ui::parts::Dialog::new(title).icon(glyph).width(500.0).show_modal(ui.ctx(), id, body, |ui| {
+    use ternarygrid_ui::{kit, parts};
+    let mut dialog = parts::Dialog::new(title).icon(glyph).width(500.0);
+    if danger {
+        dialog = dialog.tone(parts::Tone::Error);
+    }
+    dialog.show_modal(ui.ctx(), id, body, |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let clicked = if danger {
-                let pal = ternarygrid_ui::pal(ui);
-                let b =
-                    egui::Button::new(RichText::new(action).color(egui::Color32::WHITE).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))))
-                        .fill(if ui.visuals().dark_mode { egui::Color32::from_rgb(0xc4, 0x35, 0x2b) } else { pal.err })
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(ternarygrid_ui::style::RADIUS)
-                        .min_size(egui::vec2(0.0, ternarygrid_ui::style::CONTROL_H));
-                ui.add(b).clicked()
-            } else {
-                kit::primary(ui, action).clicked()
-            };
-            if clicked {
+            let kind = if danger { kit::Kind::DangerFilled } else { kit::Kind::Primary };
+            if kit::button_ex(ui, kind, None, action, false).clicked() {
                 *decided = Some(true);
+            }
+            if let Some((label, clicked)) = secondary.as_mut()
+                && kit::button_ex(ui, kit::Kind::Secondary, None, label, false).clicked()
+            {
+                **clicked = true;
             }
             if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
                 *decided = Some(false);
