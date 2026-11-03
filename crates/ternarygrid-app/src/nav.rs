@@ -2080,7 +2080,7 @@ pub fn tools_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, schema: Option<S
         cx.push(AppCommand::OpenSearch { connection: Some(conn.to_string()), data: false });
         ui.close();
     }
-    if sql && ternarygrid_ui::kit::menu_item(ui, Some(icon::MAGNIFYING_GLASS_PLUS), tr("Search data"), "").clicked() {
+    if sql && ternarygrid_ui::kit::menu_item(ui, Some(icon::BINOCULARS), tr("Search data"), "").clicked() {
         cx.push(AppCommand::OpenSearch { connection: Some(conn.to_string()), data: true });
         ui.close();
     }

@@ -1020,7 +1020,7 @@ impl TabView for SearchTab {
     fn icon(&self) -> &'static str {
         match self.mode {
             Mode::Metadata => icon::MAGNIFYING_GLASS,
-            Mode::Data => icon::LIST_MAGNIFYING_GLASS,
+            Mode::Data => icon::BINOCULARS,
         }
     }
 

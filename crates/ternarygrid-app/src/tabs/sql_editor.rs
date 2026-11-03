@@ -1628,10 +1628,16 @@ impl SqlEditorTab {
                         ternarygrid_ui::parts::segmented_small(ui, view, &[(PlanView::Diagram, tr("Diagram")), (PlanView::Tree, tr("Tree")), (PlanView::Text, tr("Text"))]);
                         let s = ternarygrid_visual::plan::plan_summary(plan);
                         if let Some(ms) = s.execution_ms {
-                            ui.label(RichText::new(trf("Execution {} ms", &[&format!("{ms:.1}")])).color(pal.text_faint));
+                            ui.label(RichText::new(trf("Execution {} ms", &[&format!("{ms:.1}")])).color(pal.text_muted));
                         }
                         if let Some(c) = s.total_cost {
-                            ui.label(RichText::new(trf("Cost {}", &[&format!("{c:.1}")])).color(pal.text_faint));
+                            // Compact, as the plan's own summary writes costs ("18.2K").
+                            let cost = match c {
+                                c if c >= 1e6 => format!("{:.1}M", c / 1e6),
+                                c if c >= 1e3 => format!("{:.1}K", c / 1e3),
+                                c => format!("{c:.1}"),
+                            };
+                            ui.label(RichText::new(trf("Cost {}", &[&cost])).color(pal.text_muted));
                         }
                         if kit::button_full(ui, kit::Kind::Ghost, Some(icon::FLOPPY_DISK), tr("Save plan…"), true, false).clicked()
                             && let Some(path) = rfd::FileDialog::new().add_filter(tr("Execution plan"), &["json"]).set_file_name("plan.json").save_file()
