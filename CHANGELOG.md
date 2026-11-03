@@ -3,6 +3,25 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.2 — 2026-11-03
+
+A pass over every screen for clarity and consistency.
+
+### Changed
+- **Results look and work the same everywhere**: under a table's data and under the SQL editor, one filter bar (WHERE, the Sort chip, Apply) and one footer (rows and time, Fetch next; Add row, the views, Export, ⋯ with the less used actions, the panels; a narrow footer moves Add row and Export into ⋯). The side panels have a tab each (Value, Metadata, Grouping, Calc, References), so every panel is one click away.
+- **Clearer actions**: every confirmation that deletes, drops, terminates or discards is red and names what it does ("Delete connection", "Terminate session", "Drop and recreate 3 tables"); safe actions are no longer red; disabled buttons stay readable; one main button per window; wizards have Next as their main button and Close / Run again after a run; tool windows share one footer.
+- **SQL editor**: Run is a split button (Run statement, Run in new tab, Run script, Explain plan); one Stop; Roll back and Commit appear once; the cursor position sits under the editor; rows and timings are shown once, in the results footer; errors show "Line 8, column 7" as a link.
+- **Command palette**: results grouped (Objects, Scripts, Commands, Connections), matched letters highlighted, word starts ranked first, shortcuts as key caps. Every command name is in sentence case.
+- **Navigator**: a failed connection shows its whole error with Retry and Edit connection; filtering hides empty folders; menus end with the destructive items; clearer icons (history, background operations, format, truncate).
+- **Object pages**: Columns and Indexes are sub-pages of Properties; DDL is formatted; empty columns of property tables are hidden; the Metadata panel fits its width; the record view shows each column's type.
+- **Grid**: key and id columns have no thousands separators; numbers are formatted the same in Calc, Grouping and dialogs; the cell menu is shorter (less used items under More); filter-by-value offers the operators that fit the column's type.
+- **Charts, plans and maps**: charts no longer plot id columns by default; plan diagrams fit on open and list their warnings; maps fit their geometries.
+- **Dialogs**: one way to show a field's error; labels line up with their controls; Test connection results in the dialog body; commit paths when disconnecting or quitting with open transactions; deleting a connected connection in one step; downloads can be cancelled.
+- **Transfer wizards**: complete summaries before running (mode, target tables, filters, files), outcome colours that reflect failures, one failures table, one "NULL as" setting and one delimiter control.
+- **Tool windows** size to their content; session and lock columns have readable names; the query builder labels joins as the SQL writes them; data compare shows "now → after sync".
+- **Settings and tasks**: clearing history and deleting a network profile ask first; network profiles save as you edit; the scheduled tasks switch moved to General; the shortcut list records on click and shows key caps; task times are relative ("Tomorrow 02:00").
+- Counts read "1 table" / "3 tables" everywhere (no more "(s)").
+
 ## 0.6.1 — 2026-11-03
 
 ### Changed

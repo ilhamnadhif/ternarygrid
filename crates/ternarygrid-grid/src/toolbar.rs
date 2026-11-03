@@ -625,6 +625,9 @@ impl<'a> ResultToolbar<'a> {
         let mut actions = Vec::new();
         auto_refresh_tick(ui, model, grid.is_editing(), state, &mut actions);
         let p = ternarygrid_ui::pal(ui);
+        // A narrow footer (a side panel open, a split editor) keeps the status, the views and
+        // ⋯; Add row and Export move into ⋯ instead of running into the status.
+        let compact = ui.available_width() < COMPACT_W;
         let row = ui.horizontal(|ui| {
             ui.set_min_height(FOOTER_H);
             ui.spacing_mut().item_spacing.x = 10.0;
@@ -668,9 +671,6 @@ impl<'a> ResultToolbar<'a> {
                     ui.ctx().request_repaint_after(crate::grid::CANCEL_AFTER - running);
                 }
             }
-            // ⋯: what the footer does besides fetching the next rows.
-            let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More result actions"), false, 26.0);
-            Popup::menu(&more).id(ui.id().with("result_more")).show(|ui| more_menu(ui, model, grid, state, &mut actions));
             // A failed fetch shows in its bar over the rows; closed, a short note here brings it back
             // (the message once on screen, not twice).
             if let Some(e) = &model.fetch.error
@@ -682,7 +682,8 @@ impl<'a> ResultToolbar<'a> {
                 }
             }
             let left_end = ui.min_rect().right();
-            // --- right, right to left: the panel toggle, Export, the views
+            // --- right, right to left: the panel toggle at the edge, ⋯ (the less used actions,
+            // the last of the result's actions as in every bar), Export, the views, Add row
             let right_start = ui
                 .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -697,15 +698,29 @@ impl<'a> ResultToolbar<'a> {
                             state.panels_hidden = false;
                         }
                     }
-                    let export = flat_button(ui, Some(icon::EXPORT), tr("Export"), Flat::Plain);
-                    if export.on_hover_text(tr("Export…")).clicked() {
-                        actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
+                    let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More result actions"), false, 28.0);
+                    Popup::menu(&more).id(ui.id().with("result_more")).show(|ui| more_menu(ui, model, grid, state, compact, &mut actions));
+                    if !compact {
+                        let export = flat_button(ui, Some(icon::EXPORT), tr("Export"), Flat::Plain);
+                        if export.on_hover_text(tr("Export…")).clicked() {
+                            actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
+                        }
                     }
                     if let Some(kind) = view_switch(ui, state.view)
                         && state.view != kind
                     {
                         state.view = kind;
                         actions.push(GridAction::SwitchView(kind));
+                    }
+                    // Adding a row is the edit people look for under the rows (as in DBeaver's
+                    // footer); the other row operations are in ⋯, the context menu and the keys.
+                    if model.is_editable() && !compact {
+                        let add = flat_button(ui, Some(icon::PLUS), tr("Add row"), Flat::Plain).on_hover_text(tr("Add a row after the selected one (Insert)"));
+                        if add.clicked()
+                            && let Err(e) = grid::add_row(model, grid)
+                        {
+                            actions.push(GridAction::Notify { message: e, error: true });
+                        }
                     }
                     if !model.is_editable()
                         && let Some(r) = model.read_only_reason()
@@ -754,6 +769,9 @@ impl<'a> ResultToolbar<'a> {
 
 /// Height of the footer's row.
 const FOOTER_H: f32 = 30.0;
+
+/// Below this width the footer moves Add row and Export into ⋯.
+const COMPACT_W: f32 = 760.0;
 
 /// The look of a [`flat_button`].
 #[derive(Clone, Copy, PartialEq)]
@@ -985,8 +1003,16 @@ fn panel_items(ui: &mut Ui, state: &ToolbarState, actions: &mut Vec<GridAction>)
 
 /// The footer's ⋯ menu: refresh, auto refresh, fetching, rows, Chart / Spatial view, the XML
 /// view, panels.
-fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, state: &mut ToolbarState, actions: &mut Vec<GridAction>) {
+fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, state: &mut ToolbarState, compact: bool, actions: &mut Vec<GridAction>) {
     kit::menu_look(ui, 260.0);
+    // What a narrow footer leaves out.
+    if compact {
+        if kit::menu_item(ui, Some(icon::EXPORT), tr("Export…"), "").clicked() {
+            actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
+            ui.close();
+        }
+        kit::menu_separator(ui);
+    }
     if kit::menu_item(ui, Some(icon::ARROW_CLOCKWISE), tr("Refresh"), keys("⌘R", "Ctrl+R")).clicked() {
         actions.push(GridAction::Refresh);
         ui.close();
