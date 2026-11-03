@@ -205,21 +205,29 @@ impl TabView for HistoryTab {
                 look::error(ui, e);
             }
             let (shown, total) = (look::grouped_number(self.entries.len() as f64, true), look::grouped_number(self.total as f64, true));
+            let count = if self.total == 1 { trf("{} of 1 entry", &[&shown]) } else { trf("{} of {} entries", &[&shown, &total]) };
             // On the design's line of 19.5 (its text on the baseline of a 16 point line box).
             ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 19.5), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_min_height(19.5);
                 ui.add_space(3.5);
-                ui.label(RichText::new(trf("{} of {} entries", &[&shown, &total])).size(12.0).color(pal.text_faint));
+                ui.label(RichText::new(count).size(12.0).color(pal.text_muted));
             });
         });
         let sel_entry = self.selected.and_then(|i| self.entries.get(i).cloned());
         let names: std::collections::HashMap<String, String> = cx.conns.configs().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
-        // The details: 12 of margin, 12 of padding, the buttons, 10, the statement's lines.
-        let detail_h = sel_entry.as_ref().map_or(0.0, |e| 12.0 * 2.0 + 12.0 * 2.0 + 2.0 + 26.0 + 10.0 + e.sql.lines().count().clamp(1, 6) as f32 * 20.0 + 8.0);
+        let conn_of = |e: &HistoryEntry| e.connection_id.as_ref().and_then(|c| names.get(c).cloned()).or_else(|| e.connection_name.clone()).unwrap_or_default();
+        // The details: 12 of margin, 12 of padding, the buttons, 10, the statement's lines,
+        // and the error under them (its height of the last frame).
+        let error_id = egui::Id::new("history_detail_error_h");
+        let error_h = if sel_entry.as_ref().is_some_and(|e| e.error_message.is_some()) { ui.data(|d| d.get_temp::<f32>(error_id)).unwrap_or(40.0) + 10.0 } else { 0.0 };
+        let detail_h = sel_entry.as_ref().map_or(0.0, |e| 12.0 * 2.0 + 12.0 * 2.0 + 2.0 + 26.0 + 10.0 + e.sql.lines().count().clamp(1, 6) as f32 * 20.0 + 8.0 + error_h);
         let avail = (ui.available_height() - detail_h).max(80.0);
+        // The connection as wide as its longest name (at most 220).
+        let conn_names: Vec<String> = self.entries.iter().map(&conn_of).collect();
+        let conn_w = look::fit(ui, conn_names.iter().map(String::as_str), 0.0, 110.0, 220.0);
         let cols = [
             look::Col::new(tr("Time"), look::Width::Initial(170.0)),
-            look::Col::new(tr("Connection"), look::Width::Initial(130.0)),
+            look::Col::new(tr("Connection"), look::Width::Fit(conn_w)),
             look::Col::new(tr("Duration"), look::Width::Initial(90.0)).right(),
             look::Col::new(tr("Rows"), look::Width::Initial(80.0)).right(),
             look::Col::new(tr("Status"), look::Width::Initial(100.0)),
@@ -239,7 +247,7 @@ impl TabView for HistoryTab {
                     let when = chrono::DateTime::from_timestamp_millis(e.timestamp_ms)
                         .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_default();
-                    let conn = e.connection_id.as_ref().and_then(|c| names.get(c).cloned()).or_else(|| e.connection_name.clone()).unwrap_or_default();
+                    let conn = conn_of(e);
                     look::cell(row, false, |ui| {
                         look::cell_text(ui, look::mono(ui, &when, pal.text_muted));
                     });
@@ -305,11 +313,6 @@ impl TabView for HistoryTab {
                         self.selected = None;
                         self.reload(cx);
                     }
-                    if let Some(err) = &e.error_message {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add(egui::Label::new(RichText::new(err.lines().next().unwrap_or("")).size(12.5).color(pal.err)).truncate());
-                        });
-                    }
                 });
                 // The statement highlighted as the design's code block: lines of 20, 4 above and
                 // below, at most six lines shown.
@@ -336,6 +339,17 @@ impl TabView for HistoryTab {
                 ui.add_space(4.0);
                 ui.add(egui::Label::new(egui::WidgetText::Galley(galley)));
                 ui.add_space(4.0);
+                // What went wrong, in full, under the statement.
+                if let Some(err) = &e.error_message {
+                    ui.add_space(10.0);
+                    let top = ui.cursor().top();
+                    look::error(ui, err.trim());
+                    let h = ui.cursor().top() - top;
+                    if (ui.data(|d| d.get_temp::<f32>(error_id)).unwrap_or(0.0) - h).abs() > 0.5 {
+                        ui.data_mut(|d| d.insert_temp(error_id, h));
+                        ui.ctx().request_repaint();
+                    }
+                }
             });
         }
     }

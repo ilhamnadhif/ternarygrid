@@ -12,7 +12,7 @@ use ternarygrid_core::ddl::SnapshotOptions;
 use ternarygrid_core::driver::{TransactionMode, execute_update};
 use ternarygrid_core::meta::SchemaRef;
 use ternarygrid_core::registry::DriverRegistry;
-use ternarygrid_core::{DbError, DbResult, Session};
+use ternarygrid_core::{DbError, DbResult, Session, trn};
 use ternarygrid_tasks::{RunContext, RunOutcome, TaskDef, TaskExecutor, TaskKind};
 
 pub struct AppTaskExecutor {
@@ -176,9 +176,9 @@ impl AppTaskExecutor {
             if b.session.in_transaction() {
                 b.session.commit().await?;
             }
-            ctx.info(format!("{} statement(s) applied", script.len()));
+            ctx.info(trn(script.len(), "1 statement applied", "{} statements applied"));
         }
-        out.message = Some(if diff.has_differences() { format!("{} difference(s)", t.changed()) } else { "The schemas are identical".into() });
+        out.message = Some(if diff.has_differences() { trn(t.changed(), "1 difference", "{} differences") } else { "The schemas are identical".into() });
         let _ = a.session.close().await;
         let _ = b.session.close().await;
         Ok(out)
@@ -236,9 +236,10 @@ pub async fn run_script(
     // "Continue on error" runs the rest, but the run did not succeed: it is recorded as
     // failed (and the failure notification fires); the statements that worked stay applied.
     if failed > 0 {
-        return Err(DbError::query(format!("{failed} of {total} statement(s) failed; the others were executed")));
+        let of = if total == 1 { "1 statement".to_string() } else { format!("{total} statements") };
+        return Err(DbError::query(format!("{failed} of {of} failed; the others were executed")));
     }
-    Ok(RunOutcome { rows: Some(rows), output_files: Vec::new(), message: Some(format!("{total} statement(s) executed")) })
+    Ok(RunOutcome { rows: Some(rows), output_files: Vec::new(), message: Some(trn(total as usize, "1 statement executed", "{} statements executed")) })
 }
 
 #[async_trait::async_trait]

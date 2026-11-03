@@ -77,18 +77,19 @@ pub fn paint_box(ui: &Ui, b: Rect, on: bool, hovered: bool) {
     }
 }
 
-/// Radio buttons for `value` in a row (16 points apart).
+/// Radio buttons for `value`, 16 points apart, in the caller's row (a form row's line: no row
+/// of their own, so the label is centred on them).
 pub fn radios<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, items: &[(T, &str)]) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 16.0;
-        for (v, l) in items {
-            if ternarygrid_ui::kit::radio(ui, *value == *v, *l).clicked() && *value != *v {
-                *value = *v;
-                changed = true;
-            }
+    let spacing = ui.spacing().item_spacing.x;
+    ui.spacing_mut().item_spacing.x = 16.0;
+    for (v, l) in items {
+        if ternarygrid_ui::kit::radio(ui, *value == *v, *l).clicked() && *value != *v {
+            *value = *v;
+            changed = true;
         }
-    });
+    }
+    ui.spacing_mut().item_spacing.x = spacing;
     changed
 }
 
@@ -221,6 +222,60 @@ pub fn text_field_h(ui: &mut Ui, value: &mut String, width: f32, h: f32, hint: &
     )
 }
 
+/// [`ternarygrid_ui::kit::search_field`] `h` high (26 in a toolbar of 26 point buttons).
+pub fn search_field_h(ui: &mut Ui, id: egui::Id, text: &mut String, hint: &str, width: f32, h: f32) -> Response {
+    let p = ternarygrid_ui::pal(ui);
+    let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
+    let frame = egui::Frame::new()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0, if hovered { p.border_strong } else { p.border }))
+        .corner_radius(CornerRadius::same(RADIUS))
+        .inner_margin(egui::Margin { left: 32, right: 26, top: 0, bottom: 0 });
+    let resp = ui.add(
+        egui::TextEdit::singleline(text)
+            .id(id)
+            .hint_text(RichText::new(hint).color(p.text_faint))
+            .desired_width(width)
+            .min_size(vec2(0.0, h))
+            .vertical_align(egui::Align::Center)
+            .frame(frame),
+    );
+    let r = resp.rect;
+    if resp.has_focus() {
+        style::focus_halo(ui, r, RADIUS);
+    }
+    ui.painter().text(egui::pos2(r.left() + 16.0, r.center().y), Align2::CENTER_CENTER, egui_phosphor::regular::MAGNIFYING_GLASS, style::icon_font(13.0), p.text_faint);
+    if !text.is_empty() {
+        let x_rect = Rect::from_center_size(egui::pos2(r.right() - 14.0, r.center().y), vec2(18.0, 18.0));
+        let x = ui.interact(x_rect, resp.id.with("clear"), Sense::click()).on_hover_text(ternarygrid_core::tr("Clear"));
+        let color = if x.hovered() { p.text } else { p.text_faint };
+        ui.painter().text(x_rect.center(), Align2::CENTER_CENTER, egui_phosphor::regular::X_CIRCLE, style::icon_font(14.0), color);
+        if x.clicked() {
+            text.clear();
+        }
+    }
+    resp
+}
+
+/// The label of a form row in a column `w` wide: muted, wrapped on at most two lines (cut
+/// with "…" past that, the whole label on hover), centred on the controls' first line `line`
+/// high. Returns the height the label needs (more than `line` when it wraps).
+pub fn form_label(ui: &mut Ui, label: &str, w: f32, line: f32) -> f32 {
+    let p = ternarygrid_ui::pal(ui);
+    let mut job = egui::text::LayoutJob::simple(label.to_string(), FontId::proportional(13.0), p.text_muted, w);
+    job.wrap.max_rows = 2;
+    job.wrap.overflow_character = Some('…');
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let h = galley.size().y;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, line.max(h)), Sense::hover());
+    let elided = galley.elided;
+    ui.painter().galley(egui::pos2(rect.left(), rect.center().y - h / 2.0), galley, fade(ui, p.text_muted));
+    if elided {
+        resp.on_hover_text(label);
+    }
+    h
+}
+
 /// A password field 30 points high.
 pub fn password_field(ui: &mut Ui, value: &mut String, width: f32, hint: &str) -> Response {
     let p = ternarygrid_ui::pal(ui);
@@ -242,12 +297,21 @@ pub fn password_field(ui: &mut Ui, value: &mut String, width: f32, hint: &str) -
 /// Width of a [`table`] column.
 #[derive(Clone, Copy)]
 pub enum Width {
-    /// Fixed.
-    Exact(f32),
     /// Resizable, starting at this width.
     Initial(f32),
+    /// As wide as its content (see [`fit`]), following it when the content changes.
+    Fit(f32),
     /// What is left (the last column).
     Rest(f32),
+}
+
+/// The width a column needs for `texts` in the body font (`extra`: an icon before them),
+/// with the cells' padding, between `min` and `max`: what [`Width::Fit`] takes.
+pub fn fit<'a>(ui: &Ui, texts: impl IntoIterator<Item = &'a str>, extra: f32, min: f32, max: f32) -> f32 {
+    let font = FontId::proportional(style::body_size(ui.ctx()));
+    let widest = texts.into_iter().map(|t| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::PLACEHOLDER).size().x).fold(0.0, f32::max);
+    // 10 of padding at the left of a cell, 12 at its right before the next column.
+    (widest + extra + 22.0).ceil().clamp(min, max)
 }
 
 /// A column of a [`table`]: its header, width and whether its cells are right-aligned.
@@ -304,8 +368,9 @@ fn table_dyn(ui: &mut Ui, id: egui::Id, cols: &[Col], rows: usize, row_h: f32, b
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
             for c in cols {
                 tb = tb.column(match c.width {
-                    Width::Exact(w) => Column::exact(w),
                     Width::Initial(w) => Column::initial(w).at_least(40.0).clip(true).resizable(true),
+                    // Not resizable: egui then takes the given width every frame.
+                    Width::Fit(w) => Column::initial(w).at_least(40.0).clip(true).resizable(false),
                     Width::Rest(min) => Column::remainder().at_least(min).clip(true),
                 });
             }
@@ -395,18 +460,44 @@ pub fn day_toggle(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     resp
 }
 
-/// [`ternarygrid_ui::parts::callout`] as tall as its text, also where the space below is
-/// unbounded (a panel).
-pub fn callout(ui: &mut Ui, tone: ternarygrid_ui::parts::Tone, title: Option<&str>, body: &str, add: impl FnOnce(&mut Ui)) {
+/// [`ternarygrid_ui::parts::callout`] without actions, as tall as its text (also where the
+/// space below is unbounded: a panel) and exactly as wide as the room. (The kit's callout
+/// leaves its item spacing (10) after the text for actions even when there are none, so it is
+/// laid out 10 points narrower.)
+pub fn note(ui: &mut Ui, tone: ternarygrid_ui::parts::Tone, body: &str) {
     let w = ui.available_width();
     ui.allocate_ui_with_layout(vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-        ternarygrid_ui::parts::callout(ui, tone, title, body, add);
+        ui.set_max_width(w - 10.0);
+        ternarygrid_ui::parts::callout(ui, tone, None, body, |_| {});
     });
 }
 
-/// An error [`callout`].
+/// A one-line note with its action buttons at the right (a banner: "Scheduled runs are off —
+/// … [Turn on]"): the callout's look, the icon, text and buttons centred on one line (the text
+/// wraps when it must).
+pub fn banner(ui: &mut Ui, tone: ternarygrid_ui::parts::Tone, body: &str, add: impl FnOnce(&mut Ui)) {
+    let p = ternarygrid_ui::pal(ui);
+    let color = tone.color(&p);
+    egui::Frame::new().fill(tone.fill(ui)).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin { left: 12, right: 8, top: 6, bottom: 6 }).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.set_min_height(style::SMALL_H);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                add(ui);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.label(RichText::new(tone.icon()).font(style::icon_font(16.0)).color(color));
+                    ui.add(egui::Label::new(RichText::new(body).size(12.5).color(p.text)).wrap());
+                });
+            });
+        });
+    });
+}
+
+/// An error [`note`].
 pub fn error(ui: &mut Ui, text: &str) {
-    callout(ui, ternarygrid_ui::parts::Tone::Error, None, text, |_| {});
+    note(ui, ternarygrid_ui::parts::Tone::Error, text);
 }
 
 /// A small muted heading (a panel's title: "Folders", "Messages").
