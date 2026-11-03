@@ -225,12 +225,17 @@ impl Shots {
 
     /// Write the last frame as `<name>-<theme>.png`.
     fn shot(&mut self, name: &str) {
+        // The pointer away from the content (no hover effects).
+        self.shot_hovering(name, egui::pos2(1439.0, 899.0));
+    }
+
+    /// [`Shots::shot`] with the pointer at `pos` (a row's hover state).
+    fn shot_hovering(&mut self, name: &str, pos: egui::Pos2) {
         if self.only.as_deref().is_some_and(|o| !o.split(',').any(|o| name.starts_with(o))) {
             return;
         }
         self.h.state_mut().toasts.clear();
-        // The pointer away from the content (no hover effects).
-        self.h.event(egui::Event::PointerMoved(egui::pos2(1439.0, 899.0)));
+        self.h.event(egui::Event::PointerMoved(pos));
         self.frames(30);
         let out = self.h.output();
         let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
@@ -536,10 +541,34 @@ fn shots(s: &mut Shots) {
         }
         s.frames(3);
         s.shot(name);
-        if section == "Network profiles" {
-            s.click("New profile");
-            s.frames(3);
-            s.shot("set_network_form");
+        match section {
+            // A row under the pointer: its shortcut records a new one, Remove at its end.
+            "Keyboard shortcuts" => {
+                let cell = s.h.query_all_by_label("Record a shortcut").nth(3).map(|n| n.rect());
+                if let Some(r) = cell {
+                    s.shot_hovering("set_keys_hover", r.center());
+                }
+            }
+            // Clearing the history asks first (how many entries go).
+            "Query history" => {
+                s.click("Clear history…");
+                s.frames(20);
+                s.shot("set_history_clear");
+                s.click("Cancel");
+                s.frames(10);
+            }
+            "Network profiles" => {
+                // Deleting a profile asks first; a new profile is saved at once and selected.
+                s.click("Delete profile…");
+                s.frames(20);
+                s.shot("set_network_delete");
+                s.click("Cancel");
+                s.frames(10);
+                s.click("New profile");
+                s.frames(3);
+                s.shot("set_network_form");
+            }
+            _ => {}
         }
     }
     // A select open (the menu look of the drop-downs): the formatter of the SQL editor.
@@ -637,7 +666,7 @@ fn shots(s: &mut Shots) {
     use ternarygrid_tasks::{MessageLevel as L, RunStatus as R, Trigger as T};
     record(&tb, 330, 41, R::Succeeded, T::Schedule, None, &[]);
     record(&te, 360, 6, R::Succeeded, T::Schedule, None, &[]);
-    record(&t1, 300, 41, R::Succeeded, T::Schedule, None, &[(0, L::Info, "Connecting to ternarygrid-sample.db…"), (41, L::Info, "1 statement(s) run")]);
+    record(&t1, 300, 41, R::Succeeded, T::Schedule, None, &[(0, L::Info, "Connecting to ternarygrid-sample.db…"), (41, L::Info, "1 statement executed")]);
     record(&t2, 2900, 3, R::Succeeded, T::Manual, None, &[(3, L::Info, "12 differences")]);
     record(&t2, 1460, 4, R::Succeeded, T::Schedule, None, &[(4, L::Info, "14 differences")]);
     let refused = "connection refused (os error 61): tplus-staging:3306";
@@ -670,7 +699,7 @@ fn shots(s: &mut Shots) {
     s.focused::<ternarygrid_app::tabs::tasks::TasksTab>().select_task(&t3.id);
     s.focused::<ternarygrid_app::tabs::tasks::TasksTab>().add_to_selection(&t2.id);
     s.frames(3);
-    s.click("Delete");
+    s.click("Delete…");
     s.frames(20);
     s.shot("task_delete");
     s.click("Cancel");

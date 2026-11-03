@@ -14,7 +14,7 @@ use ternarygrid_config::settings::{AiEffort, AiProvider, BlankLineDelimiter, Key
 use ternarygrid_config::{KeymapPreset, SecretsManager};
 use ternarygrid_core::config::{ConnectionType, NavigatorView};
 use ternarygrid_core::value::{BinaryFormat, BoolStyle};
-use ternarygrid_core::{Secret, tr, trf};
+use ternarygrid_core::{Secret, tr, trf, trn};
 use ternarygrid_ui::kit::{self, Kind};
 use ternarygrid_ui::parts::{self, Tone};
 
@@ -73,14 +73,14 @@ impl Section {
             Section::Editor => icon::FILE_CODE,
             Section::Results => icon::TABLE,
             Section::Execution => icon::PLAY,
-            Section::History => icon::CLOCK,
-            Section::Navigator => icon::TREE_STRUCTURE,
+            Section::History => icon::CLOCK_COUNTER_CLOCKWISE,
+            Section::Navigator => icon::TREE_VIEW,
             Section::Keyboard => icon::KEYBOARD,
             Section::ConnectionTypes => icon::TAG,
             Section::NetworkProfiles => icon::GLOBE,
             Section::Ai => icon::SPARKLE,
             Section::Security => icon::LOCK,
-            Section::Accessibility => icon::EYE,
+            Section::Accessibility => icon::PERSON_ARMS_SPREAD,
         }
     }
 
@@ -97,7 +97,9 @@ impl Section {
                 "Time zone",
                 "Reopen the editors of the last session on start",
                 "Ask before quitting with unsaved changes",
-                "Check for updates automatically (at start and every few hours)",
+                "Check for updates automatically",
+                "Tasks",
+                "Run scheduled tasks while TernaryGrid is open",
             ],
             Section::Editor => &[
                 "Font size",
@@ -107,7 +109,7 @@ impl Section {
                 "Auto-save interval",
                 "Insert spaces instead of tabs",
                 "Show line numbers",
-                "Code folding (statements, block comments)",
+                "Fold statements and block comments",
                 "Highlight occurrences of the word under the cursor",
                 "Highlight the current line",
                 "Wrap long lines",
@@ -118,8 +120,9 @@ impl Section {
                 "Delay",
                 "Minimum characters",
                 "Maximum proposals",
-                "Keyword case",
+                "Completion keyword case",
                 "Formatter",
+                "Formatted keyword case",
                 "Indent width",
                 "Lines between statements",
                 "Maximum line length",
@@ -157,16 +160,26 @@ impl Section {
                 "Confirm DELETE / UPDATE without WHERE, DROP and TRUNCATE",
                 "Smart commit: switch to manual commit before data changes",
             ],
-            Section::History => &["Record executed queries", "Mask passwords in recorded statements", "Keep at most", "Keep for", "Clear the whole history"],
+            Section::History => &["Record executed queries", "Mask passwords in recorded statements", "Keep at most", "Keep for", "Clear history"],
             Section::Navigator => {
                 &["Order", "Default view of new connections", "Show system schemas and objects", "Show user@host next to connection names", "Expand a connection after connecting"]
             }
             Section::Keyboard => &["Preset", "Shortcut", "Reset all"],
             Section::ConnectionTypes => &["Colour", "Production", "Auto-commit by default", "Confirm statements that change data or schema", "Confirm saving data changes"],
             Section::NetworkProfiles => &["SSH", "Proxy", "Tunnel"],
-            Section::Ai => &["Provider", "Model", "Base URL", "Maximum answer length", "Effort", "API key", "Send table and column names as context", "Allow sending sample rows"],
+            Section::Ai => &[
+                "Provider",
+                "Model",
+                "Base URL",
+                "Maximum answer length",
+                "Effort",
+                "API key",
+                "Send table and column names as context",
+                "Allow sending sample rows",
+                "Let the assistant run read-only queries",
+            ],
             Section::Security => &["Secret storage", "Lock the vault after", "Master password", "Keychain", "Encrypted file"],
-            Section::Accessibility => &["High contrast", "Reduce motion", "Always show the keyboard focus", "Run scheduled tasks while TernaryGrid is open"],
+            Section::Accessibility => &["High contrast", "Reduce motion", "Always show the keyboard focus"],
         }
     }
 
@@ -209,6 +222,8 @@ pub struct SettingsTab {
     profile_ssh_password: String,
     profile_ssh_passphrase: String,
     profile_proxy_password: String,
+    /// The profile shown has a saved SSH password, passphrase, proxy password.
+    profile_saved: [bool; 3],
     new_master: String,
     new_master2: String,
     old_master: String,
@@ -220,6 +235,12 @@ pub struct SettingsTab {
     confirm_reset: bool,
     /// The network profile's SSH options the design leaves out are shown.
     ssh_more: bool,
+    /// Asking whether to clear the query history (its number of entries).
+    confirm_clear: Option<u64>,
+    /// Asking whether to delete this network profile (its id).
+    confirm_delete_profile: Option<String>,
+    /// Asking whether to delete this connection type (id, name, connections using it).
+    confirm_delete_type: Option<(String, String, usize)>,
 }
 
 /// Every setting back to its default, except the state of the update
@@ -246,6 +267,7 @@ impl Default for SettingsTab {
             profile_ssh_password: String::new(),
             profile_ssh_passphrase: String::new(),
             profile_proxy_password: String::new(),
+            profile_saved: [false; 3],
             new_master: String::new(),
             new_master2: String::new(),
             old_master: String::new(),
@@ -253,7 +275,45 @@ impl Default for SettingsTab {
             secrets_job: None,
             confirm_reset: false,
             ssh_more: false,
+            confirm_clear: None,
+            confirm_delete_profile: None,
+            confirm_delete_type: None,
         }
+    }
+}
+
+/// A destructive confirmation: the red badge, `question` in medium, `detail` muted under it,
+/// then Cancel and the filled red `action`. `Some(true)` when confirmed, `Some(false)` when
+/// cancelled (also by ×, Escape or a click beside it), `None` while it is open.
+fn confirm_danger(ctx: &egui::Context, id: &str, title: &str, question: &str, detail: &str, action: &str) -> Option<bool> {
+    let (yes, no) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+    let dialog = parts::Dialog::new(title).tone(Tone::Error).icon(icon::TRASH).width(460.0);
+    let (resp, ()) = dialog.show_modal(
+        ctx,
+        egui::Id::new(id),
+        |ui| {
+            let p = ternarygrid_ui::pal(ui);
+            let size = ternarygrid_ui::style::body_size(ui.ctx()) + 0.5;
+            ui.add(egui::Label::new(RichText::new(question).font(ternarygrid_ui::style::medium(ui.ctx(), size)).color(p.text)).wrap());
+            ui.add(egui::Label::new(RichText::new(detail).color(p.text_muted)).wrap());
+        },
+        |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), action, false).clicked() {
+                    yes.set(true);
+                }
+                if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                    no.set(true);
+                }
+            });
+        },
+    );
+    if yes.get() {
+        Some(true)
+    } else if no.get() || resp.close {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -341,24 +401,24 @@ fn row_dyn(ui: &mut Ui, label: &str, sub: Option<&str>, h: f32, add: &mut dyn Fn
 }
 
 /// The form row of the mockups: a grid of `label_w` and the rest, 16 points apart, the label
-/// muted on the line of a 30 point control, the control's explanation 4 points under it.
+/// muted and centred on the line of the controls (`h` high: 30 for fields and segmented
+/// controls, 16 for radio buttons), the control's explanation 4 points under it. A label too
+/// long for its column wraps on a second line; the controls are then centred on both.
 fn form_row(ui: &mut Ui, label: &str, label_w: f32, sub: Option<&str>, h: f32, add: &mut dyn FnMut(&mut Ui) -> bool) -> bool {
     let p = ternarygrid_ui::pal(ui);
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
-        // The label 6 points down (on the line of a 30 point field), its cell as tall as that.
-        ui.allocate_ui_with_layout(egui::vec2(label_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_min_width(label_w);
-            ui.add_space(6.0);
-            if !label.is_empty() {
-                ui.add(egui::Label::new(RichText::new(label).size(13.0).color(p.text_muted)).truncate());
-            }
-        });
+        let line = if label.is_empty() {
+            ui.allocate_exact_size(egui::vec2(label_w, h), egui::Sense::hover());
+            h
+        } else {
+            h.max(look::form_label(ui, label, label_w, h))
+        };
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
-            // The controls centred on a line `h` high (not egui's 30 point rows).
+            // The controls centred on the label's line (not egui's 30 point rows).
             let w = ui.available_width();
-            let c = ui.allocate_ui_with_layout(egui::vec2(w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| add(ui)).inner;
+            let c = ui.allocate_ui_with_layout(egui::vec2(w, line), egui::Layout::left_to_right(egui::Align::Center), |ui| add(ui)).inner;
             if let Some(sub) = sub {
                 // 4 points under the control, on a line 1.4 times its size.
                 ui.add_space(1.0);
@@ -384,6 +444,11 @@ fn indented(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> bool) -> bool {
 
 fn check(ui: &mut Ui, value: &mut bool, label: &str) -> bool {
     found(ui, label, |ui| look::checkbox(ui, value, label).changed())
+}
+
+/// [`check`] with a muted line of explanation under its label.
+fn check_sub(ui: &mut Ui, value: &mut bool, label: &str, sub: &str) -> bool {
+    found(ui, label, |ui| look::checkbox_sub(ui, value, label, Some(sub)).changed())
 }
 
 /// Check boxes in a column, 12 points apart.
@@ -540,12 +605,22 @@ fn chip(ui: &mut Ui, text: &str, color: egui::Color32, fill: egui::Color32) -> e
 }
 
 /// A small colour square (connection types).
-fn swatch(ui: &mut Ui, color: egui::Color32, side: f32) -> egui::Response {
-    let p = ternarygrid_ui::pal(ui);
+fn swatch(ui: &mut Ui, color: Option<egui::Color32>, side: f32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
-    let r = if side > 16.0 { ternarygrid_ui::style::RADIUS } else { 3 };
-    ui.painter().rect(rect, r, color, egui::Stroke::new(1.0, if side > 16.0 { p.border } else { egui::Color32::TRANSPARENT }), egui::StrokeKind::Inside);
+    paint_swatch(ui, rect, color);
     resp
+}
+
+/// A connection type's colour at `rect`, a hairline around it; no colour (a type that does
+/// not mark its connections) is the surface crossed by a faint diagonal.
+fn paint_swatch(ui: &Ui, rect: egui::Rect, color: Option<egui::Color32>) {
+    let p = ternarygrid_ui::pal(ui);
+    let r = if rect.width() > 16.0 { ternarygrid_ui::style::RADIUS } else { 3 };
+    ui.painter().rect(rect, r, color.unwrap_or(p.surface), egui::Stroke::new(1.0, p.border_strong), egui::StrokeKind::Inside);
+    if color.is_none() {
+        let d = rect.shrink(2.5);
+        ui.painter().line_segment([d.left_bottom(), d.right_top()], egui::Stroke::new(1.2, p.text_faint));
+    }
 }
 
 /// A row of a list at the left of a section (the sections, connection types, network
@@ -577,7 +652,9 @@ impl SettingsTab {
         let s = &mut cx.settings.general;
         let mut c = group(ui, tr("Appearance"), |ui| {
             let mut c = false;
-            c |= row_h(ui, tr("Theme"), 28.0, |ui| parts::segmented(ui, &mut s.theme, &[(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))]));
+            c |= row_h(ui, tr("Theme"), look::FIELD_H, |ui| {
+                parts::segmented(ui, &mut s.theme, &[(Theme::System, tr("System")), (Theme::Light, tr("Light")), (Theme::Dark, tr("Dark"))])
+            });
             c |= row(ui, tr("Font size"), |ui| num(ui, &mut s.ui_font_size, 8.0..=32.0, tr("pt")));
             c |= row(ui, tr("Zoom"), |ui| {
                 let mut pct = (s.ui_scale * 100.0).round();
@@ -598,18 +675,26 @@ impl SettingsTab {
             let u = &mut cx.settings.updates;
             let mut auto = u.check_automatically == Some(true);
             let was = auto;
-            let c = checks(
+            let mut c = checks(
                 ui,
                 vec![
                     (&mut s.restore_session, tr("Reopen the editors of the last session on start")),
                     (&mut s.confirm_exit_with_unsaved, tr("Ask before quitting with unsaved changes")),
-                    (&mut auto, tr("Check for updates automatically (at start and every few hours)")),
                 ],
             );
+            c |= check_sub(ui, &mut auto, tr("Check for updates automatically"), tr("At start and every few hours."));
             if auto != was {
                 u.check_automatically = Some(auto);
             }
             c
+        });
+        c |= group(ui, tr("Tasks"), |ui| {
+            check_sub(
+                ui,
+                &mut cx.settings.tasks.scheduler_enabled,
+                tr("Run scheduled tasks while TernaryGrid is open"),
+                tr("Off: tasks run only when started, or by the system scheduler."),
+            )
         });
         c
     }
@@ -628,21 +713,21 @@ impl SettingsTab {
                 c |= form_row(ui, tr("Tab size"), w, None, look::FIELD_H, &mut |ui| num(ui, &mut e.tab_size, 1..=16, ""));
             });
             c |= row(ui, tr("Statement delimiter"), |ui| text(ui, &mut e.statement_delimiter, 80.0, true));
-            c |= row_h(ui, tr("Blank line ends a statement"), 28.0, |ui| {
+            c |= row_h(ui, tr("Blank line ends a statement"), look::FIELD_H, |ui| {
                 parts::segmented(
                     ui,
                     &mut e.blank_line_delimiter,
                     &[(BlankLineDelimiter::Never, tr("Never")), (BlankLineDelimiter::Smart, tr("Smart")), (BlankLineDelimiter::Always, tr("Always"))],
                 )
             });
-            c |= row(ui, tr("Auto-save interval"), |ui| num(ui, &mut e.auto_save_interval_secs, 0..=3600, "s"));
+            c |= row_sub(ui, tr("Auto-save interval"), tr("0 turns auto-save off."), |ui| num(ui, &mut e.auto_save_interval_secs, 0..=3600, "s"));
             c |= indented(ui, |ui| {
                 check_columns(
                     ui,
                     vec![
                         (&mut e.insert_spaces, tr("Insert spaces instead of tabs")),
                         (&mut e.line_numbers, tr("Show line numbers")),
-                        (&mut e.folding, tr("Code folding (statements, block comments)")),
+                        (&mut e.folding, tr("Fold statements and block comments")),
                         (&mut e.mark_occurrences, tr("Highlight occurrences of the word under the cursor")),
                         (&mut e.highlight_current_line, tr("Highlight the current line")),
                     ],
@@ -676,7 +761,7 @@ impl SettingsTab {
                     c |= row(ui, tr("Delay"), |ui| num(ui, &mut a.delay_ms, 0..=2000, "ms"));
                     c |= row(ui, tr("Minimum characters"), |ui| num(ui, &mut a.min_chars, 0..=5, ""));
                     c |= row(ui, tr("Maximum proposals"), |ui| num(ui, &mut a.max_items, 10..=1000, ""));
-                    c |= row_h(ui, tr("Keyword case"), 28.0, |ui| parts::segmented(ui, &mut a.keyword_case, &case_opts));
+                    c |= row(ui, tr("Completion keyword case"), |ui| parts::segmented(ui, &mut a.keyword_case, &case_opts));
                     c
                 })
             },
@@ -702,7 +787,7 @@ impl SettingsTab {
                             });
                         }
                     }
-                    c |= row_h(ui, tr("Keyword case"), 28.0, |ui| parts::segmented(ui, &mut f.keyword_case, &case_opts));
+                    c |= row(ui, tr("Formatted keyword case"), |ui| parts::segmented(ui, &mut f.keyword_case, &case_opts));
                     c |= row(ui, tr("Indent width"), |ui| num(ui, &mut f.indent_width, 1..=8, ""));
                     c |= row(ui, tr("Lines between statements"), |ui| num(ui, &mut f.lines_between_statements, 0..=4, ""));
                     c |= row(ui, tr("Maximum line length"), |ui| num(ui, &mut f.max_line_length, 40..=400, ""));
@@ -737,19 +822,21 @@ impl SettingsTab {
         let mut c = group(ui, tr("Fetching"), |ui| {
             let mut c = false;
             c |= row(ui, tr("Rows fetched per page"), |ui| num(ui, &mut r.fetch_size, 10..=100_000, ""));
-            c |= row_h(ui, tr("Sorting and filtering"), 28.0, |ui| {
+            c |= row_h(ui, tr("Sorting and filtering"), look::FIELD_H, |ui| {
                 parts::segmented(ui, &mut r.sort_filter_mode, &[(SortFilterMode::Server, tr("On the server (re-query)")), (SortFilterMode::Client, tr("On fetched rows"))])
             });
             c |= row(ui, tr("Confirm \"fetch all\" above"), |ui| num(ui, &mut r.confirm_fetch_all_above, 0..=100_000_000, tr(" rows")));
-            c |= row(ui, tr("Auto-refresh interval"), |ui| num(ui, &mut r.auto_refresh_secs, 0..=3600, "s"));
+            c |= row_sub(ui, tr("Auto-refresh interval"), tr("0 turns auto-refresh off."), |ui| num(ui, &mut r.auto_refresh_secs, 0..=3600, "s"));
             c
         });
         c |= group(ui, tr("Layout"), |ui| {
             let mut c = false;
-            c |= row_h(ui, tr("Results position"), 28.0, |ui| {
+            c |= row_h(ui, tr("Results position"), look::FIELD_H, |ui| {
                 parts::segmented(ui, &mut r.layout, &[(ResultsLayout::Bottom, tr("Below the editor")), (ResultsLayout::Right, tr("Right of the editor"))])
             });
-            c |= row_h(ui, tr("Row height"), 28.0, |ui| parts::segmented(ui, &mut r.row_density, &[(RowDensity::Compact, tr("Compact")), (RowDensity::Normal, tr("Normal"))]));
+            c |= row_h(ui, tr("Row height"), look::FIELD_H, |ui| {
+                parts::segmented(ui, &mut r.row_density, &[(RowDensity::Compact, tr("Compact")), (RowDensity::Normal, tr("Normal"))])
+            });
             c |= row(ui, tr("Maximum result tabs"), |ui| num(ui, &mut r.max_result_tabs, 1..=100, ""));
             c |= checks(ui, vec![(&mut r.open_each_query_in_new_tab, tr("Open each query in a new result tab")), (&mut r.show_row_numbers, tr("Show row numbers"))]);
             c
@@ -781,10 +868,10 @@ impl SettingsTab {
                         let w = field_w(ui);
                         text(ui, &mut f.datetime_format, w, true)
                     });
-                    c |= row_h(ui, tr("Binary values"), 28.0, |ui| {
+                    c |= row_h(ui, tr("Binary values"), look::FIELD_H, |ui| {
                         parts::segmented(ui, &mut f.binary_format, &[(BinaryFormat::Hex, tr("Hexadecimal")), (BinaryFormat::Base64, "Base64"), (BinaryFormat::Text, tr("Text"))])
                     });
-                    c |= row_h(ui, tr("Booleans"), 28.0, |ui| {
+                    c |= row_h(ui, tr("Booleans"), look::FIELD_H, |ui| {
                         parts::segmented(ui, &mut f.bool_style, &[(BoolStyle::TrueFalse, "true / false"), (BoolStyle::Checkbox, "☑ / ☐"), (BoolStyle::OneZero, "1 / 0")])
                     });
                     // Not in the design, kept after its rows.
@@ -817,7 +904,7 @@ impl SettingsTab {
     fn execution(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let e = &mut cx.settings.execution;
         let c = group(ui, "", |ui| {
-            let mut c = row(ui, tr("Query timeout"), |ui| num(ui, &mut e.query_timeout_secs, 0..=86_400, tr(" s (0 = none)")));
+            let mut c = row_sub(ui, tr("Query timeout"), tr("0 means no time limit."), |ui| num(ui, &mut e.query_timeout_secs, 0..=86_400, "s"));
             c |= checks(
                 ui,
                 vec![
@@ -828,7 +915,7 @@ impl SettingsTab {
             );
             c
         });
-        look::callout(ui, Tone::Info, None, tr("Production connections ask before running statements that change data, whatever is set here: see Connection types."), |_| {});
+        look::note(ui, Tone::Info, tr("Production connections ask before running statements that change data, whatever is set here: see Connection types."));
         c
     }
 
@@ -838,17 +925,41 @@ impl SettingsTab {
         let mut clear = false;
         let c = group(ui, "", |ui| {
             let mut c = checks(ui, vec![(&mut h.enabled, tr("Record executed queries")), (&mut h.redact_secrets, tr("Mask passwords in recorded statements"))]);
-            c |= row(ui, tr("Keep at most"), |ui| num(ui, &mut h.max_entries, 0..=10_000_000, tr(" entries")));
-            c |= row(ui, tr("Keep for"), |ui| num(ui, &mut h.max_age_days, 0..=36_500, tr(" days")));
+            c |= row_sub(ui, tr("Keep at most"), tr("0 keeps every entry."), |ui| num(ui, &mut h.max_entries, 0..=10_000_000, tr("entries")));
+            c |= row_sub(ui, tr("Keep for"), tr("0 keeps entries forever."), |ui| num(ui, &mut h.max_age_days, 0..=36_500, tr("days")));
             if store.is_some() {
-                clear = kit::button_ex(ui, Kind::Danger, Some(icon::TRASH), tr("Clear the whole history"), true).clicked();
+                clear = found(ui, tr("Clear history…"), |ui| kit::button_ex(ui, Kind::Danger, Some(icon::TRASH), tr("Clear history…"), true).clicked());
             }
             c
         });
-        if clear && let Some(store) = store {
-            match store.lock().clear(None) {
-                Ok(n) => cx.toasts.success(trf("Deleted {} history entries", &[&n])),
-                Err(e) => cx.toasts.error(tr("Cannot clear the history"), Some(e.to_string())),
+        if clear && let Some(store) = &store {
+            match store.lock().total() {
+                Ok(0) => cx.toasts.info(tr("The query history is already empty.")),
+                Ok(n) => self.confirm_clear = Some(n),
+                Err(e) => cx.toasts.error(tr("Cannot read the query history"), Some(e.to_string())),
+            }
+        }
+        if let Some(n) = self.confirm_clear {
+            let count = look::grouped_number(n as f64, true);
+            let question = if n == 1 { tr("Clear 1 history entry?").to_string() } else { trf("Clear {} history entries?", &[&count]) };
+            let answer = confirm_danger(
+                ui.ctx(),
+                "settings_confirm_clear_history",
+                tr("Clear query history"),
+                &question,
+                tr("Every recorded statement is deleted. This cannot be undone."),
+                tr("Clear history"),
+            );
+            if answer.is_some() {
+                self.confirm_clear = None;
+            }
+            if answer == Some(true)
+                && let Some(store) = store
+            {
+                match store.lock().clear(None) {
+                    Ok(n) => cx.toasts.success(trn(n, tr("1 history entry deleted"), tr("{} history entries deleted"))),
+                    Err(e) => cx.toasts.error(tr("Cannot clear the history"), Some(e.to_string())),
+                }
             }
         }
         c
@@ -858,10 +969,10 @@ impl SettingsTab {
         let n = &mut cx.settings.navigator;
         group(ui, "", |ui| {
             let mut c = false;
-            c |= row_h(ui, tr("Order"), 28.0, |ui| {
+            c |= row_h(ui, tr("Order"), look::FIELD_H, |ui| {
                 parts::segmented(ui, &mut n.sort, &[(NavigatorSort::Alphabetical, tr("Alphabetical")), (NavigatorSort::Natural, tr("As reported by the database"))])
             });
-            c |= row_h(ui, tr("Default view of new connections"), 28.0, |ui| {
+            c |= row_h(ui, tr("Default view of new connections"), look::FIELD_H, |ui| {
                 parts::segmented(ui, &mut n.default_view, &[(NavigatorView::Simple, tr("Simple")), (NavigatorView::Advanced, tr("Advanced"))])
             });
             c |= checks(
@@ -910,7 +1021,7 @@ impl SettingsTab {
                     }
                 })
                 .collect();
-            look::callout(ui, Tone::Warning, None, &lines.join("\n"), |_| {});
+            look::note(ui, Tone::Warning, &lines.join("\n"));
         }
         // Recording a new shortcut: the next key press with a non-modifier key.
         if let Some(action) = self.recording {
@@ -941,16 +1052,20 @@ impl SettingsTab {
                 filter.is_empty() || label.to_lowercase().contains(&filter) || keys.join(" ").to_lowercase().contains(&filter)
             })
             .collect();
-        // Action and Shortcut share what the fixed columns leave (150 and 100 points).
-        let fr = ((ui.available_width() - 252.0) / 2.0).floor().max(120.0);
+        // Action and Shortcut share what the fixed columns leave (150, and 64 for the row's
+        // buttons).
+        let fr = ((ui.available_width() - 216.0) / 2.0).floor().max(120.0);
         let cols = [
             look::Col::new(tr("Action"), look::Width::Initial(fr)),
             look::Col::new(tr("Category"), look::Width::Initial(150.0)),
             look::Col::new(tr("Shortcut"), look::Width::Initial(fr)),
-            look::Col::new("", look::Width::Rest(100.0)),
+            look::Col::new("", look::Width::Rest(64.0)),
         ];
         let recording = self.recording;
         let mut record = None;
+        // The actions whose shortcuts differ from the preset's (they can be reset).
+        let custom = km.to_config().overrides;
+        let table_x = ui.available_rect_before_wrap().x_range();
         look::table(ui, "set_keys", &cols, actions.len(), |row, i| {
             let a = actions[i];
             row.set_selected(recording == Some(a));
@@ -962,25 +1077,43 @@ impl SettingsTab {
                 look::cell_text(ui, RichText::new(tr(a.category().label())).color(pal.text_muted));
             });
             look::cell(row, false, |ui| {
+                // The cell records a new shortcut when clicked (a keyboard at its right on hover).
+                let cell = ui.max_rect();
+                let resp = ui.interact(cell, ui.id().with(("record", a.id())), egui::Sense::click());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("Record a shortcut")));
                 if recording == Some(a) {
-                    look::cell_text(ui, RichText::new(tr("Press a key combination… (Esc cancels)")).italics().color(pal.accent_text));
+                    look::cell_text(ui, RichText::new(tr("Press the new shortcut · Esc cancels")).color(pal.accent_text));
                 } else if keys.is_empty() {
-                    look::cell_text(ui, look::mono(ui, "—", pal.text_faint));
+                    look::cell_text(ui, RichText::new(tr("None")).color(pal.text_faint));
                 } else {
-                    look::cell_text(ui, look::mono(ui, &keys.join("   "), pal.text));
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for k in &keys {
+                        kit::kbd(ui, k);
+                    }
                 }
-            });
-            look::cell(row, false, |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if kit::icon_button_ex(ui, icon::ROWS, tr("Record a shortcut"), recording == Some(a), 24.0).clicked() {
+                if resp.contains_pointer() && recording != Some(a) {
+                    let at = egui::pos2(cell.right() - 16.0, cell.center().y);
+                    ui.painter().text(at, egui::Align2::CENTER_CENTER, icon::KEYBOARD, ternarygrid_ui::style::icon_font(15.0), pal.text_muted);
+                }
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tr("Click, then press the new shortcut")).clicked() {
                     record = Some(a);
                 }
-                if kit::icon_button_ex(ui, icon::REPEAT, tr("Reset to default"), false, 24.0).clicked() {
-                    km.reset(a);
+            });
+            look::cell(row, true, |ui| {
+                // Reset and Remove on the row under the pointer (and the one being recorded),
+                // when they would change something.
+                let y = ui.max_rect().y_range();
+                let hovered = ui.ctx().pointer_hover_pos().is_some_and(|p| y.contains(p.y) && table_x.contains(p.x));
+                if !(hovered || recording == Some(a)) {
+                    return;
+                }
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if !keys.is_empty() && kit::icon_button_ex(ui, icon::X, tr("Remove the shortcut"), false, 24.0).clicked() {
+                    km.unbind(a);
                     changed = true;
                 }
-                if kit::icon_button_ex(ui, icon::X, tr("Remove the shortcut"), false, 24.0).clicked() {
-                    km.unbind(a);
+                if custom.contains_key(a.id()) && kit::icon_button_ex(ui, icon::ARROW_COUNTER_CLOCKWISE, tr("Reset to default"), false, 24.0).clicked() {
+                    km.reset(a);
                     changed = true;
                 }
             });
@@ -998,16 +1131,19 @@ impl SettingsTab {
     fn connection_types(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
         let types = cx.conns.connection_types();
         let pal = ternarygrid_ui::pal(ui);
+        let dark = ui.visuals().dark_mode;
+        // The colour as connections show it (the built-in production red is the theme's; none
+        // for a type that does not mark its connections).
+        let shown = |c: [u8; 3]| crate::theme::marker(c, dark);
+        let mut delete = None;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 20.0;
             ui.allocate_ui_with_layout(egui::vec2(200.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_width(200.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 for (i, t) in types.iter().enumerate() {
-                    let color = crate::theme::rgb(t.color);
-                    let mut lead = |ui: &mut Ui, r: egui::Rect| {
-                        ui.painter().rect_filled(r, 3, color);
-                    };
+                    let color = shown(t.color);
+                    let mut lead = |ui: &mut Ui, r: egui::Rect| paint_swatch(ui, r, color);
                     if list_item(ui, self.selected_type == i, &t.name, &mut lead, 12.0, false, None).clicked() {
                         self.selected_type = i;
                     }
@@ -1032,8 +1168,8 @@ impl SettingsTab {
                     let mut c = false;
                     c |= row(ui, tr("Name"), |ui| text(ui, &mut t.name, 260.0, false));
                     c |= row(ui, tr("Colour"), |ui| {
-                        let mut color = crate::theme::rgb(t.color);
-                        swatch(ui, color, 28.0);
+                        swatch(ui, shown(t.color), 28.0);
+                        let mut color = shown(t.color).unwrap_or_else(|| crate::theme::rgb(t.color));
                         let b = kit::button_ex(ui, Kind::Secondary, None, tr("Change…"), true);
                         let mut ch = false;
                         egui::Popup::from_toggle_button_response(&b).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
@@ -1055,11 +1191,17 @@ impl SettingsTab {
                     );
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        let label = if builtin { tr("Reset to default") } else { tr("Delete type") };
-                        let kind = if builtin { Kind::Secondary } else { Kind::Danger };
-                        reset = kit::button_ex(ui, kind, None, label, true).clicked();
-                        let uses = if used == 1 { tr("1 connection uses it.").to_string() } else { trf("{} connections use it.", &[&used]) };
-                        let note = if builtin { trf("Built-in type: {}", &[&uses]) } else { uses };
+                        if builtin {
+                            reset = kit::button_ex(ui, Kind::Secondary, Some(icon::ARROW_COUNTER_CLOCKWISE), tr("Reset to default"), true).clicked();
+                        } else if kit::button_ex(ui, Kind::Danger, Some(icon::TRASH), tr("Delete type…"), true).clicked() {
+                            delete = Some((t.id.clone(), t.name.clone(), used));
+                        }
+                        let uses = match used {
+                            0 => tr("No connection uses it.").to_string(),
+                            1 => tr("1 connection uses it.").to_string(),
+                            n => trf("{} connections use it.", &[&n]),
+                        };
+                        let note = if builtin { trf("Built-in type. {}", &[&uses]) } else { uses };
                         ui.label(RichText::new(note).size(12.5).color(pal.text_muted));
                     });
                     c
@@ -1067,7 +1209,7 @@ impl SettingsTab {
                 if reset {
                     let n = cx.conns.store.remove_connection_type(&t.id);
                     if n > 0 {
-                        cx.toasts.info(trf("{} connection(s) now use the Development type", &[&n]));
+                        cx.toasts.info(trn(n, tr("1 connection now uses the Development type"), tr("{} connections now use the Development type")));
                     }
                     cx.conns.dirty = true;
                     c = false;
@@ -1077,8 +1219,9 @@ impl SettingsTab {
                     cx.conns.store.set_connection_type(t.clone());
                     cx.conns.dirty = true;
                 }
-                // How the type marks its connections: the navigator row, the tab, the top bar.
-                let marker = crate::theme::connection_marker(t.color);
+                // How the type marks its connections: the navigator row, the tab, the top bar
+                // (as they draw it: the production red, the pill on its soft tint).
+                let marker = crate::theme::marker(t.color, dark);
                 let sample = cx.conns.configs().iter().find(|c| c.connection_type == t.id).map(|c| (c.name.clone(), c.kind));
                 let sample_kind = sample.as_ref().map(|s| s.1);
                 group(ui, tr("How it looks"), |ui| {
@@ -1086,7 +1229,7 @@ impl SettingsTab {
                     preview_tab(ui, "report.sql", marker);
                     match marker {
                         Some(m) => {
-                            kit::pill(ui, &t.name.to_uppercase(), m);
+                            crate::theme::marker_pill(ui, &t.name.to_uppercase(), m);
                         }
                         None => {
                             ui.label(RichText::new(tr("Connections of this type are not marked.")).color(pal.text_muted));
@@ -1096,13 +1239,40 @@ impl SettingsTab {
                 });
             });
         });
+        if let Some((id, name, used)) = delete {
+            self.confirm_delete_type = Some((id, name, used));
+        }
+        if let Some((id, name, used)) = self.confirm_delete_type.clone() {
+            let detail = match used {
+                0 => tr("No connection uses it.").to_string(),
+                1 => tr("1 connection uses it; it will use the Development type.").to_string(),
+                n => trf("{} connections use it; they will use the Development type.", &[&n]),
+            };
+            let question = trf("Delete type \u{201c}{}\u{201d}?", &[&name]);
+            let answer = confirm_danger(ui.ctx(), "settings_confirm_delete_type", tr("Delete connection type"), &question, &detail, tr("Delete type"));
+            if answer.is_some() {
+                self.confirm_delete_type = None;
+            }
+            if answer == Some(true) {
+                let n = cx.conns.store.remove_connection_type(&id);
+                if n > 0 {
+                    cx.toasts.info(trn(n, tr("1 connection now uses the Development type"), tr("{} connections now use the Development type")));
+                }
+                cx.conns.dirty = true;
+                self.selected_type = 0;
+            }
+        }
         false
     }
 
     fn network_profiles(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
-        use ternarygrid_core::config::{NetworkProfile, ProxyConfig, SecretSlot, SshConfig};
+        use ternarygrid_core::config::{NetworkProfile, ProxyConfig, SshConfig};
         let profiles = cx.conns.store.network_profiles.clone();
         let pal = ternarygrid_ui::pal(ui);
+        // A profile deleted elsewhere (or by the confirmation below) is not shown any more.
+        if self.profile.as_ref().is_some_and(|p| !profiles.iter().any(|x| x.id == p.id)) {
+            self.profile = None;
+        }
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 20.0;
             ui.allocate_ui_with_layout(egui::vec2(220.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -1120,98 +1290,190 @@ impl SettingsTab {
                             if sel { pal.accent_text } else { pal.text_muted },
                         );
                     };
-                    if list_item(ui, sel, &p.name, &mut lead, 15.0, false, Some(trf("{} used", &[&used]).as_str())).clicked() {
-                        self.profile = Some(p.clone());
-                        self.profile_ssh_password.clear();
-                        self.profile_ssh_passphrase.clear();
-                        self.profile_proxy_password.clear();
+                    let uses = if used == 0 { tr("unused").to_string() } else { trf("{} used", &[&used]) };
+                    let r = list_item(ui, sel, &p.name, &mut lead, 15.0, false, Some(&uses)).on_hover_text(trn(
+                        used,
+                        tr("1 connection uses this profile"),
+                        tr("{} connections use this profile"),
+                    ));
+                    if r.clicked() && !sel {
+                        self.select_profile(cx, Some(p.clone()));
                     }
                 }
                 if kit::button_ex(ui, Kind::Ghost, Some(icon::PLUS), tr("New profile"), true).clicked() {
-                    self.profile = Some(NetworkProfile {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        name: tr("New profile").to_string(),
-                        ssh: Some(SshConfig { enabled: true, ..Default::default() }),
-                        proxy: None,
-                    });
+                    // Saved at once, as every setting: it is in the list, selected.
+                    let taken = |n: &str| profiles.iter().any(|p| p.name == n);
+                    let mut name = tr("New profile").to_string();
+                    let mut i = 2;
+                    while taken(&name) {
+                        name = trf("New profile {}", &[&i]);
+                        i += 1;
+                    }
+                    let p = NetworkProfile { id: uuid::Uuid::new_v4().to_string(), name, ssh: Some(SshConfig { enabled: true, ..Default::default() }), proxy: None };
+                    cx.conns.store.set_network_profile(p.clone());
+                    cx.conns.dirty = true;
+                    self.select_profile(cx, Some(p));
                 }
             });
             let Some(mut profile) = self.profile.take() else {
-                ui.label(RichText::new(tr("Select or create a profile.")).color(pal.text_muted));
+                ui.label(RichText::new(tr("Select a profile, or create one.")).color(pal.text_muted));
                 return;
             };
             let p = &mut profile;
-            let mut deleted = false;
+            let mut delete = false;
+            let mut commit = false;
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 14.0;
-                row(ui, tr("Name"), |ui| text(ui, &mut p.name, 300.0, false));
+                group(ui, tr("General"), |ui| {
+                    row(ui, tr("Name"), |ui| {
+                        // As wide as the host row under it.
+                        let r = look::text_field(ui, &mut p.name, ui.available_width(), "", false);
+                        if p.name.trim().is_empty() {
+                            kit::error_outline(ui, r.rect);
+                        }
+                        r.changed()
+                    });
+                    if p.name.trim().is_empty() {
+                        indented(ui, |ui| {
+                            kit::field_error(ui, tr("Enter a name for the profile."));
+                            false
+                        });
+                    }
+                    false
+                });
                 let more = std::cell::Cell::new(self.ssh_more);
                 let ssh = p.ssh.get_or_insert_with(SshConfig::default);
+                let saved = self.profile_saved;
+                let (pw, phrase) = (&mut self.profile_ssh_password, &mut self.profile_ssh_passphrase);
                 if ssh.enabled {
                     group_more(ui, "SSH", &more, |ui| {
-                        profile_ssh_form(ui, ssh, &mut self.profile_ssh_password, &mut self.profile_ssh_passphrase, more.get());
+                        commit |= profile_ssh_form(ui, ssh, pw, phrase, saved, more.get());
                         false
                     });
                 } else {
                     group(ui, "SSH", |ui| {
-                        profile_ssh_form(ui, ssh, &mut self.profile_ssh_password, &mut self.profile_ssh_passphrase, false);
+                        commit |= profile_ssh_form(ui, ssh, pw, phrase, saved, false);
                         false
                     });
                 }
                 self.ssh_more = more.get();
                 group(ui, tr("Proxy"), |ui| {
                     let proxy = p.proxy.get_or_insert_with(ProxyConfig::default);
-                    profile_proxy_form(ui, proxy, &mut self.profile_proxy_password);
+                    commit |= profile_proxy_form(ui, proxy, &mut self.profile_proxy_password, saved[2]);
                     false
                 });
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    if kit::button_ex(ui, Kind::Primary, None, tr("Save profile"), false).clicked() {
-                        let id = p.id.clone();
-                        let ssh_save = p.ssh.as_ref().is_some_and(|s| s.enabled && s.save_credentials);
-                        let proxy_save = p.proxy.as_ref().is_some_and(|s| s.enabled && s.save_credentials);
-                        let pairs = [
-                            (SecretSlot::SshPassword, &self.profile_ssh_password, ssh_save),
-                            (SecretSlot::SshPassphrase, &self.profile_ssh_passphrase, ssh_save),
-                            (SecretSlot::ProxyPassword, &self.profile_proxy_password, proxy_save),
-                        ];
-                        for (slot, value, save) in pairs {
-                            let key = ternarygrid_config::profile_secret_key(&id, slot);
-                            let r = if save && !value.is_empty() {
-                                cx.conns.secrets.set(&key, &Secret::new(value.clone()))
-                            } else if !save {
-                                cx.conns.secrets.delete(&key)
-                            } else {
-                                Ok(())
-                            };
-                            if let Err(e) = r
-                                && !crate::dialogs::vault::unlock_after_failed_write(cx, &e)
-                            {
-                                cx.toasts.error(tr("Cannot store the password securely"), Some(e.to_string()));
-                            }
-                        }
-                        cx.conns.store.set_network_profile(p.clone());
-                        cx.conns.dirty = true;
-                        cx.toasts.success(tr("Profile saved"));
-                    }
-                    if kit::button_ex(ui, Kind::Danger, None, tr("Delete profile"), false).clicked() {
-                        let n = cx.conns.store.remove_network_profile(&p.id);
-                        for slot in [SecretSlot::SshPassword, SecretSlot::SshPassphrase, SecretSlot::ProxyPassword] {
-                            let _ = cx.conns.secrets.delete(&ternarygrid_config::profile_secret_key(&p.id, slot));
-                        }
-                        cx.conns.dirty = true;
-                        if n > 0 {
-                            cx.toasts.info(trf("{} connection(s) now use their own network settings", &[&n]));
-                        }
-                        deleted = true;
-                    }
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    delete = kit::button_ex(ui, Kind::Danger, Some(icon::TRASH), tr("Delete profile…"), false).clicked();
+                    ui.label(RichText::new(tr("Changes are saved as you make them.")).size(12.5).color(pal.text_muted));
                 });
             });
-            if !deleted {
-                self.profile = Some(profile);
+            // Saved as every setting is, when it changed and has a name (an unused tunnel or
+            // proxy is no change).
+            let mut normal = profile.clone();
+            if normal.proxy.as_ref() == Some(&ProxyConfig::default()) {
+                normal.proxy = None;
             }
+            if normal.ssh.as_ref() == Some(&SshConfig::default()) {
+                normal.ssh = None;
+            }
+            if !normal.name.trim().is_empty() && profiles.iter().find(|x| x.id == normal.id).is_some_and(|s| *s != normal) {
+                cx.conns.store.set_network_profile(normal);
+                cx.conns.dirty = true;
+            }
+            if commit {
+                self.store_profile_secrets(cx, &profile);
+            }
+            if delete {
+                self.confirm_delete_profile = Some(profile.id.clone());
+            }
+            self.profile = Some(profile);
         });
+        if let Some(id) = self.confirm_delete_profile.clone() {
+            let name = profiles.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default();
+            let used = cx.conns.configs().iter().filter(|c| c.network_profile.as_deref() == Some(id.as_str())).count();
+            let detail = match used {
+                0 => tr("No connection uses it.").to_string(),
+                1 => tr("1 connection uses it; it will use its own network settings.").to_string(),
+                n => trf("{} connections use it; they will use their own network settings.", &[&n]),
+            };
+            let question = trf("Delete profile \u{201c}{}\u{201d}?", &[&name]);
+            let answer = confirm_danger(ui.ctx(), "settings_confirm_delete_profile", tr("Delete network profile"), &question, &detail, tr("Delete profile"));
+            if answer.is_some() {
+                self.confirm_delete_profile = None;
+            }
+            if answer == Some(true) {
+                use ternarygrid_core::config::SecretSlot;
+                let n = cx.conns.store.remove_network_profile(&id);
+                for slot in [SecretSlot::SshPassword, SecretSlot::SshPassphrase, SecretSlot::ProxyPassword] {
+                    let _ = cx.conns.secrets.delete(&ternarygrid_config::profile_secret_key(&id, slot));
+                }
+                cx.conns.dirty = true;
+                if n > 0 {
+                    cx.toasts.info(trn(n, tr("1 connection now uses its own network settings"), tr("{} connections now use their own network settings")));
+                }
+                self.profile = None;
+                self.select_profile(cx, None);
+            }
+        }
         false
+    }
+
+    /// Show `profile` in the form: the passwords typed for the one shown before are saved
+    /// first; which passwords of the new one are saved is read once.
+    fn select_profile(&mut self, cx: &mut AppContext, profile: Option<ternarygrid_core::config::NetworkProfile>) {
+        use ternarygrid_core::config::SecretSlot;
+        if let Some(old) = self.profile.clone() {
+            self.store_profile_secrets(cx, &old);
+        }
+        self.profile_ssh_password.clear();
+        self.profile_ssh_passphrase.clear();
+        self.profile_proxy_password.clear();
+        self.profile_saved = [false; 3];
+        if let Some(p) = &profile
+            && !cx.conns.secrets.is_locked()
+        {
+            for (i, slot) in [SecretSlot::SshPassword, SecretSlot::SshPassphrase, SecretSlot::ProxyPassword].into_iter().enumerate() {
+                self.profile_saved[i] = cx.conns.secrets.get(&ternarygrid_config::profile_secret_key(&p.id, slot)).ok().flatten().is_some();
+            }
+        }
+        self.profile = profile;
+    }
+
+    /// Save the passwords typed for `p` (when its tunnel or proxy saves its credentials), or
+    /// forget the saved ones when it no longer does.
+    fn store_profile_secrets(&mut self, cx: &mut AppContext, p: &ternarygrid_core::config::NetworkProfile) {
+        use ternarygrid_core::config::SecretSlot;
+        let ssh_save = p.ssh.as_ref().is_some_and(|s| s.enabled && s.save_credentials);
+        let proxy_save = p.proxy.as_ref().is_some_and(|s| s.enabled && s.save_credentials);
+        let mut stored = 0;
+        let slots = [
+            (SecretSlot::SshPassword, &mut self.profile_ssh_password, ssh_save, 0),
+            (SecretSlot::SshPassphrase, &mut self.profile_ssh_passphrase, ssh_save, 1),
+            (SecretSlot::ProxyPassword, &mut self.profile_proxy_password, proxy_save, 2),
+        ];
+        for (slot, value, save, i) in slots {
+            let key = ternarygrid_config::profile_secret_key(&p.id, slot);
+            let r = if !save && self.profile_saved[i] {
+                cx.conns.secrets.delete(&key).map(|_| self.profile_saved[i] = false)
+            } else if save && !value.is_empty() {
+                cx.conns.secrets.set(&key, &Secret::new(value.clone())).map(|_| {
+                    value.clear();
+                    self.profile_saved[i] = true;
+                    stored += 1;
+                })
+            } else {
+                Ok(())
+            };
+            if let Err(e) = r
+                && !crate::dialogs::vault::unlock_after_failed_write(cx, &e)
+            {
+                cx.toasts.error(tr("Cannot store the password securely"), Some(e.to_string()));
+            }
+        }
+        if stored > 0 {
+            cx.toasts.success(trn(stored, tr("Password saved securely"), tr("{} passwords saved securely")));
+        }
     }
 
     fn ai(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
@@ -1224,18 +1486,18 @@ impl SettingsTab {
         let a = &mut cx.settings.ai;
         let mut c = group(ui, "", |ui| {
             let mut c = parts::switch(ui, &mut a.enabled, tr("Enable the AI assistant"), None).changed();
-            c |= row_h(ui, tr("Provider"), 28.0, |ui| {
+            c |= row_h(ui, tr("Provider"), look::FIELD_H, |ui| {
                 parts::segmented(ui, &mut a.provider, &[(AiProvider::Anthropic, "Anthropic Claude"), (AiProvider::OpenAiCompatible, tr("OpenAI-compatible server"))])
             });
             c |= row(ui, tr("Model"), |ui| text(ui, &mut a.model, 300.0, true));
             c |= row(ui, tr("Base URL"), |ui| {
                 let mut v = a.base_url.clone().unwrap_or_default();
-                let ch = look::text_field(ui, &mut v, 300.0, tr("(provider default)"), false).changed();
+                let ch = look::text_field(ui, &mut v, 300.0, tr("Provider default"), false).changed();
                 a.base_url = if v.trim().is_empty() { None } else { Some(v.trim().to_string()) };
                 ch
             });
             c |= row(ui, tr("Maximum answer length"), |ui| num(ui, &mut a.max_tokens, 256..=128_000, tr(" tokens")));
-            c |= row_h(ui, tr("Effort"), 28.0, |ui| {
+            c |= row_h(ui, tr("Effort"), look::FIELD_H, |ui| {
                 parts::segmented(
                     ui,
                     &mut a.effort,
@@ -1251,21 +1513,15 @@ impl SettingsTab {
             c
         });
         c |= group(ui, tr("What it may send"), |ui| {
-            checks(
-                ui,
-                vec![
-                    (&mut a.include_schema_context, tr("Send table and column names as context")),
-                    (&mut a.send_sample_data, tr("Allow sending sample rows")),
-                    (&mut a.agent_queries, tr("Let the assistant run read-only queries (their results are sent to the AI service)")),
-                ],
-            )
+            checks(ui, vec![(&mut a.include_schema_context, tr("Send table and column names as context")), (&mut a.send_sample_data, tr("Allow sending sample rows"))])
+                | check_sub(ui, &mut a.agent_queries, tr("Let the assistant run read-only queries"), tr("Their results are sent to the AI service."))
         });
         group(ui, tr("API key"), |ui| {
             row(ui, tr("API key"), |ui| {
-                let hint = if self.ai_key_saved { tr("(saved — enter a new key to replace it)") } else { tr("(not set)") };
+                let hint = if self.ai_key_saved { tr("Saved — enter a new key to replace it") } else { tr("Paste your API key") };
                 look::password_field(ui, &mut self.ai_key, 360.0, hint);
                 let can_save = !self.ai_key.trim().is_empty();
-                if ui.add_enabled_ui(can_save, |ui| kit::button_ex(ui, Kind::Primary, None, tr("Save key"), true)).inner.clicked() {
+                if ui.add_enabled_ui(can_save, |ui| kit::button_ex(ui, Kind::Primary, None, tr("Save API key"), false)).inner.clicked() {
                     let key = Secret::new(self.ai_key.trim().to_string());
                     let r = cx.services.secrets.read().set_ai_api_key(provider.id(), Some(&key));
                     match r {
@@ -1278,7 +1534,7 @@ impl SettingsTab {
                         Err(e) => cx.toasts.error(tr("Cannot store the API key"), Some(e.to_string())),
                     }
                 }
-                if self.ai_key_saved && kit::button_ex(ui, Kind::Danger, None, tr("Remove key"), true).clicked() {
+                if self.ai_key_saved && kit::button_ex(ui, Kind::Danger, None, tr("Remove API key"), false).clicked() {
                     let r = cx.services.secrets.read().set_ai_api_key(provider.id(), None);
                     match r {
                         Ok(()) => self.ai_key_saved = false,
@@ -1320,7 +1576,9 @@ impl SettingsTab {
                 chip(ui, label, pal.accent_text, pal.accent_soft);
                 false
             });
-            row(ui, tr("Lock the vault after"), |ui| num(ui, &mut cx.settings.security.auto_lock_minutes, 0..=1440, tr(" min idle (0 = never)")))
+            row_sub(ui, tr("Lock the vault after"), tr("0 keeps it unlocked until you lock it."), |ui| {
+                num(ui, &mut cx.settings.security.auto_lock_minutes, 0..=1440, tr("min idle"))
+            })
         });
         let target = match current {
             SecretBackend::Keychain => SecretBackend::EncryptedFile,
@@ -1368,7 +1626,7 @@ impl SettingsTab {
                         secrets.write().switch_backend(SecretBackend::Keychain, keychain, &keys, true)
                     };
                     let r = r.map_err(|e| e.to_string())?;
-                    Ok((trf("{} secret(s) moved", &[&r.migrated.len()]), Some(target)))
+                    Ok((trn(r.migrated.len(), tr("1 secret moved"), tr("{} secrets moved")), Some(target)))
                 }));
             }
         }
@@ -1407,7 +1665,7 @@ impl SettingsTab {
         }
         match &self.message {
             Some(Ok(m)) => {
-                look::callout(ui, Tone::Success, None, m, |_| {});
+                look::note(ui, Tone::Success, m);
             }
             Some(Err(e)) => look::error(ui, e),
             None => {}
@@ -1424,7 +1682,6 @@ impl SettingsTab {
             c |= look::checkbox_sub(ui, &mut a.reduce_motion, tr("Reduce motion"), Some(tr("No fading or sliding windows and pop-ups."))).changed();
             c |= look::checkbox_sub(ui, &mut a.focus_indicator, tr("Always show the keyboard focus"), Some(tr("A ring around the focused control, also after mouse clicks.")))
                 .changed();
-            c |= check(ui, &mut cx.settings.tasks.scheduler_enabled, tr("Run scheduled tasks while TernaryGrid is open"));
             c
         })
     }
@@ -1513,12 +1770,16 @@ fn host_port(ui: &mut Ui, host: &mut String, port: &mut u16) {
 /// The SSH group of a network profile as designed: host and port, user, authentication, its
 /// key file or password and the host key check. The other options (passphrase, saved
 /// credentials, local port, keep-alive, switching the tunnel off) are under "More options".
-fn profile_ssh_form(ui: &mut Ui, ssh: &mut ternarygrid_core::config::SshConfig, password: &mut String, passphrase: &mut String, more: bool) {
+///
+/// True when a password was entered (its field left) or the credentials are no longer saved:
+/// the passwords are then stored (or forgotten).
+fn profile_ssh_form(ui: &mut Ui, ssh: &mut ternarygrid_core::config::SshConfig, password: &mut String, passphrase: &mut String, saved: [bool; 3], more: bool) -> bool {
     use ternarygrid_core::config::{HostKeyPolicy, SshAuth};
     if !ssh.enabled {
         check(ui, &mut ssh.enabled, tr("Use SSH tunnel"));
-        return;
+        return false;
     }
+    let mut commit = false;
     row(ui, tr("SSH host"), |ui| {
         host_port(ui, &mut ssh.host, &mut ssh.port);
         false
@@ -1541,7 +1802,10 @@ fn profile_ssh_form(ui: &mut Ui, ssh: &mut ternarygrid_core::config::SshConfig, 
     });
     match &mut ssh.auth {
         SshAuth::Password => {
-            row(ui, tr("Password"), |ui| look::password_field(ui, password, 260.0, "").changed());
+            row(ui, tr("Password"), |ui| {
+                commit |= secret_field(ui, password, saved[0]);
+                false
+            });
         }
         SshAuth::PublicKey { key_path } => {
             row(ui, tr("Private key file"), |ui| {
@@ -1568,7 +1832,10 @@ fn profile_ssh_form(ui: &mut Ui, ssh: &mut ternarygrid_core::config::SshConfig, 
     });
     if more {
         if matches!(ssh.auth, SshAuth::PublicKey { .. }) {
-            row(ui, tr("Passphrase"), |ui| look::password_field(ui, passphrase, 260.0, "").changed());
+            row(ui, tr("Passphrase"), |ui| {
+                commit |= secret_field(ui, passphrase, saved[1]);
+                false
+            });
         }
         row(ui, tr("Local port"), |ui| {
             let mut lp = ssh.local_port.map(|p| p.to_string()).unwrap_or_default();
@@ -1577,17 +1844,28 @@ fn profile_ssh_form(ui: &mut Ui, ssh: &mut ternarygrid_core::config::SshConfig, 
             }
             false
         });
-        row(ui, tr("Keep-alive (s)"), |ui| num(ui, &mut ssh.keepalive_secs, 0..=3600, ""));
-        checks(ui, vec![(&mut ssh.save_credentials, tr("Save credentials")), (&mut ssh.enabled, tr("Use SSH tunnel"))]);
+        row_sub(ui, tr("Keep-alive interval"), tr("0 sends no keep-alive messages."), |ui| num(ui, &mut ssh.keepalive_secs, 0..=3600, "s"));
+        commit |= checks(ui, vec![(&mut ssh.save_credentials, tr("Save credentials")), (&mut ssh.enabled, tr("Use SSH tunnel"))]);
     }
+    commit
+}
+
+/// A password field of a profile: "Saved" as its placeholder when one is saved. True when a
+/// new password was entered (Enter, or the field left).
+fn secret_field(ui: &mut Ui, value: &mut String, saved: bool) -> bool {
+    let hint = if saved { tr("Saved — type a new one to replace it") } else { "" };
+    let r = look::password_field(ui, value, 260.0, hint);
+    r.lost_focus() && !value.is_empty()
 }
 
 /// The proxy group of a network profile: "Use proxy", then its type, host, user, password.
-fn profile_proxy_form(ui: &mut Ui, proxy: &mut ternarygrid_core::config::ProxyConfig, password: &mut String) {
+/// True when a password was entered or the credentials are no longer saved (see
+/// [`profile_ssh_form`]).
+fn profile_proxy_form(ui: &mut Ui, proxy: &mut ternarygrid_core::config::ProxyConfig, password: &mut String, saved: bool) -> bool {
     use ternarygrid_core::config::ProxyKind;
-    check(ui, &mut proxy.enabled, tr("Use proxy"));
+    let mut commit = check(ui, &mut proxy.enabled, tr("Use proxy"));
     if !proxy.enabled {
-        return;
+        return commit;
     }
     row_h(ui, tr("Type"), 16.0, |ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
@@ -1610,8 +1888,12 @@ fn profile_proxy_form(ui: &mut Ui, proxy: &mut ternarygrid_core::config::ProxyCo
         }
         ch
     });
-    row(ui, tr("Password"), |ui| look::password_field(ui, password, 260.0, "").changed());
-    check(ui, &mut proxy.save_credentials, tr("Save credentials"));
+    row(ui, tr("Password"), |ui| {
+        commit |= secret_field(ui, password, saved);
+        false
+    });
+    commit |= check(ui, &mut proxy.save_credentials, tr("Save credentials"));
+    commit
 }
 
 /// A navigator row as it looks for a connection of the type (its stripe).
@@ -1708,7 +1990,7 @@ impl TabView for SettingsTab {
                 if self.section != Section::Security
                     && let Some(Ok(m)) = &self.message
                 {
-                    look::callout(ui, Tone::Success, None, m, |_| {});
+                    look::note(ui, Tone::Success, m);
                 }
                 ui.add_space(20.0);
             });

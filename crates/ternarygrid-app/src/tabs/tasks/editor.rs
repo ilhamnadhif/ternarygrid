@@ -71,8 +71,8 @@ fn section(ui: &mut Ui, title: &str, first: bool) {
     kit::semibold_label(ui, title, 13.0, p.text);
 }
 
-/// A form row of the editor: the label 6 points down in a column of 120, the controls 16
-/// points further on a 30 point line.
+/// A form row of the editor: the label in a column of 120, the controls 16 points further on a
+/// 30 point line, the label centred on it.
 fn row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     row_h(ui, label, look::FIELD_H, add)
 }
@@ -86,18 +86,18 @@ fn row_h<R>(ui: &mut Ui, label: &str, h: f32, add: impl FnOnce(&mut Ui) -> R) ->
 }
 
 fn row_dyn(ui: &mut Ui, label: &str, h: f32, add: &mut dyn FnMut(&mut Ui)) {
-    let p = ternarygrid_ui::pal(ui);
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
-        ui.allocate_ui_with_layout(egui::vec2(LABEL_W, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_min_width(LABEL_W);
-            ui.add_space(6.0);
-            if !label.is_empty() {
-                ui.add(egui::Label::new(RichText::new(label).size(13.0).color(p.text_muted)).truncate());
-            }
-        });
+        // The label centred on the controls' line (on the first line of a taller box).
+        let line = h.min(look::FIELD_H);
+        let line = if label.is_empty() {
+            ui.allocate_exact_size(egui::vec2(LABEL_W, line), egui::Sense::hover());
+            h
+        } else {
+            h.max(look::form_label(ui, label, LABEL_W, line))
+        };
         let w = ui.available_width();
-        ui.allocate_ui_with_layout(egui::vec2(w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.allocate_ui_with_layout(egui::vec2(w, line), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             add(ui);
         });
@@ -108,7 +108,7 @@ fn row_dyn(ui: &mut Ui, label: &str, h: f32, add: &mut dyn FnMut(&mut Ui)) {
 /// the schemas.
 fn schema_input(ui: &mut Ui, cx: &mut AppContext, conn: &str, value: &mut String) {
     let p = ternarygrid_ui::pal(ui);
-    let field = look::text_field(ui, value, 200.0, tr("(default)"), false);
+    let field = look::text_field(ui, value, 200.0, tr("Default schema"), false);
     if !cx.conns.is_connected(conn) {
         return;
     }
@@ -204,7 +204,7 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
     let p = ternarygrid_ui::pal(ui);
     // The modes' pill group spans the row (only its first part holds the modes).
     let at = ui.cursor().min;
-    ui.painter().rect_filled(egui::Rect::from_min_size(at, egui::vec2(ui.available_width(), 28.0)), 7, p.subtle);
+    ui.painter().rect_filled(egui::Rect::from_min_size(at, egui::vec2(ui.available_width(), ternarygrid_ui::style::CONTROL_H)), 7, p.subtle);
     ternarygrid_ui::parts::segmented(
         ui,
         &mut s.mode,
@@ -257,7 +257,7 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
         ScheduleMode::Daily => {
             row(ui, tr("At"), |ui| {
                 look::text_field(ui, &mut s.daily_at, 70.0, "HH:MM", false);
-                ui.label(RichText::new(tr("(local time)")).color(p.text_muted));
+                ui.label(RichText::new(tr("local time")).color(p.text_muted));
             });
             row_h(ui, tr("Days"), 26.0, |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -273,7 +273,7 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
         ScheduleMode::Once => {
             row(ui, tr("At"), |ui| {
                 look::text_field(ui, &mut s.once_at, 150.0, "YYYY-MM-DD HH:MM", false);
-                ui.label(RichText::new(tr("(local time)")).color(p.text_muted));
+                ui.label(RichText::new(tr("local time")).color(p.text_muted));
             });
         }
     }
@@ -291,7 +291,7 @@ pub(super) fn schedule_ui(ui: &mut Ui, s: &mut ScheduleDraft) {
             if times.is_empty() {
                 ui.label(RichText::new(tr("No upcoming runs.")).color(p.text_muted));
             } else {
-                ui.label(RichText::new(tr("Next runs:")).size(12.0).color(p.text_faint));
+                ui.label(RichText::new(tr("Next runs")).size(12.0).color(p.text_muted));
                 let names = weekday_names();
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -361,7 +361,7 @@ impl TaskEditor {
                 ui.add(egui::Label::new(RichText::new(p).color(pal.warn)).truncate());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_enabled_ui(can_save, |ui| kit::button_ex(ui, Kind::Primary, Some(icon::FLOPPY_DISK), tr("Save"), false)).inner.clicked() {
+                if ui.add_enabled_ui(can_save, |ui| kit::button_ex(ui, Kind::Primary, Some(icon::CHECK), tr("Save"), false)).inner.clicked() {
                     save.set(true);
                 }
                 if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel"), false).clicked() {
@@ -417,7 +417,7 @@ impl TaskEditor {
         row(ui, tr("Name"), |ui| look::text_field(ui, &mut d.name, ui.available_width(), "", false));
         row(ui, tr("Folder"), |ui| {
             let w = ui.available_width() - if folders.is_empty() { 0.0 } else { 52.0 };
-            look::text_field(ui, &mut d.folder, w, tr("(top level)"), false);
+            look::text_field(ui, &mut d.folder, w, tr("Top level"), false);
             if !folders.is_empty() {
                 // A select box of 44 × 30 with its chevron.
                 let b = ui
@@ -425,7 +425,7 @@ impl TaskEditor {
                     .on_hover_text(tr("Folders"));
                 egui::Popup::menu(&b).show(|ui| {
                     kit::menu_look(ui, 200.0);
-                    if kit::menu_item(ui, None, tr("(top level)"), "").clicked() {
+                    if kit::menu_item(ui, Some(icon::LIST_CHECKS), tr("Top level"), "").clicked() {
                         d.folder.clear();
                         ui.close();
                     }
@@ -448,7 +448,7 @@ impl TaskEditor {
                     .min_size(egui::vec2(0.0, 48.0)),
             );
         });
-        row_h(ui, "", 17.0, |ui| look::checkbox(ui, &mut d.enabled, tr("Enabled (disabled tasks are not run by the scheduler)")));
+        row_h(ui, "", 17.0, |ui| look::checkbox_sub(ui, &mut d.enabled, tr("Enabled"), Some(tr("Disabled tasks are not run on their schedule."))));
     }
 
     fn kind_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, tasks: &[TaskDef]) {
@@ -468,7 +468,7 @@ impl TaskEditor {
                 if let Some(w) = credential_warning(cx, &d.connection_id) {
                     row(ui, "", |ui| warn(ui, w));
                 }
-                row(ui, tr("Database"), |ui| look::text_field(ui, &mut d.database, 200.0, tr("(connection database)"), false));
+                row(ui, tr("Database"), |ui| look::text_field(ui, &mut d.database, 200.0, tr("The connection's database"), false));
                 row(ui, tr("Schema"), |ui| {
                     let conn = d.connection_id.clone();
                     schema_input(ui, cx, &conn, &mut d.schema);
@@ -501,7 +501,7 @@ impl TaskEditor {
                 ui.label(
                     RichText::new(tr("Runs with the system shell (sh -c, cmd /C on Windows); the output goes to the run log."))
                         .size(12.0)
-                        .color(ternarygrid_ui::pal(ui).text_faint),
+                        .color(ternarygrid_ui::pal(ui).text_muted),
                 );
             }
             KindDraft::Backup { connection_id, form } => {
@@ -576,7 +576,7 @@ impl TaskEditor {
                                     ui.add(egui::Label::new(name).truncate());
                                 }
                                 None => {
-                                    ui.label(RichText::new(tr("(missing task)")).color(pal.err));
+                                    ui.label(RichText::new(tr("Missing task")).color(pal.err));
                                 }
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -632,12 +632,10 @@ impl TaskEditor {
                 });
             }
             KindDraft::External(kind) => {
-                look::callout(
+                look::note(
                     ui,
                     ternarygrid_ui::parts::Tone::Info,
-                    None,
                     tr("This task was created by a transfer wizard; its settings are shown read-only. Create it again from the wizard to change them."),
-                    |_| {},
                 );
                 let conns: Vec<String> = kind.connection_ids().iter().map(|c| cx.conns.config(c).map(|c| c.name.clone()).unwrap_or_else(|| c.to_string())).collect();
                 if !conns.is_empty() {
