@@ -627,7 +627,7 @@ fn record_view_has_the_grids_menu_and_keys() {
     v.frame(vec![press(value, PointerButton::Secondary, Modifiers::NONE)]);
     v.frame(vec![release(value, PointerButton::Secondary, Modifiers::NONE)]);
     v.frame(vec![]);
-    for item in ["Copy with column names", "Set NULL", "Set DEFAULT", "Add row", "Duplicate row(s)", "Delete row(s)", "Filter by value", "Generate SQL"] {
+    for item in ["Copy with column names", "Set NULL", "Set DEFAULT", "Add row", "Duplicate row", "Delete row", "Filter by value", "Generate SQL"] {
         assert!(v.find(item).is_some(), "{item} in the menu");
     }
     assert!(v.find("Zoom").is_none(), "the grid's own");

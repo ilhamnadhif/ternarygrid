@@ -671,11 +671,14 @@ impl<'a> ResultToolbar<'a> {
             // ⋯: what the footer does besides fetching the next rows.
             let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More result actions"), false, 26.0);
             Popup::menu(&more).id(ui.id().with("result_more")).show(|ui| more_menu(ui, model, grid, state, &mut actions));
-            // A failed fetch popped up once; a click shows it again.
-            if let Some(e) = &model.fetch.error {
-                let label = egui::Label::new(RichText::new(format!("{} {}", icon::WARNING_CIRCLE, e)).size(12.5).color(p.err)).truncate().sense(egui::Sense::click());
-                if ui.add(label).on_hover_text(tr("Show the error")).clicked() {
-                    state.error_popup = Some(e.clone());
+            // A failed fetch shows in its bar over the rows; closed, a short note here brings it back
+            // (the message once on screen, not twice).
+            if let Some(e) = &model.fetch.error
+                && state.dismissed_fetch_error.as_ref() == Some(e)
+            {
+                let label = egui::Label::new(RichText::new(format!("{} {}", icon::WARNING_CIRCLE, tr("The fetch failed"))).size(12.5).color(p.err)).sense(egui::Sense::click());
+                if ui.add(label).on_hover_text(e.as_str()).clicked() {
+                    state.dismissed_fetch_error = None;
                 }
             }
             let left_end = ui.min_rect().right();
@@ -895,7 +898,10 @@ fn pending_pill(ui: &mut Ui, count: &str, pending: usize) -> Option<bool> {
     if key_button(ui, None, tr("Discard"), None, false, 26.0).on_hover_text(tr("Discard pending changes")).clicked() {
         out = Some(false);
     }
-    if key_button(ui, None, tr("Save"), Some(SAVE_KEYS), true, 26.0).on_hover_text(trf("Save {} pending change(s) (Cmd+S)", &[&pending])).clicked() {
+    if key_button(ui, None, tr("Save"), Some(SAVE_KEYS), true, 26.0)
+        .on_hover_text(ternarygrid_core::trn(pending, tr("Save 1 pending change (⌘S)"), tr("Save {} pending changes (⌘S)")))
+        .clicked()
+    {
         out = Some(true);
     }
     out

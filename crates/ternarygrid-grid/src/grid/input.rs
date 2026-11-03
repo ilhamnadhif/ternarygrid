@@ -713,9 +713,9 @@ impl GridFrame<'_> {
                 self.ctx.copy_text(text);
                 self.actions.push(GridAction::Copied { cells, format: opts.format });
                 let msg = if opts.format == CopyFormat::Tsv && !opts.include_header {
-                    trf("Copied {} cell(s)", &[&cells])
+                    ternarygrid_core::trn(cells, tr("Copied 1 cell"), tr("Copied {} cells"))
                 } else {
-                    trf("Copied {} cell(s) as {}", &[&cells, &opts.format.label()])
+                    trf(tr("{} as {}"), &[&ternarygrid_core::trn(cells, tr("Copied 1 cell"), tr("Copied {} cells")), &opts.format.label()])
                 };
                 self.notify(msg, false);
             }
@@ -760,7 +760,7 @@ impl GridFrame<'_> {
             return;
         }
         match super::paste_into(self.model, self.state, text) {
-            Ok(n) => self.notify(trf("Pasted {} cell(s)", &[&n]), false),
+            Ok(n) => self.notify(ternarygrid_core::trn(n, tr("Pasted 1 cell"), tr("Pasted {} cells")), false),
             Err(e) => self.notify(e, true),
         }
     }
@@ -891,7 +891,7 @@ impl GridFrame<'_> {
         }
         match self.model.delete_rows(&rows) {
             Ok(n) => {
-                let msg = trf("{} row(s) marked for deletion", &[&n]);
+                let msg = ternarygrid_core::trn(n, tr("1 row marked for deletion"), tr("{} rows marked for deletion"));
                 self.notify(msg, false);
             }
             Err(e) => self.notify(e, true),
@@ -1033,7 +1033,7 @@ impl GridFrame<'_> {
         for c in empty {
             self.state.set_column_visible(c, false);
         }
-        self.notify(trf("{} column(s) without data hidden", &[&hidden]), false);
+        self.notify(ternarygrid_core::trn(hidden, tr("1 column without data hidden"), tr("{} columns without data hidden")), false);
     }
 
     /// Add a new row after the active row and start editing it.

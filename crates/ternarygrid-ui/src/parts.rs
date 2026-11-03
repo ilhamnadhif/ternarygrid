@@ -763,3 +763,50 @@ fn toolbar_dyn(ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)) {
     ui.painter().hline(ui.max_rect().x_range(), bottom + 0.5, Stroke::new(1.0, p.border));
     ui.add_space(bottom + 1.0 - ui.cursor().top());
 }
+
+/// Read-only code in a bordered box (dialogs' SQL, previews): monospace 12.5 on lines of 20,
+/// numbered in a faint gutter when `gutter`, in the colours of `job` (its sections' fonts and
+/// colours; the line height and the wrapping are set here). When `wrap`, long lines wrap at the
+/// box's width (a wrapped line's continuation has no number); else the box scrolls sideways and
+/// keeps room for its scroll bar under the last line (the bar never covers code). It scrolls
+/// down past `max_height`.
+pub fn code_block(ui: &mut Ui, id: Id, mut job: egui::text::LayoutJob, gutter: bool, wrap: bool, max_height: f32) -> Response {
+    const LINE: f32 = 20.0;
+    let p = style::pal(ui);
+    let left = if gutter { 46.0 } else { 12.0 };
+    for s in &mut job.sections {
+        s.format.line_height = Some(LINE);
+    }
+    bordered(ui)
+        .inner_margin(Margin::symmetric(0, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let view_w = ui.available_width();
+            job.wrap.max_width = if wrap { (view_w - left - 12.0).max(40.0) } else { f32::INFINITY };
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            // The empty row after a final newline is not a line of its own.
+            let trailing = galley.rows.len() > 1 && galley.rows.last().is_some_and(|r| r.glyphs.is_empty());
+            let rows = (galley.rows.len() - usize::from(trailing)).max(1);
+            let content_w = left + galley.size().x + 12.0;
+            // Floating scroll bars are drawn over the content's bottom: room for one under the last line.
+            let scroll = ui.spacing().scroll;
+            let bar = if !wrap && content_w > view_w + 0.5 { scroll.bar_width + scroll.bar_outer_margin + 4.0 } else { 0.0 };
+            egui::ScrollArea::both().id_salt(id).max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(content_w, rows as f32 * LINE + bar), Sense::hover());
+                if gutter {
+                    let format = egui::TextFormat { font_id: egui::FontId::monospace(12.5), color: p.text_faint, line_height: Some(LINE), ..Default::default() };
+                    let mut line = 0;
+                    for (i, row) in galley.rows.iter().enumerate().take(rows) {
+                        if i > 0 && !galley.rows[i - 1].ends_with_newline {
+                            continue;
+                        }
+                        line += 1;
+                        let g = ui.painter().layout_job(egui::text::LayoutJob::single_section(line.to_string(), format.clone()));
+                        ui.painter().galley(egui::pos2(rect.left() + 32.0 - g.size().x, rect.top() + row.pos.y), g, p.text_faint);
+                    }
+                }
+                ui.painter().galley(egui::pos2(rect.left() + left, rect.top()), galley, p.text);
+            });
+        })
+        .response
+}

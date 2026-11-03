@@ -149,12 +149,21 @@ impl Default for ChartConfig {
 impl ChartConfig {
     /// A sensible configuration for a result set: x = first temporal
     /// column (line chart) or first text column (bar chart) or first
-    /// numeric column (scatter); y = up to three other numeric columns.
+    /// numeric column (scatter); y = up to three other numeric columns,
+    /// not identifiers (see [`ChartConfig::suggest_with`]).
     pub fn suggest(columns: &[ColumnMeta]) -> ChartConfig {
+        Self::suggest_with(columns, |_| false)
+    }
+
+    /// [`ChartConfig::suggest`], `is_key` telling the key and foreign key
+    /// columns: those, auto-increment columns and integers named `id` /
+    /// `*_id` are identifiers, not measures (a line of ids, a pie of summed
+    /// ids mean nothing); with no measure left, the rows are counted.
+    pub fn suggest_with(columns: &[ColumnMeta], is_key: impl Fn(usize) -> bool) -> ChartConfig {
         let numeric: Vec<usize> = columns
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.kind.is_numeric())
+            .filter(|(i, c)| c.kind.is_numeric() && !is_identifier(*i, c, &is_key))
             .map(|(i, _)| i)
             .collect();
         let temporal = columns.iter().position(|c| {
@@ -192,9 +201,46 @@ impl ChartConfig {
     }
 }
 
+/// A column of identifiers: a key (by `is_key`), auto-increment, or an
+/// integer named `id`, `*_id` or `*Id`.
+fn is_identifier(i: usize, c: &ColumnMeta, is_key: &impl Fn(usize) -> bool) -> bool {
+    let lower = c.name.to_ascii_lowercase();
+    let named = lower == "id"
+        || lower.ends_with("_id")
+        || (c.name.len() > 2
+            && c.name.ends_with("Id")
+            && c.name[..c.name.len() - 2].ends_with(|ch: char| ch.is_ascii_lowercase()));
+    is_key(i) || c.auto_increment == Some(true) || (c.kind == DataKind::Int && named)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifiers_are_no_measures() {
+        let cols = vec![
+            ColumnMeta::new("id", "bigint", DataKind::Int),
+            ColumnMeta::new("customer_id", "bigint", DataKind::Int),
+            ColumnMeta::new("status", "text", DataKind::Text),
+            ColumnMeta::new("total", "numeric", DataKind::Decimal),
+            ColumnMeta::new("created_at", "timestamptz", DataKind::DateTimeTz),
+        ];
+        let c = ChartConfig::suggest(&cols);
+        assert_eq!(
+            (c.x_column, c.y_columns.clone(), c.aggregate),
+            (Some(4), vec![3], ChartAggregate::None)
+        );
+        // Only identifiers: the rows are counted.
+        let c = ChartConfig::suggest(&cols[..3]);
+        assert_eq!(
+            (c.y_columns.clone(), c.aggregate),
+            (vec![], ChartAggregate::Count)
+        );
+        // A key by the caller's knowledge.
+        let c = ChartConfig::suggest_with(&cols[2..4], |i| i == 1);
+        assert_eq!(c.aggregate, ChartAggregate::Count);
+    }
 
     #[test]
     fn suggestions() {

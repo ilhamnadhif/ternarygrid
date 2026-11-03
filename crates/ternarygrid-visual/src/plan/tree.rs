@@ -48,6 +48,30 @@ pub fn show_plan_tree(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) 
         }
     }
 
+    // Inset as the results' other views (16 from the left; the table scrolls to the right edge).
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 16,
+            right: 0,
+            top: 8,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            tree_body(ui, &flat, &visible, &hot, metric, state, before)
+        })
+        .inner
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tree_body(
+    ui: &mut Ui,
+    flat: &[FlatPlanNode<'_>],
+    visible: &[usize],
+    hot: &BTreeSet<usize>,
+    metric: PlanMetric,
+    state: &mut PlanViewState,
+    before: Option<super::analysis::PlanNodePath>,
+) -> PlanResponse {
     ui.horizontal(|ui| {
         use ternarygrid_ui::kit;
         if kit::button_full(
@@ -96,20 +120,28 @@ pub fn show_plan_tree(ui: &mut Ui, plan: &QueryPlan, state: &mut PlanViewState) 
                 .num_columns(8)
                 .spacing(vec2(14.0, 3.0))
                 .show(ui, |ui| {
-                    for h in [
-                        "Node",
-                        "Cost",
-                        "Rows (est.)",
-                        "Rows (actual)",
-                        "Rows ×",
-                        "Time",
-                        "Loops",
-                        "Exclusive",
+                    // The numbers' headers over them, at the right.
+                    for (h, right) in [
+                        ("Node", false),
+                        ("Cost", true),
+                        ("Rows (est.)", true),
+                        ("Rows (actual)", true),
+                        ("Estimate", true),
+                        ("Time", true),
+                        ("Loops", true),
+                        ("Exclusive", false),
                     ] {
-                        ui.label(RichText::new(tr(h)).strong());
+                        let text = RichText::new(tr(h)).strong();
+                        if right {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(text)
+                            });
+                        } else {
+                            ui.label(text);
+                        }
                     }
                     ui.end_row();
-                    for &i in &visible {
+                    for &i in visible {
                         let Some(f) = flat.get(i) else { continue };
                         let selected = state.selected.as_ref() == Some(&f.path);
                         let row_resp = node_cell(
@@ -213,28 +245,33 @@ fn num(ui: &mut Ui, v: Option<String>) {
     });
 }
 
+/// How far the actual rows are from the estimate: "1.6K× more" / "8× fewer" (muted; in the
+/// warning colour from 10 times on), "–" for a close estimate (half to twice).
 fn misestimate(ui: &mut Ui, f: &FlatPlanNode<'_>) {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let p = ternarygrid_ui::pal(ui);
         match f.row_factor {
-            Some(rf) => {
-                let (arrow, k) = if rf >= 1.0 {
-                    (icon::ARROW_DOWN, rf)
+            Some(rf) if rf > 0.0 && (0.5..=2.0).contains(&rf) => ui
+                .label(RichText::new("–").color(p.text_faint))
+                .on_hover_text(tr("Close to the estimate")),
+            Some(rf) if rf > 0.0 => {
+                let more = rf >= 1.0;
+                let k = if more { rf } else { 1.0 / rf };
+                let n = compact(k, 1);
+                let text = if more {
+                    trf("{}× more", &[&n])
                 } else {
-                    (icon::ARROW_UP, 1.0 / rf)
+                    trf("{}× fewer", &[&n])
                 };
-                let text = format!("{arrow}{}", compact(k, 1));
-                if k >= 10.0 {
-                    ui.colored_label(ui.visuals().warn_fg_color, RichText::new(text).monospace())
-                        .on_hover_text(if rf >= 1.0 {
-                            trf("{}x more rows than estimated", &[&compact(k, 1)])
-                        } else {
-                            trf("{}x fewer rows than estimated", &[&compact(k, 1)])
-                        })
-                } else {
-                    ui.weak(RichText::new(text).monospace())
-                }
+                let color = if k >= 10.0 { p.warn } else { p.text_muted };
+                ui.label(RichText::new(text).monospace().color(color))
+                    .on_hover_text(if more {
+                        trf("{} times more rows than estimated", &[&n])
+                    } else {
+                        trf("{} times fewer rows than estimated", &[&n])
+                    })
             }
-            None => ui.weak("–"),
+            _ => ui.label(RichText::new("–").color(p.text_faint)),
         }
     });
 }
@@ -300,23 +337,39 @@ pub fn show_plan_text(ui: &mut Ui, plan: &QueryPlan) {
     } else {
         plan.text.clone()
     };
-    ui.horizontal(|ui| {
-        if ui
-            .button((ternarygrid_icons::ic(icon::COPY), tr("Copy")))
-            .clicked()
-        {
-            ui.ctx().copy_text(text.clone());
-        }
-    });
-    egui::ScrollArea::both()
-        .auto_shrink(false)
-        .id_salt("ternarygrid_plan_text")
+    // Inset as the results' other views: Copy in a bar 16 / 8 from the edges, the text 16 in.
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 16,
+            right: 16,
+            top: 8,
+            bottom: 8,
+        })
         .show(ui, |ui| {
-            let mut t = text.as_str();
-            ui.add(
-                egui::TextEdit::multiline(&mut t)
-                    .code_editor()
-                    .desired_width(f32::INFINITY),
-            );
+            use ternarygrid_ui::kit;
+            if kit::button_full(
+                ui,
+                kit::Kind::Secondary,
+                Some(icon::COPY),
+                tr("Copy"),
+                true,
+                false,
+            )
+            .clicked()
+            {
+                ui.ctx().copy_text(text.clone());
+            }
+            ui.add_space(4.0);
+            egui::ScrollArea::both()
+                .auto_shrink(false)
+                .id_salt("ternarygrid_plan_text")
+                .show(ui, |ui| {
+                    let mut t = text.as_str();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut t)
+                            .code_editor()
+                            .desired_width(f32::INFINITY),
+                    );
+                });
         });
 }

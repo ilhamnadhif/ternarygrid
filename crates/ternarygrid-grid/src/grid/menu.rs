@@ -11,7 +11,7 @@ use crate::view::{FilterOp, SortKey};
 use egui::{Popup, PopupCloseBehavior, PopupKind, Response, SetOpenCommand, Ui};
 use egui_phosphor::regular as icon;
 use ternarygrid_core::dialect::GenericDialect;
-use ternarygrid_core::{Dialect, Value, tr, trf};
+use ternarygrid_core::{DataKind, Dialect, Value, tr, trf};
 use ternarygrid_ui::kit;
 
 /// A menu item in the kit's look; `keys` its shortcut as the menus write it (see [`keys`]).
@@ -29,6 +29,36 @@ fn submenu(ui: &mut Ui, icon: Option<&str>, text: &str, add: &mut dyn FnMut(&mut
 const CELL_MENU_W: f32 = 280.0;
 const HEAD_MENU_W: f32 = 300.0;
 const SUBMENU_W: f32 = 230.0;
+
+/// The filters offered for a cell's value (the cell menu's "Filter by value", the column
+/// menu's "Cell value"), by the column's type: comparisons for numbers and dates, "contains"
+/// for text (`>` on text, a `LIKE` without wildcards are not what one means).
+fn value_filter_ops(kind: DataKind, value: &Value) -> &'static [FilterOp] {
+    if value.is_null() {
+        return &[FilterOp::IsNull, FilterOp::IsNotNull];
+    }
+    if kind.is_numeric() || kind.is_temporal() || matches!(value, Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Decimal(_)) {
+        &[FilterOp::Eq, FilterOp::NotEq, FilterOp::Gt, FilterOp::GtEq, FilterOp::Lt, FilterOp::LtEq, FilterOp::IsNull, FilterOp::IsNotNull]
+    } else if kind == DataKind::Bool || matches!(value, Value::Bool(_)) {
+        &[FilterOp::Eq, FilterOp::NotEq, FilterOp::IsNull, FilterOp::IsNotNull]
+    } else {
+        &[FilterOp::Eq, FilterOp::NotEq, FilterOp::Contains, FilterOp::IsNull, FilterOp::IsNotNull]
+    }
+}
+
+/// A value filter's menu label: `status = 'open'`, `status contains 'open'`, `note IS NULL`.
+fn value_filter_label(name: &str, op: FilterOp, v: &str) -> String {
+    match op {
+        FilterOp::IsNull | FilterOp::IsNotNull => format!("{name} {}", op.sql()),
+        FilterOp::Contains => trf("{} contains '{}'", &[&name, &v]),
+        _ => format!("{name} {} '{v}'", op.sql()),
+    }
+}
+
+/// "Delete row" / "Delete 3 rows" (`one` and `many` with `{}` for the count).
+fn rows_label(n: usize, one: &str, many: &str) -> String {
+    if n <= 1 { one.to_string() } else { trf(many, &[&crate::format::display_count(n)]) }
+}
 
 fn short_value(v: &Value) -> String {
     if v.is_null() {
@@ -64,6 +94,7 @@ impl GridFrame<'_> {
                 return;
             };
             self.column_items(ui, col);
+            self.more_menu(ui, col, None);
             kit::menu_separator(ui);
             if item(ui, Some(icon::COPY), tr("Copy column name"), None).clicked() {
                 self.ctx.copy_text(self.model.column_name(col).to_string());
@@ -142,13 +173,15 @@ impl GridFrame<'_> {
             && let Some(row) = row
             && let Some(value) = self.menu_value(row, col)
         {
-            kit::menu_separator(ui);
-            kit::menu_caption(ui, tr("Cell value"));
+            // The cell menu's list, without the NULL tests (under Custom); nothing for a NULL.
             let v = short_value(&value);
-            let ops: &[FilterOp] = if value.is_null() { &[FilterOp::Eq, FilterOp::NotEq] } else { &[FilterOp::Eq, FilterOp::NotEq, FilterOp::Gt, FilterOp::Lt] };
-            for &op in ops {
-                let label = if value.is_null() { format!("{name} {}", if op == FilterOp::Eq { "IS NULL" } else { "IS NOT NULL" }) } else { format!("{name} {} '{v}'", op.sql()) };
-                if item(ui, None, &label, None).clicked() {
+            let ops: Vec<FilterOp> = value_filter_ops(self.model.column_kind(col), &value).iter().copied().filter(|op| !op.is_unary()).collect();
+            if !ops.is_empty() {
+                kit::menu_separator(ui);
+                kit::menu_caption(ui, tr("Cell value"));
+            }
+            for op in ops {
+                if item(ui, None, &value_filter_label(&name, op, &v), None).clicked() {
                     apply_value_filter(self.model, self.state, self.options, (col, op, &value), &self.ctx, &mut self.actions);
                     ui.close();
                 }
@@ -227,6 +260,11 @@ impl GridFrame<'_> {
         // --- editing
         if let Some((row, col)) = active {
             let cell_ok = editable && self.model.can_edit_cell(row, col).is_ok();
+            // A new UUID only where one fits: a uuid column, or text holding UUIDs.
+            let kind = self.model.column_kind(col);
+            let uuid_ok = kind == DataKind::Uuid
+                || kind == DataKind::Text
+                    && self.menu_value(row, col).is_some_and(|v| matches!(v, Value::Uuid(_)) || v.as_str().is_some_and(|s| uuid::Uuid::parse_str(s.trim()).is_ok()));
             ui.add_enabled_ui(cell_ok, |ui| {
                 if item(ui, Some(icon::PENCIL_SIMPLE), tr("Edit cell"), Some(keys("↩", "Enter"))).clicked() {
                     self.start_edit(row, col, None);
@@ -240,22 +278,25 @@ impl GridFrame<'_> {
                     self.set_selected_default();
                     ui.close();
                 }
+                if uuid_ok && item(ui, None, tr("Generate UUID"), None).clicked() {
+                    self.generate_uuid();
+                    ui.close();
+                }
             });
         }
+        // The rows the items act on: "Delete row" / "Delete 3 rows".
+        let selected_rows = self.state.rt.selection.rows(self.geo.nrows, 10_000).len();
         ui.add_enabled_ui(editable, |ui| {
-            if item(ui, Some(icon::PLUS), tr("Add row"), Some(keys("Insert", "Insert"))).clicked() {
+            // Insert (Shift+Insert: above); Macs have no Insert key: the menu or the footer's + only.
+            if item(ui, Some(icon::PLUS), tr("Add row"), if cfg!(target_os = "macos") { None } else { Some("Insert") }).clicked() {
                 self.add_row_after_active();
                 ui.close();
             }
-            if item(ui, Some(icon::COPY), tr("Duplicate row(s)"), Some(keys("⌘D", "Ctrl+D"))).clicked() {
+            if item(ui, Some(icon::ROWS_PLUS_BOTTOM), &rows_label(selected_rows, tr("Duplicate row"), tr("Duplicate {} rows")), Some(keys("⌘D", "Ctrl+D"))).clicked() {
                 self.duplicate_selected();
                 ui.close();
             }
-            if active.is_some() && item(ui, None, tr("Generate UUID"), None).clicked() {
-                self.generate_uuid();
-                ui.close();
-            }
-            if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete row(s)"), keys("⌫", "Delete")).clicked() {
+            if kit::menu_item_danger(ui, Some(icon::TRASH), &rows_label(selected_rows, tr("Delete row"), tr("Delete {} rows")), keys("⌫", "Delete")).clicked() {
                 self.delete_selected();
                 ui.close();
             }
@@ -280,50 +321,20 @@ impl GridFrame<'_> {
             let value = known.clone().unwrap_or_default();
             let name = self.model.column_name(col).to_string();
             let virtual_server = self.model.is_virtual_column(col) && self.state.mode == super::DataMode::Server;
+            let kind = self.model.column_kind(col);
             ui.add_enabled_ui(!virtual_server && known.is_some(), |ui| {
                 submenu(ui, Some(icon::FUNNEL), tr("Filter by value"), &mut |ui| {
                     let v = short_value(&value);
-                    for op in FilterOp::ALL {
-                        if value.is_null() && !op.is_unary() && op != FilterOp::Eq && op != FilterOp::NotEq {
-                            continue;
-                        }
+                    for &op in value_filter_ops(kind, &value) {
                         // The comparisons, then a line and the NULL tests.
-                        if op == FilterOp::IsNull {
+                        if op == FilterOp::IsNull && !value.is_null() {
                             kit::menu_separator(ui);
                         }
-                        let label = match op {
-                            FilterOp::IsNull | FilterOp::IsNotNull => format!("{name} {}", op.sql()),
-                            FilterOp::Contains => trf("{} contains '{}'", &[&name, &v]),
-                            _ if value.is_null() => {
-                                format!("{name} {}", if op == FilterOp::Eq { "IS NULL" } else { "IS NOT NULL" })
-                            }
-                            _ => format!("{name} {} '{v}'", op.sql()),
-                        };
-                        if item(ui, None, &label, None).clicked() {
+                        if item(ui, None, &value_filter_label(&name, op, &v), None).clicked() {
+                            let value = if op.is_unary() { Value::Null } else { value.clone() };
                             apply_value_filter(self.model, self.state, self.options, (col, op, &value), &self.ctx, &mut self.actions);
                             ui.close();
                         }
-                    }
-                });
-            });
-            ui.add_enabled_ui(known.is_some(), |ui| {
-                submenu(ui, None, tr("Highlight rows with this value"), &mut |ui| {
-                    let text = (!value.is_null()).then(|| value.to_text().into_owned());
-                    for (label, rgb) in super::state::HIGHLIGHT_COLORS {
-                        let swatch = egui::RichText::new("■").color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
-                        if ui.button(egui::WidgetText::from(swatch)).on_hover_text(tr(label)).clicked() {
-                            self.state.set_highlight(&name, text.clone(), Some(rgb));
-                            ui.close();
-                        }
-                    }
-                    kit::menu_separator(ui);
-                    if item(ui, None, tr("Remove this highlight"), None).clicked() {
-                        self.state.set_highlight(&name, text.clone(), None);
-                        ui.close();
-                    }
-                    if !self.state.highlights.is_empty() && item(ui, None, tr("Remove all highlights"), None).clicked() {
-                        self.state.highlights.clear();
-                        ui.close();
                     }
                 });
             });
@@ -333,6 +344,7 @@ impl GridFrame<'_> {
                 ui.close();
             }
             self.column_items(ui, col);
+            self.more_menu(ui, col, known.map(|v| (name.clone(), v)));
             kit::menu_separator(ui);
             // --- navigation / values
             if let Some(i) = self.model.foreign_key_for_column(col) {
@@ -398,15 +410,6 @@ impl GridFrame<'_> {
         });
         if item(ui, Some(icon::EYE_SLASH), tr("Hide column"), None).clicked() {
             self.state.set_column_visible(col, false);
-            ui.close();
-        }
-        // The header's tooltip summarises the fetched rows; this asks the server.
-        if !self.model.is_virtual_column(col)
-            && item(ui, Some(icon::CHART_BAR), tr("Statistics of the whole column"), None)
-                .on_hover_text(tr("Rows, NULLs, distinct values, the smallest and the largest, over all rows of the query"))
-                .clicked()
-        {
-            self.actions.push(GridAction::ColumnStatistics { column: col });
             ui.close();
         }
         let active = self.active();
@@ -492,7 +495,44 @@ impl GridFrame<'_> {
                 }
             });
         });
-        self.format_menu(ui, col);
+    }
+
+    /// "More ▸": the column's format, its statistics over all rows and (for a cell's `value`
+    /// of the column `name`) highlighting the rows with it.
+    fn more_menu(&mut self, ui: &mut Ui, col: usize, value: Option<(String, Value)>) {
+        submenu(ui, Some(icon::DOTS_THREE), tr("More"), &mut |ui| {
+            if let Some((name, value)) = &value {
+                submenu(ui, Some(icon::HIGHLIGHTER), tr("Highlight rows with this value"), &mut |ui| {
+                    let text = (!value.is_null()).then(|| value.to_text().into_owned());
+                    for (label, rgb) in super::state::HIGHLIGHT_COLORS {
+                        let swatch = egui::RichText::new("■").color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                        if ui.button(egui::WidgetText::from(swatch)).on_hover_text(tr(label)).clicked() {
+                            self.state.set_highlight(name, text.clone(), Some(rgb));
+                            ui.close();
+                        }
+                    }
+                    kit::menu_separator(ui);
+                    if item(ui, None, tr("Remove this highlight"), None).clicked() {
+                        self.state.set_highlight(name, text.clone(), None);
+                        ui.close();
+                    }
+                    if !self.state.highlights.is_empty() && item(ui, None, tr("Remove all highlights"), None).clicked() {
+                        self.state.highlights.clear();
+                        ui.close();
+                    }
+                });
+            }
+            self.format_menu(ui, col);
+            // The header's tooltip summarises the fetched rows; this asks the server.
+            if !self.model.is_virtual_column(col)
+                && item(ui, Some(icon::CHART_BAR), tr("Statistics of the whole column"), None)
+                    .on_hover_text(tr("Rows, NULLs, distinct values, the smallest and the largest, over all rows of the query"))
+                    .clicked()
+            {
+                self.actions.push(GridAction::ColumnStatistics { column: col });
+                ui.close();
+            }
+        });
     }
 
     fn format_menu(&mut self, ui: &mut Ui, col: usize) {
