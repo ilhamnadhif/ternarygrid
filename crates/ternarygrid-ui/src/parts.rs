@@ -378,7 +378,8 @@ fn callout_dyn(ui: &mut Ui, tone: Tone, title: Option<&str>, body: &str, add: &m
                 // of their own; their width is the last frame's.
                 let id = ui.id().with(("callout_actions", body.len(), title.map(str::len)));
                 let actions_w = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
-                let text_w = (ui.available_width() - if actions_w > 0.0 { actions_w + 12.0 } else { 0.0 }).max(120.0);
+                // The actions' column follows the text one item spacing on (an empty one too).
+                let text_w = (ui.available_width() - ui.spacing().item_spacing.x - actions_w).max(120.0);
                 let text = ui.allocate_ui_with_layout(vec2(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(text_w);
                     ui.spacing_mut().item_spacing.y = 2.0;
