@@ -587,8 +587,19 @@ fn result_screens(s: &mut Shots, conn: &str) {
         return;
     }
     use ternarygrid_grid::{PanelKind, ResultViewKind};
-    // Views.
+    // A cell being edited (opened with Enter: its text selected).
     orders(s, conn);
+    {
+        let g = &mut s.data().view.grid;
+        g.select_cell(2, 2);
+        g.request_focus();
+    }
+    s.frames(2);
+    s.h.key_press(egui::Key::F2);
+    s.frames(3);
+    s.shot("res_cell_edit");
+    s.escape();
+    // Views.
     {
         let p = s.data();
         p.model.set_cell(2, 2, "shipped").unwrap();
@@ -597,6 +608,20 @@ fn result_screens(s: &mut Shots, conn: &str) {
     }
     s.park();
     s.shot("res_record");
+    // Editing a field: a double-click on the value of "total" (the fourth field).
+    {
+        s.pause();
+        let pos = egui::pos2(700.0, 387.0);
+        for _ in 0..2 {
+            s.h.event(egui::Event::PointerMoved(pos));
+            s.h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+            s.h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+            s.frames(1);
+        }
+        s.frames(3);
+    }
+    s.shot("res_record_edit");
+    s.escape();
     {
         let p = s.data();
         p.model.discard_changes();

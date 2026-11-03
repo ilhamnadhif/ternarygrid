@@ -556,117 +556,90 @@ impl ObjectEditorTab {
     }
 }
 
+/// Height of the object editor's header: its pages, underlined, and its buttons.
+const HEADER_H: f32 = 36.0;
+
 impl ObjectEditorTab {
-    /// The header: on one line the icon, the name (semibold), where it is (muted) and its
-    /// size (faint), Back / Forward of foreign key navigation, Refresh and ⋯ at the right;
-    /// under it the pages, underlined, with the counts of columns and indexes.
+    /// The header, one line: the pages, underlined, with the counts of columns and indexes;
+    /// at the right Back / Forward of foreign key navigation, Refresh and ⋯. The object's name
+    /// is the tab's title (its full path, signature included, the tab's tooltip), its size and
+    /// row estimate on the Statistics page.
     fn header_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let p = ternarygrid_ui::pal(ui);
-        let frame = egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 10, bottom: 0 });
+        let frame = egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 10, top: 0, bottom: 0 });
         let header = frame.show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
             let width = ui.available_width();
-            ui.allocate_ui_with_layout(egui::vec2(width, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.set_min_height(30.0);
-                ui.spacing_mut().item_spacing.x = 8.0;
-                // The 18 point icon in its box (the glyph is drawn a little smaller, see `icon_font`).
-                let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, crate::nav::kind_icon(self.obj.kind), ternarygrid_ui::style::icon_font(18.0), p.text_muted);
-                let name = match &self.obj.signature {
-                    Some(sig) if sig.starts_with('(') => format!("{}{sig}", self.obj.name),
-                    _ => self.obj.name.clone(),
-                };
-                kit::semibold_label(ui, &name, 15.0, p.text);
-                // Where it is: database › schema (› table for a column, an index, a trigger), 6 apart.
-                let place: Vec<&str> = [&self.obj.database, &self.obj.schema, &self.obj.table].into_iter().flatten().map(String::as_str).collect();
-                if !place.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        for (i, part) in place.iter().enumerate() {
-                            if i > 0 {
-                                ui.label(RichText::new("›").size(12.5).color(p.text_faint));
-                            }
-                            ui.label(RichText::new(*part).size(12.5).color(p.text_muted));
+            ui.allocate_ui_with_layout(egui::vec2(width, HEADER_H), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.set_min_height(HEADER_H);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More actions"), false, 28.0);
+                egui::Popup::menu(&more).show(|ui| crate::nav::object_menu(ui, cx, &self.conn.clone(), &self.obj.clone(), false));
+                if kit::icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 28.0).clicked() {
+                    self.refresh();
+                    match (self.page, self.diagram.as_mut(), self.data.as_mut()) {
+                        (ObjectPage::Diagram, Some(d), _) => d.reload(cx),
+                        // The data page reloads its rows (asking first when edits are pending).
+                        (ObjectPage::Data, _, Some(d)) => {
+                            let _ = d.on_action(crate::keys::Action::Refresh, cx);
                         }
+                        _ => {}
+                    }
+                    cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: Some(self.obj.clone()), schema: None });
+                }
+                // Back / forward of foreign key navigation on the data page.
+                if let (ObjectPage::Data, Some(d)) = (self.page, self.data.as_mut()) {
+                    d.header_ui(ui, cx);
+                }
+                ui.add_space(12.0);
+                // The pages take the rest; in a narrow tab they scroll (wheel) under the buttons
+                // instead of running into them.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    egui::ScrollArea::horizontal().id_salt("object_pages").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+                        ui.horizontal_centered(|ui| self.pages_ui(ui));
                     });
-                }
-                if let Some(t) = self.table.get() {
-                    let mut facts = Vec::new();
-                    if let Some(r) = t.row_estimate.filter(|r| *r >= 0) {
-                        // Grouped by spaces, as the mockups write an estimate ("≈ 12 840 rows").
-                        facts.push(ternarygrid_core::trf("≈ {} rows", &[&ternarygrid_grid::format::group_thousands(&r.to_string()).replace(',', " ")]));
-                    }
-                    if let Some(b) = t.size_bytes {
-                        facts.push(widgets::format_bytes(b));
-                    }
-                    if !facts.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(facts.join(" · ")).size(12.5).color(p.text_faint));
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More actions"), false, 30.0);
-                    egui::Popup::menu(&more).show(|ui| crate::nav::object_menu(ui, cx, &self.conn.clone(), &self.obj.clone(), false));
-                    if kit::icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 30.0).clicked() {
-                        self.refresh();
-                        match (self.page, self.diagram.as_mut(), self.data.as_mut()) {
-                            (ObjectPage::Diagram, Some(d), _) => d.reload(cx),
-                            // The data page reloads its rows (asking first when edits are pending).
-                            (ObjectPage::Data, _, Some(d)) => {
-                                let _ = d.on_action(crate::keys::Action::Refresh, cx);
-                            }
-                            _ => {}
-                        }
-                        cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: Some(self.obj.clone()), schema: None });
-                    }
-                    // Back / forward of foreign key navigation on the data page.
-                    if let (ObjectPage::Data, Some(d)) = (self.page, self.data.as_mut()) {
-                        d.header_ui(ui, cx);
-                    }
                 });
             });
-            ui.add_space(6.0);
-            ui.allocate_ui_with_layout(egui::vec2(width, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                // 20 apart, as in the mockups' table data page.
-                ui.spacing_mut().item_spacing.x = 20.0;
-                let def = self.table.get().cloned();
-                let count = |n: Option<usize>| n.filter(|n| *n > 0).map(|n| n.to_string());
-                let mut pages: Vec<(ObjectPage, Option<TablePage>, &str, Option<String>)> = vec![(ObjectPage::Properties, None, tr("Properties"), None)];
-                if self.obj.kind.has_data() {
-                    pages.push((ObjectPage::Data, None, tr("Data"), None));
-                }
-                pages.push((ObjectPage::Ddl, None, tr("DDL"), None));
-                if def.is_some() {
-                    pages.push((ObjectPage::Properties, Some(TablePage::Columns), tr("Columns"), count(def.as_ref().map(|t| t.columns.len()))));
-                    if self.obj.kind.is_table_like() {
-                        pages.push((ObjectPage::Properties, Some(TablePage::Indexes), tr("Indexes"), count(def.as_ref().map(|t| t.indexes.len()))));
-                    }
-                }
-                pages.push((ObjectPage::Dependencies, None, tr("Dependencies"), None));
-                if self.obj.kind.has_data() {
-                    pages.push((ObjectPage::Statistics, None, tr("Statistics"), None));
-                }
-                if self.obj.kind.is_table_like() {
-                    pages.push((ObjectPage::Diagram, None, tr("ER diagram"), None));
-                }
-                for (page, sub, label, n) in pages {
-                    // Columns and Indexes are the property pages of those names, one click away.
-                    let selected = self.page == page && (page != ObjectPage::Properties || self.via == sub && sub.is_none_or(|s| s == self.table_page));
-                    if kit::underline_tab(ui, None, label, n.as_deref(), selected, 34.0).clicked() {
-                        self.page = page;
-                        self.via = sub;
-                        if let Some(s) = sub {
-                            self.table_page = s;
-                        }
-                    }
-                }
-            });
         });
-        // The line under the tabs (the selected one's underline sits on it).
+        // The line under the pages (the selected one's underline sits on it).
         ui.painter().hline(ui.max_rect().x_range(), header.response.rect.bottom() + 0.5, egui::Stroke::new(1.0, p.border));
         // The page right under the line.
         ui.add_space(1.0 - ui.spacing().item_spacing.y);
+    }
+
+    /// The pages of the header, 20 apart as in the mockups' table data page.
+    fn pages_ui(&mut self, ui: &mut Ui) {
+        ui.spacing_mut().item_spacing.x = 20.0;
+        let def = self.table.get().cloned();
+        let count = |n: Option<usize>| n.filter(|n| *n > 0).map(|n| n.to_string());
+        let mut pages: Vec<(ObjectPage, Option<TablePage>, &str, Option<String>)> = vec![(ObjectPage::Properties, None, tr("Properties"), None)];
+        if self.obj.kind.has_data() {
+            pages.push((ObjectPage::Data, None, tr("Data"), None));
+        }
+        pages.push((ObjectPage::Ddl, None, tr("DDL"), None));
+        if def.is_some() {
+            pages.push((ObjectPage::Properties, Some(TablePage::Columns), tr("Columns"), count(def.as_ref().map(|t| t.columns.len()))));
+            if self.obj.kind.is_table_like() {
+                pages.push((ObjectPage::Properties, Some(TablePage::Indexes), tr("Indexes"), count(def.as_ref().map(|t| t.indexes.len()))));
+            }
+        }
+        pages.push((ObjectPage::Dependencies, None, tr("Dependencies"), None));
+        if self.obj.kind.has_data() {
+            pages.push((ObjectPage::Statistics, None, tr("Statistics"), None));
+        }
+        if self.obj.kind.is_table_like() {
+            pages.push((ObjectPage::Diagram, None, tr("ER diagram"), None));
+        }
+        for (page, sub, label, n) in pages {
+            // Columns and Indexes are the property pages of those names, one click away.
+            let selected = self.page == page && (page != ObjectPage::Properties || self.via == sub && sub.is_none_or(|s| s == self.table_page));
+            if kit::underline_tab(ui, None, label, n.as_deref(), selected, HEADER_H).clicked() {
+                self.page = page;
+                self.via = sub;
+                if let Some(s) = sub {
+                    self.table_page = s;
+                }
+            }
+        }
     }
 
     fn page_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {

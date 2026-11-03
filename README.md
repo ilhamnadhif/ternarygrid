@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/ilhamnadhif/ternarygrid/master/scri
 
 The script downloads the latest release, checks it (the SHA-256 GitHub publishes, the code
 signature, the bundle id and version), installs `TernaryGrid.app` into `/Applications`, and opens it. Run
-it again to update. To install a specific version, pass it as an argument: `… | bash -s -- v0.6.0`.
+it again to update. To install a specific version, pass it as an argument: `… | bash -s -- v0.6.1`.
 
 **Disk image**: download **`TernaryGrid-<version>.dmg`**, open it and drag **TernaryGrid** onto **Applications**.
 

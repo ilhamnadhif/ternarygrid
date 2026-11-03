@@ -3,6 +3,15 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.1 — 2026-11-03
+
+### Changed
+- Object pages have a one-line header: the pages (Properties, Data, DDL, Columns, Indexes…) with Back / Forward, Refresh and ⋯ at their right, so the data has more room. The object's name is the tab's title; its full path is the tab's tooltip, its size and row estimate on the Statistics page.
+
+### Fixed
+- The light theme no longer shows dark notches at the corners of the tab bar and the page under it.
+- Editing a field in the record view looks like editing a grid cell: the selection's colour in a square accent border, the text where the value was, instead of a bright rounded frame that stood out of the row.
+
 ## 0.6.0 — 2026-11-03
 
 ### Changed

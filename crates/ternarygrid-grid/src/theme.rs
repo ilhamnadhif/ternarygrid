@@ -99,6 +99,15 @@ impl GridTheme {
     }
 }
 
+/// The selected text of a cell editor (the grid's, the record view's): a highlight that shows
+/// on the selection's fill under the editor, the text in its own colour (egui's would be the
+/// accent on the accent's tint).
+pub(crate) fn editor_selection(ui: &mut egui::Ui, theme: &GridTheme) {
+    let v = ui.visuals_mut();
+    v.selection.bg_fill = mix(theme.selection, theme.active_border, 0.55);
+    v.selection.stroke.color = theme.text;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

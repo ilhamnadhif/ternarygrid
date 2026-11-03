@@ -37,6 +37,7 @@ impl GridFrame<'_> {
         let output = {
             let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)).id_salt("cell_editor_ui"));
             child.set_clip_rect(rect);
+            crate::theme::editor_selection(&mut child, &theme);
             TextEdit::singleline(&mut text)
                 .id(editor_id)
                 .font(font)

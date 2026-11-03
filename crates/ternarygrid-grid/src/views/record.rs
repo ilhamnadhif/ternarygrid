@@ -636,20 +636,29 @@ fn rows_table(
                                 if state.editing.as_ref().is_some_and(|(er, ec, _, _)| *er == r && *ec == c) {
                                     if let Some((_, _, text, original)) = state.editing.as_mut() {
                                         let id = ui.id().with(("record_edit", r, c));
-                                        let te = ui.add_sized(
-                                            [widths[j], row_h],
-                                            TextEdit::singleline(text).id(id).margin(egui::Margin::symmetric(7, 0)).vertical_align(egui::Align::Center),
-                                        );
+                                        // As the grid's editor: on the selection's fill in a square 2 point accent
+                                        // border (red for a value it refused), the text where the value was, 12 in
+                                        // (not egui's rounded frame in the bright focus colour).
+                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(widths[j], row_h), egui::Sense::hover());
+                                        ui.painter().rect_filled(rect, 0.0, theme.selection);
+                                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                        crate::theme::editor_selection(&mut child, &theme);
+                                        let te = TextEdit::singleline(text)
+                                            .id(id)
+                                            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 0)))
+                                            .desired_width(rect.width())
+                                            .min_size(egui::vec2(rect.width(), rect.height()))
+                                            .vertical_align(egui::Align::Center)
+                                            .show(&mut child)
+                                            .response;
+                                        let border = if state.error.is_some() { theme.error } else { theme.active_border };
+                                        ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(2.0, border), egui::StrokeKind::Inside);
                                         if let Some(all) = state.select_text.take() {
                                             let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
                                             let n = text.chars().count();
                                             let range = if all { CCursorRange::two(CCursor::new(0), CCursor::new(n)) } else { CCursorRange::one(CCursor::new(n)) };
                                             st.cursor.set_char_range(Some(range));
                                             st.store(ui.ctx(), id);
-                                        }
-                                        // A value it refused: the field is outlined in red, as the grid's editor.
-                                        if state.error.is_some() {
-                                            ui.painter().rect_stroke(te.rect, 2.0, egui::Stroke::new(1.5, theme.error), egui::StrokeKind::Inside);
                                         }
                                         if te.lost_focus() {
                                             let (escape, enter) = ui.input(|inp| (inp.key_pressed(Key::Escape), inp.key_pressed(Key::Enter)));

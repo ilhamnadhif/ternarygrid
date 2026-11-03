@@ -1601,6 +1601,12 @@ impl TernaryGridApp {
 }
 
 impl eframe::App for TernaryGridApp {
+    /// The theme's chrome, not eframe's near-black: a corner nothing paints over then
+    /// blends in instead of showing as a dark notch in the light theme.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        ternarygrid_ui::palette(visuals.dark_mode).chrome.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         crate::theme::sync_fonts(&ctx);

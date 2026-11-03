@@ -251,6 +251,9 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     // point thick), the tabs 8 points from its ends and 2 apart; the active tab reaches up
     // to the top bar's hairline and opens onto the content.
     s.tab_bar.bg_fill = p.chrome;
+    // Square, as in the design: egui_dock rounds the bar's top corners and the body's by
+    // default, and nothing is painted behind them (the window's clear colour shows through).
+    s.tab_bar.corner_radius = CornerRadius::ZERO;
     s.tab_bar.hline_color = Color32::TRANSPARENT;
     s.tab_bar.height = crate::tabs::TAB_BAR_H;
     s.tab_bar.inner_margin = egui::Margin { left: 8, right: 8, top: -1, bottom: 0 };
@@ -277,6 +280,8 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     s.tab.tab_body.bg_fill = p.canvas;
     s.tab.tab_body.stroke = Stroke::NONE;
     s.tab.tab_body.inner_margin = egui::Margin::ZERO;
+    s.tab.tab_body.corner_radius = CornerRadius::ZERO;
+    s.main_surface_border_rounding = CornerRadius::ZERO;
     s.dock_area_padding = None;
     s.separator.width = 1.0;
     s.separator.color_idle = p.border;
