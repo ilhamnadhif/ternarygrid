@@ -1921,19 +1921,32 @@ impl eframe::App for TernaryGridApp {
             scrim_layer = Some(shown.response.layer_id);
         }
         let mut focused_layer = None;
+        // A tool window that sizes to its content is at most this high; its body scrolls beyond.
+        let max_popup_h = (ctx.content_rect().height() - 80.0).max(240.0);
         for tab in &mut self.popups {
             // In the header of the dialogs: the tab's icon, its title and its connection, and ×.
             // `popup_size` is the design's window inside its 1-point border (the modal's CSS
             // width and height, header included), as `Dialog::width`; the window adds the border.
             let size = tab.view.popup_size().unwrap_or(egui::vec2(720.0, 520.0)) + egui::vec2(2.0, 2.0);
+            // The tool windows (`dbtools::look::body`) say how much taller or shorter their body
+            // wants to be: the window then fits its content (its width stays the user's).
+            let fit_id = egui::Id::new(("ternarygrid_popup_fit", tab.id));
+            let fitted: Option<f32> = ctx.data(|d| d.get_temp(fit_id));
             let title = tab.view.title();
             let name = |id: Option<&str>| id.and_then(|c| cx.conns.config(c)).map(|c| c.name.clone());
-            let subtitle = match (name(tab.view.connection_id()), name(tab.view.popup_target())) {
+            let mut subtitle = match (name(tab.view.connection_id()), name(tab.view.popup_target())) {
                 (Some(source), Some(target)) => format!("{source} → {target}"),
                 (source, _) => source.unwrap_or_default(),
             };
+            // "tplus-staging · SQLite 3.53.2": the connection once, with the server it is.
+            if let Some(facts) = crate::tabs::dbtools::popup_facts(tab.view.as_ref(), &cx)
+                && !subtitle.is_empty()
+            {
+                subtitle = format!("{subtitle} · {facts}");
+            }
             let tab_icon = tab.view.icon();
-            let shown = egui::Window::new(&title)
+            let tone = crate::tabs::dbtools::popup_tone(tab.view.as_ref());
+            let window = egui::Window::new(&title)
                 .id(egui::Id::new(("ternarygrid_popup", tab.id)))
                 .title_bar(false)
                 .frame(dialogs::window_frame(&ctx))
@@ -1941,29 +1954,46 @@ impl eframe::App for TernaryGridApp {
                 .min_size(egui::vec2(360.0, 240.0))
                 .pivot(egui::Align2::CENTER_CENTER)
                 .default_pos(center)
-                .collapsible(false)
-                .resizable(true)
-                .show(&ctx, |ui| {
-                    // The tab is laid out with the usual spacing, not the dialogs'.
-                    let spacing = ui.spacing().item_spacing;
-                    let width = ui.available_width();
-                    let dialog = Dialog::new(&title).icon(tab_icon).subtitle(&subtitle).width(width).body_padding(egui::Margin::ZERO);
-                    dialog
-                        .contents(
-                            ui,
-                            |ui| {
-                                ui.spacing_mut().item_spacing = spacing;
-                                cx.tab_active = true;
-                                cx.current_tab = Some(tab.id);
-                                cx.popup = true;
-                                tab.view.ui(ui, &mut cx);
-                                cx.popup = false;
-                                cx.current_tab = None;
-                            },
-                            None,
-                        )
-                        .0
-                });
+                .collapsible(false);
+            let window = match fitted {
+                Some(h) => window.resizable([true, false]).min_height(h).max_height(h),
+                None => window.resizable(true),
+            };
+            let shown = window.show(&ctx, |ui| {
+                // The tab is laid out with the usual spacing, not the dialogs'.
+                let spacing = ui.spacing().item_spacing;
+                let width = ui.available_width();
+                let mut dialog = Dialog::new(&title).icon(tab_icon).subtitle(&subtitle).width(width).body_padding(egui::Margin::ZERO);
+                if let Some(t) = tone {
+                    dialog = dialog.tone(t);
+                }
+                dialog
+                    .contents(
+                        ui,
+                        |ui| {
+                            ui.spacing_mut().item_spacing = spacing;
+                            cx.tab_active = true;
+                            cx.current_tab = Some(tab.id);
+                            cx.popup = true;
+                            tab.view.ui(ui, &mut cx);
+                            cx.popup = false;
+                            cx.current_tab = None;
+                        },
+                        None,
+                    )
+                    .0
+            });
+            // Fitted to the content the body reported (at most `max_popup_h`): from the next frame.
+            if let Some(shown) = &shown
+                && let Some(delta) = crate::tabs::dbtools::look::take_fit(&ctx, shown.response.layer_id)
+            {
+                let current = fitted.unwrap_or_else(|| shown.response.rect.height());
+                let h = (current + delta).clamp(160.0, max_popup_h).round();
+                if fitted.is_none_or(|f| (f - h).abs() >= 1.0) {
+                    ctx.data_mut(|d| d.insert_temp(fit_id, h));
+                    ctx.request_repaint();
+                }
+            }
             // Closed by its ×.
             let open = !shown.as_ref().and_then(|s| s.inner).unwrap_or(false);
             if let Some(shown) = &shown

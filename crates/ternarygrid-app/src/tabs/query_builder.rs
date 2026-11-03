@@ -95,17 +95,22 @@ impl QueryBuilderTab {
             |ui| {
                 let p = style::pal(ui);
                 ui.spacing_mut().item_spacing.y = 8.0;
-                kit::search_field(ui, filter_id, filter_text, tr("Filter…"), ui.available_width());
+                let search = kit::search_field(ui, filter_id, filter_text, tr("Filter…"), ui.available_width());
+                // Enter in the filter adds the first table that matches it.
+                let enter = search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let filter = filter_text.to_lowercase();
                 egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    let mut first = true;
                     for kind in [ObjectKind::Table, ObjectKind::View] {
                         match live.meta.objects.get(&(schema.clone(), kind)) {
                             Some(Loadable::Loaded(list)) => {
                                 for o in list.iter().filter(|o| filter.is_empty() || o.obj.name.to_lowercase().contains(&filter)) {
-                                    if picker_row(ui, kind, &o.obj.name).double_clicked() {
+                                    // A click adds the table; the picker stays open for more.
+                                    if picker_row(ui, kind, &o.obj.name).clicked() || (enter && first) {
                                         chosen = Some(o.obj.clone());
                                     }
+                                    first = false;
                                 }
                             }
                             Some(Loadable::Failed(e)) => {
@@ -117,7 +122,7 @@ impl QueryBuilderTab {
                         }
                     }
                 });
-                ui.label(RichText::new(tr("Double-click a table to add it.")).size(12.0).color(p.text_faint));
+                ui.label(RichText::new(tr("Click or press Enter to add.")).size(12.0).color(p.text_faint));
             },
             None,
         );

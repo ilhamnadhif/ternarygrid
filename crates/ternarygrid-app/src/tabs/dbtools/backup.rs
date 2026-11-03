@@ -122,6 +122,45 @@ fn tool_card(ui: &mut Ui, id: &str, label_w: f32, tool_path: &mut String, extra_
     changed
 }
 
+/// The name of a compression level in the picker.
+fn compression_label(on: bool, level: u8) -> String {
+    match (on, level) {
+        (false, _) => tr("Default of the tool").to_string(),
+        (true, 0) => tr("0 (none)").to_string(),
+        (true, 1) => tr("1 (fastest)").to_string(),
+        (true, 9) => tr("9 (smallest)").to_string(),
+        (true, l) => l.to_string(),
+    }
+}
+
+/// The compression level picker: the tool's default, or a level from 0 (none) to 9.
+fn compression_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, on: &mut bool, level: &mut u8) -> bool {
+    let mut changed = false;
+    let width = 200.0;
+    // As high as the form's fields.
+    ui.spacing_mut().interact_size.y = ternarygrid_ui::style::CONTROL_H;
+    egui::ComboBox::from_id_salt(id)
+        .icon(kit::combo_caret)
+        .popup_style(egui::containers::menu::menu_style.into())
+        .selected_text(compression_label(*on, *level))
+        .width(width)
+        .show_ui(ui, |ui| {
+            kit::menu_look(ui, width);
+            if crate::tabs::transfer::wizard::choice(ui, !*on, &compression_label(false, 0)) && *on {
+                *on = false;
+                changed = true;
+            }
+            for l in 0..=9u8 {
+                let current = *on && *level == l;
+                if crate::tabs::transfer::wizard::choice(ui, current, &compression_label(true, l)) && !current {
+                    (*on, *level) = (true, l);
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
 /// Editable form of [`BackupOptions`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackupForm {
@@ -313,18 +352,10 @@ impl BackupForm {
                     changed |= look::checkbox(ui, &mut self.single_transaction, tr("Single transaction (consistent snapshot)")).changed();
                     changed |= look::checkbox(ui, &mut self.routines, tr("Include routines and events")).changed();
                 }
-                if pg && self.format != BackupFormat::Tar && !whole_server {
-                    // As in the design: the label, a level bar (drag or click; a double click
-                    // goes back to the tool's default) and the level.
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 10.0;
-                        look::muted(ui, tr("Compression level"));
-                        changed |= look::level_bar(ui, tr("Compression level"), &mut self.compress, &mut self.compression, 9, 182.0);
-                        let shown = if self.compress { self.compression.to_string() } else { tr("default").to_string() };
-                        ui.label(RichText::new(shown).size(12.5));
-                    });
-                }
             });
+            if pg && self.format != BackupFormat::Tar && !whole_server {
+                look::row(ui, tr("Compression"), lw, |ui| changed |= compression_combo(ui, (id, "compression"), &mut self.compress, &mut self.compression));
+            }
             changed |= self.more_ui(ui, flavor, id, !whole_server);
         });
         changed
@@ -535,8 +566,25 @@ struct PreviewKey {
 
 struct Preview {
     key: PreviewKey,
-    /// (program, display text) or the error.
-    result: Result<(String, String), String>,
+    /// The command or the error.
+    result: Result<Built, String>,
+}
+
+/// A command built for the preview.
+#[derive(Clone)]
+struct Built {
+    program: String,
+    /// The command line shown (without secrets).
+    display: String,
+    /// The password goes to the tool through its environment.
+    password_env: bool,
+}
+
+impl Built {
+    fn of(spec: &CommandSpec) -> Built {
+        let password_env = spec.env.iter().any(|(k, _)| k.contains("PASSWORD") || k.ends_with("PWD"));
+        Built { program: spec.program.clone(), display: spec.display(), password_env }
+    }
 }
 
 enum ToolVersion {
@@ -650,7 +698,7 @@ impl BackupTab {
     pub fn command_line(&mut self, cx: &AppContext) -> Result<String, String> {
         self.refresh_preview(cx);
         match self.preview.as_ref().map(|p| &p.result) {
-            Some(Ok((_, display))) => Ok(display.clone()),
+            Some(Ok(b)) => Ok(b.display.clone()),
             Some(Err(e)) => Err(e.clone()),
             None => Err(tr("Connect first: the tools use the connection's settings").to_string()),
         }
@@ -661,7 +709,7 @@ impl BackupTab {
         if self.preview.as_ref().is_some_and(|p| p.key == key) {
             return;
         }
-        let result = self.spec(cx).map(|s| (s.program.clone(), s.display())).map_err(|e| e.message);
+        let result = self.spec(cx).map(|s| Built::of(&s)).map_err(|e| e.message);
         self.preview = Some(Preview { key, result });
     }
 
@@ -682,7 +730,7 @@ impl BackupTab {
     /// Tool name, version line and the newer-than-server warning.
     fn tool_status(&mut self, cx: &AppContext) -> Option<(String, Option<String>, Option<String>)> {
         let program = match self.preview.as_ref().map(|p| &p.result) {
-            Some(Ok((program, _))) => program.clone(),
+            Some(Ok(b)) => b.program.clone(),
             _ => return None,
         };
         let name = std::path::Path::new(&program).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| program.clone());
@@ -789,7 +837,7 @@ impl BackupTab {
             let outcome = classify(&result, &lines);
             let state = match &outcome {
                 ToolOutcome::Succeeded => OpState::Succeeded(if self.restore { tr("Restore completed").to_string() } else { tr("Backup completed").to_string() }),
-                ToolOutcome::Warnings { errors, .. } => OpState::Succeeded(trf("Completed with {} warning(s)", &[&errors.len()])),
+                ToolOutcome::Warnings { errors, .. } => OpState::Succeeded(ternarygrid_core::trn(errors.len(), tr("Completed with 1 warning"), tr("Completed with {} warnings"))),
                 ToolOutcome::Failed(e) => OpState::Failed(e.lines().next().unwrap_or_default().to_string()),
                 ToolOutcome::Cancelled => OpState::Cancelled,
             };
@@ -821,45 +869,59 @@ impl BackupTab {
         }
     }
 
-    fn header(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        let name = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_else(|| self.conn.clone());
+    /// The connection (in a tab; a pop-up names it in its header), Connect, or why the tool
+    /// cannot run; false when nothing was drawn.
+    fn header(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
+        let mut drew = false;
         if !cx.popup {
+            let name = cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_else(|| self.conn.clone());
             look::title(ui, if self.restore { tr("Restore") } else { tr("Backup") });
+            let facts = cx.conns.live(&self.conn).map(|live| format!("{} {}", live.server.product, live.server.version.split_whitespace().next().unwrap_or("")));
+            look::conn_title(ui, &name, facts.as_deref());
+            drew = true;
         }
-        let facts = cx.conns.live(&self.conn).map(|live| format!("{} {}", live.server.product, live.server.version.split_whitespace().next().unwrap_or("")));
-        look::conn_title(ui, &name, facts.as_deref());
         if !cx.conns.is_connected(&self.conn) {
             look::note_with(ui, parts::Tone::Info, None, tr("Connect to build the command: the tools use the connection's host, user and password."), |ui| {
                 if kit::button_ex(ui, kit::Kind::Secondary, Some(icon::PLUGS_CONNECTED), tr("Connect"), true).clicked() {
                     cx.push(AppCommand::Connect(self.conn.clone()));
                 }
             });
+            drew = true;
         } else if let Some(live) = cx.conns.live(&self.conn) {
             let caps = &live.driver.info().capabilities;
             let supported = if self.restore { caps.restore } else { caps.backup };
             if !supported {
                 look::error(ui, if self.restore { tr("Restore is not supported for this database.") } else { tr("Backup is not supported for this database.") });
+                drew = true;
             }
         }
+        drew
     }
 
     fn command_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.refresh_preview(cx);
         let p = ternarygrid_ui::pal(ui);
         let preview = self.preview.as_ref().map(|p| p.result.clone());
+        let connected = cx.conns.is_connected(&self.conn);
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             parts::section_header(ui, tr("Command"), |ui| {
-                if let Some(Ok((_, display))) = &preview
+                if let Some(Ok(b)) = &preview
                     && kit::icon_button_ex(ui, icon::COPY, tr("Copy"), false, 24.0).clicked()
                 {
-                    ui.ctx().copy_text(display.clone());
+                    ui.ctx().copy_text(b.display.clone());
                 }
             });
             match &preview {
-                Some(Ok((_, display))) => {
-                    look::command_block(ui, display);
-                    look::faint(ui, tr("The password is passed through the environment and is not part of the command line."));
+                Some(Ok(b)) => {
+                    look::command_block(ui, &b.display);
+                    if b.password_env {
+                        look::faint(ui, tr("The password is passed through the environment and is not part of the command line."));
+                    }
+                }
+                // The note above says to connect: no error here.
+                _ if !connected => {
+                    look::faint(ui, tr("The command appears once connected."));
                 }
                 Some(Err(e)) => {
                     ui.label(RichText::new(e).color(p.err));
@@ -871,7 +933,7 @@ impl BackupTab {
                     look::muted(ui, tr("Tool:"));
                     match &line {
                         Some(l) => {
-                            ui.label(RichText::new(l.as_str()).font(look::mono(12.0)).color(p.text_muted));
+                            ui.label(RichText::new(super::short_tool_version(&tool, l)).font(look::mono(12.0)).color(p.text_muted)).on_hover_text(l.as_str());
                         }
                         None => {
                             if self.versions.values().any(|v| matches!(v, ToolVersion::Loading(_))) {
@@ -891,21 +953,40 @@ impl BackupTab {
         });
     }
 
-    /// Start (backup), Cancel and Save as task… (the restore has them in its footer).
-    fn run_buttons(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        let running = self.is_running();
-        let (glyph, label) = if self.restore { (icon::REPEAT, tr("Start restore")) } else { (icon::PLAY, tr("Start backup")) };
-        let ready = cx.conns.is_connected(&self.conn) && matches!(self.preview.as_ref().map(|p| &p.result), Some(Ok(_)));
-        if ui.add_enabled_ui(!running && ready, |ui| kit::primary_icon(ui, glyph, label)).inner.clicked() {
-            if self.restore {
-                self.confirm = true;
+    /// The footer: Save as task… at the left; Cancel (Stop while the tool runs) and the start
+    /// button at the right; after a run that ended with warnings, Run again and Close.
+    fn footer_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        self.save_buttons(ui, cx);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let running = self.is_running();
+            let (glyph, label) = if self.restore { (icon::REPEAT, tr("Start restore")) } else { (icon::PLAY, tr("Start backup")) };
+            let ready = cx.conns.is_connected(&self.conn) && matches!(self.preview.as_ref().map(|p| &p.result), Some(Ok(_)));
+            let warned = !running && matches!(self.outcome(), Some(ToolOutcome::Warnings { .. }));
+            let start;
+            if warned {
+                if kit::primary(ui, tr("Close")).clicked() {
+                    self.done = true;
+                }
+                start = ui.add_enabled_ui(ready, |ui| kit::secondary(ui, Some(glyph), tr("Run again"))).inner.clicked();
             } else {
-                self.start(cx);
+                start = ui.add_enabled_ui(!running && ready, |ui| kit::primary_icon(ui, glyph, label)).inner.clicked();
+                if running {
+                    if kit::secondary(ui, Some(icon::STOP_CIRCLE), tr("Stop")).clicked() {
+                        self.cancel();
+                    }
+                } else if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                    // Closes the pop-up.
+                    self.done = true;
+                }
             }
-        }
-        if running && kit::secondary(ui, Some(icon::STOP), tr("Cancel")).clicked() {
-            self.cancel();
-        }
+            if start {
+                if self.restore {
+                    self.confirm = true;
+                } else {
+                    self.start(cx);
+                }
+            }
+        });
     }
 
     fn save_buttons(&mut self, ui: &mut Ui, cx: &mut AppContext) {
@@ -920,23 +1001,13 @@ impl BackupTab {
         }
     }
 
-    /// How the last run ended and Open folder.
+    /// How the last run ended and Open folder (a line of the body, under the command).
     fn status_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let Some(run) = self.run.as_ref() else { return };
         let p = ternarygrid_ui::pal(ui);
         let elapsed = crate::widgets::format_duration(run.ended.unwrap_or_else(Instant::now).duration_since(run.started));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            if let (Some(ToolOutcome::Succeeded | ToolOutcome::Warnings { .. }), Some(path)) = (&run.outcome, &run.output) {
-                let dir = if path.is_dir() { Some(path.clone()) } else { path.parent().map(|d| d.to_path_buf()) };
-                if let Some(dir) = dir
-                    && kit::ghost(ui, Some(icon::FOLDER_OPEN), tr("Open folder")).clicked()
-                {
-                    cx.backend.spawn_detached(async move {
-                        let _ = open::that_detached(dir);
-                    });
-                }
-            }
             let (glyph, color, text) = match &run.outcome {
                 None => {
                     ui.ctx().request_repaint_after(Duration::from_millis(500));
@@ -953,14 +1024,13 @@ impl BackupTab {
                     let text = if *only_settings {
                         tr("Completed with warnings: the server does not know some settings written by a newer tool version; they were skipped.").to_string()
                     } else {
-                        trf("Completed, but the tool reported {} error(s).", &[&errors.len()])
+                        ternarygrid_core::trn(errors.len(), tr("Completed, but the tool reported 1 error."), tr("Completed, but the tool reported {} errors."))
                     };
                     (Some(icon::WARNING), p.warn, text)
                 }
-                Some(ToolOutcome::Failed(_)) => (Some(icon::X_CIRCLE), p.err, tr("The tool failed").to_string()),
-                Some(ToolOutcome::Cancelled) => (Some(icon::PROHIBIT), p.warn, tr("Cancelled").to_string()),
+                Some(ToolOutcome::Failed(_)) => (Some(icon::X_CIRCLE), p.err, tr("The tool failed.").to_string()),
+                Some(ToolOutcome::Cancelled) => (Some(icon::PROHIBIT), p.warn, tr("Cancelled.").to_string()),
             };
-            ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).truncate());
             match glyph {
                 Some(g) => {
                     ui.label(RichText::new(g).font(ternarygrid_ui::style::icon_font(15.0)).color(color));
@@ -968,6 +1038,28 @@ impl BackupTab {
                 None => {
                     ui.spinner();
                 }
+            }
+            let open_folder = match (&run.outcome, &run.output) {
+                (Some(ToolOutcome::Succeeded | ToolOutcome::Warnings { .. }), Some(path)) => {
+                    if path.is_dir() {
+                        Some(path.clone())
+                    } else {
+                        path.parent().map(|d| d.to_path_buf())
+                    }
+                }
+                _ => None,
+            };
+            let room = ui.available_width() - if open_folder.is_some() { kit::button_width(ui, Some(icon::FOLDER_OPEN), tr("Open folder"), true) + 8.0 } else { 0.0 };
+            ui.scope(|ui| {
+                ui.set_max_width(room.max(80.0));
+                ui.add(egui::Label::new(RichText::new(&text).size(12.5).color(color)).truncate()).on_hover_text(&text);
+            });
+            if let Some(dir) = open_folder
+                && kit::button_ex(ui, kit::Kind::Ghost, Some(icon::FOLDER_OPEN), tr("Open folder"), true).clicked()
+            {
+                cx.backend.spawn_detached(async move {
+                    let _ = open::that_detached(dir);
+                });
             }
         });
     }
@@ -1008,27 +1100,32 @@ impl BackupTab {
             let db = Some(self.restore_form.database.trim().to_string()).filter(|d| !d.is_empty()).unwrap_or_else(|| tr("(connection database)").to_string());
             let file = std::path::Path::new(self.restore_form.input.trim()).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| self.restore_form.input.clone());
             let question = trf("Restore {} into \"{}\" / {}?", &[&file, &target, &db]);
+            let production = cx.conns.type_of(&self.conn).is_production();
             let (mut run, mut cancel) = (false, false);
-            let (resp, _) = parts::Dialog::new(tr("Restore the backup")).icon(icon::REPEAT).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
-                ui.ctx(),
-                egui::Id::new(("confirm_restore", &self.conn)),
-                |ui| {
-                    let p = ternarygrid_ui::pal(ui);
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    ui.add(egui::Label::new(RichText::new(&question).size(13.5)).wrap()).on_hover_text(self.restore_form.input.as_str());
-                    ui.label(RichText::new(tr("Existing objects can be dropped or overwritten.")).color(p.text_muted));
-                },
-                |ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::REPEAT), tr("Restore"), false).clicked() {
-                            run = true;
+            let (resp, _) =
+                parts::Dialog::new(tr("Restore the backup")).icon(icon::WARNING).tone(parts::Tone::Error).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
+                    ui.ctx(),
+                    egui::Id::new(("confirm_restore", &self.conn)),
+                    |ui| {
+                        let p = ternarygrid_ui::pal(ui);
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        ui.add(egui::Label::new(RichText::new(&question).size(13.5)).wrap()).on_hover_text(self.restore_form.input.as_str());
+                        ui.label(RichText::new(tr("Existing objects of the database can be dropped or overwritten.")).color(p.text_muted));
+                        if production {
+                            look::note(ui, parts::Tone::Warning, None, &trf("{} is a Production connection: the live database will be changed.", &[&target]));
                         }
-                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
-                            cancel = true;
-                        }
-                    });
-                },
-            );
+                    },
+                    |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::REPEAT), tr("Restore backup"), false).clicked() {
+                                run = true;
+                            }
+                            if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                                cancel = true;
+                            }
+                        });
+                    },
+                );
             if run {
                 self.start(cx);
             }
@@ -1108,17 +1205,13 @@ impl TabView for BackupTab {
         let flavor = self.flavor(cx);
         let running = self.is_running();
         let conn = self.conn.clone();
-        if self.restore {
-            look::footer(ui, ("restore_footer", &conn), |ui| {
-                self.save_buttons(ui, cx);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.run_buttons(ui, cx));
-            });
-        }
+        look::footer(ui, ("backup_footer", &conn, self.restore), |ui| self.footer_ui(ui, cx));
         look::body(ui, ("backup_body", &conn, self.restore), |ui| {
             // The design's parts are 14 apart.
             ui.spacing_mut().item_spacing.y = 14.0;
-            self.header(ui, cx);
-            look::divider(ui);
+            if self.header(ui, cx) {
+                look::divider(ui);
+            }
             ui.add_enabled_ui(!running, |ui| {
                 if self.restore {
                     self.restore_form.ui(ui, flavor, "restore_tab");
@@ -1128,16 +1221,7 @@ impl TabView for BackupTab {
             });
             look::divider(ui);
             self.command_ui(ui, cx);
-            if !self.restore {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    self.run_buttons(ui, cx);
-                    self.save_buttons(ui, cx);
-                    self.status_ui(ui, cx);
-                });
-            } else if self.run.is_some() {
-                ui.horizontal(|ui| self.status_ui(ui, cx));
-            }
+            self.status_ui(ui, cx);
             self.log_ui(ui);
         });
         self.dialogs(ui, cx);

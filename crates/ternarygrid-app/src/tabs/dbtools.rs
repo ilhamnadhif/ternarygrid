@@ -37,6 +37,36 @@ where
     backend.spawn(async move { tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| Err(DbError::internal(e.to_string()))) })
 }
 
+/// The server of a tool window's connection, for its header after the connection's name
+/// ("tplus-staging · SQLite 3.53.2"): the tools of this module only, once connected.
+pub(crate) fn popup_facts(view: &dyn crate::tabs::TabView, cx: &AppContext) -> Option<String> {
+    let any = view.as_any();
+    let tool = any.is::<BackupTab>() || any.is::<MaintenanceTab>() || any.is::<ChangePasswordTab>() || any.is::<FdwConfigTab>();
+    let live = cx.conns.live(view.connection_id().filter(|_| tool)?)?;
+    let version = live.server.version.split_whitespace().next().unwrap_or("");
+    Some(format!("{} {version}", live.server.product).trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// The tone of a tool window's header badge: red for the destructive ones (Truncate).
+pub(crate) fn popup_tone(view: &dyn crate::tabs::TabView) -> Option<ternarygrid_ui::parts::Tone> {
+    view.as_any().downcast_ref::<MaintenanceTab>().filter(|m| m.is_truncate()).map(|_| ternarygrid_ui::parts::Tone::Error)
+}
+
+/// A tool's `--version` line shortened to its name and version ("sqlite3 3.43.2",
+/// "pg_dump 17.2"); the line as it is when no version is found in it.
+pub fn short_tool_version(tool: &str, line: &str) -> String {
+    let token = |s: &str| s.split(|c: char| c.is_whitespace() || c == ',').find(|t| t.starts_with(|c: char| c.is_ascii_digit()) && t.contains('.')).map(str::to_string);
+    // MariaDB's mysqldump: "Ver 10.19 Distrib 10.11.6-MariaDB" (the server version is the one that counts).
+    let version = match line.find("Distrib ") {
+        Some(i) => token(&line[i + "Distrib ".len()..]),
+        None => token(line),
+    };
+    match version {
+        Some(v) => format!("{tool} {v}"),
+        None => line.to_string(),
+    }
+}
+
 /// Command line options differ between the PostgreSQL and the MySQL tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolFlavor {
@@ -395,5 +425,9 @@ mod tests {
         assert!(is_unknown_setting_error("ERROR 1193 (HY000) at line 17: Unknown system variable 'foo'"));
         assert!(!is_unknown_setting_error("psql:/tmp/x.sql:3: ERROR:  relation \"t\" already exists"));
         assert_eq!(file_safe("my db/prod"), "my_db_prod");
+        assert_eq!(short_tool_version("sqlite3", "3.43.2 2023-10-10 13:08:14 1b37c146ee9ebb7acd0160c0ab1fd11017a419fa8a3187386ed8cb32b709aapl (64-bit)"), "sqlite3 3.43.2");
+        assert_eq!(short_tool_version("pg_dump", "pg_dump (PostgreSQL) 17.2 (Homebrew)"), "pg_dump 17.2");
+        assert_eq!(short_tool_version("mysqldump", "mysqldump  Ver 10.19 Distrib 10.11.6-MariaDB, for Linux"), "mysqldump 10.11.6-MariaDB");
+        assert_eq!(short_tool_version("x", "no version here"), "no version here");
     }
 }
