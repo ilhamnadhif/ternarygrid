@@ -3,13 +3,15 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
-## 0.6.0 — unreleased
+## 0.6.0 — 2026-11-03
 
 ### Changed
 - **A new, modern interface**, shared with TernaryWire and TernaryShell: a teal accent, quiet monochrome icons (logos, connection types and warnings keep their colours), clearer type, and a lighter dark theme. Every screen was redesigned: the SQL editor, results, object pages, dialogs, wizards, tools, settings, tasks, history, the ER diagram, the table designer and the AI assistant.
 - The toolbar is replaced by a **top bar**: the active connection › schema (click to switch), a search box for every command, object and script (`⇧⌘P`), a PRODUCTION badge for production connections, and the AI, theme and settings buttons; **Update** appears there only when a new version is out. On macOS the top bar is the window's title bar.
 - An **icon rail** on the left opens the Database Navigator, Projects, Query history and Tasks; background operations and Settings sit at its bottom. The **status bar** shows the connection, the schema, the transaction mode (with the number of pending statements; a click opens Pending transactions), the rows and the time of the last run, the time zone and the memory used.
-- Results have **one filter bar** (WHERE and ORDER BY with Apply) and **one footer**: rows and timing, Save and Discard only while there are changes, the views and the side panels. NULL is shown in faint italics, JSON and XML types in the column header.
+- Results have **one filter bar** and **one footer**. On table pages the filter bar is the WHERE field and a **Sort chip** ("Sort ↓ created_at ×": a click edits the ORDER BY, × removes it); the SQL editor keeps its ORDER BY field. The footer shows the rows and timing, Fetch next, Save and Discard only while there are changes, the views, Export and the side panels; the less used actions are in its ⋯ menu.
+- Grid cells: NULL is shown as a faint italic `NULL` (was `[NULL]`), binary values as their size (`‹binary · 64 B›`), numbers with thousands separators (key columns without), the column's type faint at the right of its header; rows are taller and scroll bars float over the cells. Settings that still had the old defaults follow the new ones.
+- Menus and drop-down lists have the new look: an icon column, shortcuts at the right, check marks for the current choice and destructive actions in red.
 - The SQL editor has a **Run** button as its main action, quiet connection and schema pickers, result tabs with their row counts, a compact toolbar when the editor is narrow, and an error card with **Fix error**, which asks the AI assistant.
 - Object pages have a header with the object's place and name and underlined pages with counts (Columns 12, Indexes 3).
 - Dialogs, wizards and tool windows share one frame: an icon and a title, a stepper for wizards, and a footer for the buttons. The transfer wizards show their Run button on the last page; the app dims behind the tool window you are working in (a click on the app brings it back).
