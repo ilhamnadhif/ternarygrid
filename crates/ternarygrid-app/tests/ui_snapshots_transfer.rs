@@ -5,8 +5,10 @@
 //! cargo test -p ternarygrid-app --test ui_snapshots_transfer -- --ignored
 //! ```
 //!
-//! writes `target/ui-snapshots/transfer/<shot>-<dark|light>.png`, to compare with the design
-//! canvas (`s_transfer.py`, `s_more.py`).
+//! writes `target/ui-snapshots/transfer/<shot>-<dark|light>.png` (`transfer-<label>` with
+//! `TERNARYGRID_SNAPSHOT_LABEL=<label>`; `TERNARYGRID_SNAPSHOT_ONLY=a,b` writes only the shots
+//! whose names start with those, `TERNARYGRID_SNAPSHOT_THEME=dark|light` one theme,
+//! `TERNARYGRID_SNAPSHOT_PPP=1` at one pixel per point).
 
 use egui::epaint::{ClippedPrimitive, Primitive};
 use egui::{Color32, ColorImage, TextureId};
@@ -32,8 +34,11 @@ use ternarygrid_transfer::{ExportFormat, GeneratorKind, ImportMode, MigrationMod
 
 type H = Harness<'static, TernaryGridApp>;
 
-/// Pixels per point of the screenshots (a Retina display).
-const PPP: f32 = 2.0;
+/// Pixels per point of the screenshots: a Retina display (2), or
+/// `TERNARYGRID_SNAPSHOT_PPP` (1 for quick reviews).
+fn ppp() -> f32 {
+    std::env::var("TERNARYGRID_SNAPSHOT_PPP").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0)
+}
 
 /// Textures the frames set, kept for rasterising (the font atlas comes in
 /// the first frames, so they are recorded from the start).
@@ -73,17 +78,18 @@ impl Raster {
 
     /// Rasterise tessellated `prims` (barycentric, textured, alpha blended).
     fn render(&self, prims: &[ClippedPrimitive], size: [usize; 2], bg: Color32) -> image::RgbaImage {
+        let scale = ppp();
         let (w, h) = (size[0], size[1]);
         let mut fb: Vec<[f32; 4]> = vec![[bg.r() as f32, bg.g() as f32, bg.b() as f32, 255.0]; w * h];
         for p in prims {
             let Primitive::Mesh(mesh) = &p.primitive else { continue };
             let Some(tex) = self.textures.get(&mesh.texture_id) else { continue };
             let clip = p.clip_rect;
-            let (cx0, cy0) = ((clip.min.x * PPP).max(0.0) as i64, (clip.min.y * PPP).max(0.0) as i64);
-            let (cx1, cy1) = (((clip.max.x * PPP).ceil() as i64).min(w as i64), ((clip.max.y * PPP).ceil() as i64).min(h as i64));
+            let (cx0, cy0) = ((clip.min.x * scale).max(0.0) as i64, (clip.min.y * scale).max(0.0) as i64);
+            let (cx1, cy1) = (((clip.max.x * scale).ceil() as i64).min(w as i64), ((clip.max.y * scale).ceil() as i64).min(h as i64));
             for tri in mesh.indices.as_chunks::<3>().0 {
                 let v = tri.map(|i| mesh.vertices[i as usize]);
-                let pts = v.map(|v| (v.pos.x * PPP, v.pos.y * PPP));
+                let pts = v.map(|v| (v.pos.x * scale, v.pos.y * scale));
                 let minx = pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min).floor().max(cx0 as f32) as i64;
                 let maxx = pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max).ceil().min(cx1 as f32) as i64;
                 let miny = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min).floor().max(cy0 as f32) as i64;
@@ -153,6 +159,7 @@ struct Shots {
     raster: Rc<RefCell<Raster>>,
     dir: PathBuf,
     theme: &'static str,
+    only: Option<String>,
 }
 
 impl Shots {
@@ -169,7 +176,7 @@ impl Shots {
         let conns = ConnectionManager::new(ternarygrid_app::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
         let h = Harness::builder()
             .with_size(egui::vec2(1440.0, 900.0))
-            .with_pixels_per_point(PPP)
+            .with_pixels_per_point(ppp())
             .with_max_steps(400)
             .with_step_dt(1.0 / 60.0)
             .renderer(CpuTextures(raster.clone()))
@@ -185,7 +192,8 @@ impl Shots {
             });
         ternarygrid_app::theme::apply_settings(&h.ctx, &h.state().settings);
         let theme = if theme == Theme::Dark { "dark" } else { "light" };
-        let mut s = Shots { h, raster, dir, theme };
+        let only = std::env::var("TERNARYGRID_SNAPSHOT_ONLY").ok().filter(|s| !s.is_empty());
+        let mut s = Shots { h, raster, dir, theme, only };
         s.frames(4);
         s
     }
@@ -206,16 +214,19 @@ impl Shots {
         }
     }
 
-    /// Write the last frame as `<name>-<theme>.png`.
+    /// Write the last frame as `<name>-<theme>.png` (unless `TERNARYGRID_SNAPSHOT_ONLY` leaves it out).
     fn shot(&mut self, name: &str) {
+        if !self.only.as_deref().is_none_or(|o| o.split(',').any(|o| name.starts_with(o))) {
+            return;
+        }
         // Without toasts, after a few calm frames (hover effects and animations settle).
         self.h.state_mut().toasts.clear();
         // The pointer away from the content: no hover effects.
         self.h.event(egui::Event::PointerMoved(egui::pos2(1439.0, 899.0)));
         self.frames(30);
         let out = self.h.output();
-        let prims = self.h.ctx.tessellate(out.shapes.clone(), PPP);
-        let size = self.h.ctx.content_rect().size() * PPP;
+        let prims = self.h.ctx.tessellate(out.shapes.clone(), ppp());
+        let size = self.h.ctx.content_rect().size() * ppp();
         let bg = self.h.ctx.global_style().visuals.panel_fill;
         let mut img = self.raster.borrow().render(&prims, [size.x as usize, size.y as usize], bg);
         traffic_lights(&mut img);
@@ -227,8 +238,9 @@ impl Shots {
 
 /// The macOS window buttons, as the system paints them over the top bar's left end.
 fn traffic_lights(img: &mut image::RgbaImage) {
+    let scale = ppp();
     for (i, c) in [[0xff, 0x5f, 0x57], [0xfe, 0xbc, 0x2e], [0x28, 0xc8, 0x40]].iter().enumerate() {
-        let (cx, cy, r) = ((16.0 + 6.0 + 20.0 * i as f32) * PPP, 22.0 * PPP, 6.0 * PPP);
+        let (cx, cy, r) = ((16.0 + 6.0 + 20.0 * i as f32) * scale, 22.0 * scale, 6.0 * scale);
         for y in (cy - r - 2.0) as u32..=(cy + r + 2.0) as u32 {
             for x in (cx - r - 2.0) as u32..=(cx + r + 2.0) as u32 {
                 let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
@@ -265,6 +277,13 @@ fn click(s: &mut Shots, label: &str) {
         n.click();
     }
     s.frames(3);
+}
+
+/// Scroll what is under `at` by `dy` points (negative: down the page).
+fn scroll(s: &mut Shots, at: egui::Pos2, dy: f32) {
+    s.h.event(egui::Event::PointerMoved(at));
+    s.h.event(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, dy), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE });
+    s.frames(20);
 }
 
 fn close_popups(s: &mut Shots) {
@@ -313,7 +332,11 @@ const DESIGN_TABLES: &[&str] = &[
 #[test]
 #[ignore = "writes screenshots of the transfer wizards for visual review; run with --ignored"]
 fn transfer_snapshots() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots/transfer");
+    let folder = match std::env::var("TERNARYGRID_SNAPSHOT_LABEL") {
+        Ok(l) if !l.is_empty() => format!("transfer-{l}"),
+        _ => "transfer".to_string(),
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots").join(folder);
     std::fs::create_dir_all(&root).unwrap();
     let only = std::env::var("TERNARYGRID_SNAPSHOT_THEME").ok();
     for theme in [Theme::Dark, Theme::Light] {
@@ -380,6 +403,8 @@ fn transfer_snapshots() {
         s.shot("export_2_format_xlsx");
         popup::<ExportTab>(&mut s.h).settings_mut().format = ExportFormat::Csv;
         s.frames(2);
+        // The cards are at the end of the page, under the CSV options.
+        scroll(&mut s, egui::pos2(720.0, 450.0), -600.0);
         click(&mut s, "File and reading");
         s.shot("export_2_format_open");
         {
@@ -524,12 +549,15 @@ fn transfer_snapshots() {
         popup::<MigrationTab>(&mut s.h).options_mut().mode = MigrationMode::DropAndCreate;
         popup::<MigrationTab>(&mut s.h).set_page(4);
         s.frames(3);
+        s.shot("migration_4_summary");
         click(&mut s, "Run migration");
         s.frames(30);
         s.shot("migration_confirm");
         s.h.key_press(egui::Key::Escape);
         s.frames(30);
-        // customer into the existing orders table fails (its NOT NULL columns): the result stays.
+        // customer into an existing orders table of the target fails (its NOT NULL columns the
+        // customers have not): the result stays.
+        run_sql(&mut s, &target, &["CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, status TEXT NOT NULL)"]);
         {
             let tab = popup::<MigrationTab>(&mut s.h);
             tab.options_mut().mode = MigrationMode::Append;
