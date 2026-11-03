@@ -266,13 +266,16 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
         t.text_color = p.text;
         t.corner_radius = top;
     }
+    // Inactive and hovered tabs have no fill: the bar shows through, and the top bar's hairline
+    // (which the tab bar's -1 margin lets the tabs reach) stays one unbroken line; a fill in the
+    // bar's colour covered it over each tab and left bumps at their rounded corners.
     for t in [&mut s.tab.inactive, &mut s.tab.inactive_with_kb_focus] {
-        t.bg_fill = p.chrome;
+        t.bg_fill = Color32::TRANSPARENT;
         t.outline_color = Color32::TRANSPARENT;
         t.text_color = p.text_muted;
         t.corner_radius = top;
     }
-    s.tab.hovered.bg_fill = p.chrome;
+    s.tab.hovered.bg_fill = Color32::TRANSPARENT;
     s.tab.hovered.outline_color = Color32::TRANSPARENT;
     s.tab.hovered.text_color = p.text;
     s.tab.hovered.corner_radius = top;

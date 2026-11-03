@@ -8,6 +8,7 @@ pub mod alter_db;
 pub mod connection;
 pub mod create_db;
 pub mod drop;
+pub mod export_conns;
 pub mod import;
 pub mod vault;
 
@@ -86,6 +87,7 @@ pub struct Dialogs {
     pub drivers_open: bool,
     pub vault: vault::VaultDialog,
     pub import: Option<import::ImportDialog>,
+    pub export_conns: Option<export_conns::ExportConnectionsDialog>,
     pub drop: Option<drop::DropDialog>,
     pub create_db: Option<create_db::CreateDatabaseDialog>,
     pub alter_db: Option<alter_db::AlterDatabaseDialog>,
@@ -157,6 +159,7 @@ impl Dialogs {
             || self.drop.is_some()
             || !self.prompts.is_empty()
             || self.import.is_some()
+            || self.export_conns.is_some()
             || self.create_db.is_some()
             || self.alter_db.is_some()
             || !self.connection.is_empty()
@@ -184,6 +187,11 @@ impl Dialogs {
             && !d.show(ctx, cx)
         {
             self.import = None;
+        }
+        if let Some(d) = self.export_conns.as_mut()
+            && !d.show(ctx, cx)
+        {
+            self.export_conns = None;
         }
         if let Some(d) = self.drop.as_mut()
             && !d.show(ctx, cx)

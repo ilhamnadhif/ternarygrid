@@ -79,6 +79,8 @@ pub enum AppCommand {
         folder: Option<String>,
     },
     ImportConnections,
+    /// Export connections into a file; `Some`: these are ticked (a folder's, a selection), else all.
+    ExportConnections(Option<Vec<String>>),
     SaveConnections,
     /// Create the SQLite sample database and a connection to it.
     CreateSampleDatabase,

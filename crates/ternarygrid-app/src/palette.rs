@@ -195,6 +195,7 @@ fn collect(cx: &AppContext) -> Vec<Item> {
         command(icon::ARROWS_LEFT_RIGHT, "Compare data…", C::Tools, || AppCommand::OpenDataCompare { connection: None, table: None }),
         command(icon::SPARKLE, "AI assistant", C::Tools, || AppCommand::OpenAiAssistant { connection: None }),
         command(icon::DOWNLOAD_SIMPLE, "Import connections…", C::Connections, || AppCommand::ImportConnections),
+        command(icon::UPLOAD_SIMPLE, "Export connections…", C::Connections, || AppCommand::ExportConnections(None)),
         command(icon::SIDEBAR, "Toggle navigator", C::View, || AppCommand::ToggleNavigator),
         command(icon::ACTIVITY, "Background operations", C::Tools, || AppCommand::ToggleOperations),
         command(icon::KEYBOARD, "Keyboard shortcuts", C::Help, || AppCommand::ShowShortcuts),

@@ -6527,6 +6527,7 @@ version = "0.6.2"
 dependencies = [
  "aes",
  "argon2",
+ "base64 0.23.1",
  "cbc",
  "chacha20poly1305",
  "chrono",

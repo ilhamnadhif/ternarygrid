@@ -594,6 +594,21 @@ fn ui_snapshots_dialogs() {
         s.frames(3);
         s.shot("import_found");
         s.reset();
+        // Export connections: all ticked; with the passwords, the file's password.
+        s.h.state_mut().push_command(AppCommand::ExportConnections(None));
+        s.frames(3);
+        s.shot("export_conns");
+        s.click("Include the saved passwords");
+        s.frames(3);
+        s.shot("export_conns_passwords");
+        s.reset();
+        // Import's TernaryGrid file source.
+        s.h.state_mut().dialogs.import = Some(ternarygrid_app::dialogs::import::ImportDialog::default());
+        s.frames(3);
+        s.click("TernaryGrid file");
+        s.frames(3);
+        s.shot("import_tg");
+        s.reset();
         {
             // A vault saved before: unlock it.
             let path = home.join("vault-saved.bin");

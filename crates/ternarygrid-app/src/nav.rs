@@ -1208,6 +1208,15 @@ impl Navigator {
                     ui.close();
                 }
                 kit::menu_separator(ui);
+                if kit::menu_item(ui, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), "").clicked() {
+                    cx.push(AppCommand::ImportConnections);
+                    ui.close();
+                }
+                if ui.add_enabled_ui(!cx.conns.configs().is_empty(), |ui| kit::menu_item(ui, Some(icon::UPLOAD_SIMPLE), tr("Export connections…"), "")).inner.clicked() {
+                    cx.push(AppCommand::ExportConnections(None));
+                    ui.close();
+                }
+                kit::menu_separator(ui);
                 let mut props = cx.settings.navigator.show_properties;
                 if kit::menu_check(ui, &mut props, tr("Properties panel")).changed() {
                     cx.settings.navigator.show_properties = props;
@@ -1693,6 +1702,12 @@ impl Navigator {
                     cx.push(AppCommand::NewFolder { parent: Some(f.clone()) });
                     ui.close();
                 }
+                let inside = |folder: &Option<String>| folder.as_deref().is_some_and(|x| x == f || x.starts_with(&format!("{f}/")));
+                let ids: Vec<String> = cx.conns.configs().iter().filter(|c| inside(&c.folder)).map(|c| c.id.clone()).collect();
+                if ui.add_enabled_ui(!ids.is_empty(), |ui| ternarygrid_ui::kit::menu_item(ui, Some(icon::UPLOAD_SIMPLE), tr("Export connections…"), "")).inner.clicked() {
+                    cx.push(AppCommand::ExportConnections(Some(ids)));
+                    ui.close();
+                }
                 ternarygrid_ui::kit::menu_separator(ui);
                 if ternarygrid_ui::kit::menu_item(ui, Some(icon::PENCIL_SIMPLE), tr("Rename folder…"), "").clicked() {
                     cx.push(AppCommand::RenameFolder(f.clone()));
@@ -1742,6 +1757,10 @@ impl Navigator {
                 }
                 if ternarygrid_ui::kit::menu_item(ui, Some(icon::COPY), tr("Duplicate"), "").clicked() {
                     cx.push(AppCommand::DuplicateConnection(id.clone()));
+                    ui.close();
+                }
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::UPLOAD_SIMPLE), tr("Export connection…"), "").clicked() {
+                    cx.push(AppCommand::ExportConnections(Some(vec![id.clone()])));
                     ui.close();
                 }
                 let others: Vec<String> = cx.conns.configs().iter().map(|c| c.id.clone()).filter(|c| c != id && cx.conns.is_connected(c)).collect();

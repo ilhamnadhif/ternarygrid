@@ -7,6 +7,9 @@ notes of a new version once after it was updated (Help → What's new).
 
 A pass over every screen for clarity and consistency.
 
+### Added
+- **Export connections** (Database menu, the navigator's ⋯, a connection's or folder's context menu, the search box): the chosen connections with their folders, connection types and network profiles in a file that Import connections › TernaryGrid file reads back on another machine. Saved passwords are left out, or included encrypted with a password for the file (Argon2id and XChaCha20-Poly1305, as the vault).
+
 ### Changed
 - **Results look and work the same everywhere**: under a table's data and under the SQL editor, one filter bar (WHERE, the Sort chip, Apply) and one footer (rows and time, Fetch next; Add row, the views, Export, ⋯ with the less used actions, the panels; a narrow footer moves Add row and Export into ⋯). The side panels have a tab each (Value, Metadata, Grouping, Calc, References), so every panel is one click away.
 - **Clearer actions**: every confirmation that deletes, drops, terminates or discards is red and names what it does ("Delete connection", "Terminate session", "Drop and recreate 3 tables"); safe actions are no longer red; disabled buttons stay readable; one main button per window; wizards have Next as their main button and Close / Run again after a run; tool windows share one footer.
@@ -21,6 +24,9 @@ A pass over every screen for clarity and consistency.
 - **Tool windows** size to their content; session and lock columns have readable names; the query builder labels joins as the SQL writes them; data compare shows "now → after sync".
 - **Settings and tasks**: clearing history and deleting a network profile ask first; network profiles save as you edit; the scheduled tasks switch moved to General; the shortcut list records on click and shows key caps; task times are relative ("Tomorrow 02:00").
 - Counts read "1 table" / "3 tables" everywhere (no more "(s)").
+
+### Fixed
+- The top bar's hairline is one unbroken line above the tabs (inactive tabs covered it, leaving bumps at their corners).
 
 ## 0.6.1 — 2026-11-03
 

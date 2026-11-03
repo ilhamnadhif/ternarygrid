@@ -618,6 +618,9 @@ impl TernaryGridApp {
                     self.dialogs.import = Some(crate::dialogs::import::ImportDialog::default());
                 }
             }
+            AppCommand::ExportConnections(ids) => {
+                self.dialogs.export_conns = Some(crate::dialogs::export_conns::ExportConnectionsDialog::new(&self.conns.store, ids.as_deref()));
+            }
             AppCommand::DeleteConnection(id) => self.dialogs.confirm_delete_connection(&id, &self.conns),
             AppCommand::NewFolder { parent } => self.dialogs.folder_dialog(FolderAction::New { parent }),
             AppCommand::RenameFolder(path) => self.dialogs.folder_dialog(FolderAction::Rename(path)),
@@ -1473,6 +1476,7 @@ impl TernaryGridApp {
             M::Quit => Some(AppCommand::Quit),
             M::NewConnection => Some(AppCommand::NewConnection { kind: None, folder: None }),
             M::ImportConnections => Some(AppCommand::ImportConnections),
+            M::ExportConnections => Some(AppCommand::ExportConnections(None)),
             M::NewDatabase => self.menu_connection().map(|c| AppCommand::NewDatabase { connection: c }),
             M::NewSchema => {
                 let database = self.nav.selected_schema().and_then(|s| s.database);
@@ -1565,6 +1569,7 @@ impl TernaryGridApp {
                 kit::menu_look(ui, 230.0);
                 item(ui, true, Some(icon::PLUS), tr("New connection…"), M::NewConnection);
                 item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), M::ImportConnections);
+                item(ui, true, Some(icon::UPLOAD_SIMPLE), tr("Export connections…"), M::ExportConnections);
                 kit::menu_separator(ui);
                 for (on, why, glyph, text, action) in [
                     (state.new_database, &database_why, icon::DATABASE, tr("New database…"), M::NewDatabase),

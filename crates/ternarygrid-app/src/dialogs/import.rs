@@ -1,4 +1,5 @@
-//! Import connections from DBeaver, `~/.pgpass` or a connection URL (FR-C8).
+//! Import connections from a TernaryGrid connections file (Export connections), DBeaver,
+//! `~/.pgpass` or a connection URL (FR-C8).
 
 use super::{Column, W, add_field, cancel_button, hint, muted, rest, right, table, text_field};
 use crate::cx::AppContext;
@@ -15,6 +16,7 @@ use ternarygrid_ui::style;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
+    TernaryGrid,
     Dbeaver,
     Pgpass,
     Url,
@@ -28,6 +30,10 @@ pub struct ImportDialog {
     pgpass_store_passwords: bool,
     url: String,
     url_name: String,
+    /// A TernaryGrid connections file, its password (when it has passwords).
+    tg_path: String,
+    tg_password: String,
+    tg_has_secrets: bool,
     result: Option<ImportResult>,
     selected: Vec<bool>,
     policy: DuplicatePolicy,
@@ -41,13 +47,17 @@ impl Default for ImportDialog {
         let workspaces = ternarygrid_config::import::dbeaver::find_workspaces();
         let pgpass_path = ternarygrid_config::import::pgpass::PgPass::default_path().map(|p| p.display().to_string()).unwrap_or_default();
         ImportDialog {
-            source: Source::Dbeaver,
+            // DBeaver when a workspace was found, else a TernaryGrid file.
+            source: if workspaces.is_empty() { Source::TernaryGrid } else { Source::Dbeaver },
             workspace: workspaces.first().cloned(),
             workspaces,
             pgpass_path,
             pgpass_store_passwords: false,
             url: String::new(),
             url_name: String::new(),
+            tg_path: String::new(),
+            tg_password: String::new(),
+            tg_has_secrets: false,
             result: None,
             selected: Vec::new(),
             policy: DuplicatePolicy::Skip,
@@ -71,6 +81,12 @@ impl ImportDialog {
     fn load(&mut self) {
         self.error = None;
         let res: DbResult<ImportResult> = match self.source {
+            Source::TernaryGrid => {
+                std::fs::read(self.tg_path.trim()).map_err(|e| ternarygrid_core::DbError::config(trf("Cannot read {}: {}", &[&self.tg_path.trim(), &e]))).and_then(|bytes| {
+                    let pw = Some(ternarygrid_core::Secret::new(self.tg_password.clone())).filter(|p| !p.is_empty());
+                    ternarygrid_config::import::ternarygrid::import(&bytes, pw.as_ref())
+                })
+            }
             Source::Dbeaver => match &self.workspace {
                 Some(ws) => ternarygrid_config::import::dbeaver::import_workspace(ws),
                 None => Err(ternarygrid_core::DbError::config(tr("Choose a DBeaver workspace folder."))),
@@ -169,7 +185,7 @@ impl ImportDialog {
         let p = style::pal(ui);
         super::form_spacing(ui, 12.0);
         let mut source = self.source;
-        if parts::segmented(ui, &mut source, &[(Source::Dbeaver, "DBeaver"), (Source::Pgpass, ".pgpass"), (Source::Url, "URL")]) {
+        if parts::segmented(ui, &mut source, &[(Source::TernaryGrid, tr("TernaryGrid file")), (Source::Dbeaver, "DBeaver"), (Source::Pgpass, ".pgpass"), (Source::Url, "URL")]) {
             self.source = source;
             self.result = None;
             self.error = None;
@@ -187,6 +203,39 @@ impl ImportDialog {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             match self.source {
+                Source::TernaryGrid => {
+                    muted(ui, tr("A file written by Export connections"));
+                    ui.horizontal(|ui| {
+                        let w = rest(ui, find_w + browse_w + 16.0);
+                        let r =
+                            add_field(ui, text_field(&mut self.tg_path, w).font(egui::FontId::monospace(12.5)).hint_text(super::mono_hint(ui, "~/TernaryGrid connections.json")));
+                        let mut picked = false;
+                        if kit::secondary(ui, Some(icon::FOLDER_OPEN), tr("Browse…")).clicked()
+                            && let Some(p) = rfd::FileDialog::new().add_filter(tr("TernaryGrid connections"), &["json"]).pick_file()
+                        {
+                            self.tg_path = p.display().to_string();
+                            picked = true;
+                        }
+                        if picked || r.lost_focus() {
+                            self.tg_has_secrets = std::fs::read(self.tg_path.trim()).is_ok_and(|b| ternarygrid_config::import::ternarygrid::has_secrets(&b));
+                        }
+                        find |= find_button(ui);
+                    });
+                    if self.tg_has_secrets {
+                        super::form_row_w(ui, tr("File password"), 110.0, |ui| {
+                            add_field(ui, text_field(&mut self.tg_password, 320.0).password(true));
+                        });
+                        ui.label(
+                            RichText::new(tr(
+                                "The file's passwords are encrypted with the password given when it was exported. Without it the connections are imported without their passwords.",
+                            ))
+                            .size(12.0)
+                            .color(p.text_muted),
+                        );
+                    } else {
+                        ui.label(RichText::new(tr("Connections with their folders, connection types and network profiles.")).size(12.0).color(p.text_muted));
+                    }
+                }
                 Source::Dbeaver => {
                     muted(ui, tr("Workspace folder (contains General/.dbeaver/data-sources.json)"));
                     ui.horizontal(|ui| {
@@ -344,7 +393,7 @@ impl ImportDialog {
 
 /// The table header's check box: all rows, none, or a dash while only some are (a click
 /// selects all, or none when all are).
-fn header_checkbox(ui: &mut Ui, selected: &mut [bool]) {
+pub(super) fn header_checkbox(ui: &mut Ui, selected: &mut [bool]) {
     let p = style::pal(ui);
     let n = selected.iter().filter(|s| **s).count();
     let all = n > 0 && n == selected.len();
@@ -371,7 +420,7 @@ fn header_checkbox(ui: &mut Ui, selected: &mut [bool]) {
 }
 
 /// `path` with the home folder written `~`.
-fn home_relative(path: &std::path::Path) -> String {
+pub(super) fn home_relative(path: &std::path::Path) -> String {
     match std::env::var_os("HOME").map(PathBuf::from).and_then(|h| path.strip_prefix(h).ok().map(|r| r.display().to_string())) {
         Some(rest) => format!("~/{rest}"),
         None => path.display().to_string(),

@@ -76,6 +76,7 @@ impl AppMenu {
             &[
                 &item(tr("New connection…"), None, M::NewConnection),
                 &item(tr("Import connections…"), None, M::ImportConnections),
+                &item(tr("Export connections…"), None, M::ExportConnections),
                 &sep(),
                 &new_database,
                 &new_schema,
