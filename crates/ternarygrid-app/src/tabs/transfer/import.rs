@@ -2,10 +2,11 @@
 //! existing or a new table, with a live preview, type guessing, column
 //! mapping, conversion options and a report of the rows that failed.
 
-use super::wizard::{self, Clicked, Form, W, col, line};
+use super::wizard::{self, Clicked, Form, LABEL_W, W, col, fact, line};
 use super::{
-    COMMON_KINDS, MessageLog, Running, TaskSaver, char_edit, combo, combo_w, connection_name, current_schema, delimiter_choice, error_text, kind_label, lines_edit, next_uid,
-    not_connected, on_error_options, opt_char_edit, opt_number, opt_text, progress_ui, reload_table_def, schema_combo, schema_tables, section, table_def_of, transaction_options,
+    COMMON_KINDS, MessageLog, ProgressKind, Running, TaskSaver, char_edit, close_wizard, combo, combo_w, connection_name, current_schema, delimiter_choice, error_text, kind_label,
+    lines_edit, next_uid, not_connected, on_error_options, opt_char_edit, opt_number, opt_text, outcome_tone, progress_ui, reload_table_def, schema_combo, schema_tables, section,
+    table_def_of, transaction_options,
 };
 use crate::backend::Job;
 use crate::command::AppCommand;
@@ -17,13 +18,13 @@ use egui_phosphor::regular as icon;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use ternarygrid_core::meta::{ObjectRef, SchemaRef};
-use ternarygrid_core::{ColumnMeta, DbError, DbResult, Row, tr, trf};
+use ternarygrid_core::{ColumnMeta, DbError, DbResult, Row, tr, trf, trn};
 use ternarygrid_tasks::TaskKind;
 use ternarygrid_transfer::{
     BinaryEncoding, ColumnMapping, CsvHeader, CsvReadOptions, EscapeStyle, ImportJob, ImportMapping, ImportMode, ImportSourceConfig, ImportSummary, InferOptions, JsonInputFormat,
     JsonReadOptions, OnError, PeekableSource, RowSource, SessionFactory, SheetSelector, XlsxReadOptions, XmlReadOptions, infer_columns, run_import_job, xlsx_sheet_names,
 };
-use ternarygrid_ui::kit::{self, Kind};
+use ternarygrid_ui::kit;
 use ternarygrid_ui::parts::{self, Tone};
 
 const PAGE_FILE: usize = 0;
@@ -139,6 +140,8 @@ pub struct ImportTab {
     error: Option<String>,
     report_job: Option<Job<std::io::Result<PathBuf>>>,
     saver: TaskSaver,
+    /// The new table a run created: running again imports into it instead of creating it.
+    created: Option<ObjectRef>,
 }
 
 impl ImportTab {
@@ -181,6 +184,7 @@ impl ImportTab {
             error: None,
             report_job: None,
             saver: TaskSaver::default(),
+            created: None,
         }
     }
 
@@ -263,8 +267,8 @@ impl ImportTab {
     pub fn mapping(&self) -> Option<ImportMapping> {
         let target = self.target_ref()?;
         let mut m = self.options.clone();
+        m.create_table = self.target == ImportTarget::New && self.created.as_ref() != Some(&target);
         m.target = target;
-        m.create_table = self.target == ImportTarget::New;
         m.columns = self.columns.clone();
         m.key_columns = self.key_columns.clone();
         Some(m)
@@ -529,6 +533,9 @@ impl ImportTab {
                         self.done = true;
                     }
                     self.refresh_metadata(cx, summary.created_table);
+                    if summary.created_table {
+                        self.created = self.target_ref();
+                    }
                     self.result = Some(Ok(summary));
                 }
                 Err(e) => {
@@ -646,21 +653,26 @@ impl ImportTab {
                 {
                     self.set_file(p);
                 }
-                let r = ui.add(line(&mut self.path).font(egui::TextStyle::Monospace).hint_text(tr("path of the file")).desired_width(f32::INFINITY));
-                if r.changed()
+                // The file name always shows (its folder shortened in the middle).
+                if wizard::path_field(ui, egui::Id::new(("imp_path", id)), &mut self.path, tr("path of the file"))
                     && let Some(f) = ImportFileFormat::from_path(Path::new(self.path.trim()))
                 {
                     self.format = f;
                 }
             });
         });
-        ui.horizontal(|ui| {
-            wizard::muted(ui, tr("Format"));
-            let formats: Vec<(ImportFileFormat, &str)> = ImportFileFormat::ALL.iter().map(|f| (*f, f.label())).collect();
-            parts::segmented(ui, &mut self.format, &formats);
+        let csv = matches!(self.format, ImportFileFormat::Csv | ImportFileFormat::Tsv);
+        wizard::form(ui, ("imp_format", id), 1, LABEL_W, |f| {
+            f.seg_row(tr("Format"), |ui| {
+                let formats: Vec<(ImportFileFormat, &str)> = ImportFileFormat::ALL.iter().map(|f| (*f, f.label())).collect();
+                parts::segmented(ui, &mut self.format, &formats);
+            });
+            if self.format == ImportFileFormat::Csv {
+                f.row(tr("Delimiter"), |ui| delimiter_choice(ui, ("imp_delim", id), &mut self.csv.delimiter));
+            }
         });
-        wizard::form(ui, ("imp_reader", id), 2, 150.0, |f| match self.format {
-            ImportFileFormat::Csv | ImportFileFormat::Tsv => csv_reader_ui(f, id, &mut self.csv, self.format == ImportFileFormat::Tsv, false),
+        wizard::form(ui, ("imp_reader", id), 2, LABEL_W, |f| match self.format {
+            ImportFileFormat::Csv | ImportFileFormat::Tsv => csv_reader_ui(f, id, &mut self.csv, false),
             ImportFileFormat::Xlsx => {
                 let sheets = match &self.sheets {
                     Some((p, names)) if *p == self.path.trim() => names.clone(),
@@ -671,19 +683,17 @@ impl ImportTab {
             ImportFileFormat::Xml => xml_reader_ui(f, id, &mut self.xml),
             ImportFileFormat::Json => json_reader_ui(f, id, &mut self.json),
         });
-        section(ui, tr("Preview"));
-        self.preview_ui(ui);
-        // The other reading options, folded under the preview.
+        // The other reading options, folded above the preview (which takes the rest of the page).
         let key = egui::Id::new(("imp_more", id));
         let mut open = wizard::remembered_open(ui, key, false);
-        let csv = matches!(self.format, ImportFileFormat::Csv | ImportFileFormat::Tsv);
         ui.add_space(16.0 - wizard::GAP);
-        let summary = trf("{} rows read for the preview and the type guess", &[&super::group(self.sample_rows as u64)]);
+        let rows = super::group(self.sample_rows as u64);
+        let summary = if csv { trf("quotes, rows to skip, comments · {} rows sampled", &[&rows]) } else { trf("{} rows read for the preview and the type guess", &[&rows]) };
         if wizard::fold_card(ui, key, &mut open, tr("More options"), Some(&summary), true, |ui| {
             if csv {
-                wizard::form(ui, ("imp_reader_more", id), 2, 150.0, |f| csv_reader_ui(f, id, &mut self.csv, self.format == ImportFileFormat::Tsv, true));
+                wizard::form(ui, ("imp_reader_more", id), 2, wizard::CARD_LABEL_W, |f| csv_reader_ui(f, id, &mut self.csv, true));
             }
-            wizard::form(ui, ("imp_sample", id), 1, 150.0, |f| {
+            wizard::form(ui, ("imp_sample", id), 1, wizard::CARD_LABEL_W, |f| {
                 f.row(tr("Rows read"), |ui| {
                     wizard::number(ui, &mut self.sample_rows, 10..=100_000, 120.0);
                     wizard::faint(ui, tr("for the preview and the type guess"));
@@ -692,13 +702,25 @@ impl ImportTab {
         }) {
             wizard::remember_open(ui, key, open);
         }
+        self.preview_ui(ui);
     }
 
-    /// The first rows of the file, like the data grid.
+    /// The first rows of the file, like the data grid, under the "Preview" title (the counts at
+    /// its right).
     fn preview_ui(&mut self, ui: &mut Ui) {
         let id = self.uid;
+        let counts = self.preview.as_ref().filter(|_| self.preview_ready()).map(|p| {
+            let rows = trn(p.rows.len(), "1 row", "{} rows");
+            let rows = if p.rows.len() >= self.sample_rows { format!("{rows}+") } else { rows };
+            trf("{}, {} read", &[&trn(p.columns.len(), "1 column", "{} columns"), &rows])
+        });
+        wizard::section_with(ui, tr("Preview"), |ui| {
+            if let Some(c) = &counts {
+                wizard::faint(ui, c);
+            }
+        });
         if self.path.trim().is_empty() {
-            wizard::faint(ui, tr("Choose a file to see its first rows."));
+            wizard::muted(ui, tr("Choose a file to see its first rows."));
             return;
         }
         if let Some((config, e)) = &self.preview_error
@@ -716,17 +738,17 @@ impl ImportTab {
         }
         let Some(p) = &self.preview else { return };
         let pal = ternarygrid_ui::pal(ui);
-        let more = if p.rows.len() >= self.sample_rows { "+" } else { "" };
-        ui.scope(|ui| {
-            ui.spacing_mut().interact_size.y = 16.0;
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                wizard::faint(ui, &trf("{} columns, {}{} rows read", &[&p.columns.len(), &p.rows.len(), &more]));
-                for w in p.warnings.iter().take(5) {
-                    ui.label(RichText::new(w).size(12.5).color(pal.warn));
-                }
+        if !p.warnings.is_empty() {
+            ui.scope(|ui| {
+                ui.spacing_mut().interact_size.y = 16.0;
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    for w in p.warnings.iter().take(5) {
+                        ui.label(RichText::new(format!("{} {w}", icon::WARNING)).size(12.5).color(pal.warn));
+                    }
+                });
             });
-        });
+        }
         // Like the data grid: row numbers, the column names with their types, NULL in italics.
         let font = egui::FontId::proportional(ternarygrid_ui::style::body_size(ui.ctx()));
         let text_w = |ui: &Ui, s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x;
@@ -744,13 +766,14 @@ impl ImportTab {
             let column = col(&c.name, W::Px(head.max(widest).clamp(80.0, 280.0))).grid();
             cols.push(if number { column.right() } else { column });
         }
-        // 180 high as in the design; the rows scroll under the header.
+        // The rest of the page (at least 4 rows); the rows scroll under the header.
+        let rows_h = wizard::fit_height(ui, 29.0 * rows.len().max(1) as f32, 29.0 * 4.0, 35.0);
         wizard::table(
             ui,
             ("imp_preview", id),
             &cols,
             28.0,
-            Some(180.0 - 35.0),
+            Some(rows_h),
             rows.len(),
             |ui, c| {
                 if c > 0
@@ -788,7 +811,7 @@ impl ImportTab {
         section(ui, tr("Target table"));
         if cx.conns.live(&conn).is_none() {
             ui.horizontal(|ui| {
-                wizard::faint(ui, tr("Connect to choose the target table."));
+                wizard::muted(ui, tr("Connect to choose the target table."));
                 if kit::secondary(ui, Some(icon::PLUGS_CONNECTED), tr("Connect")).clicked() {
                     cx.push(AppCommand::Connect(conn.clone()));
                 }
@@ -828,7 +851,7 @@ impl ImportTab {
         }
         section(ui, tr("Columns"));
         if self.preview.is_none() {
-            wizard::faint(ui, tr("The columns appear once the file has been read."));
+            wizard::muted(ui, tr("The columns appear once the file has been read."));
             return;
         }
         if self.mapping_for != self.current_key() {
@@ -846,7 +869,11 @@ impl ImportTab {
         let conn = self.conn.clone();
         let Some(schema) = self.schema.clone().or_else(|| current_schema(cx, &conn)) else { return };
         let tables = schema_tables(cx, &conn, &schema, false);
-        let label = self.table.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| tr("Choose…").to_string());
+        let faint = ternarygrid_ui::pal(ui).text_faint;
+        let label: egui::WidgetText = match &self.table {
+            Some(t) => t.name.clone().into(),
+            None => RichText::new(tr("Choose…")).color(faint).into(),
+        };
         egui::ComboBox::from_id_salt(("imp_table", self.uid))
             .icon(kit::combo_caret)
             .popup_style(egui::containers::menu::menu_style.into())
@@ -884,11 +911,11 @@ impl ImportTab {
         let dialect = cx.conns.live(&self.conn).map(|l| l.dialect.clone());
         let names = self.preview_columns();
         wizard::tight_row(ui, |ui| {
-            if wizard::ghost(ui, Some(icon::MAGIC_WAND), tr("Guess types again")).clicked() {
+            if wizard::action(ui, Some(icon::MAGIC_WAND), tr("Guess types again")).clicked() {
                 self.columns_edited = false;
                 self.mapping_for = None;
             }
-            wizard::faint(ui, tr("Key columns become the primary key of the new table."));
+            wizard::muted(ui, tr("Key columns become the primary key of the new table."));
         });
         let pal = ternarygrid_ui::pal(ui);
         let samples: Vec<String> = (0..self.columns.len()).map(|i| self.sample_values(self.columns[i].source_index)).collect();
@@ -942,14 +969,29 @@ impl ImportTab {
                         }
                     }
                     3 => {
-                        let menu_w = if dialect.is_some() { 28.0 } else { 0.0 };
-                        let ty = wizard::fit(egui::TextEdit::singleline(&mut c.target_type), 26.0).font(egui::TextStyle::Monospace);
-                        if ui.add(ty.desired_width((ui.available_width() - menu_w).max(60.0))).changed() {
+                        // An editable select: the type typed in, or picked from the list behind
+                        // the caret inside the field's right end (as the kit's selects).
+                        let caret_w = if dialect.is_some() { 26 } else { 0 };
+                        let ty = wizard::fit(egui::TextEdit::singleline(&mut c.target_type), 26.0).font(egui::TextStyle::Monospace).margin(egui::Margin {
+                            left: 13,
+                            right: 10 + caret_w,
+                            top: 0,
+                            bottom: 0,
+                        });
+                        let field = ui.add(ty.desired_width(ui.available_width()));
+                        if field.changed() {
                             c.target_kind = None;
                             edited = true;
                         }
                         if let Some(d) = &dialect {
-                            let r = kit::icon_button_sized(ui, icon::CARET_DOWN, tr("Types"), false, 22.0, 11.0);
+                            let at = egui::Rect::from_center_size(egui::pos2(field.rect.right() - 15.0, field.rect.center().y), vec2(24.0, field.rect.height() - 4.0));
+                            let r = ui.interact(at, ui.id().with(("imp_type_menu", i)), egui::Sense::click()).on_hover_text(tr("Types"));
+                            let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&r));
+                            let visuals = if r.hovered() { ui.visuals().widgets.hovered } else { ui.visuals().widgets.inactive };
+                            kit::combo_caret(ui, at, &visuals, open);
+                            if r.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
                             egui::Popup::menu(&r).show(|ui| {
                                 kit::menu_look(ui, 260.0);
                                 for kind in COMMON_KINDS {
@@ -1003,11 +1045,11 @@ impl ImportTab {
         let Some(Ok(def)) = table_def_of(cx, &conn, &table) else { return };
         let names = self.preview_columns();
         wizard::tight_row(ui, |ui| {
-            if wizard::ghost(ui, Some(icon::REPEAT), tr("Match by name again")).clicked() {
+            if wizard::action(ui, Some(icon::REPEAT), tr("Match by name again")).clicked() {
                 self.mapping_for = None;
             }
             if !self.key_columns.is_empty() {
-                wizard::faint(ui, &trf("Key: {}", &[&self.key_columns.join(", ")]));
+                wizard::muted(ui, &trf("Key: {}", &[&self.key_columns.join(", ")]));
             }
         });
         let pal = ternarygrid_ui::pal(ui);
@@ -1054,7 +1096,7 @@ impl ImportTab {
                             });
                     }
                     2 => {
-                        wizard::faint(ui, if c.skip { "" } else { &c.target_type });
+                        wizard::mono(ui, if c.skip { "" } else { &c.target_type }, pal.text_muted, 12.0);
                     }
                     _ => {
                         let s = samples.get(i).cloned().unwrap_or_default();
@@ -1066,7 +1108,7 @@ impl ImportTab {
         let unmapped: Vec<&str> =
             def.columns.iter().filter(|col| col.generated.is_none() && !self.columns.iter().any(|c| !c.skip && c.target_name == col.name)).map(|col| col.name.as_str()).collect();
         if !unmapped.is_empty() {
-            wizard::faint(ui, &trf("Table columns without a source (default value or NULL): {}", &[&unmapped.join(", ")]));
+            wizard::muted(ui, &trf("Table columns without a source (default value or NULL): {}", &[&unmapped.join(", ")]));
         }
     }
 
@@ -1080,7 +1122,7 @@ impl ImportTab {
             left.spacing_mut().item_spacing = egui::vec2(8.0, wizard::GAP);
             right.spacing_mut().item_spacing = egui::vec2(8.0, wizard::GAP);
             section(left, tr("Writing"));
-            wizard::form(left, ("imp_opts", id), 1, 170.0, |f| {
+            wizard::form(left, ("imp_opts", id), 1, LABEL_W, |f| {
                 f.row(tr("Existing rows"), |ui| {
                     let w = ui.available_width().min(300.0);
                     combo_w(
@@ -1128,11 +1170,13 @@ impl ImportTab {
 
             section(right, tr("Reading values"));
             let c = &mut o.convert;
-            wizard::form(right, ("imp_conv", id), 1, 170.0, |f| {
-                f.row(tr("Date formats"), |ui| lines_edit(ui, &mut c.date_formats, tr("one per line, e.g. %d/%m/%Y"), f32::INFINITY));
+            // The lists: one entry per line (their hints on one line).
+            wizard::form(right, ("imp_conv", id), 1, LABEL_W, |f| {
+                f.row(tr("Date formats"), |ui| lines_edit(ui, &mut c.date_formats, tr("e.g. %d/%m/%Y"), f32::INFINITY));
                 f.row(tr("Decimal separator"), |ui| char_edit(ui, &mut c.decimal_separator));
                 f.row(tr("Thousands separator"), |ui| opt_char_edit(ui, &mut c.thousands_separator, ""));
-                f.row(tr("NULL markers"), |ui| lines_edit(ui, &mut c.null_values, tr("one per line, e.g. NULL or \\N"), f32::INFINITY));
+                // The one NULL setting of the wizard: texts read as NULL, in every format.
+                f.row(tr("NULL as"), |ui| lines_edit(ui, &mut c.null_values, tr("e.g. NULL or \\N"), f32::INFINITY));
                 // Wrapped when the column is narrow (the window keeps the design's width).
                 f.check_row(tr("Text"), |ui| {
                     ui.horizontal_wrapped(|ui| {
@@ -1141,12 +1185,9 @@ impl ImportTab {
                         wizard::check(ui, &mut c.empty_text_as_null, tr("Empty text is NULL"));
                     });
                 });
-                f.row(tr("Time zone of timestamps"), |ui| {
-                    opt_number(ui, &mut c.default_offset_minutes, tr("local"));
-                    wizard::faint(ui, tr("minutes east of UTC")).on_hover_text(tr("minutes east of UTC, for timestamps without an offset"));
-                });
-                f.row(tr("Timestamp formats"), |ui| lines_edit(ui, &mut c.datetime_formats, tr("one per line, e.g. %d/%m/%Y %H:%M"), f32::INFINITY));
-                f.row(tr("Time formats"), |ui| lines_edit(ui, &mut c.time_formats, tr("one per line, e.g. %H.%M"), f32::INFINITY));
+                f.row(tr("Time zone"), |ui| time_zone_ui(ui, ("imp_tz", id), &mut c.default_offset_minutes));
+                f.row(tr("Timestamp formats"), |ui| lines_edit(ui, &mut c.datetime_formats, tr("e.g. %d/%m/%Y %H:%M"), f32::INFINITY));
+                f.row(tr("Time formats"), |ui| lines_edit(ui, &mut c.time_formats, tr("e.g. %H.%M"), f32::INFINITY));
                 f.row(tr("Binary values"), |ui| {
                     combo(
                         ui,
@@ -1175,10 +1216,8 @@ impl ImportTab {
     fn run_page(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if let Some(run) = &self.run {
             wizard::title(ui, tr("Importing…"));
-            if progress_ui(ui, &run.progress, run.is_cancelling()) {
-                run.cancel();
-            }
-            self.log.ui(ui, ("imp_log", self.uid), 260.0);
+            progress_ui(ui, &run.progress, ProgressKind { label: tr("Objects"), items: (tr("object"), tr("objects")), files: false });
+            self.log.ui(ui, ("imp_log", self.uid), 260.0, false);
             return;
         }
         match &self.result {
@@ -1189,7 +1228,7 @@ impl ImportTab {
             Some(Err(e)) => {
                 wizard::outcome(ui, Tone::Error, tr("The import failed"), None);
                 crate::widgets::error_box(ui, e);
-                if kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked() {
+                if kit::secondary(ui, Some(icon::PENCIL_SIMPLE), tr("Change settings")).clicked() {
                     self.result = None;
                     self.page = PAGE_FILE;
                 }
@@ -1197,28 +1236,56 @@ impl ImportTab {
             None => self.summary_ui(ui, cx),
         }
         if self.result.is_some() {
-            self.log.ui(ui, ("imp_log", self.uid), 220.0);
+            // The counters and the failed rows tell what happened: the log is folded away.
+            let folded = matches!(self.result, Some(Ok(_)));
+            self.log.ui(ui, ("imp_log", self.uid), 220.0, folded);
+        }
+    }
+
+    /// The tone of a finished run (the outcome's icon, the stepper's last step).
+    fn outcome(&self) -> Option<Tone> {
+        match &self.result {
+            Some(Ok(s)) => Some(outcome_tone(s.rows_written, s.rows_failed)),
+            Some(Err(_)) => Some(Tone::Error),
+            None => None,
         }
     }
 
     fn summary_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         section(ui, tr("Summary"));
+        let p = ternarygrid_ui::pal(ui);
         let mapped = self.columns.iter().filter(|c| !c.skip).count();
+        let creates = self.mapping().is_some_and(|m| m.create_table);
         let target = self.target_ref().map(|t| t.display_path()).unwrap_or_default();
-        let target = if self.target == ImportTarget::New { trf("{} (new)", &[&target]) } else { target };
-        wizard::facts(
-            ui,
-            ("imp_sum", self.uid),
-            120.0,
-            8.0,
-            &[
-                (tr("File"), self.path.trim().to_string(), None),
-                (tr("Format"), self.format.label().to_string(), None),
-                (tr("Connection"), connection_name(cx, &self.conn), None),
-                (tr("Target table"), target, None),
-                (tr("Columns"), trf("{} of {}", &[&mapped, &self.columns.len()]), None),
-            ],
-        );
+        let target = if creates { trf("{} (new)", &[&target]) } else { target };
+        let o = &self.options;
+        let mode = match o.mode {
+            ImportMode::Append => tr("Keep them and add the new rows"),
+            ImportMode::TruncateFirst => tr("Delete them first"),
+            ImportMode::Replace => tr("Insert or replace rows by key"),
+        };
+        let mut rows = vec![
+            fact(tr("File"), self.path.trim()).path(),
+            fact(tr("Format"), self.format.label()),
+            fact(tr("Connection"), connection_name(cx, &self.conn)),
+            fact(tr("Target table"), target),
+            fact(tr("Columns"), trf("{} of {}", &[&mapped, &self.columns.len()])),
+        ];
+        if !creates {
+            // Deleting the rows first is the one that loses data: in the warning colour.
+            rows.push(fact(tr("Existing rows"), mode).color((o.mode == ImportMode::TruncateFirst).then_some(p.warn)));
+        }
+        if o.mode == ImportMode::Replace || (creates && !self.key_columns.is_empty()) {
+            let keys = if self.key_columns.is_empty() { tr("None").to_string() } else { self.key_columns.join(", ") };
+            rows.push(fact(tr("Key columns"), keys));
+        }
+        let on_error = on_error_options().into_iter().find(|(v, _)| *v == o.on_error).map(|(_, l)| l).unwrap_or_default();
+        let on_error = match o.max_errors {
+            Some(n) if o.on_error != OnError::Abort => format!("{on_error}, {}", trn(n as usize, "stop after 1 failed row", "stop after {} failed rows")),
+            _ => on_error,
+        };
+        rows.push(fact(tr("On error"), on_error));
+        wizard::facts(ui, ("imp_sum", self.uid), 8.0, &rows);
         if let Err(e) = self.validate() {
             crate::widgets::error_box(ui, &e);
         }
@@ -1226,60 +1293,39 @@ impl ImportTab {
 
     fn result_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, s: &ImportSummary) {
         let p = ternarygrid_ui::pal(ui);
-        wizard::outcome(ui, Tone::Success, &describe(s), None);
+        wizard::outcome(ui, outcome_tone(s.rows_written, s.rows_failed), &describe(s), None);
         let mut facts = vec![
-            (tr("Rows read"), s.rows_read.to_string(), None),
-            (tr("Rows written"), s.rows_written.to_string(), Some(p.ok)),
-            (tr("Rows failed"), s.rows_failed.to_string(), (s.rows_failed > 0).then_some(p.err)),
+            fact(tr("Rows read"), super::group(s.rows_read)),
+            fact(tr("Rows written"), super::group(s.rows_written)).color((s.rows_written > 0).then_some(p.ok)),
+            fact(tr("Rows failed"), super::group(s.rows_failed)).color((s.rows_failed > 0).then_some(p.err)),
         ];
         if s.created_table {
-            facts.push((tr("Table"), tr("created").to_string(), None));
+            facts.push(fact(tr("Table"), tr("Created")));
         }
-        facts.push((tr("Statements"), s.statements.to_string(), None));
-        facts.push((tr("Time"), crate::widgets::format_duration(std::time::Duration::from_millis(s.duration_ms)), None));
+        facts.push(fact(tr("Statements"), super::group(s.statements)));
+        facts.push(fact(tr("Time"), crate::widgets::format_duration(std::time::Duration::from_millis(s.duration_ms))));
         let mut save_report = false;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
             let left_w = if s.errors.is_empty() { 300.0_f32.min(ui.available_width()) } else { 300.0 };
             ui.allocate_ui_with_layout(vec2(left_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_width(left_w);
-                wizard::facts(ui, ("imp_res", self.uid), 140.0, 6.0, &facts);
+                wizard::facts(ui, ("imp_res", self.uid), 6.0, &facts);
             });
             if !s.errors.is_empty() {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 8.0;
                     parts::section_header(ui, tr("Failed rows"), |ui| {
-                        if ui.add_enabled_ui(self.report_job.is_none(), |ui| wizard::ghost(ui, Some(icon::FLOPPY_DISK), tr("Save report…"))).inner.clicked() {
+                        if ui.add_enabled_ui(self.report_job.is_none(), |ui| wizard::action(ui, Some(icon::FLOPPY_DISK), tr("Save report…"))).inner.clicked() {
                             save_report = true;
                         }
                     });
                     if s.errors_truncated {
-                        wizard::faint(ui, &trf("Only the first {} failed rows are listed.", &[&s.errors.len()]));
+                        wizard::muted(ui, &trf("Only the first {} failed rows are listed.", &[&s.errors.len()]));
                     }
-                    let cols = [col(tr("Row"), W::Px(80.0)), col(tr("Column"), W::Px(120.0)), col(tr("Error"), W::Fr(1.0))];
-                    wizard::table(
-                        ui,
-                        ("imp_errors", self.uid),
-                        &cols,
-                        30.0,
-                        Some(240.0),
-                        s.errors.len(),
-                        |_, _| {},
-                        |ui, r, c| {
-                            let e = &s.errors[r];
-                            match c {
-                                0 => {
-                                    ui.label(e.row.to_string());
-                                }
-                                1 => {
-                                    ui.add(egui::Label::new(e.column.clone().unwrap_or_default()).truncate());
-                                }
-                                _ => {
-                                    ui.add(egui::Label::new(&e.message).truncate()).on_hover_text(&e.message);
-                                }
-                            }
-                        },
-                    );
+                    let failures: Vec<wizard::Failure> =
+                        s.errors.iter().map(|e| wizard::Failure { object: None, row: Some(e.row), column: e.column.clone(), message: e.message.clone() }).collect();
+                    wizard::failures_table(ui, ("imp_errors", self.uid), &failures, 240.0);
                 });
             }
         });
@@ -1290,54 +1336,65 @@ impl ImportTab {
         for w in &s.warnings {
             ui.label(RichText::new(format!("{} {w}", icon::WARNING)).color(p.warn));
         }
-        ui.horizontal(|ui| {
+        wizard::tight_row(ui, |ui| {
             if let Some(target) = self.target_ref()
-                && kit::secondary(ui, Some(icon::TABLE), tr("Open the table")).clicked()
+                && kit::secondary(ui, Some(icon::TABLE), tr("Open table")).clicked()
             {
                 cx.push(AppCommand::OpenObject { connection: self.conn.clone(), object: target, page: crate::command::ObjectPage::Data });
             }
-            if kit::button_ex(ui, Kind::Ghost, Some(icon::PENCIL_SIMPLE), tr("Change settings"), false).clicked() {
+            if kit::secondary(ui, Some(icon::PENCIL_SIMPLE), tr("Change settings")).clicked() {
                 self.result = None;
                 self.page = PAGE_FILE;
-                // A created table exists now: import into it next time.
-                if s.created_table
-                    && self.target == ImportTarget::New
-                    && let Some(t) = self.target_ref()
-                {
-                    self.table = Some(t);
-                    self.target = ImportTarget::Existing;
-                }
+                self.import_into_created();
             }
         });
+    }
+
+    /// A table the last run created exists now: the next run imports into it.
+    fn import_into_created(&mut self) {
+        if self.target == ImportTarget::New
+            && let Some(t) = self.target_ref()
+            && self.created.as_ref() == Some(&t)
+        {
+            self.table = Some(t);
+            self.target = ImportTarget::Existing;
+        }
     }
 
     fn footer(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let running = self.run.is_some();
         let reachable = self.reachable();
         let ok = reachable == PAGE_RUN && !running;
+        // Saving as a task is offered with the summary (the whole configuration) and after a run.
+        let invalid = self.validate().err();
         let footer = wizard::Footer {
             back: (self.page > PAGE_FILE).then_some(!running),
             next: (self.page < PAGE_RUN).then_some(self.page < reachable && !running),
             run: (tr("Run import"), ok),
-            save: Some((ok && !self.saver.is_saving(), None)),
+            save: (self.page == PAGE_RUN).then_some((ok && !self.saver.is_saving(), invalid.as_deref())),
             error: self.error.as_deref(),
+            running: self.run.as_ref().map(|r| r.is_cancelling()),
+            finished: self.page == PAGE_RUN && self.result.is_some(),
         };
         match wizard::footer(ui, &footer) {
             Some(Clicked::Back) => self.page -= 1,
             Some(Clicked::Next) => self.page += 1,
+            // Run again into a table the last run created: `created` keeps it from being created twice.
             Some(Clicked::Run) => self.start(cx),
             Some(Clicked::Save) => {
                 let target = self.target_ref().map(|t| t.name).unwrap_or_default();
                 self.saver.open(trf("Import {}", &[&target]));
             }
+            Some(Clicked::Cancel) => self.cancel(),
+            Some(Clicked::Close) => close_wizard(cx, &mut self.done),
             None => {}
         }
     }
 }
 
 fn describe(s: &ImportSummary) -> String {
-    let written = super::group(s.rows_written);
-    if s.rows_failed > 0 { trf("{} rows imported, {} failed", &[&written, &super::group(s.rows_failed)]) } else { trf("{} rows imported", &[&written]) }
+    let written = super::rows_text(s.rows_written);
+    if s.rows_failed > 0 { trf("{} imported, {} failed", &[&written, &super::group(s.rows_failed)]) } else { trf("{} imported", &[&written]) }
 }
 
 /// Text of a preview cell (canonical text, NULL marked).
@@ -1373,6 +1430,72 @@ fn table_name_from(stem: &str) -> String {
     }
 }
 
+/// The time zone given to timestamps without an offset (going into time zone aware columns):
+/// the machine's, UTC, or a fixed offset typed as ±HH:MM.
+fn time_zone_ui(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug + Copy, value: &mut Option<i32>) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Zone {
+        Local,
+        Utc,
+        Fixed,
+    }
+    let fixed_key = ui.id().with(("tz_fixed", id));
+    let fixed = ui.data(|d| d.get_temp::<bool>(fixed_key)).unwrap_or(false) || matches!(value, Some(m) if *m != 0);
+    let mut zone = match value {
+        None => Zone::Local,
+        Some(0) if !fixed => Zone::Utc,
+        _ => Zone::Fixed,
+    };
+    let local = chrono::Local::now().offset().local_minus_utc() / 60;
+    let options = [(Zone::Local, trf("Local (UTC{})", &[&offset_text(local, true)])), (Zone::Utc, tr("UTC").to_string()), (Zone::Fixed, tr("Fixed offset…").to_string())];
+    if combo(ui, ("tz", id), &mut zone, &options) {
+        *value = match zone {
+            Zone::Local => None,
+            Zone::Utc => Some(0),
+            Zone::Fixed => Some(value.unwrap_or(local)),
+        };
+        ui.data_mut(|d| d.insert_temp(fixed_key, zone == Zone::Fixed));
+    }
+    if zone == Zone::Fixed {
+        super::parsed_edit(ui, offset_text(value.unwrap_or(0), false), "+07:00", 80.0, false, |t| {
+            if let Some(m) = parse_offset(t) {
+                *value = Some(m);
+            }
+        });
+    }
+}
+
+/// An offset in minutes as `+07:00` (`short`: `+7`, `+5:30`).
+fn offset_text(minutes: i32, short: bool) -> String {
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let (h, m) = (minutes.abs() / 60, minutes.abs() % 60);
+    match (short, m) {
+        (true, 0) => format!("{sign}{h}"),
+        (true, _) => format!("{sign}{h}:{m:02}"),
+        _ => format!("{sign}{h:02}:{m:02}"),
+    }
+}
+
+/// `+07:00`, `-5`, `+0530`, `UTC+7` → minutes east of UTC.
+fn parse_offset(text: &str) -> Option<i32> {
+    let t = text.trim();
+    let t = t.strip_prefix("UTC").unwrap_or(t).trim();
+    let (sign, rest) = match t.chars().next()? {
+        '-' => (-1, &t[1..]),
+        '+' => (1, &t[1..]),
+        _ => (1, t),
+    };
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit() || c == ':') {
+        return None;
+    }
+    let (h, m) = match rest.split_once(':') {
+        Some((h, m)) => (h.parse::<i32>().ok()?, m.parse::<i32>().ok()?),
+        None if rest.len() > 2 => (rest[..rest.len() - 2].parse().ok()?, rest[rest.len() - 2..].parse().ok()?),
+        None => (rest.parse().ok()?, 0),
+    };
+    (h <= 14 && m < 60).then_some(sign * (h * 60 + m))
+}
+
 // ------------------------------------------------------------ reader options
 
 /// A choice of text encodings (export and import), 160 wide.
@@ -1387,9 +1510,13 @@ pub(crate) fn encoding_combo(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::D
     });
 }
 
-/// The CSV reader's options: the common ones, or (`more`) the others, shown under the preview.
-fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, tsv: bool, more: bool) {
+/// The CSV reader's options (the delimiter is chosen with the format): the common ones, or
+/// (`more`) the others, folded under "More options". NULL markers are set once, with the
+/// options of reading values.
+fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, more: bool) {
     if more {
+        f.row(tr("Quote character"), |ui| opt_char_edit(ui, &mut o.quote_char, tr("none")));
+        f.row(tr("Skip rows"), |ui| wizard::number(ui, &mut o.skip_rows, 0..=1_000_000, 70.0));
         f.row(tr("Quotes inside values"), |ui| {
             combo(
                 ui,
@@ -1400,14 +1527,7 @@ fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, tsv: bool, m
         });
         f.row(tr("Comment lines"), |ui| opt_char_edit(ui, &mut o.comment_char, tr("none")));
         f.check_row(tr("Spaces"), |ui| wizard::check(ui, &mut o.trim, tr("Trim spaces around values")));
-        // Any other delimiter (the common ones are chosen above, as in the design).
-        if !tsv {
-            f.row(tr("Other delimiter"), |ui| ui.add(wizard::mono_line(&mut o.delimiter, 60.0)));
-        }
         return;
-    }
-    if !tsv {
-        f.seg_row(tr("Delimiter"), |ui| delimiter_choice(ui, &mut o.delimiter));
     }
     f.row(tr("Header"), |ui| {
         let w = ui.available_width();
@@ -1423,9 +1543,6 @@ fn csv_reader_ui(f: &mut Form<'_>, id: u64, o: &mut CsvReadOptions, tsv: bool, m
             w,
         )
     });
-    f.row(tr("Skip rows"), |ui| wizard::number(ui, &mut o.skip_rows, 0..=1_000_000, 70.0));
-    f.row(tr("Quote character"), |ui| opt_char_edit(ui, &mut o.quote_char, tr("none")));
-    f.row(tr("NULL text"), |ui| ui.add(line(&mut o.null_string).hint_text(tr("empty")).desired_width(140.0)));
     f.row(tr("Encoding"), |ui| encoding_combo(ui, ("csv_rd_enc", id), &mut o.encoding, &ENCODINGS));
 }
 
@@ -1522,8 +1639,8 @@ impl TabView for ImportTab {
             }
             let steps = [tr("File"), tr("Target"), tr("Options"), tr("Run")];
             let reachable = if self.run.is_some() { self.page } else { self.reachable() };
-            let finished = self.page == PAGE_RUN && matches!(self.result, Some(Ok(_)));
-            if let Some(p) = wizard::steps(ui, &steps, self.page, reachable.max(self.page), finished)
+            let outcome = if self.page == PAGE_RUN { self.outcome() } else { None };
+            if let Some(p) = wizard::steps(ui, &steps, self.page, reachable.max(self.page), outcome)
                 && self.run.is_none()
             {
                 self.page = p;
@@ -1566,6 +1683,31 @@ mod tests {
         assert_eq!(ImportFileFormat::from_path(Path::new("a/b.JSONL")), Some(ImportFileFormat::Json));
         assert_eq!(ImportFileFormat::from_path(Path::new("a.tsv")), Some(ImportFileFormat::Tsv));
         assert_eq!(ImportFileFormat::from_path(Path::new("a.bin")), None);
+    }
+
+    #[test]
+    fn time_zone_offsets() {
+        assert_eq!(parse_offset("+07:00"), Some(420));
+        assert_eq!(parse_offset("UTC-5"), Some(-300));
+        assert_eq!(parse_offset("+0530"), Some(330));
+        assert_eq!(parse_offset("7"), Some(420));
+        assert_eq!(parse_offset("+25:00"), None);
+        assert_eq!(parse_offset("+-5"), None);
+        assert_eq!(parse_offset("é"), None);
+        assert_eq!(offset_text(420, true), "+7");
+        assert_eq!(offset_text(-330, true), "-5:30");
+        assert_eq!(offset_text(420, false), "+07:00");
+    }
+
+    #[test]
+    fn a_created_table_is_not_created_again() {
+        let mut tab = ImportTab::new("c".into(), None, Some(SchemaRef::schema("public")));
+        tab.set_file("/tmp/sales.csv");
+        assert!(tab.mapping().unwrap().create_table);
+        tab.created = tab.target_ref();
+        assert!(!tab.mapping().unwrap().create_table, "run again: into the table the last run created");
+        tab.new_name = "sales_2".into();
+        assert!(tab.mapping().unwrap().create_table, "another name: a new table");
     }
 
     #[test]

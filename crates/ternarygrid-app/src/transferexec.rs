@@ -11,6 +11,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::conn::{LiveConnection, init_session};
+use crate::tabs::transfer::rows_text;
 use crate::taskexec::AppTaskExecutor;
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -22,7 +23,7 @@ use std::time::Duration;
 use ternarygrid_core::config::ConnectionConfig;
 use ternarygrid_core::driver::{ConnectParams, Driver, TransactionMode};
 use ternarygrid_core::meta::ObjectRef;
-use ternarygrid_core::{DbError, DbKind, DbResult, Dialect, Session, tr, trf};
+use ternarygrid_core::{DbError, DbKind, DbResult, Dialect, Session, tr, trf, trn};
 use ternarygrid_tasks::{RunContext, RunOutcome};
 use ternarygrid_transfer::{
     ExportItem, ExportJob, ExportJobSummary, ImportJob, MessageLevel, MigrationJob, Progress, SessionFactory, run_export_job_with, run_import_job, run_migration,
@@ -229,14 +230,16 @@ pub async fn export(exec: &AppTaskExecutor, ctx: &RunContext, connection_id: &st
     let factory: Arc<dyn SessionFactory> = Arc::new(factory);
     let progress = Progress::shared();
     let total = job.items.len();
-    ctx.info(trf("Exporting {} object(s) to {}", &[&total, &job.output_folder.display()]));
+    let objects = trn(total, "1 object", "{} objects");
+    ctx.info(trf("Exporting {} to {}", &[&objects, &job.output_folder.display()]));
     let summary = drive(ctx, &progress, run_export_job_with(job, factory, sql_dialect, progress.clone(), ctx.cancel.clone())).await?;
     let failed: Vec<String> = summary.items.iter().filter_map(|i| i.error.as_ref().map(|e| format!("{}: {e}", i.name))).collect();
     let files = export_output_files(&summary);
     if !failed.is_empty() {
-        return Err(DbError::query(trf("{} of {} object(s) failed: {}", &[&failed.len(), &total, &failed.join("; ")])));
+        return Err(DbError::query(trf("{} of {} failed: {}", &[&failed.len(), &objects, &failed.join("; ")])));
     }
-    Ok(RunOutcome { rows: Some(summary.rows), message: Some(trf("{} rows exported to {} file(s)", &[&summary.rows, &files.len()])), output_files: files })
+    let message = trf("{} exported to {}", &[&rows_text(summary.rows), &trn(files.len(), "1 file", "{} files")]);
+    Ok(RunOutcome { rows: Some(summary.rows), message: Some(message), output_files: files })
 }
 
 /// Run a saved import (`TaskKind::Import`).
@@ -274,7 +277,8 @@ pub async fn import(exec: &AppTaskExecutor, ctx: &RunContext, connection_id: &st
     for w in &summary.warnings {
         ctx.warn(w.clone());
     }
-    Ok(RunOutcome { rows: Some(summary.rows_written), output_files: Vec::new(), message: Some(trf("{} rows imported, {} failed", &[&summary.rows_written, &summary.rows_failed])) })
+    let message = trf("{} imported, {} failed", &[&rows_text(summary.rows_written), &summary.rows_failed]);
+    Ok(RunOutcome { rows: Some(summary.rows_written), output_files: Vec::new(), message: Some(message) })
 }
 
 /// Run a saved migration (`TaskKind::Migration`).
@@ -302,7 +306,8 @@ pub async fn migrate(exec: &AppTaskExecutor, ctx: &RunContext, source: &str, tar
     let (src, dst): (Arc<dyn SessionFactory>, Arc<dyn SessionFactory>) = (Arc::new(src), Arc::new(dst));
     let progress = Progress::new();
     let tables = job.tables.len();
-    ctx.info(trf("Migrating {} table(s)", &[&tables]));
+    let tables_text = trn(tables, "1 table", "{} tables");
+    ctx.info(trf("Migrating {}", &[&tables_text]));
     let summary = drive(ctx, &progress, run_migration(job, src, dst, &progress, &ctx.cancel)).await?;
     let failed: Vec<String> = summary
         .tables
@@ -313,17 +318,14 @@ pub async fn migrate(exec: &AppTaskExecutor, ctx: &RunContext, source: &str, tar
         })
         .collect();
     if !failed.is_empty() {
-        return Err(DbError::query(trf("{} of {} table(s) failed: {}", &[&failed.len(), &tables, &failed.join("; ")])));
+        return Err(DbError::query(trf("{} of {} failed: {}", &[&failed.len(), &tables_text, &failed.join("; ")])));
     }
     let failed_rows: u64 = summary.tables.iter().map(|t| t.rows_failed).sum();
+    let copied = trf("{} copied into {}", &[&rows_text(summary.rows), &tables_text]);
     Ok(RunOutcome {
         rows: Some(summary.rows),
         output_files: Vec::new(),
-        message: Some(if failed_rows > 0 {
-            trf("{} rows copied into {} table(s), {} rows failed", &[&summary.rows, &tables, &failed_rows])
-        } else {
-            trf("{} rows copied into {} table(s)", &[&summary.rows, &tables])
-        }),
+        message: Some(if failed_rows > 0 { trf("{}, {} failed", &[&copied, &rows_text(failed_rows)]) } else { copied }),
     })
 }
 
