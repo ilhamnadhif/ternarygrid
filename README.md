@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/ilhamnadhif/ternarygrid/master/scri
 
 The script downloads the latest release, checks it (the SHA-256 GitHub publishes, the code
 signature, the bundle id and version), installs `TernaryGrid.app` into `/Applications`, and opens it. Run
-it again to update. To install a specific version, pass it as an argument: `… | bash -s -- v0.5.2`.
+it again to update. To install a specific version, pass it as an argument: `… | bash -s -- v0.6.0`.
 
 **Disk image**: download **`TernaryGrid-<version>.dmg`**, open it and drag **TernaryGrid** onto **Applications**.
 
@@ -211,7 +211,7 @@ Measured on the release build (Apple M1 Pro) with `ternarygrid --bench all`:
 
 | | Target | Measured |
 | --- | --- | --- |
-| Binary size (macOS) | < 50 MB | 49.8 MB |
+| Binary size (macOS) | < 50 MB | 49.6 MB |
 | Cold start to first frame | < 1 s | ≈ 0.12 s |
 | Idle memory | < 120 MB | ≈ 88 MB |
 | 3 connections + 5 result tabs | < 250 MB | ≈ 94 MB |

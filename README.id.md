@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/ilhamnadhif/ternarygrid/master/scri
 
 Script ini mengunduh rilis terbaru, memeriksanya (SHA-256 yang diterbitkan GitHub, tanda tangan kode,
 bundle id dan versi), memasang `TernaryGrid.app` ke `/Applications`, lalu membukanya. Jalankan lagi untuk
-memperbarui. Untuk memasang versi tertentu, berikan versinya: `… | bash -s -- v0.5.2`.
+memperbarui. Untuk memasang versi tertentu, berikan versinya: `… | bash -s -- v0.6.0`.
 
 **Disk image**: unduh **`TernaryGrid-<versi>.dmg`**, buka, lalu seret **TernaryGrid** ke **Applications**.
 
@@ -216,7 +216,7 @@ Diukur pada build rilis (Apple M1 Pro) dengan `ternarygrid --bench all`:
 
 | | Target | Hasil |
 | --- | --- | --- |
-| Ukuran biner (macOS) | < 50 MB | 49,8 MB |
+| Ukuran biner (macOS) | < 50 MB | 49,6 MB |
 | Waktu buka sampai frame pertama | < 1 dtk | ≈ 0,12 dtk |
 | Memori saat diam | < 120 MB | ≈ 88 MB |
 | 3 koneksi + 5 tab hasil | < 250 MB | ≈ 94 MB |
