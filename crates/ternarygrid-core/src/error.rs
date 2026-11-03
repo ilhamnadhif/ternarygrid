@@ -125,6 +125,13 @@ impl DbError {
 
     /// Multi-line text with every available detail, for error panels and logs.
     pub fn full_text(&self) -> String {
+        let position = self.position.map(|p| format!("Position: {p}"));
+        self.full_text_with_position(position.as_deref())
+    }
+
+    /// [`DbError::full_text`] with `position` as its last line in place of the server's raw
+    /// character offset (an editor says "Line 8, column 7"); `None` leaves it out.
+    pub fn full_text_with_position(&self, position: Option<&str>) -> String {
         let mut s = String::new();
         if let Some(code) = &self.code {
             s.push_str(&format!("[{code}] "));
@@ -142,8 +149,9 @@ impl DbError {
             s.push_str("\nContext: ");
             s.push_str(c);
         }
-        if let Some(p) = self.position {
-            s.push_str(&format!("\nPosition: {p}"));
+        if let Some(p) = position {
+            s.push('\n');
+            s.push_str(p);
         }
         s
     }
@@ -179,3 +187,16 @@ impl From<serde_json::Error> for DbError {
 }
 
 pub type DbResult<T> = Result<T, DbError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_text_puts_the_position_last() {
+        let e = DbError::query("no such column: statuss").with_code("SQLITE_ERROR").with_hint("Check the name").with_position(222);
+        assert_eq!(e.full_text(), "[SQLITE_ERROR] no such column: statuss\nHint: Check the name\nPosition: 222");
+        assert_eq!(e.full_text_with_position(Some("Line 8, column 7")), "[SQLITE_ERROR] no such column: statuss\nHint: Check the name\nLine 8, column 7");
+        assert_eq!(e.full_text_with_position(None), "[SQLITE_ERROR] no such column: statuss\nHint: Check the name");
+    }
+}

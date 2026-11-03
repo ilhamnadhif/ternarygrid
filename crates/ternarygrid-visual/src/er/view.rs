@@ -941,15 +941,23 @@ fn toolbar(
             )
             .on_hover_text(tr("Columns shown in the boxes"));
             let s = &mut diagram.settings;
-            if kit::button_full(ui, Kind::Ghost, None, tr("Types"), true, s.show_types)
+            // Toggles outlined (tinted when on), apart from the actions (Auto layout, Export…).
+            if kit::button_full(ui, Kind::Secondary, None, tr("Types"), true, s.show_types)
                 .on_hover_text(tr("Show column types"))
                 .clicked()
             {
                 s.show_types = !s.show_types;
             }
-            if kit::button_full(ui, Kind::Ghost, None, tr("Comments"), true, s.show_comments)
-                .on_hover_text(tr("Show table comments"))
-                .clicked()
+            if kit::button_full(
+                ui,
+                Kind::Secondary,
+                None,
+                tr("Comments"),
+                true,
+                s.show_comments,
+            )
+            .on_hover_text(tr("Show table comments"))
+            .clicked()
             {
                 s.show_comments = !s.show_comments;
             }
@@ -1012,7 +1020,7 @@ fn toolbar(
             } else {
                 kit::button_full(
                     ui,
-                    Kind::Ghost,
+                    Kind::Secondary,
                     Some(icon::PENCIL_SIMPLE),
                     tr("Edit mode"),
                     true,
@@ -1038,12 +1046,26 @@ fn toolbar(
                 return;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let counts = trf(
-                    "{} tables, {} relations",
-                    &[&diagram.model.tables.len(), &diagram.model.relations.len()],
-                );
+                let views = diagram
+                    .model
+                    .tables
+                    .iter()
+                    .filter(|t| t.kind == ErTableKind::View)
+                    .count();
+                let tables = diagram.model.tables.len() - views;
+                let mut parts = vec![ternarygrid_core::trn(tables, "1 table", "{} tables")];
+                if views > 0 {
+                    parts.push(ternarygrid_core::trn(views, "1 view", "{} views"));
+                }
+                parts.push(ternarygrid_core::trn(
+                    diagram.model.relations.len(),
+                    "1 relation",
+                    "{} relations",
+                ));
+                let counts = parts.join(", ");
+                // Cut with "…" where the toolbar is full (egui shows the whole on hover).
                 ui.add(
-                    egui::Label::new(egui::RichText::new(counts).size(12.0).color(p.text_faint))
+                    egui::Label::new(egui::RichText::new(counts).size(12.0).color(p.text_muted))
                         .truncate(),
                 );
             });
@@ -1115,8 +1137,8 @@ fn context_menu_ui(
             title(ui, name);
             item(
                 ui,
-                icon::EYE,
-                tr("Open"),
+                icon::ARROW_SQUARE_OUT,
+                tr("Properties"),
                 MenuAction::Emit(ErEvent::OpenTable(key.clone())),
                 false,
             );
@@ -1160,21 +1182,21 @@ fn context_menu_ui(
                 item(
                     ui,
                     icon::PENCIL_SIMPLE,
-                    tr("Edit table…"),
+                    tr("Edit table"),
                     MenuAction::Emit(ErEvent::EditTable(key.clone())),
                     false,
                 );
                 item(
                     ui,
                     icon::PLUS,
-                    tr("Add column…"),
+                    tr("Add column"),
                     MenuAction::Emit(ErEvent::AddColumn(key.clone())),
                     false,
                 );
                 item(
                     ui,
                     icon::TRASH,
-                    tr("Delete table…"),
+                    tr("Drop…"),
                     MenuAction::Emit(ErEvent::DeleteTables(keys)),
                     true,
                 );

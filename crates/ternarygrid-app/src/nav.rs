@@ -116,6 +116,45 @@ enum RowKind {
     Loading,
     Error(String),
     Empty,
+    /// Why a connection failed, with Retry and Edit connection under it: a block of several
+    /// rows (`part` of them), each drawing its slice of it.
+    Failed {
+        conn: String,
+        message: String,
+        part: usize,
+    },
+}
+
+/// The block under a failed connection: its message (the code in the error colour, the text
+/// muted, at most three lines) and the Retry / Edit connection links, laid out for `width`.
+struct FailedBlock {
+    message: std::sync::Arc<egui::Galley>,
+    height: f32,
+}
+
+impl FailedBlock {
+    const TOP: f32 = 5.0;
+    const LINKS_H: f32 = 22.0;
+
+    fn layout(ui: &Ui, message: &str, width: f32) -> FailedBlock {
+        let p = ternarygrid_ui::pal(ui);
+        let size = 12.5;
+        // "[SQLITE_CANTOPEN] Cannot open …": the code apart from the message.
+        let (code, text) = match message.strip_prefix('[').and_then(|m| m.split_once(']')) {
+            Some((code, rest)) => (Some(code), rest.trim_start()),
+            None => (None, message),
+        };
+        let mut job = egui::text::LayoutJob::default();
+        if let Some(code) = code {
+            job.append(code, 0.0, egui::TextFormat::simple(ternarygrid_ui::style::medium(ui.ctx(), size), p.err));
+            job.append(" ", 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), p.text_muted));
+        }
+        job.append(text.lines().collect::<Vec<_>>().join(" ").as_str(), 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), p.text_muted));
+        job.wrap = egui::text::TextWrapping { max_width: width.max(40.0), max_rows: 3, break_anywhere: false, overflow_character: Some('…') };
+        let message = ui.painter().layout_job(job);
+        let height = Self::TOP + message.size().y + 2.0 + Self::LINKS_H;
+        FailedBlock { message, height }
+    }
 }
 
 #[derive(Default)]
@@ -420,7 +459,7 @@ impl Navigator {
         // Unfolded while connecting or after a failure: the state shows under the row.
         let pending = match &status {
             ConnStatus::Connecting if unfolded => Some(RowKind::Loading),
-            ConnStatus::Failed(e) if unfolded => Some(RowKind::Error(e.clone())),
+            ConnStatus::Failed(e) if unfolded => Some(RowKind::Failed { conn: cfg.id.clone(), message: e.clone(), part: 0 }),
             _ => None,
         };
         let filter_hit = self.filter_matches(&cfg.name);
@@ -573,6 +612,11 @@ impl Navigator {
             }
             let node = NavNode::CatalogGroup { conn: conn.to_string(), group };
             let expanded = self.expanded.contains(&node);
+            let filtering = !self.filter.trim().is_empty();
+            if filtering && !expanded {
+                continue;
+            }
+            let start = rows.len();
             let group_icon = match group {
                 CatalogGroup::Security => icon::SHIELD_CHECK,
                 CatalogGroup::Storage => icon::HARD_DRIVES,
@@ -597,14 +641,23 @@ impl Navigator {
             if expanded {
                 self.push_catalog_folders(live, rows, conn, folders, CatalogContext::default(), depth + 1);
             }
+            if filtering && rows.len() == start + 1 {
+                rows.truncate(start);
+            }
         }
     }
 
     /// Catalog folders and, when expanded, their objects and sub-folders.
     fn push_catalog_folders(&self, live: &mut LiveConnection, rows: &mut Vec<Row>, conn: &str, folders: Vec<CatalogFolder>, base: CatalogContext, depth: usize) {
+        let filtering = !self.filter.trim().is_empty();
         for f in folders {
             let node = NavNode::CatalogFolder { conn: conn.to_string(), folder: f.id, ctx: base.clone() };
             let expanded = !f.table_only && self.expanded.contains(&node);
+            // Filtering: only the unfolded folders that have a match.
+            if filtering && !expanded {
+                continue;
+            }
+            let folder_row = rows.len();
             rows.push(Row {
                 node,
                 depth,
@@ -662,8 +715,10 @@ impl Navigator {
                     self.push_catalog_folders(live, rows, conn, children, child_ctx, depth + 2);
                 }
             }
-            if shown == 0 && self.filter.trim().is_empty() {
+            if shown == 0 && !filtering {
                 rows.push(placeholder(depth + 1, RowKind::Empty));
+            } else if shown == 0 {
+                rows.truncate(folder_row);
             }
         }
     }
@@ -753,8 +808,13 @@ impl Navigator {
                 continue;
             }
             let node = NavNode::KindFolder { conn: conn.to_string(), schema: schema.clone(), kind };
-            let expanded = self.expanded.contains(&node) || (!self.filter.trim().is_empty() && matches!(kind, ObjectKind::Table | ObjectKind::View));
+            let filtering = !self.filter.trim().is_empty();
+            let expanded = self.expanded.contains(&node) || (filtering && matches!(kind, ObjectKind::Table | ObjectKind::View));
             let count = live.meta.objects.get(&(schema.clone(), kind)).and_then(|l| l.get()).map(|v| v.len());
+            // Filtering: a folder whose objects are not loaded has nothing to show.
+            if filtering && !expanded && count.is_none() {
+                continue;
+            }
             let folder_row = rows.len();
             rows.push(Row {
                 node,
@@ -779,15 +839,29 @@ impl Navigator {
                 let leaf = live.config.kind == DbKind::Redis;
                 let has_children = !leaf && (kind.is_table_like() || matches!(kind, ObjectKind::View | ObjectKind::MaterializedView));
                 self.push_objects(live, rows, conn, schema, kind, depth + 1, has_children);
-                if !self.filter.trim().is_empty()
-                    && let Some(total) = count
-                {
+                if filtering && let Some(total) = count {
                     let shown = rows[folder_row + 1..].iter().filter(|r| r.depth == depth + 1 && r.kind == RowKind::Node).count();
+                    // Filtering: the folders without a match are hidden.
+                    if shown == 0 {
+                        rows.truncate(folder_row);
+                        continue;
+                    }
                     rows[folder_row].detail = Some(ternarygrid_core::trf("{} of {}", &[&shown, &total]));
                 }
                 // expanded objects get their child folders
                 let objs: Vec<ObjectInfo> = live.meta.objects.get(&(schema.clone(), kind)).and_then(|l| l.get()).cloned().unwrap_or_default();
                 let _ = objs;
+            } else if filtering {
+                // Folded but loaded: shown with its matches only when it has some.
+                let cfg = &live.config;
+                let show_system = cfg.init.show_system_objects || self.prefs.show_system_objects;
+                let list = live.meta.objects.get(&(schema.clone(), kind)).and_then(|l| l.get());
+                let shown = list.map_or(0, |v| v.iter().filter(|o| (show_system || !o.is_system) && filter_ok(cfg, kind, &o.obj.name) && self.filter_matches(&o.obj.name)).count());
+                if shown == 0 {
+                    rows.truncate(folder_row);
+                } else if let Some(total) = count {
+                    rows[folder_row].detail = Some(ternarygrid_core::trf("{} of {}", &[&shown, &total]));
+                }
             }
         }
     }
@@ -1104,6 +1178,8 @@ impl Navigator {
             ui.spacing_mut().item_spacing.x = 2.0;
             let sel_conn = self.selected.as_ref().and_then(|n| n.connection()).map(str::to_string);
             let connected = sel_conn.as_deref().is_some_and(|c| cx.conns.is_connected(c));
+            let failed = sel_conn.as_deref().is_some_and(|c| matches!(cx.conns.status(c), ConnStatus::Failed(_)));
+            let sel_name = sel_conn.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_default();
             let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More"), false, 26.0, 15.0);
             egui::Popup::menu(&more).gap(4.0).show(|ui| {
                 kit::menu_look(ui, 200.0);
@@ -1117,8 +1193,12 @@ impl Navigator {
                     ui.close();
                 }
                 if let Some(c) = &sel_conn {
-                    let (plug, label) = if connected { (icon::PLUGS, tr("Disconnect")) } else { (icon::PLUGS_CONNECTED, tr("Connect")) };
-                    if kit::menu_item(ui, Some(plug), label, "").clicked() {
+                    let (plug, label) = if connected {
+                        (icon::PLUGS, ternarygrid_core::trf("Disconnect {}", &[&sel_name]))
+                    } else {
+                        (icon::PLUGS_CONNECTED, ternarygrid_core::trf("Connect {}", &[&sel_name]))
+                    };
+                    if kit::menu_item(ui, Some(plug), &label, "").clicked() {
                         cx.push(if connected { AppCommand::Disconnect(c.clone()) } else { AppCommand::Connect(c.clone()) });
                         ui.close();
                     }
@@ -1140,10 +1220,15 @@ impl Navigator {
                 }
             });
             // No connections (the empty state): New connection and "⋯" only, as in the design.
+            // Refresh; for a connection that failed, connect again.
+            let tip = if failed { tr("Connect again") } else { tr("Refresh") };
             if !cx.conns.configs().is_empty()
-                && ui.add_enabled_ui(connected, |ui| kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 15.0)).inner.clicked()
+                && ui.add_enabled_ui(connected || failed, |ui| kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tip, false, 26.0, 15.0)).inner.clicked()
             {
-                self.refresh_selected(cx);
+                match &sel_conn {
+                    Some(c) if failed => cx.push(AppCommand::Connect(c.clone())),
+                    _ => self.refresh_selected(cx),
+                }
             }
             if kit::icon_button_sized(ui, icon::PLUS, tr("New connection"), false, 26.0, 15.0).clicked() {
                 cx.push(AppCommand::Action(crate::keys::Action::NewConnection));
@@ -1179,7 +1264,7 @@ impl Navigator {
 
         if cx.conns.configs().is_empty() {
             ternarygrid_ui::kit::empty_state_at(ui, 32.0, icon::DATABASE, tr("No connections yet"), tr("Connect to a database to browse it here."), |ui| {
-                if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Primary, Some(icon::PLUS), tr("New connection"), true).clicked() {
+                if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Secondary, Some(icon::PLUS), tr("New connection"), true).clicked() {
                     cx.push(AppCommand::NewConnection { kind: None, folder: None });
                 }
                 if ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Ghost, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), true)
@@ -1195,6 +1280,28 @@ impl Navigator {
         // Rows of 26 points a point apart, inset by 6 points (their rounded fill).
         let (row_h, pitch) = (26.0, 27.0);
         let rows = std::mem::take(&mut self.rows);
+        // A failed connection's message takes as many rows as its lines need.
+        let text_left = |depth: usize| 6.0 + 8.0 + depth as f32 * 14.0 + 18.0 + 19.0;
+        let panel_w = ui.available_width();
+        let mut failed_blocks = std::collections::HashMap::new();
+        let rows: Vec<Row> = rows
+            .into_iter()
+            .flat_map(|r| match &r.kind {
+                RowKind::Failed { conn, message, .. } => {
+                    let block = FailedBlock::layout(ui, message, panel_w - text_left(r.depth) - 14.0);
+                    let parts = (block.height / pitch).ceil().max(1.0) as usize;
+                    failed_blocks.insert(conn.clone(), block);
+                    (0..parts)
+                        .map(|part| {
+                            let mut r = placeholder(r.depth, RowKind::Failed { conn: conn.clone(), message: message.clone(), part });
+                            r.node = NavNode::Connection(conn.clone());
+                            r
+                        })
+                        .collect::<Vec<_>>()
+                }
+                _ => vec![r],
+            })
+            .collect();
         let mut clicked: Option<(usize, bool)> = None; // (row, double)
         let mut toggled: Option<usize> = None;
         let mut context: Option<(usize, egui::Response)> = None;
@@ -1227,6 +1334,7 @@ impl Navigator {
                     RowKind::Loading => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, tr("Loading…")),
                     RowKind::Error(e) => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, e),
                     RowKind::Empty => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, tr("(empty)")),
+                    RowKind::Failed { message, .. } => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, message),
                 });
                 let inner = rect.shrink2(egui::vec2(6.0, 0.0));
                 let is_node = r.kind == RowKind::Node;
@@ -1262,7 +1370,14 @@ impl Navigator {
                 let small = egui::FontId::proportional(12.5);
                 match &r.kind {
                     RowKind::Loading => {
-                        ui.painter().text(egui::pos2(x + 6.5, y), egui::Align2::CENTER_CENTER, icon::CLOCK_COUNTER_CLOCKWISE, ternarygrid_ui::style::icon_font(13.0), p.text_faint);
+                        // A turning spinner (the history's clock meant something else).
+                        let angle = ui.input(|i| i.time) as f32 * 4.0;
+                        let c = egui::pos2(x + 6.5, y);
+                        let shape = egui::epaint::PathShape::line(
+                            (0..=16).map(|k| c + 5.0 * egui::Vec2::angled(angle + k as f32 / 16.0 * std::f32::consts::TAU * 0.75)).collect(),
+                            egui::Stroke::new(1.5, p.text_faint),
+                        );
+                        ui.painter().add(shape);
                         ui.painter().text(egui::pos2(x + 19.0, y), egui::Align2::LEFT_CENTER, tr("Loading…"), small, p.text_faint);
                         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                         continue;
@@ -1282,6 +1397,54 @@ impl Navigator {
                     }
                     RowKind::Empty => {
                         ui.painter().text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, tr("(empty)"), small, p.text_faint);
+                        continue;
+                    }
+                    RowKind::Failed { conn, message, part } => {
+                        let Some(block) = failed_blocks.get(conn) else { continue };
+                        // This row's slice of the block, which starts `part` rows higher.
+                        let top = slot.top() - *part as f32 * pitch;
+                        let painter = ui.painter().with_clip_rect(slot.intersect(ui.clip_rect()));
+                        painter.text(
+                            egui::pos2(x + 6.5, top + FailedBlock::TOP + 8.0),
+                            egui::Align2::CENTER_CENTER,
+                            icon::WARNING_CIRCLE,
+                            ternarygrid_ui::style::icon_font(13.0),
+                            p.err,
+                        );
+                        let text_pos = egui::pos2(x + 19.0, top + FailedBlock::TOP);
+                        let text_rect = egui::Rect::from_min_size(text_pos, block.message.size());
+                        painter.galley(text_pos, block.message.clone(), p.text_muted);
+                        if slot.intersects(text_rect) && block.message.elided {
+                            ui.interact(text_rect.intersect(slot), ui.id().with(("nav_failed_text", i)), Sense::hover()).on_hover_text(message.clone());
+                        }
+                        // Retry · Edit connection…
+                        let mut lx = text_pos.x;
+                        let ly = text_rect.bottom() + 2.0 + FailedBlock::LINKS_H / 2.0;
+                        for (k, (label, command)) in
+                            [(tr("Retry"), AppCommand::Connect(conn.clone())), (tr("Edit connection…"), AppCommand::EditConnection(conn.clone()))].into_iter().enumerate()
+                        {
+                            if k > 0 {
+                                let dot = painter.layout_no_wrap("·".into(), small.clone(), p.text_faint);
+                                painter.galley(egui::pos2(lx + 6.0, ly - dot.size().y / 2.0), dot.clone(), p.text_faint);
+                                lx += 12.0 + dot.size().x;
+                            }
+                            let g = painter.layout_no_wrap(label.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.5), p.accent_text);
+                            let r = egui::Rect::from_min_size(egui::pos2(lx, ly - g.size().y / 2.0), g.size());
+                            lx = r.right();
+                            if !slot.contains(r.center()) {
+                                continue;
+                            }
+                            let link = ui.interact(r.expand2(egui::vec2(3.0, 3.0)), ui.id().with(("nav_failed_link", i, k)), Sense::click());
+                            link.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+                            if link.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                painter.hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, p.accent_text));
+                            }
+                            painter.galley(r.min, g, p.accent_text);
+                            if link.clicked() {
+                                cx.push(command);
+                            }
+                        }
                         continue;
                     }
                     RowKind::Node => {}
@@ -1331,9 +1494,12 @@ impl Navigator {
                     ui.painter().circle_filled(egui::pos2(after + 9.5, y), 3.5, badge);
                     after += 16.0;
                 }
+                // A connection's detail (the server, the file) only where enough of it shows:
+                // 70 points, or the whole of a short one; else its tooltip has it.
+                let detail_room = right - (after + 8.0);
                 if is_conn
                     && let Some(d) = &r.detail
-                    && right - (after + 8.0) > 24.0
+                    && (detail_room >= 70.0 || ui.painter().layout_no_wrap(d.clone(), egui::FontId::proportional(11.5), p.text_faint).size().x <= detail_room)
                 {
                     let g = fit(ui, RichText::new(d).size(11.5).color(p.text_faint), right - (after + 8.0));
                     ui.painter().galley(egui::pos2(after + 8.0, y - g.size().y / 2.0), g, p.text_faint);
@@ -1562,13 +1728,13 @@ impl Navigator {
                     cx.push(AppCommand::NewSqlEditor { connection: Some(id.clone()), schema: None, text: None });
                     ui.close();
                 }
-                if ternarygrid_ui::kit::menu_item(ui, Some(icon::TERMINAL), tr("Open SQL console"), "").clicked() {
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::TERMINAL_WINDOW), tr("New SQL console"), "").clicked() {
                     cx.push(AppCommand::NewSqlConsole { connection: id.clone() });
                     ui.close();
                 }
                 create_menu_items(ui, cx, id, None);
                 ternarygrid_ui::kit::menu_separator(ui);
-                if ternarygrid_ui::kit::menu_item(ui, Some(icon::PENCIL_SIMPLE), tr("Edit connection"), &crate::keys::label(cx.keymap, crate::keys::Action::EditConnection))
+                if ternarygrid_ui::kit::menu_item(ui, Some(icon::PENCIL_SIMPLE), tr("Edit connection…"), &crate::keys::label(cx.keymap, crate::keys::Action::EditConnection))
                     .clicked()
                 {
                     cx.push(AppCommand::EditConnection(id.clone()));
@@ -1578,10 +1744,6 @@ impl Navigator {
                     cx.push(AppCommand::DuplicateConnection(id.clone()));
                     ui.close();
                 }
-                if ternarygrid_ui::kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete"), "").clicked() {
-                    cx.push(AppCommand::DeleteConnection(id.clone()));
-                    ui.close();
-                }
                 let others: Vec<String> = cx.conns.configs().iter().map(|c| c.id.clone()).filter(|c| c != id && cx.conns.is_connected(c)).collect();
                 if !others.is_empty() && ternarygrid_ui::kit::menu_item(ui, None, tr("Disconnect others"), "").clicked() {
                     for o in others {
@@ -1589,7 +1751,7 @@ impl Navigator {
                     }
                     ui.close();
                 }
-                ternarygrid_ui::kit::submenu(ui, None, tr("Move"), 170.0, &mut |ui| {
+                ternarygrid_ui::kit::submenu(ui, Some(icon::ARROWS_DOWN_UP), tr("Reorder"), 170.0, &mut |ui| {
                     use crate::command::MovePos as M;
                     for (pos, label, i) in [
                         (M::Top, tr("To the top"), icon::ARROW_LINE_UP),
@@ -1632,6 +1794,12 @@ impl Navigator {
                         tools_menu(ui, cx, id, None);
                     });
                 }
+                // Destructive, last and apart (it asks first).
+                ternarygrid_ui::kit::menu_separator(ui);
+                if ternarygrid_ui::kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete connection…"), "").clicked() {
+                    cx.push(AppCommand::DeleteConnection(id.clone()));
+                    ui.close();
+                }
             }
             NavNode::Database { conn, db } => database_menu(ui, cx, conn, db),
             NavNode::Schema { conn, schema } | NavNode::KindFolder { conn, schema, .. } => {
@@ -1665,7 +1833,7 @@ impl Navigator {
                         cx.push(AppCommand::OpenErDiagram { connection: conn.clone(), schema: schema.clone(), tables: Vec::new() });
                         ui.close();
                     }
-                    if ternarygrid_ui::kit::menu_item(ui, Some(icon::DOWNLOAD), tr("Import data"), "").clicked() {
+                    if ternarygrid_ui::kit::menu_item(ui, Some(icon::DOWNLOAD_SIMPLE), tr("Import data…"), "").clicked() {
                         cx.push(AppCommand::OpenImport { connection: conn.clone(), table: None, schema: Some(schema.clone()) });
                         ui.close();
                     }
@@ -1829,7 +1997,7 @@ fn database_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, db: &str) {
         ui.close();
     }
     create_menu_items(ui, cx, conn, Some(db.to_string()));
-    if maintenance && ternarygrid_ui::kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance"), "").on_hover_text(tr("Vacuum, analyze, reindex the whole database")).clicked() {
+    if maintenance && ternarygrid_ui::kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance…"), "").on_hover_text(tr("Vacuum, analyze, reindex the whole database")).clicked() {
         cx.push(AppCommand::OpenMaintenance { connection: conn.to_string(), objects: vec![database.clone()], op: None });
         ui.close();
     }
@@ -1912,7 +2080,7 @@ pub fn tools_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, schema: Option<S
         cx.push(AppCommand::OpenSearch { connection: Some(conn.to_string()), data: false });
         ui.close();
     }
-    if sql && ternarygrid_ui::kit::menu_item(ui, Some(icon::TEXT_AA), tr("Search data"), "").clicked() {
+    if sql && ternarygrid_ui::kit::menu_item(ui, Some(icon::MAGNIFYING_GLASS_PLUS), tr("Search data"), "").clicked() {
         cx.push(AppCommand::OpenSearch { connection: Some(conn.to_string()), data: true });
         ui.close();
     }
@@ -1952,15 +2120,24 @@ pub fn object_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, obj: &ObjectRef
     let c = conn.to_string();
     let sql = is_sql(cx, conn);
     let keys = |k: &str| if in_navigator { k.to_string() } else { String::new() };
-    if in_navigator && item(ui, icon::EYE, tr("Open"), &keys(OPEN_KEYS)).clicked() {
-        cx.push(AppCommand::OpenObject { connection: c.clone(), object: obj.clone(), page: ObjectPage::Properties });
-        ui.close();
-    }
-    if in_navigator && obj.kind.has_data() && ternarygrid_ui::kit::menu_item(ui, Some(icon::TABLE), tr("View data"), "").clicked() {
+    // Enter (a double click) opens the page `activate` opens: its key beside that item.
+    let enter = if obj.kind.has_data() {
+        ObjectPage::Data
+    } else if obj.kind.is_routine() || obj.kind == ObjectKind::Trigger {
+        ObjectPage::Ddl
+    } else {
+        ObjectPage::Properties
+    };
+    let enter_keys = |page: ObjectPage| if page == enter { keys(OPEN_KEYS) } else { String::new() };
+    if in_navigator && obj.kind.has_data() && item(ui, icon::TABLE, tr("View data"), &enter_keys(ObjectPage::Data)).clicked() {
         cx.push(AppCommand::OpenObject { connection: c.clone(), object: obj.clone(), page: ObjectPage::Data });
         ui.close();
     }
-    if in_navigator && ternarygrid_ui::kit::menu_item(ui, Some(icon::FILE_CODE), tr("View DDL"), "").clicked() {
+    if in_navigator && item(ui, icon::ARROW_SQUARE_OUT, tr("Properties"), &enter_keys(ObjectPage::Properties)).clicked() {
+        cx.push(AppCommand::OpenObject { connection: c.clone(), object: obj.clone(), page: ObjectPage::Properties });
+        ui.close();
+    }
+    if in_navigator && item(ui, icon::FILE_CODE, tr("View DDL"), &enter_keys(ObjectPage::Ddl)).clicked() {
         cx.push(AppCommand::OpenObject { connection: c.clone(), object: obj.clone(), page: ObjectPage::Ddl });
         ui.close();
     }
@@ -1986,28 +2163,28 @@ pub fn object_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, obj: &ObjectRef
     }
     if obj.kind.has_data() {
         ternarygrid_ui::kit::menu_separator(ui);
-        if ternarygrid_ui::kit::menu_item(ui, Some(icon::EXPORT), tr("Export data"), "").clicked() {
+        if ternarygrid_ui::kit::menu_item(ui, Some(icon::EXPORT), tr("Export data…"), "").clicked() {
             cx.push(AppCommand::OpenExport { connection: c.clone(), objects: vec![obj.clone()], sql: None });
             ui.close();
         }
         if sql && obj.kind.is_table_like() {
-            if ternarygrid_ui::kit::menu_item(ui, Some(icon::DOWNLOAD), tr("Import data"), "").clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::DOWNLOAD_SIMPLE), tr("Import data…"), "").clicked() {
                 cx.push(AppCommand::OpenImport { connection: c.clone(), table: Some(obj.clone()), schema: Some(obj.schema_ref()) });
                 ui.close();
             }
-            if ternarygrid_ui::kit::menu_item(ui, Some(icon::MAGIC_WAND), tr("Generate mock data"), "").clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::MAGIC_WAND), tr("Generate mock data…"), "").clicked() {
                 cx.push(AppCommand::OpenMockData { connection: c.clone(), table: obj.clone() });
                 ui.close();
             }
-            if ternarygrid_ui::kit::menu_item(ui, Some(icon::ARROW_RIGHT), tr("Migrate to another database"), "").clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::ARROW_RIGHT), tr("Migrate to another database…"), "").clicked() {
                 cx.push(AppCommand::OpenMigration { connection: c.clone(), objects: vec![obj.clone()] });
                 ui.close();
             }
-            if ternarygrid_ui::kit::menu_item(ui, Some(icon::GIT_DIFF), tr("Compare data"), "").clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::ARROWS_LEFT_RIGHT), tr("Compare data…"), "").clicked() {
                 cx.push(AppCommand::OpenDataCompare { connection: Some(c.clone()), table: Some(obj.clone()) });
                 ui.close();
             }
-            if ternarygrid_ui::kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance"), "").clicked() {
+            if ternarygrid_ui::kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance…"), "").clicked() {
                 cx.push(AppCommand::OpenMaintenance { connection: c.clone(), objects: vec![obj.clone()], op: None });
                 ui.close();
             }
@@ -2036,7 +2213,7 @@ pub fn object_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, obj: &ObjectRef
     }
     if obj.kind == ObjectKind::Trigger
         && cx.conns.live(conn).is_some_and(|l| l.dialect.maintenance_ops().iter().any(|o| o.applies_to.contains(&ObjectKind::Trigger)))
-        && ternarygrid_ui::kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance"), "").on_hover_text(tr("Enable or disable the trigger")).clicked()
+        && ternarygrid_ui::kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance…"), "").on_hover_text(tr("Enable or disable the trigger")).clicked()
     {
         cx.push(AppCommand::OpenMaintenance { connection: conn.to_string(), objects: vec![obj.clone()], op: None });
         ui.close();
@@ -2047,7 +2224,7 @@ pub fn object_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, obj: &ObjectRef
         cx.push(AppCommand::HideInNavigator { connection: conn.to_string(), object: obj.clone() });
         ui.close();
     }
-    if ternarygrid_ui::kit::menu_item(ui, Some(icon::PUSH_PIN), tr("Add bookmark"), "").clicked() {
+    if ternarygrid_ui::kit::menu_item(ui, Some(icon::BOOKMARK_SIMPLE), tr("Add bookmark"), "").clicked() {
         cx.push(AppCommand::AddBookmark { connection: c.clone(), object: obj.clone() });
         ui.close();
     }
@@ -2064,7 +2241,7 @@ pub fn object_menu(ui: &mut Ui, cx: &mut AppContext, conn: &str, obj: &ObjectRef
     // Truncate (Tools › Truncate in DBeaver): its options and SQL in the maintenance dialog.
     if sql
         && matches!(obj.kind, ObjectKind::Table | ObjectKind::Partition)
-        && ternarygrid_ui::kit::menu_item_danger(ui, Some(icon::TRASH), tr("Truncate…"), "").on_hover_text(tr("Delete every row of the table")).clicked()
+        && ternarygrid_ui::kit::menu_item_danger(ui, Some(icon::ERASER), tr("Truncate…"), "").on_hover_text(tr("Delete every row of the table")).clicked()
     {
         cx.push(AppCommand::OpenMaintenance { connection: c.clone(), objects: vec![obj.clone()], op: Some(ternarygrid_core::admin::MaintenanceOp::TRUNCATE.to_string()) });
         ui.close();

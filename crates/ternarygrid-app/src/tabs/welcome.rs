@@ -6,6 +6,9 @@ use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use ternarygrid_core::tr;
 
+/// The sample database's icon, wherever it is offered (the start page, New, Help).
+pub const SAMPLE_ICON: &str = icon::FLASK;
+
 /// Most recently modified scripts of the default project (cached for a few seconds).
 fn recent_scripts(ui: &Ui, cx: &AppContext) -> Vec<ternarygrid_config::project::ScriptInfo> {
     let id = egui::Id::new("welcome_recent_scripts");
@@ -102,10 +105,15 @@ fn action_row(ui: &mut Ui, ic: &str, label: &str, keys: &str) -> egui::Response 
     resp
 }
 
-/// The start page's main action: a full-width primary button, 36 points high.
+/// The start page's main action: a primary button sized to its text, 34 points high, at the
+/// card's left edge.
 fn new_connection_button(ui: &mut Ui) -> egui::Response {
     let p = ternarygrid_ui::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+    let size = ternarygrid_ui::style::body_size(ui.ctx()) + 0.5;
+    let plus = ui.painter().layout_no_wrap(icon::PLUS.to_string(), ternarygrid_ui::style::icon_font(15.0), p.on_accent);
+    let g = ui.painter().layout_no_wrap(tr("New connection").to_string(), ternarygrid_ui::style::medium(ui.ctx(), size), p.on_accent);
+    let w = plus.size().x + 8.0 + g.size().x;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w + 2.0 * 16.0, 34.0), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("New connection")));
     if ui.is_rect_visible(rect) {
         let fill = if resp.hovered() { p.accent_hover } else { p.accent };
@@ -114,16 +122,21 @@ fn new_connection_button(ui: &mut Ui) -> egui::Response {
             ui.painter().rect_stroke(rect.expand(2.0), ternarygrid_ui::style::RADIUS + 2, egui::Stroke::new(1.5, p.accent), egui::StrokeKind::Outside);
         }
         // The plus, 8 points, the text (13.5, medium), centred.
-        let size = ternarygrid_ui::style::body_size(ui.ctx()) + 0.5;
-        let plus = ui.painter().layout_no_wrap(icon::PLUS.to_string(), ternarygrid_ui::style::icon_font(15.0), p.on_accent);
-        let g = ui.painter().layout_no_wrap(tr("New connection").to_string(), ternarygrid_ui::style::medium(ui.ctx(), size), p.on_accent);
-        let w = plus.size().x + 8.0 + g.size().x;
         let x = rect.center().x - w / 2.0;
         let plus_w = plus.size().x;
         ui.painter().galley(egui::pos2(x, rect.center().y - plus.size().y / 2.0), plus, p.on_accent);
         ui.painter().galley(egui::pos2(x + plus_w + 8.0, rect.center().y - g.size().y / 2.0), g, p.on_accent);
     }
     resp
+}
+
+/// The caption over a group of the Recent card (Connections, Scripts): small, medium and
+/// faint as the menus' captions, 12 points under what is above it.
+fn caption(ui: &mut Ui, text: &str, first: bool) {
+    let p = ternarygrid_ui::pal(ui);
+    ui.add_space(if first { 4.0 } else { 12.0 });
+    ui.label(RichText::new(text).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::SMALL)).color(p.text_faint));
+    ui.add_space(2.0);
 }
 
 /// The app's mark: the grid on a rounded accent square.
@@ -157,10 +170,17 @@ pub fn show(ui: &mut Ui, cx: &mut AppContext) {
         });
         ui.add_space(if first_start { 30.0 } else { 28.0 });
         // Two cards side by side when there is room (as tall as each other), else stacked:
-        // 380 and 400 points of content, padded by 18, 24 apart.
-        let (start_w, recent_w) = (380.0, if first_start { 380.0 } else { 400.0 });
-        let wide = ui.available_width() >= start_w + recent_w + 2.0 * 38.0 + 48.0;
-        let total = if wide { start_w + recent_w + 2.0 * 38.0 + 24.0 } else { start_w.max(recent_w) + 38.0 };
+        // 380 and 400 points of content, padded by 18, 24 apart. A first start has nothing
+        // recent: the Start card alone, centred.
+        let (start_w, recent_w) = (380.0, 400.0);
+        let wide = !first_start && ui.available_width() >= start_w + recent_w + 2.0 * 38.0 + 48.0;
+        let total = if wide {
+            start_w + recent_w + 2.0 * 38.0 + 24.0
+        } else if first_start {
+            start_w + 38.0
+        } else {
+            start_w.max(recent_w) + 38.0
+        };
         let margin = ((ui.available_width() - total) / 2.0).max(8.0);
         let height_id = egui::Id::new("welcome_card_height");
         let min_h: f32 = if wide { ui.data(|d| d.get_temp(height_id)).unwrap_or(0.0) } else { 0.0 };
@@ -188,14 +208,16 @@ pub fn show(ui: &mut Ui, cx: &mut AppContext) {
         let push = |c: AppCommand| cmds.borrow_mut().push(c);
         let ro: &AppContext = cx;
         let mut start = |ui: &mut Ui| {
+            ui.add_space(4.0);
             if new_connection_button(ui).clicked() {
                 push(AppCommand::NewConnection { kind: None, folder: None });
             }
+            ui.add_space(4.0);
             let items: [(&str, &str, Option<Action>, Option<&str>, AppCommand); 4] = [
                 (icon::FILE_CODE, tr("New SQL editor"), Some(Action::NewSqlEditor), None, AppCommand::NewSqlEditor { connection: None, schema: None, text: None }),
                 (icon::MAGNIFYING_GLASS, tr("Search or run a command"), Some(Action::CommandPalette), None, AppCommand::ShowPalette),
                 (icon::DOWNLOAD_SIMPLE, tr("Import connections…"), None, Some(tr("From DBeaver, ~/.pgpass or a connection URL")), AppCommand::ImportConnections),
-                (icon::DATABASE, tr("Create sample database"), None, Some(tr("A small SQLite shop database to try every feature")), AppCommand::CreateSampleDatabase),
+                (SAMPLE_ICON, tr("Create sample database"), None, Some(tr("A small SQLite shop database to try every feature")), AppCommand::CreateSampleDatabase),
             ];
             for (ic, label, action, tip, cmd) in items {
                 let keys = action.map(shortcut).unwrap_or_default();
@@ -212,7 +234,7 @@ pub fn show(ui: &mut Ui, cx: &mut AppContext) {
             let mut recent: Vec<_> = ro.conns.configs().iter().filter(|c| c.last_connected.is_some()).cloned().collect();
             recent.sort_by_key(|c| std::cmp::Reverse(c.last_connected));
             let pal = ternarygrid_ui::pal(ui);
-            ui.label(RichText::new(tr("Connections")).size(11.5).color(pal.text_faint));
+            caption(ui, tr("Connections"), true);
             if recent.is_empty() {
                 ui.label(RichText::new(tr("Connections you open appear here.")).color(pal.text_muted));
             }
@@ -230,7 +252,7 @@ pub fn show(ui: &mut Ui, cx: &mut AppContext) {
             }
             let scripts = recent_scripts(ui, ro);
             if !scripts.is_empty() {
-                ui.label(RichText::new(tr("Scripts")).size(11.5).color(pal.text_faint));
+                caption(ui, tr("Scripts"), false);
                 // Where a script is: from its project's folder ("General/Scripts/reports").
                 let root = ro.services.projects.as_ref().and_then(|m| m.default_project().ok()).and_then(|p| p.path().parent().map(|r| r.to_path_buf()));
                 for s in scripts.into_iter().take(6) {
@@ -246,7 +268,9 @@ pub fn show(ui: &mut Ui, cx: &mut AppContext) {
         };
         ui.horizontal_top(|ui| {
             ui.add_space(margin);
-            if wide {
+            if first_start {
+                card(ui, tr("Start"), start_w, 6.0, &mut start);
+            } else if wide {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 card(ui, tr("Start"), start_w, 6.0, &mut start);
                 ui.add_space(24.0);

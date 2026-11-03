@@ -312,7 +312,12 @@ const ANSWER: &str = "Three customers stand out: Kartika Kurniawan placed the mo
 #[test]
 #[ignore = "writes screenshots for visual review; run with --ignored"]
 fn ui_snapshots_designer() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots/designer");
+    // `TERNARYGRID_SNAPSHOT_LABEL=fix` writes to `designer-fix` (beside an earlier run).
+    let folder = match std::env::var("TERNARYGRID_SNAPSHOT_LABEL") {
+        Ok(l) if !l.is_empty() => format!("designer-{l}"),
+        _ => "designer".to_string(),
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots").join(folder);
     std::fs::create_dir_all(&root).unwrap();
     let only = std::env::var("TERNARYGRID_SNAPSHOT_ONLY").unwrap_or_default();
     let want = |part: &str| only.is_empty() || only.split(',').any(|p| p == part);

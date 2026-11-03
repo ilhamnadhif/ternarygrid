@@ -608,6 +608,8 @@ pub struct AiAssistantTab {
     unsaved: bool,
     /// The history's popup was open in the last frame (its button shows it on).
     history_open: bool,
+    /// "Clear history…" asks first: the number of conversations it deletes.
+    confirm_clear: Option<usize>,
 }
 
 /// Shift+Enter starts a new line in the assistant's inputs; Enter sends.
@@ -647,6 +649,7 @@ impl AiAssistantTab {
             saved: None,
             unsaved: false,
             history_open: false,
+            confirm_clear: None,
         }
     }
 
@@ -1172,12 +1175,42 @@ impl AiAssistantTab {
                 });
                 let y = ui.cursor().top() + 3.0;
                 ui.painter().hline(ui.max_rect().x_range().shrink(4.0), y, Stroke::new(1.0, p.border));
-                ui.add_space(7.0);
-                if kit::button_ex(ui, kit::Kind::Ghost, Some(icon::TRASH), tr("Clear history"), true).clicked() {
-                    clear = true;
-                }
+                ui.add_space(4.0);
+                // Deletes every conversation: red, and it asks first.
+                ui.scope(|ui| {
+                    // A menu item's look (no frame at rest) in this pop-up.
+                    egui::containers::menu::menu_style(ui.style_mut());
+                    kit::menu_look(ui, 340.0);
+                    if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Clear history…"), "").clicked() {
+                        self.confirm_clear = Some(saved.len());
+                        ui.close();
+                    }
+                });
             });
         self.history_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+        if let Some(n) = self.confirm_clear {
+            let body = ternarygrid_core::trn(n, "The saved conversation is deleted. This cannot be undone.", "The {} saved conversations are deleted. This cannot be undone.");
+            let (mut yes, mut no) = (false, false);
+            let (resp, ()) = ternarygrid_ui::parts::Dialog::new(tr("Clear the AI history?")).tone(ternarygrid_ui::parts::Tone::Error).icon(icon::TRASH).width(440.0).show_modal(
+                ui.ctx(),
+                egui::Id::new(("ai_clear_history", self.uid)),
+                |ui| {
+                    ui.add(egui::Label::new(RichText::new(body).color(p.text_muted)).wrap());
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        yes = kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::TRASH), tr("Clear history"), false).clicked();
+                        no = kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked();
+                    });
+                },
+            );
+            if yes {
+                clear = true;
+            }
+            if yes || no || resp.close {
+                self.confirm_clear = None;
+            }
+        }
         let store = Self::store(cx);
         let done = if clear {
             store.clear()
@@ -1225,7 +1258,9 @@ impl AiAssistantTab {
             }
             Some(l) => {
                 if let Some(s) = l.get() {
-                    ui.add(egui::Label::new(faint(&trf("Schema context: {} tables, {} views", &[&s.tables.len(), &s.views.len()]))).truncate())
+                    let tables = ternarygrid_core::trn(s.tables.len(), "1 table", "{} tables");
+                    let views = ternarygrid_core::trn(s.views.len(), "1 view", "{} views");
+                    ui.add(egui::Label::new(faint(&trf("Schema context: {}, {}", &[&tables, &views]))).truncate())
                         .on_hover_text(tr("Table and column names of this schema are sent with each question. No data rows are sent."));
                 }
             }
@@ -1338,7 +1373,7 @@ impl AiAssistantTab {
         });
     }
 
-    /// A query the assistant ran: one line ("Ran a query · 3 row(s)") over its result (open at
+    /// A query the assistant ran: one line ("Ran a query · 3 rows") over its result (open at
     /// first; the line folds it). Its SQL shows with "SQL" at the right of the line (at once
     /// when the query failed or returned no columns).
     fn step_ui(&self, ui: &mut Ui, cx: &mut AppContext, step: &ToolStep, id: (u64, usize, usize)) {
@@ -1563,6 +1598,10 @@ impl AiAssistantTab {
             let mut send = false;
             let code = self.action.takes_sql() || self.action == QuickAction::Describe;
             let rows = if code { 4 } else { 2 };
+            // Fixing an error takes two texts: each under its name.
+            if self.action == QuickAction::FixError {
+                field_label(ui, tr("Statement"));
+            }
             let resp = input_box(ui, &mut self.input, ("ai_input", self.uid), self.action.hint(), rows, code);
             if self.focus_input {
                 self.focus_input = false;
@@ -1572,6 +1611,7 @@ impl AiAssistantTab {
                 send = true;
             }
             if self.action == QuickAction::FixError {
+                field_label(ui, tr("Error message"));
                 let r = input_box(ui, &mut self.error_input, ("ai_error", self.uid), tr("Error message from the database"), 2, false);
                 if r.has_focus() && enter_pressed(ui) {
                     send = true;
@@ -1733,6 +1773,14 @@ fn input_box(ui: &mut Ui, text: &mut String, id: impl std::hash::Hash + std::fmt
     out.inner
 }
 
+/// The name over a text box (11.5 points, muted), close to it.
+fn field_label(ui: &mut Ui, text: &str) {
+    let p = ternarygrid_ui::pal(ui);
+    let gap = ui.spacing().item_spacing.y;
+    ui.label(RichText::new(text).size(11.5).color(p.text_muted));
+    ui.add_space(4.0 - gap);
+}
+
 /// What was clicked in an entry of the history.
 enum HistoryClick {
     Open,
@@ -1746,9 +1794,9 @@ fn history_item(ui: &mut Ui, title: &str, detail: &str, current: bool) -> Option
     // 8 × 10 of padding, the title's line as tall as the trash button (22), 2, the detail.
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::click());
     resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, current, title));
-    let trash_rect = Rect::from_center_size(egui::pos2(rect.right() - 21.0, rect.top() + 19.0), Vec2::splat(22.0));
-    let trash = ui.interact(trash_rect, resp.id.with("delete"), Sense::click()).on_hover_text(tr("Delete"));
-    trash.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, tr("Delete")));
+    let trash_rect = Rect::from_center_size(egui::pos2(rect.right() - 21.0, rect.top() + 19.0), Vec2::splat(24.0));
+    let trash = ui.interact(trash_rect, resp.id.with("delete"), Sense::click()).on_hover_text(tr("Delete the conversation"));
+    trash.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, tr("Delete the conversation")));
     let resp = resp.on_hover_text(title);
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
@@ -1757,11 +1805,14 @@ fn history_item(ui: &mut Ui, title: &str, detail: &str, current: bool) -> Option
         } else if resp.hovered() || trash.hovered() {
             painter.rect_filled(rect, CornerRadius::same(style::RADIUS), p.hover);
         }
+        // The trash while the entry is hovered: 14 points, muted (the text on its own hover).
         if trash.hovered() {
             painter.rect_filled(trash_rect, CornerRadius::same(style::RADIUS), p.subtle);
         }
-        let trash_color = if trash.hovered() { p.text } else { p.text_muted };
-        painter.text(trash_rect.center(), Align2::CENTER_CENTER, icon::TRASH, style::icon_font(11.0), trash_color);
+        if resp.hovered() || trash.hovered() || trash.has_focus() {
+            let trash_color = if trash.hovered() { p.text } else { p.text_muted };
+            painter.text(trash_rect.center(), Align2::CENTER_CENTER, icon::TRASH, style::icon_font(14.0), trash_color);
+        }
         let font = if current { style::medium(ui.ctx(), 13.0) } else { FontId::proportional(13.0) };
         let max_w = (rect.width() - 50.0).max(40.0);
         let mut job = egui::text::LayoutJob::simple_singleline(title.to_string(), font, p.text);

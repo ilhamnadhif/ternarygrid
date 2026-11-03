@@ -29,47 +29,125 @@ enum Target {
 struct Item {
     icon: &'static str,
     label: String,
+    /// At the right: the category (commands), the connection and schema (objects), the
+    /// server (connections).
     detail: String,
+    /// The command's shortcut, drawn as key caps at the right end.
+    keys: String,
     target: Target,
 }
 
-/// Case-insensitive subsequence score; higher is better.
-pub fn fuzzy(pattern: &str, text: &str) -> Option<i32> {
-    if pattern.is_empty() {
-        return Some(0);
+/// The palette's groups, each under its caption.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Group {
+    Commands,
+    Connections,
+    Scripts,
+    Objects,
+}
+
+impl Group {
+    fn caption(self) -> &'static str {
+        match self {
+            Group::Commands => tr("Commands"),
+            Group::Connections => tr("Connections"),
+            Group::Scripts => tr("Scripts"),
+            Group::Objects => tr("Objects"),
+        }
     }
-    let t: Vec<char> = text.to_lowercase().chars().collect();
-    let mut score = 0i32;
-    let mut ti = 0usize;
-    let mut last: Option<usize> = None;
-    for pc in pattern.to_lowercase().chars().filter(|c| !c.is_whitespace()) {
-        let mut found = None;
-        while ti < t.len() {
-            if t[ti] == pc {
-                found = Some(ti);
+}
+
+impl Item {
+    fn group(&self) -> Group {
+        match self.target {
+            Target::Action(_) | Target::Command(_) => Group::Commands,
+            Target::Connect(_) | Target::Editor(_) => Group::Connections,
+            Target::Script(_) => Group::Scripts,
+            Target::Bookmark(..) | Target::Object(..) => Group::Objects,
+        }
+    }
+}
+
+/// How well `pattern` matches `text` (case-insensitive; higher is better) and which characters
+/// of `text` matched (char indices, for the highlight). Matches typed in one piece come first
+/// (at the start, then at a word's start, then anywhere), then the word starts typed in pieces
+/// ("nse" or "new ed" for "New SQL editor"), then letters scattered over the text.
+pub fn fuzzy_match(pattern: &str, text: &str) -> Option<(i32, Vec<usize>)> {
+    let lower = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let pat: Vec<char> = pattern.trim().chars().map(lower).collect();
+    if pat.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    let orig: Vec<char> = text.chars().collect();
+    let t: Vec<char> = orig.iter().copied().map(lower).collect();
+    let starts: Vec<bool> =
+        (0..t.len()).map(|i| i == 0 || matches!(orig[i - 1], ' ' | '_' | '.' | '-' | ':' | '/' | '(' | '·') || (orig[i - 1].is_lowercase() && orig[i].is_uppercase())).collect();
+    let penalty = t.len() as i32 / 4;
+    // In one piece.
+    let at = |i: usize| t.len() >= i + pat.len() && t[i..i + pat.len()] == pat[..];
+    let hits: Vec<usize> = (0..t.len()).filter(|&i| at(i)).collect();
+    if let Some(&i) = hits.iter().find(|&&i| starts[i]).or(hits.first()) {
+        let tier = if i == 0 {
+            1000
+        } else if starts[i] {
+            800
+        } else {
+            600
+        };
+        return Some((tier - penalty, (i..i + pat.len()).collect()));
+    }
+    // Word starts in pieces: each piece the beginning of a later word.
+    let pc: Vec<char> = pat.iter().copied().filter(|c| !c.is_whitespace()).collect();
+    let mut positions = Vec::new();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    while pi < pc.len() && ti < t.len() {
+        if starts[ti] && t[ti] == pc[pi] {
+            while pi < pc.len() && ti < t.len() && t[ti] == pc[pi] {
+                positions.push(ti);
+                pi += 1;
                 ti += 1;
-                break;
             }
+        } else {
             ti += 1;
         }
-        let i = found?;
+    }
+    if pi == pc.len() {
+        return Some((500 - penalty, positions));
+    }
+    // Scattered letters.
+    let mut score = 100i32;
+    let mut positions = Vec::new();
+    let mut ti = 0usize;
+    for &c in &pc {
+        let i = (ti..t.len()).find(|&i| t[i] == c)?;
         score += 10;
-        if i == 0 || matches!(t.get(i.wrapping_sub(1)), Some(' ' | '_' | '.' | '-' | ':' | '/')) {
+        if starts[i] {
             score += 8;
         }
-        if last.is_some_and(|l| l + 1 == i) {
+        if positions.last().is_some_and(|&l| l + 1 == i) {
             score += 6;
         }
-        last = Some(i);
+        positions.push(i);
+        ti = i + 1;
     }
-    // Typed as one piece: "set" ranks "Settings" above "Session Manager".
-    let (text, pattern) = (text.to_lowercase(), pattern.trim().to_lowercase());
-    if text.starts_with(&pattern) {
-        score += 30;
-    } else if text.contains(&pattern) {
-        score += 15;
+    Some((score - penalty, positions))
+}
+
+/// [`fuzzy_match`]'s score.
+pub fn fuzzy(pattern: &str, text: &str) -> Option<i32> {
+    fuzzy_match(pattern, text).map(|m| m.0)
+}
+
+/// How `it` matches `query`: by its label (the characters to highlight), else, ranked lower, by
+/// its detail typed in one piece or by word starts (a connection's or a schema's name).
+fn score(query: &str, it: &Item) -> Option<(i32, Vec<usize>)> {
+    if let Some(m) = fuzzy_match(query, &it.label) {
+        return Some(m);
     }
-    Some(score - t.len() as i32 / 4)
+    match fuzzy_match(query, &it.detail) {
+        Some((s, _)) if s >= 400 => Some((s - 450, Vec::new())),
+        _ => None,
+    }
 }
 
 fn collect_project(cx: &AppContext, state: &mut PaletteState) -> Vec<Item> {
@@ -84,13 +162,14 @@ fn collect_project(cx: &AppContext, state: &mut PaletteState) -> Vec<Item> {
         .clone();
     let mut items = Vec::new();
     for (name, path) in &data.0 {
-        items.push(Item { icon: icon::FILE_CODE, label: name.clone(), detail: tr("Script").to_string(), target: Target::Script(path.clone()) });
+        items.push(Item { icon: icon::FILE_CODE, label: name.clone(), detail: String::new(), keys: String::new(), target: Target::Script(path.clone()) });
     }
     for b in &data.1 {
         items.push(Item {
             icon: icon::BOOKMARK_SIMPLE,
             label: b.label.clone(),
             detail: tr("Bookmark").to_string(),
+            keys: String::new(),
             target: Target::Bookmark(b.connection_id.clone(), b.object.clone()),
         });
     }
@@ -98,62 +177,74 @@ fn collect_project(cx: &AppContext, state: &mut PaletteState) -> Vec<Item> {
 }
 
 fn collect(cx: &AppContext) -> Vec<Item> {
+    use crate::keys::ActionCategory as C;
+    let command = |icon: &'static str, label: &str, category: C, target: fn() -> AppCommand| Item {
+        icon,
+        label: tr(label).into(),
+        detail: tr(category.label()).into(),
+        keys: String::new(),
+        target: Target::Command(target),
+    };
     let mut items = vec![
-        Item { icon: icon::PLUS, label: tr("New connection").into(), detail: String::new(), target: Target::Command(|| AppCommand::NewConnection { kind: None, folder: None }) },
-        Item {
-            icon: icon::FILE_CODE,
-            label: tr("New SQL editor").into(),
-            detail: String::new(),
-            target: Target::Command(|| AppCommand::NewSqlEditor { connection: None, schema: None, text: None }),
-        },
-        Item { icon: icon::GEAR, label: tr("Settings").into(), detail: String::new(), target: Target::Command(|| AppCommand::OpenSettings) },
-        Item { icon: icon::CLOCK_COUNTER_CLOCKWISE, label: tr("Query history").into(), detail: String::new(), target: Target::Command(|| AppCommand::OpenHistory) },
-        Item { icon: icon::LIST_CHECKS, label: tr("Tasks").into(), detail: String::new(), target: Target::Command(|| AppCommand::OpenTasks) },
-        Item {
-            icon: icon::GIT_DIFF,
-            label: tr("Compare schemas").into(),
-            detail: String::new(),
-            target: Target::Command(|| AppCommand::OpenSchemaCompare { connection: None, schema: None }),
-        },
-        Item {
-            icon: icon::ARROWS_LEFT_RIGHT,
-            label: tr("Compare data").into(),
-            detail: String::new(),
-            target: Target::Command(|| AppCommand::OpenDataCompare { connection: None, table: None }),
-        },
-        Item { icon: icon::SPARKLE, label: tr("AI assistant").into(), detail: String::new(), target: Target::Command(|| AppCommand::OpenAiAssistant { connection: None }) },
-        Item { icon: icon::DOWNLOAD_SIMPLE, label: tr("Import connections").into(), detail: String::new(), target: Target::Command(|| AppCommand::ImportConnections) },
-        Item { icon: icon::SIDEBAR, label: tr("Toggle navigator").into(), detail: String::new(), target: Target::Command(|| AppCommand::ToggleNavigator) },
-        Item { icon: icon::HOURGLASS, label: tr("Background operations").into(), detail: String::new(), target: Target::Command(|| AppCommand::ToggleOperations) },
-        Item { icon: icon::KEYBOARD, label: tr("Keyboard shortcuts").into(), detail: String::new(), target: Target::Command(|| AppCommand::ShowShortcuts) },
-        Item { icon: icon::PLUGS, label: tr("Disconnect all").into(), detail: String::new(), target: Target::Command(|| AppCommand::DisconnectAll) },
+        command(icon::PLUS, "New connection…", C::Connections, || AppCommand::NewConnection { kind: None, folder: None }),
+        command(icon::FILE_CODE, "New SQL editor", C::Sql, || AppCommand::NewSqlEditor { connection: None, schema: None, text: None }),
+        command(icon::GEAR_SIX, "Settings", C::Application, || AppCommand::OpenSettings),
+        command(icon::CLOCK_COUNTER_CLOCKWISE, "Query history", C::Tools, || AppCommand::OpenHistory),
+        command(icon::LIST_CHECKS, "Tasks", C::Tools, || AppCommand::OpenTasks),
+        command(icon::GIT_DIFF, "Compare schemas…", C::Tools, || AppCommand::OpenSchemaCompare { connection: None, schema: None }),
+        command(icon::ARROWS_LEFT_RIGHT, "Compare data…", C::Tools, || AppCommand::OpenDataCompare { connection: None, table: None }),
+        command(icon::SPARKLE, "AI assistant", C::Tools, || AppCommand::OpenAiAssistant { connection: None }),
+        command(icon::DOWNLOAD_SIMPLE, "Import connections…", C::Connections, || AppCommand::ImportConnections),
+        command(icon::SIDEBAR, "Toggle navigator", C::View, || AppCommand::ToggleNavigator),
+        command(icon::ACTIVITY, "Background operations", C::Tools, || AppCommand::ToggleOperations),
+        command(icon::KEYBOARD, "Keyboard shortcuts", C::Help, || AppCommand::ShowShortcuts),
+        command(icon::PLUGS, "Disconnect all", C::Connections, || AppCommand::DisconnectAll),
     ];
+    // "New connection…" and "New connection" are one command.
+    let key = |s: &str| s.trim_end_matches('…').to_lowercase();
     for a in crate::keys::Action::ALL {
         let label = crate::keys::action_label(*a).to_string();
-        let detail = format!("{} {}", tr(a.category().label()), crate::keys::label(cx.keymap, *a)).trim().to_string();
+        let (detail, keys) = (tr(a.category().label()).to_string(), crate::keys::label(cx.keymap, *a));
         // The same command listed above: it gets the category and shortcut.
-        if let Some(it) = items.iter_mut().find(|it| it.label.to_lowercase() == label.to_lowercase()) {
-            it.detail = detail;
+        if let Some(it) = items.iter_mut().find(|it| key(&it.label) == key(&label)) {
+            (it.detail, it.keys) = (detail, keys);
             continue;
         }
-        items.push(Item { icon: crate::keys::action_icon(*a), label, detail, target: Target::Action(*a) });
+        items.push(Item { icon: crate::keys::action_icon(*a), label, detail, keys, target: Target::Action(*a) });
     }
     for c in cx.conns.configs() {
         let connected = cx.conns.is_connected(&c.id);
         if !connected {
-            items.push(Item { icon: icon::PLUGS_CONNECTED, label: format!("{} {}", tr("Connect:"), c.name), detail: c.summary(), target: Target::Connect(c.id.clone()) });
+            items.push(Item {
+                icon: icon::PLUGS_CONNECTED,
+                label: format!("{} {}", tr("Connect:"), c.name),
+                detail: c.summary(),
+                keys: String::new(),
+                target: Target::Connect(c.id.clone()),
+            });
         }
-        items.push(Item { icon: icon::FILE_CODE, label: format!("{} {}", tr("SQL editor:"), c.name), detail: c.summary(), target: Target::Editor(c.id.clone()) });
+        items.push(Item {
+            icon: icon::FILE_CODE,
+            label: format!("{} {}", tr("SQL editor:"), c.name),
+            detail: c.summary(),
+            keys: String::new(),
+            target: Target::Editor(c.id.clone()),
+        });
     }
     for id in cx.conns.live_ids() {
         let Some(live) = cx.conns.live(&id) else { continue };
         for ((schema, kind), list) in &live.meta.objects {
             if let Loadable::Loaded(objs) = list {
                 for o in objs.iter().take(5000) {
+                    let detail = match &schema.schema {
+                        Some(s) => format!("{} · {s}", live.config.name),
+                        None => live.config.name.clone(),
+                    };
                     items.push(Item {
                         icon: crate::nav::kind_icon(*kind),
                         label: o.obj.name.clone(),
-                        detail: format!("{} · {}", live.config.name, schema.schema.clone().unwrap_or_default()),
+                        detail,
+                        keys: String::new(),
                         target: Target::Object(id.clone(), o.obj.clone()),
                     });
                 }
@@ -168,9 +259,10 @@ pub fn reset(ctx: &egui::Context) {
     ctx.data_mut(|d| d.remove::<PaletteState>(egui::Id::new("ternarygrid_palette")));
 }
 
-/// One full-width row: the coloured icon, the label, and on the right the
-/// detail (category and shortcut, connection, script folder).
-fn row(ui: &mut egui::Ui, it: &Item, selected: bool) -> egui::Response {
+/// One full-width row: the coloured icon, the label with the characters that matched in the
+/// accent, and on the right the detail (category, connection, server) in small faint text and
+/// the shortcut as key caps.
+fn row(ui: &mut egui::Ui, it: &Item, hits: &[usize], selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
     let p = ternarygrid_ui::pal(ui);
     if selected {
@@ -178,22 +270,43 @@ fn row(ui: &mut egui::Ui, it: &Item, selected: bool) -> egui::Response {
     } else if resp.hovered() {
         ui.painter().rect_filled(rect, ternarygrid_ui::style::RADIUS, p.hover);
     }
-    let text = p.text;
-    let weak = p.text_faint;
+    let painter = ui.painter().clone();
+    let cy = rect.center().y;
     let icon_color = if selected { p.accent_text } else { ternarygrid_icons::color(it.icon).unwrap_or(p.text_muted) };
-    // As in the design: the icon 12 points in, the label 12 after it (13.5), the detail at the
-    // right in small faint text.
-    ui.painter().text(rect.left_center() + egui::vec2(19.5, 0.0), egui::Align2::CENTER_CENTER, it.icon, ternarygrid_ui::style::icon_font(15.0), icon_color);
-    let fit = |text: RichText, width: f32, style: egui::TextStyle| egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), width, style);
-    let detail = (!it.detail.is_empty()).then(|| fit(RichText::new(&it.detail).size(12.0).color(weak), rect.width() * 0.45, egui::TextStyle::Small));
-    let detail_w = detail.as_ref().map_or(0.0, |g| g.size().x + 16.0);
-    let label = fit(RichText::new(&it.label).size(13.5).color(text), (rect.width() - 51.0 - detail_w).max(40.0), egui::TextStyle::Body);
-    ui.painter().galley(egui::pos2(rect.left() + 39.0, rect.center().y - label.size().y / 2.0), label, text);
-    if let Some(g) = detail {
-        ui.painter().galley(egui::pos2(rect.right() - 12.0 - g.size().x, rect.center().y - g.size().y / 2.0), g, weak);
+    // As in the design: the icon 12 points in, the label 12 after it (13.5).
+    painter.text(rect.left_center() + egui::vec2(19.5, 0.0), egui::Align2::CENTER_CENTER, it.icon, ternarygrid_ui::style::icon_font(15.0), icon_color);
+    let label_x = rect.left() + 39.0;
+    let mut right = rect.right() - 12.0;
+    if !it.keys.is_empty() {
+        right = ternarygrid_ui::kit::paint_kbd_text(&painter, ui.ctx(), &it.keys, right, cy, &p).left() - 10.0;
     }
+    if !it.detail.is_empty() {
+        let width = (rect.width() * 0.45).min(right - label_x - 80.0).max(20.0);
+        let g = egui::WidgetText::from(RichText::new(&it.detail).size(12.0).color(p.text_faint)).into_galley(ui, Some(egui::TextWrapMode::Truncate), width, egui::TextStyle::Small);
+        let w = g.size().x;
+        painter.galley(egui::pos2(right - w, cy - g.size().y / 2.0), g, p.text_faint);
+        right -= w + 16.0;
+    }
+    let mut job = egui::text::LayoutJob::default();
+    let (plain, matched) = (egui::FontId::proportional(13.5), ternarygrid_ui::style::medium(ui.ctx(), 13.5));
+    for (i, c) in it.label.chars().enumerate() {
+        let hit = hits.contains(&i);
+        let format = egui::TextFormat::simple(if hit { matched.clone() } else { plain.clone() }, if hit { p.accent_text } else { p.text });
+        job.append(c.encode_utf8(&mut [0; 4]), 0.0, format);
+    }
+    job.wrap = egui::text::TextWrapping::truncate_at_width((right - label_x).max(40.0));
+    let label = painter.layout_job(job);
+    painter.galley(egui::pos2(label_x, cy - label.size().y / 2.0), label, p.text);
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &it.label));
     resp
+}
+
+/// A group's caption over its rows: small, medium and faint, as the menus' captions.
+fn caption(ui: &mut egui::Ui, text: &str, first: bool) {
+    let p = ternarygrid_ui::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), if first { 22.0 } else { 30.0 }), egui::Sense::hover());
+    let font = ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::SMALL);
+    ui.painter().text(egui::pos2(rect.left() + 12.0, rect.bottom() - 6.0), egui::Align2::LEFT_BOTTOM, text, font, p.text_faint);
 }
 
 pub fn show(ctx: &egui::Context, cx: &mut AppContext, open: &mut bool) {
@@ -201,9 +314,17 @@ pub fn show(ctx: &egui::Context, cx: &mut AppContext, open: &mut bool) {
     let mut state: PaletteState = ctx.data_mut(|d| d.get_temp(id)).unwrap_or_default();
     let mut items = collect(cx);
     items.extend(collect_project(cx, &mut state));
-    let mut scored: Vec<(i32, &Item)> = items.iter().filter_map(|it| fuzzy(&state.query, &format!("{} {}", it.label, it.detail)).map(|s| (s, it))).collect();
+    let mut scored: Vec<(i32, Vec<usize>, &Item)> = items.iter().filter_map(|it| score(&state.query, it).map(|(s, hits)| (s, hits, it))).collect();
     scored.sort_by_key(|s| std::cmp::Reverse(s.0));
     scored.truncate(60);
+    // In groups under their captions: the group of the best match first (before typing:
+    // commands, connections, scripts, objects), each sorted by score.
+    let best = |g: Group| scored.iter().filter(|s| s.2.group() == g).map(|s| s.0).max();
+    let mut groups: Vec<Group> = [Group::Commands, Group::Connections, Group::Scripts, Group::Objects].into_iter().filter(|g| best(*g).is_some()).collect();
+    if !state.query.trim().is_empty() {
+        groups.sort_by_key(|g| std::cmp::Reverse(best(*g)));
+    }
+    scored.sort_by_key(|s| (groups.iter().position(|g| *g == s.2.group()), std::cmp::Reverse(s.0)));
     if state.selected >= scored.len() {
         state.selected = scored.len().saturating_sub(1);
     }
@@ -255,9 +376,14 @@ pub fn show(ctx: &egui::Context, cx: &mut AppContext, open: &mut bool) {
             ui.add_space(1.0);
             egui::Frame::new().inner_margin(6).show(ui, |ui| {
                 egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
-                    for (i, (_, it)) in scored.iter().enumerate() {
+                    let mut group = None;
+                    for (i, (_, hits, it)) in scored.iter().enumerate() {
+                        if group != Some(it.group()) {
+                            caption(ui, it.group().caption(), group.is_none());
+                            group = Some(it.group());
+                        }
                         let sel = i == state.selected;
-                        let resp = row(ui, it, sel);
+                        let resp = row(ui, it, hits, sel);
                         if sel {
                             resp.scroll_to_me(None);
                         }
@@ -292,7 +418,7 @@ pub fn show(ctx: &egui::Context, cx: &mut AppContext, open: &mut bool) {
         *open = false;
     }
     if let Some(i) = chosen {
-        if let Some((_, it)) = scored.get(i) {
+        if let Some((_, _, it)) = scored.get(i) {
             match &it.target {
                 Target::Action(a) => cx.push(AppCommand::Action(*a)),
                 Target::Script(p) => cx.push(AppCommand::OpenScript(p.clone())),
@@ -322,7 +448,7 @@ pub fn show(ctx: &egui::Context, cx: &mut AppContext, open: &mut bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::fuzzy;
+    use super::{fuzzy, fuzzy_match};
 
     #[test]
     fn fuzzy_ranks_prefix_higher() {
@@ -331,7 +457,23 @@ mod tests {
         assert!(a > b);
         assert!(fuzzy("xyz", "New connection").is_none());
         // A word typed in one piece beats letters spread over several words.
-        assert!(fuzzy("set", "Settings Application ⌘,").unwrap() > fuzzy("set", "Session Manager Tools").unwrap());
-        assert!(fuzzy("export", "Export data Results").unwrap() > fuzzy("export", "Open recent export folder").unwrap());
+        assert!(fuzzy("set", "Settings").unwrap() > fuzzy("set", "Reset zoom").unwrap());
+        assert!(fuzzy("set", "Settings").unwrap() > fuzzy("set", "Session manager Tools").unwrap());
+        assert!(fuzzy("export", "Export data…").unwrap() > fuzzy("export", "Open recent export folder").unwrap());
+    }
+
+    #[test]
+    fn fuzzy_prefers_word_starts_to_scattered_letters() {
+        // "ord": the tables and the script named so, then letters spread over a label.
+        let order = fuzzy("ord", "order_line").unwrap();
+        let script = fuzzy("ord", "reports/orders_daily.sql").unwrap();
+        let spread = fuzzy("ord", "Morph to delimited list").unwrap();
+        let export = fuzzy("ord", "Export data…").unwrap();
+        assert!(order > script && script > spread && script > export);
+        // Word starts typed in pieces beat scattered letters.
+        assert!(fuzzy("nse", "New SQL editor").unwrap() > fuzzy("nse", "Toggle line comment").unwrap_or(i32::MIN));
+        // The matched characters, for the highlight.
+        assert_eq!(fuzzy_match("ord", "reports/orders_daily.sql").unwrap().1, vec![8, 9, 10]);
+        assert_eq!(fuzzy_match("nse", "New SQL editor").unwrap().1, vec![0, 4, 8]);
     }
 }

@@ -602,7 +602,7 @@ fn shots(s: &mut Shots) {
     s.click("Projects and scripts");
     s.frames(4);
     s.shot("projects");
-    s.click("Database Navigator");
+    s.click("Database navigator");
 
     // The navigator's states: filtered, a connection that failed, an empty folder.
     let failed = s.h.state().conns.configs().iter().find(|c| c.name == "local-notes.db").unwrap().id.clone();

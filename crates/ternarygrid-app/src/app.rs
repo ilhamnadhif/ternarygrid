@@ -1514,6 +1514,8 @@ impl TernaryGridApp {
     fn menu_bar(&mut self, ui: &mut Ui) {
         use crate::menu::MenuAction as M;
         let state = self.menu_state();
+        // Why New database… / New schema… are off, for their tooltips.
+        let (database_why, schema_why) = (self.cannot_create(false), self.cannot_create(true));
         let chosen: std::cell::Cell<Option<M>> = std::cell::Cell::new(None);
         egui::MenuBar::new().ui(ui, |ui| {
             // An item as in the design's menus: a muted icon (or its room) and the text.
@@ -1528,7 +1530,7 @@ impl TernaryGridApp {
                 item(ui, true, Some(icon::FILE_CODE), tr("New SQL editor"), M::NewSqlEditor);
                 item(ui, true, Some(icon::FOLDER_OPEN), tr("Open script…"), M::OpenScript);
                 kit::menu_separator(ui);
-                item(ui, true, Some(icon::GEAR), tr("Settings…"), M::Settings);
+                item(ui, true, Some(icon::GEAR_SIX), tr("Settings…"), M::Settings);
                 kit::menu_separator(ui);
                 item(ui, true, None, tr("Quit"), M::Quit);
             });
@@ -1537,8 +1539,20 @@ impl TernaryGridApp {
                 item(ui, true, Some(icon::PLUS), tr("New connection…"), M::NewConnection);
                 item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), M::ImportConnections);
                 kit::menu_separator(ui);
-                item(ui, state.new_database, Some(icon::DATABASE), tr("New database…"), M::NewDatabase);
-                item(ui, state.new_schema, Some(icon::STACK), tr("New schema…"), M::NewSchema);
+                for (on, why, glyph, text, action) in [
+                    (state.new_database, &database_why, icon::DATABASE, tr("New database…"), M::NewDatabase),
+                    (state.new_schema, &schema_why, icon::STACK, tr("New schema…"), M::NewSchema),
+                ] {
+                    let r = ui.add_enabled_ui(on, |ui| kit::menu_item(ui, Some(glyph), text, "")).inner;
+                    let r = match why.as_deref() {
+                        Some(why) if !on => r.on_disabled_hover_text(why),
+                        _ => r,
+                    };
+                    if r.clicked() {
+                        chosen.set(Some(action));
+                        ui.close();
+                    }
+                }
                 kit::menu_separator(ui);
                 item(ui, true, Some(icon::PLUGS), tr("Disconnect all"), M::DisconnectAll);
                 item(ui, true, Some(icon::QUEUE), tr("Pending transactions…"), M::PendingTransactions);
@@ -1549,10 +1563,10 @@ impl TernaryGridApp {
             });
             ui.menu_button(tr("Tools"), |ui| {
                 kit::menu_look(ui, 230.0);
-                item(ui, true, Some(icon::CLOCK), tr("Query history"), M::QueryHistory);
+                item(ui, true, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Query history"), M::QueryHistory);
                 item(ui, true, Some(icon::LIST_CHECKS), tr("Tasks"), M::Tasks);
                 item(ui, true, Some(icon::SPARKLE), tr("AI assistant"), M::AiAssistant);
-                item(ui, true, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Background operations"), M::BackgroundOperations);
+                item(ui, true, Some(icon::ACTIVITY), tr("Background operations"), M::BackgroundOperations);
                 kit::menu_separator(ui);
                 item(ui, true, Some(icon::EXPORT), tr("Export data…"), M::ExportData);
                 item(ui, true, Some(icon::DOWNLOAD_SIMPLE), tr("Import data…"), M::ImportData);
@@ -1581,9 +1595,9 @@ impl TernaryGridApp {
             });
             ui.menu_button(tr("Help"), |ui| {
                 kit::menu_look(ui, 230.0);
-                item(ui, true, None, tr("Keyboard shortcuts"), M::KeyboardShortcuts);
-                item(ui, true, None, tr("Database drivers"), M::DatabaseDrivers);
-                item(ui, true, None, tr("Create sample database"), M::CreateSampleDatabase);
+                item(ui, true, Some(icon::KEYBOARD), tr("Keyboard shortcuts"), M::KeyboardShortcuts);
+                item(ui, true, Some(icon::PLUG), tr("Database drivers"), M::DatabaseDrivers);
+                item(ui, true, Some(crate::tabs::welcome::SAMPLE_ICON), tr("Create sample database"), M::CreateSampleDatabase);
                 item(ui, true, Some(icon::LIGHTBULB), tr("Tip of the day"), M::TipOfTheDay);
                 kit::menu_separator(ui);
                 item(ui, true, Some(icon::WARNING_OCTAGON), tr("Error log"), M::ErrorLog);
@@ -1790,18 +1804,20 @@ impl eframe::App for TernaryGridApp {
             // high over a hairline, the title at 14, its buttons 8 from the edge.
             let frame = egui::Frame::new().fill(ternarygrid_ui::pal(ui).canvas).inner_margin(egui::Margin { left: 0, right: 1, top: 0, bottom: 0 });
             let nav_panel = egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(273.0).size_range(180.0..=600.0).frame(frame).show(ui, |ui| {
-                let title = if self.show_project { tr("Projects") } else { tr("Database Navigator") };
+                let title = if self.show_project { tr("Projects") } else { tr("Database navigator") };
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 38.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.set_min_height(38.0);
                     ui.add_space(14.0);
                     kit::semibold_label(ui, title, 13.0, ternarygrid_ui::pal(ui).text);
-                    if !self.show_project {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(8.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        if self.show_project {
+                            self.project.toolbar_ui(ui, &mut cx);
+                        } else {
                             self.nav.toolbar_ui(ui, &mut cx);
-                        });
-                    }
+                        }
+                    });
                 });
                 ternarygrid_ui::parts::hline(ui);
                 if self.show_project {

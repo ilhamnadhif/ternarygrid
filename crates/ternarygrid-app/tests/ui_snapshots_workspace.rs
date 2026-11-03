@@ -452,7 +452,7 @@ fn shots(s: &mut Shots) {
     s.click("Projects and scripts");
     s.frames(4);
     s.shot("projects");
-    s.click("Database Navigator");
+    s.click("Database navigator");
 
     // Query history: a few statements, one failing.
     run_sql(s, &conn, "select * from product order by price desc");

@@ -68,6 +68,26 @@ impl ProjectView {
         self.diagrams = p.list_diagrams().unwrap_or_default();
     }
 
+    /// The buttons of the panel's header, as the navigator's (laid out right to left): open the
+    /// project's folder, refresh, a new SQL script.
+    pub fn toolbar_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let folder_tip = if crate::keys::IS_MAC { tr("Show in Finder") } else { tr("Open the project's folder") };
+            if let Some(p) = cx.services.projects.as_ref().and_then(|m| m.default_project().ok())
+                && kit::icon_button_sized(ui, icon::FOLDER_OPEN, folder_tip, false, 26.0, 15.0).clicked()
+            {
+                let _ = open::that(p.path());
+            }
+            if kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 15.0).clicked() {
+                self.reload(cx);
+            }
+            if kit::icon_button_sized(ui, icon::FILE_PLUS, tr("New SQL editor"), false, 26.0, 15.0).clicked() {
+                cx.push(AppCommand::NewSqlEditor { connection: None, schema: None, text: None });
+            }
+        });
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if self.loaded.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
             self.reload(cx);
@@ -123,22 +143,7 @@ impl ProjectView {
                 }
             }
         }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.add_space(8.0);
-            if kit::icon_button_sized(ui, icon::PLUS, tr("New SQL editor"), false, 26.0, 14.0).clicked() {
-                cx.push(AppCommand::NewSqlEditor { connection: None, schema: None, text: None });
-            }
-            if kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 14.0).clicked() {
-                self.reload(cx);
-            }
-            if let Some(p) = cx.services.projects.as_ref().and_then(|m| m.default_project().ok())
-                && kit::icon_button_sized(ui, icon::FOLDER_OPEN, tr("Show in Finder"), false, 26.0, 14.0).clicked()
-            {
-                let _ = open::that(p.path());
-            }
-        });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         egui::Frame::new()
             .inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 8 })
             .show(ui, |ui| kit::search_field(ui, egui::Id::new("project_filter"), &mut self.filter, tr("Filter"), ui.available_width()));
@@ -157,7 +162,7 @@ impl ProjectView {
             {
                 self.folder(ui, cx, &root, &filter, 1);
             }
-            if section(ui, &mut self.folded, "bookmarks", icon::PUSH_PIN, tr("Bookmarks")) {
+            if section(ui, &mut self.folded, "bookmarks", icon::BOOKMARK_SIMPLE, tr("Bookmarks")) {
                 if self.bookmarks.is_empty() {
                     hint(ui, tr("Right-click an object in the navigator to bookmark it."));
                 }
