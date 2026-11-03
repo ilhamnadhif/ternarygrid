@@ -452,30 +452,57 @@ impl TernaryGridApp {
             // Committed or rolled back meanwhile (Review transactions): nothing is lost any more.
             decided = Some(true);
         } else {
-            let (answer, reviewed) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false));
-            let (resp, _) = Dialog::new(tr("Uncommitted transactions")).icon(icon::WARNING).width(520.0).body_padding(dialogs::BODY).show_modal(
-                ctx,
-                egui::Id::new("confirm_disconnect"),
-                |ui| {
-                    dialogs::body_text(ui, tr("Disconnecting rolls back the uncommitted changes of:"));
-                    let p = ternarygrid_ui::pal(ui);
-                    dialogs::bullets(ui, pending.iter().take(10).map(|p| format!("{} — {}", p.conn_name, p.owner)), p.text);
-                },
-                |ui| {
-                    if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Review transactions"), false).clicked() {
-                        reviewed.set(true);
-                    }
-                    dialogs::right(ui, |ui| {
-                        let label = if reconnect { tr("Roll back and reconnect") } else { tr("Roll back and disconnect") };
-                        if kit::button_ex(ui, kit::Kind::DangerFilled, None, label, false).clicked() {
-                            answer.set(Some(true));
+            let (answer, reviewed, commit) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false), std::cell::Cell::new(false));
+            // Committing: disconnected once the commits are done (a failed one stays, with its toast).
+            let committing = self.pending_tx.busy();
+            let (resp, _) = Dialog::new(tr("Uncommitted transactions"))
+                .icon(icon::WARNING)
+                .tone(ternarygrid_ui::parts::Tone::Warning)
+                .width(dialogs::WIDTH_M)
+                .body_padding(dialogs::BODY)
+                .show_modal(
+                    ctx,
+                    egui::Id::new("confirm_disconnect"),
+                    |ui| {
+                        let text = if reconnect { tr("Reconnecting rolls back the uncommitted changes of:") } else { tr("Disconnecting rolls back the uncommitted changes of:") };
+                        dialogs::body_text(ui, text);
+                        let p = ternarygrid_ui::pal(ui);
+                        dialogs::bullets(ui, pending.iter().take(10).map(|p| format!("{} — {}", p.conn_name, p.owner)), p.text);
+                        // Beside the list it is about (the footer has the three answers).
+                        if dialogs::review_button(ui, !committing) {
+                            reviewed.set(true);
                         }
-                        if dialogs::cancel_button(ui).clicked() {
-                            answer.set(Some(false));
+                    },
+                    |ui| {
+                        if committing {
+                            ternarygrid_ui::parts::spinner_label(ui, tr("Committing…"));
                         }
-                    });
-                },
-            );
+                        dialogs::right(ui, |ui| {
+                            ui.add_enabled_ui(!committing, |ui| {
+                                let (roll_back, keep) = if reconnect {
+                                    (tr("Roll back and reconnect"), tr("Commit and reconnect"))
+                                } else {
+                                    (tr("Roll back and disconnect"), tr("Commit and disconnect"))
+                                };
+                                if kit::button_ex(ui, kit::Kind::DangerFilled, None, roll_back, false).clicked() {
+                                    answer.set(Some(true));
+                                }
+                                if kit::secondary(ui, None, keep).clicked() {
+                                    commit.set(true);
+                                }
+                                if dialogs::cancel_button(ui).clicked() {
+                                    answer.set(Some(false));
+                                }
+                            });
+                        });
+                    },
+                );
+            if commit.get() {
+                self.pending_tx.commit_all(&self.backend, &pending);
+            }
+            if committing || commit.get() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
             decided = answer.get();
             review = reviewed.get();
             if resp.close && decided.is_none() && !review {
@@ -1692,46 +1719,89 @@ impl eframe::App for TernaryGridApp {
         if self.confirm_quit {
             let dirty: Vec<String> = self.dock.iter_all_tabs().filter(|(_, t)| t.view.is_dirty()).map(|(_, t)| t.view.title()).collect();
             let pending = crate::pending_tx::collect(&self.dock, &self.conns);
-            let running = self.ops.running();
-            let (answer, reviewed) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false));
-            let (resp, _) = Dialog::new(tr("Quit TernaryGrid?")).icon(icon::WARNING).width(560.0).body_padding(dialogs::BODY).show_modal(
-                &ctx,
-                egui::Id::new("confirm_quit"),
-                |ui| {
-                    let p = ternarygrid_ui::pal(ui);
-                    if !dirty.is_empty() {
-                        dialogs::strong(ui, tr("These tabs have unsaved changes:"));
-                        let tabs: Vec<String> = dirty.iter().take(10).map(|t| format!("• {t}")).collect();
-                        ui.add(egui::Label::new(RichText::new(tabs.join(" ")).color(p.text_muted)).wrap());
-                    }
-                    if !pending.is_empty() {
-                        dialogs::strong(ui, tr("These connections have uncommitted transactions; quitting rolls them back:"));
-                        dialogs::bullets(ui, pending.iter().take(10).map(|p| format!("{} — {}", p.conn_name, p.owner)), p.text_muted);
-                    }
-                    if running > 0 {
-                        let text = if running == 1 {
-                            tr("1 operation is still running (export, import, migration …); quitting stops it half way.").to_string()
-                        } else {
-                            ternarygrid_core::trf("{} operations are still running (export, import, migration …); quitting stops them half way.", &[&running])
+            let running = self.ops.running_titles();
+            // "Commit and quit" was chosen: quit once the commits are done (a failed one stays
+            // listed, with its toast).
+            let after_commit = egui::Id::new("confirm_quit_after_commit");
+            let committing = ctx.data(|d| d.get_temp::<bool>(after_commit)).unwrap_or(false);
+            let (answer, reviewed, commit) = (std::cell::Cell::new(None::<bool>), std::cell::Cell::new(false), std::cell::Cell::new(false));
+            // The danger button says what is lost.
+            let quit_label = match (!pending.is_empty(), !dirty.is_empty()) {
+                (true, true) => tr("Discard and quit"),
+                (true, false) => tr("Roll back and quit"),
+                (false, true) => tr("Quit without saving"),
+                (false, false) => tr("Stop and quit"),
+            };
+            // Committing keeps nothing else back: no unsaved tab, no operation that would stop.
+            let can_commit = !pending.is_empty() && dirty.is_empty() && running.is_empty();
+            let (resp, _) =
+                Dialog::new(tr("Quit TernaryGrid")).icon(icon::WARNING).tone(ternarygrid_ui::parts::Tone::Warning).width(dialogs::WIDTH_M).body_padding(dialogs::BODY).show_modal(
+                    &ctx,
+                    egui::Id::new("confirm_quit"),
+                    |ui| {
+                        let p = ternarygrid_ui::pal(ui);
+                        if !dirty.is_empty() {
+                            dialogs::strong(ui, tr("These tabs have unsaved changes:"));
+                            let tabs: Vec<String> = dirty.iter().take(10).map(|t| format!("• {t}")).collect();
+                            ui.add(egui::Label::new(RichText::new(tabs.join("   ")).color(p.text_muted)).wrap());
+                        }
+                        if !pending.is_empty() {
+                            if !dirty.is_empty() {
+                                ui.add_space(6.0);
+                            }
+                            dialogs::strong(ui, tr("These connections have uncommitted transactions; quitting rolls them back:"));
+                            dialogs::bullets(ui, pending.iter().take(10).map(|p| format!("{} — {}", p.conn_name, p.owner)), p.text_muted);
+                            if dialogs::review_button(ui, !committing) {
+                                reviewed.set(true);
+                            }
+                        }
+                        let text = match running.as_slice() {
+                            [] => None,
+                            [one] => Some(ternarygrid_core::trf("{} is still running; quitting stops it halfway.", &[one])),
+                            [a, b] => Some(ternarygrid_core::trf("{} and {} are still running; quitting stops them halfway.", &[a, b])),
+                            [a, rest @ ..] => Some(ternarygrid_core::trf("{} and {} more operations are still running; quitting stops them halfway.", &[a, &rest.len()])),
                         };
-                        dialogs::note(ui, ternarygrid_ui::parts::Tone::Warning, &text);
-                    }
-                },
-                |ui| {
-                    if !pending.is_empty() && kit::button_ex(ui, kit::Kind::Ghost, None, tr("Review transactions"), false).clicked() {
-                        reviewed.set(true);
-                    }
-                    dialogs::right(ui, |ui| {
-                        if kit::button_ex(ui, kit::Kind::DangerFilled, None, tr("Quit without saving"), false).clicked() {
-                            answer.set(Some(true));
+                        if let Some(text) = text {
+                            dialogs::note(ui, ternarygrid_ui::parts::Tone::Warning, &text);
                         }
-                        if dialogs::cancel_button(ui).clicked() {
-                            answer.set(Some(false));
+                    },
+                    |ui| {
+                        if committing {
+                            ternarygrid_ui::parts::spinner_label(ui, tr("Committing…"));
                         }
-                    });
-                },
-            );
+                        dialogs::right(ui, |ui| {
+                            ui.add_enabled_ui(!committing, |ui| {
+                                if kit::button_ex(ui, kit::Kind::DangerFilled, None, quit_label, false).clicked() {
+                                    answer.set(Some(true));
+                                }
+                                if can_commit && kit::secondary(ui, None, tr("Commit and quit")).clicked() {
+                                    commit.set(true);
+                                }
+                                if dialogs::cancel_button(ui).clicked() {
+                                    answer.set(Some(false));
+                                }
+                            });
+                        });
+                    },
+                );
             let (mut decided, review) = (answer.get(), reviewed.get());
+            if commit.get() {
+                self.pending_tx.commit_all(&self.backend, &pending);
+                ctx.data_mut(|d| d.insert_temp(after_commit, true));
+            }
+            if committing && !self.pending_tx.busy() {
+                // Done: quit when every transaction was committed, else ask again.
+                ctx.data_mut(|d| d.remove::<bool>(after_commit));
+                if pending.is_empty() {
+                    decided = Some(true);
+                }
+            }
+            if committing || commit.get() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            if decided == Some(false) || (decided.is_none() && resp.close) {
+                ctx.data_mut(|d| d.remove::<bool>(after_commit));
+            }
             if review {
                 self.pending_tx.open = true;
                 decided = Some(false);

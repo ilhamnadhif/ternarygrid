@@ -116,9 +116,8 @@ impl AlterDatabaseDialog {
         let can = !statements.is_empty() && !busy && !read_only && !in_use;
         let script = statements.iter().map(|s| format!("{s};\n")).collect::<String>();
         let (save_clicked, editor, cancel) = (Cell::new(false), Cell::new(false), Cell::new(false));
-        let title = trf("Database {}", &[&name]);
-        let subtitle = trf("On {}", &[&conn_name]);
-        let (resp, _) = Dialog::new(&title).icon(icon::DATABASE).subtitle(&subtitle).width(600.0).body_padding(super::BODY).show_modal(
+        let subtitle = trf("{} · on {}", &[&name, &conn_name]);
+        let (resp, _) = Dialog::new(tr("Edit database")).icon(icon::DATABASE).subtitle(&subtitle).width(super::WIDTH_M).body_padding(super::BODY).show_modal(
             ctx,
             egui::Id::new(("alter_database", &self.conn)),
             |ui| {
@@ -142,8 +141,19 @@ impl AlterDatabaseDialog {
                         tr("The connection itself uses this database, so PostgreSQL cannot rename it: choose another database in the connection's settings first."),
                     );
                 }
+                let editable = edits.name
+                    || edits.owner
+                    || edits.encoding
+                    || edits.collation
+                    || edits.tablespace
+                    || edits.connection_limit
+                    || edits.is_template
+                    || edits.allow_connections
+                    || edits.comment;
                 if self.original.is_some() {
-                    if statements.is_empty() {
+                    if !editable {
+                        super::muted(ui, &trf("{} can't change a database's properties with SQL.", &[&kind.display_name()]));
+                    } else if statements.is_empty() {
                         super::muted(ui, tr("No changes."));
                     } else {
                         super::sql_preview(ui, ("alter_db_sql", &self.conn), Some(dialect.clone()), script.trim_end(), 140.0, false);
@@ -187,7 +197,8 @@ impl AlterDatabaseDialog {
     /// The fields: editable where the product can change them, else shown as read.
     fn form(&mut self, ui: &mut egui::Ui, original: &DatabaseProps, kind: DbKind, edits: ternarygrid_core::DatabaseEdits, save: &mut bool) {
         let p = ternarygrid_ui::pal(ui);
-        let value = |ui: &mut egui::Ui, v: &str| super::value_text(ui, v, p.text_muted, false);
+        // Read-only values in the text colour (muted would read as disabled); unset: a dash.
+        let value = |ui: &mut egui::Ui, v: &str| if v.is_empty() { super::value_text(ui, "—", p.text_faint, false) } else { super::value_text(ui, v, p.text, false) };
         super::form_row(ui, tr("Name"), |ui| {
             if edits.name {
                 let r = add_field(ui, text_field(&mut self.edited.name, f32::INFINITY));
@@ -243,7 +254,7 @@ impl AlterDatabaseDialog {
                 let edit = egui::TextEdit::multiline(&mut text)
                     .margin(egui::Margin::symmetric(13, 6))
                     .min_size(egui::vec2(0.0, 50.0))
-                    .vertical_align(egui::Align::Center)
+                    .vertical_align(egui::Align::Min)
                     .desired_rows(2)
                     .desired_width(f32::INFINITY);
                 let r = ui.add_enabled_ui(edits.comment, |ui| add_field(ui, edit)).inner;

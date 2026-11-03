@@ -10,9 +10,9 @@ use egui_phosphor::regular as icon;
 use std::cell::Cell;
 use ternarygrid_core::ddl::{CheckDef, ForeignKeyDef, IndexDef, KeyDef, RoutineDef, SequenceDef, TableDef, TriggerDef, ViewDef};
 use ternarygrid_core::meta::{ObjectKind, ObjectRef};
-use ternarygrid_core::{DbResult, Dialect, tr, trf};
+use ternarygrid_core::{DbResult, Dialect, tr, trn};
 use ternarygrid_ui::kit::{self, Kind};
-use ternarygrid_ui::parts::{self, Dialog};
+use ternarygrid_ui::parts::{self, Dialog, Tone};
 use ternarygrid_ui::style;
 
 pub struct DropDialog {
@@ -80,7 +80,7 @@ impl DropDialog {
             self.job = None;
             match r {
                 Ok(n) => {
-                    cx.toasts.success(trf("{} object(s) dropped", &[&n]));
+                    cx.toasts.success(trn(n, "1 object dropped", "{} objects dropped"));
                     // A dropped database leaves the list of databases.
                     if self.objects.iter().any(|o| o.kind == ObjectKind::Database) {
                         cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: None, schema: None });
@@ -122,13 +122,19 @@ impl DropDialog {
         let (drop, editor, cancel) = (Cell::new(false), Cell::new(false), Cell::new(false));
         let error = self.error.clone();
         let count = self.objects.len();
+        // The verb and the object: "Drop table", "Drop 3 objects".
+        let button = match self.objects.as_slice() {
+            [o] => format!("{} {}", tr("Drop"), tr(o.kind.label()).to_lowercase()),
+            _ => trn(count, "Drop 1 object", "Drop {} objects"),
+        };
         let cascade = &mut self.cascade;
-        let (resp, _) = Dialog::new(tr("Drop objects")).icon(icon::TRASH).subtitle(&place).width(580.0).body_padding(super::BODY).show_modal(
+        let title = if count == 1 { tr("Drop object") } else { tr("Drop objects") };
+        let (resp, _) = Dialog::new(title).icon(icon::TRASH).tone(Tone::Error).subtitle(&place).width(super::WIDTH_M).body_padding(super::BODY).show_modal(
             ctx,
             egui::Id::new(("drop_objects", &self.conn)),
             |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
-                let question = if count == 1 { tr("Drop 1 object? This cannot be undone.").to_string() } else { trf("Drop {} objects? This cannot be undone.", &[&count]) };
+                let question = trn(count, "Drop 1 object? This cannot be undone.", "Drop {} objects? This cannot be undone.");
                 ui.add(egui::Label::new(RichText::new(question).font(style::medium(ui.ctx(), 13.5))).wrap());
                 ternarygrid_ui::kit::checkbox(ui, cascade, tr("Cascade (also drop dependent objects)"));
                 super::sql_preview(ui, "drop_sql", Some(dialect.clone()), script.trim_end(), 240.0, true);
@@ -150,7 +156,7 @@ impl DropDialog {
                     editor.set(true);
                 }
                 super::right(ui, |ui| {
-                    if ui.add_enabled_ui(!busy && !read_only && !opening, |ui| kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), tr("Drop"), false)).inner.clicked() {
+                    if ui.add_enabled_ui(!busy && !read_only && !opening, |ui| kit::button_ex(ui, Kind::DangerFilled, Some(icon::TRASH), &button, false)).inner.clicked() {
                         drop.set(true);
                     }
                     if ui.add_enabled_ui(!busy, super::cancel_button).inner.clicked() {

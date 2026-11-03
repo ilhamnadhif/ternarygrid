@@ -272,6 +272,8 @@ enum Install {
         release: Release,
         stage: std::sync::Arc<parking_lot::Mutex<crate::selfupdate::Stage>>,
         job: Job<Result<crate::selfupdate::Prepared, String>>,
+        /// Set by "Cancel download": the download stops and its files are removed.
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     Ready {
         release: Release,
@@ -487,7 +489,7 @@ impl Updates {
         if let Some(notes) = &self.whats_new {
             let (close, all) = (Cell::new(false), Cell::new(false));
             let title = trf("What's new in TernaryGrid {}", &[&current_version()]);
-            let (resp, _) = Dialog::new(&title).icon(icon::SPARKLE).width(600.0).body_padding(dialogs::BODY).show_modal(
+            let (resp, _) = Dialog::new(&title).icon(icon::SPARKLE).width(dialogs::WIDTH_M).body_padding(dialogs::BODY).show_modal(
                 ctx,
                 egui::Id::new("ternarygrid_whats_new"),
                 |ui| {
@@ -499,7 +501,14 @@ impl Updates {
                                 ui.add_space(6.0);
                             }
                             if notes.len() > 1 || !n.date.is_empty() {
-                                dialogs::semibold_text(ui, &format!("{} {}", n.version, n.date), 12.5, p.text_muted, Some(1.5), true);
+                                dialogs::semibold_text(
+                                    ui,
+                                    &if n.date.is_empty() { n.version.clone() } else { format!("{} · {}", n.version, n.date) },
+                                    12.5,
+                                    p.text_muted,
+                                    Some(1.5),
+                                    true,
+                                );
                             }
                             markdown(ui, &n.body, 8.0, Some(1.5));
                         }
@@ -531,7 +540,7 @@ impl Updates {
         if let Some(r) = self.available.clone() {
             let can_install = installable(&r);
             let act = Cell::new(None::<Offer>);
-            let (resp, _) = Dialog::new(tr("A new version of TernaryGrid is available")).icon(icon::ARROW_UP).width(640.0).body_padding(dialogs::BODY).show_modal(
+            let (resp, _) = Dialog::new(tr("A new version of TernaryGrid is available")).icon(icon::ARROW_UP).width(dialogs::WIDTH_M).body_padding(dialogs::BODY).show_modal(
                 ctx,
                 egui::Id::new("ternarygrid_update_available"),
                 |ui| {
@@ -554,12 +563,26 @@ impl Updates {
                         dialogs::muted(ui, tr("Installing it from here needs TernaryGrid in the Applications folder; download the new version instead."));
                     }
                     if cfg!(target_os = "macos") {
-                        ui.label(RichText::new(tr("Homebrew: brew upgrade --cask ternarygrid")).size(12.0).color(p.text_faint));
+                        // The command as code, to copy into a terminal.
+                        const BREW: &str = "brew upgrade --cask ternarygrid";
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(RichText::new(tr("With Homebrew:")).size(12.5).color(p.text_muted));
+                            egui::Frame::new().fill(p.subtle).corner_radius(egui::CornerRadius::same(4)).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+                                ui.add(egui::Label::new(RichText::new(BREW).monospace().size(12.0).color(p.text)).selectable(true));
+                            });
+                            if kit::icon_button_sized(ui, icon::COPY, tr("Copy"), false, 24.0, 14.0).clicked() {
+                                ui.ctx().copy_text(BREW.to_string());
+                            }
+                        });
                     }
                 },
                 |ui| {
                     if kit::button_ex(ui, Kind::Ghost, None, tr("Skip this version"), false).clicked() {
                         act.set(Some(Offer::Skip));
+                    }
+                    if kit::button_ex(ui, Kind::Ghost, Some(icon::ARROW_SQUARE_OUT), tr("View on GitHub"), false).clicked() {
+                        act.set(Some(Offer::GitHub));
                     }
                     right(ui, |ui| {
                         if can_install {
@@ -571,9 +594,6 @@ impl Updates {
                         }
                         if kit::secondary(ui, None, tr("Remind me later")).clicked() {
                             act.set(Some(Offer::Later));
-                        }
-                        if kit::button_ex(ui, Kind::Ghost, None, tr("View on GitHub"), false).clicked() {
-                            act.set(Some(Offer::GitHub));
                         }
                     });
                 },
@@ -608,8 +628,8 @@ impl Updates {
             let answer: Cell<Option<bool>> = Cell::new(None);
             let dark = ctx.global_style().visuals.dark_mode;
             let p = ternarygrid_ui::palette(dark);
-            // At the bottom right, above the status bar (as far right as the design has it).
-            egui::Area::new(egui::Id::new("ternarygrid_update_question")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(0.0, -60.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            // At the bottom right, 16 points in from the window's edge, above the status bar.
+            egui::Area::new(egui::Id::new("ternarygrid_update_question")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -44.0)).order(egui::Order::Foreground).show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(p.surface)
                     .stroke(egui::Stroke::new(1.0, p.border))
@@ -682,6 +702,7 @@ impl Updates {
                 release,
                 stage: std::sync::Arc::new(parking_lot::Mutex::new(crate::selfupdate::Stage::Downloading { done, total })),
                 job: backend.spawn(std::future::pending()),
+                cancel: Default::default(),
             },
             None => {
                 let dir = std::env::temp_dir();
@@ -698,10 +719,11 @@ impl Updates {
     fn start_install(&mut self, backend: &Backend, release: Release) {
         let Some(asset) = release.archive.clone() else { return };
         let stage = std::sync::Arc::new(parking_lot::Mutex::new(crate::selfupdate::Stage::Starting));
-        let (st, version) = (stage.clone(), release.version.clone());
-        let job =
-            backend.spawn(async move { tokio::task::spawn_blocking(move || crate::selfupdate::download(&version, &asset, &st)).await.unwrap_or_else(|e| Err(e.to_string())) });
-        self.install = Install::Downloading { release, stage, job };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (st, version, stop) = (stage.clone(), release.version.clone(), cancel.clone());
+        let job = backend
+            .spawn(async move { tokio::task::spawn_blocking(move || crate::selfupdate::download(&version, &asset, &st, &stop)).await.unwrap_or_else(|e| Err(e.to_string())) });
+        self.install = Install::Downloading { release, stage, job, cancel };
         self.install_visible = true;
     }
 
@@ -727,14 +749,19 @@ impl Updates {
         if !self.install_visible || matches!(self.install, Install::Idle) {
             return false;
         }
-        let (hide_c, restart_c, dismiss_c, releases) = (Cell::new(false), Cell::new(false), Cell::new(false), Cell::new(false));
+        let (hide_c, restart_c, dismiss_c, releases, cancel_c) = (Cell::new(false), Cell::new(false), Cell::new(false), Cell::new(false), Cell::new(false));
         let (title, icon_name) = match &self.install {
             Install::Downloading { release, .. } => (trf("Updating to TernaryGrid {}", &[&release.version]), icon::DOWNLOAD_SIMPLE),
             Install::Ready { release, .. } => (trf("TernaryGrid {} is ready to install", &[&release.version]), icon::CHECK_CIRCLE),
             _ => (tr("Software update").to_string(), icon::WARNING),
         };
         let install = &self.install;
-        let (resp, _) = Dialog::new(&title).icon(icon_name).width(480.0).body_padding(dialogs::BODY).show_modal(
+        let failed = matches!(self.install, Install::Failed(_));
+        let mut dialog = Dialog::new(&title).icon(icon_name).width(dialogs::WIDTH_S).body_padding(dialogs::BODY);
+        if failed {
+            dialog = dialog.tone(ternarygrid_ui::parts::Tone::Warning);
+        }
+        let (resp, _) = dialog.show_modal(
             ctx,
             egui::Id::new("ternarygrid_update_install"),
             |ui| match install {
@@ -761,8 +788,11 @@ impl Updates {
             },
             |ui| match install {
                 Install::Downloading { .. } => {
+                    if kit::button_ex(ui, Kind::Ghost, None, tr("Cancel download"), false).clicked() {
+                        cancel_c.set(true);
+                    }
                     right(ui, |ui| {
-                        if kit::button_ex(ui, Kind::Ghost, None, tr("Hide"), false).on_hover_text(tr("The download goes on; the top bar shows its progress")).clicked() {
+                        if kit::secondary(ui, None, tr("Hide")).on_hover_text(tr("The download goes on; the top bar shows its progress")).clicked() {
                             hide_c.set(true);
                         }
                     });
@@ -782,7 +812,7 @@ impl Updates {
                         releases.set(true);
                     }
                     right(ui, |ui| {
-                        if kit::primary(ui, tr("OK")).clicked() {
+                        if kit::primary(ui, tr("Close")).clicked() {
                             dismiss_c.set(true);
                         }
                     });
@@ -791,6 +821,15 @@ impl Updates {
         );
         if releases.get() {
             ctx.open_url(egui::OpenUrl::new_tab(RELEASES_PAGE));
+        }
+        if cancel_c.get()
+            && let Install::Downloading { cancel, .. } = &self.install
+        {
+            // The download stops and removes its files; the Update button offers it again.
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.install = Install::Idle;
+            self.install_visible = false;
+            return false;
         }
         let (mut hide, restart, dismiss) = (hide_c.get(), restart_c.get(), dismiss_c.get());
         if resp.close {
@@ -831,7 +870,8 @@ fn markdown(ui: &mut egui::Ui, text: &str, gap: f32, lh: Option<f32>) {
     };
     for l in text.lines() {
         let t = l.trim_end();
-        let plain = |s: &str| s.replace("**", "").replace('`', "");
+        // U+E1FE: the ⋯ of the More buttons (Phosphor's; the text font has no ⋯).
+        let plain = |s: &str| s.replace("**", "").replace('`', "").replace('⋯', "\u{E1FE}");
         if t.trim().is_empty() {
             continue;
         } else if let Some(h) = t.strip_prefix("### ").or_else(|| t.strip_prefix("## ")).or_else(|| t.strip_prefix("# ")) {
