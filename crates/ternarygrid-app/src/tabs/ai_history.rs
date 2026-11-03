@@ -63,15 +63,10 @@ impl ConversationStore {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(c)?)?;
         std::fs::rename(&tmp, &path)?;
-        // By the files' times: without reading them.
-        let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&self.dir)?
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-            .map(|e| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), e.path()))
-            .collect();
-        files.sort_by_key(|f| std::cmp::Reverse(f.0));
-        for (_, old) in files.into_iter().skip(MAX_CONVERSATIONS) {
-            let _ = std::fs::remove_file(old);
+        // By the conversations' own times, not the files': files written within the file
+        // system's clock resolution (coarse on Windows) have the same, and the newest could go.
+        for old in self.list().into_iter().skip(MAX_CONVERSATIONS) {
+            let _ = self.delete(&old.id);
         }
         Ok(())
     }
