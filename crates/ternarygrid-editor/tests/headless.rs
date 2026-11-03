@@ -615,7 +615,7 @@ fn context_actions_and_save_shortcut() {
     assert_eq!(h.text(), "SELECT 42");
     h.key(Key::S, cmd());
     assert!(h.events.contains(&EditorEvent::SaveRequested));
-    assert!(ContextAction::Execute.label().contains("Execute"));
+    assert!(ContextAction::Execute.label().contains("Run"));
     assert!(!ContextAction::Format.is_editor_action());
 }
 

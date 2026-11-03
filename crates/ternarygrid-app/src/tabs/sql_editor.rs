@@ -47,8 +47,19 @@ fn parse_plan_file(text: &str) -> Result<(String, QueryPlan), String> {
 
 enum ResultItem {
     Rows(Box<ResultPanel>),
-    Plan { sql: String, plan: Box<QueryPlan>, state: ternarygrid_visual::plan::PlanViewState, view: PlanView },
-    Error { sql: String, text: String },
+    Plan {
+        sql: String,
+        plan: Box<QueryPlan>,
+        state: ternarygrid_visual::plan::PlanViewState,
+        view: PlanView,
+    },
+    /// A failed statement: its SQL, the error's text and where in the editor it is (line,
+    /// column), when the server tells.
+    Error {
+        sql: String,
+        text: String,
+        at: Option<(usize, usize)>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -725,7 +736,7 @@ impl SqlEditorTab {
         let history =
             cx.services.history_sink(Some(conn.clone()), name, self.schema.as_ref().and_then(|s| s.database.clone()), self.schema.as_ref().and_then(|s| s.schema.clone()));
         self.variables = prepared.variables.clone();
-        self.log("INFO", trf("Executing {} statement(s)…", &[&prepared.plans.len()]));
+        self.log("INFO", ternarygrid_core::trn(prepared.plans.len(), "Executing 1 statement…", "Executing {} statements…"));
         self.exec = Some(Execution::start(cx.backend, session, prepared.plans, opts, history));
         // What runs shows its progress, results and messages under the editor.
         self.show_results = true;
@@ -823,7 +834,7 @@ impl SqlEditorTab {
                         st.message = tag.clone().unwrap_or_default();
                     }
                     let mut msg = match rows {
-                        Some(n) => trf("{} row(s) affected", &[&n]),
+                        Some(n) => ternarygrid_core::trn(n as usize, "1 row affected", "{} rows affected"),
                         None => tag.unwrap_or_else(|| tr("Done").to_string()),
                     };
                     if let Some(id) = last_insert_id.filter(|i| *i > 0) {
@@ -842,7 +853,14 @@ impl SqlEditorTab {
                     self.mark_error(index, error.position, &error.message);
                     let sql = self.stats.iter().find(|s| s.index == index).map(|s| s.sql.clone()).unwrap_or_default();
                     if self.stats.len() == 1 {
-                        self.results.push(ResultItem::Error { sql, text });
+                        // Where in the editor, rather than the server's character offset.
+                        let at = error.position.and_then(|p| self.error_line_col(index, p));
+                        let place = at.map(|(l, c)| trf("Line {}, column {}", &[&l, &c]));
+                        let text = match &place {
+                            Some(place) => error.full_text_with_position(None) + "\n" + place,
+                            None => text,
+                        };
+                        self.results.push(ResultItem::Error { sql, text, at });
                         self.bottom = Bottom::Result(self.results.len() - 1);
                     }
                     self.show_results = true;
@@ -871,7 +889,10 @@ impl SqlEditorTab {
                     let msg = if cancelled {
                         trf("Cancelled after {}", &[&crate::widgets::format_duration(elapsed)])
                     } else {
-                        trf("{} statement(s) executed, {} failed, in {}", &[&executed, &failed, &crate::widgets::format_duration(elapsed)])
+                        trf(
+                            "{}, {} failed, in {}",
+                            &[&ternarygrid_core::trn(executed, "1 statement executed", "{} statements executed"), &failed, &crate::widgets::format_duration(elapsed)],
+                        )
                     };
                     self.log(if failed > 0 { "WARNING" } else { "INFO" }, msg);
                     if self.stats.len() > 1 && !matches!(self.bottom, Bottom::Result(_)) {
@@ -913,6 +934,19 @@ impl SqlEditorTab {
         }
         let pos = text.find(st.sql.as_str())?;
         Some(pos..pos + st.sql.len())
+    }
+
+    /// The 1-based line and column in the editor of an error at character `position` (1-based)
+    /// of the statement with this plan index.
+    fn error_line_col(&self, index: usize, position: usize) -> Option<(usize, usize)> {
+        let range = self.statement_range(index)?;
+        let text = self.editor.text();
+        let stmt = text.get(range.clone())?;
+        let off = range.start + ternarygrid_sql::char_pos_to_byte(stmt, position);
+        let before = text.get(..off)?;
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+        Some((line, column))
     }
 
     /// Mark a failed statement in the editor (error position when known).
@@ -1223,8 +1257,8 @@ impl SqlEditorTab {
                 // Connection selector.
                 let conn_name = short(self.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("No connection").to_string()), 14);
                 let marker = self.conn.as_ref().and_then(|c| cx.conns.color_of(c)).and_then(|c| crate::theme::marker(c, ui.visuals().dark_mode));
-                let lead = RichText::new(icon::PLUG).color(marker.unwrap_or(p.text_muted));
-                let r = picker(ui, lead, &conn_name, format!("{} ({})", tr("Active connection"), crate::keys::label(cx.keymap, Action::SelectConnection)));
+                let kind = self.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.kind);
+                let r = connection_chip(ui, kind, marker, &conn_name, &format!("{} ({})", tr("Active connection"), crate::keys::label(cx.keymap, Action::SelectConnection)));
                 if r.clicked() {
                     self.select_conn_open = !self.select_conn_open;
                 }
@@ -1327,36 +1361,59 @@ impl SqlEditorTab {
                 kit::vdivider(ui, 18.0);
                 let running = self.exec.is_some() || self.explain_job.is_some();
                 let tip = |a: Action| format!("{} ({})", crate::keys::action_label(a), crate::keys::label(cx.keymap, a));
-                // Run, or Stop while a statement runs (the same place: the hand need not move).
+                // Run (its ▾: the other ways to run), or Stop while a statement runs (the same
+                // place: the hand need not move).
+                let explain = self.can_explain(cx);
+                let mut chosen_run: Option<Action> = None;
                 if running {
-                    if kit::button_full(ui, kit::Kind::Danger, Some(icon::STOP), tr("Stop"), true, false).on_hover_text(tip(Action::CancelQuery)).clicked() {
+                    if kit::button_full(ui, kit::Kind::Danger, Some(icon::STOP_CIRCLE), tr("Stop"), true, false).on_hover_text(tip(Action::CancelQuery)).clicked() {
                         self.cancel(cx);
                     }
-                } else if kit::button_full(ui, kit::Kind::Primary, Some(icon::PLAY), tr("Run"), true, false).on_hover_text(tip(Action::ExecuteStatement)).clicked() {
-                    self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None });
+                } else {
+                    let (main, more) = run_split_button(ui, egui::Id::new(("sql_run", self.editor.id())), &tip(Action::ExecuteStatement));
+                    if main.clicked() {
+                        chosen_run = Some(Action::ExecuteStatement);
+                    }
+                    egui::Popup::menu(&more).gap(4.0).show(|ui| {
+                        kit::menu_look(ui, 240.0);
+                        let mut ways = vec![Action::ExecuteStatement, Action::ExecuteInNewTab, Action::ExecuteScript];
+                        if explain {
+                            ways.push(Action::ExplainPlan);
+                        }
+                        for a in ways {
+                            if a == Action::ExplainPlan {
+                                kit::menu_separator(ui);
+                            }
+                            if kit::menu_item(ui, Some(crate::keys::action_icon(a)), crate::keys::action_label(a), &crate::keys::label(cx.keymap, a)).clicked() {
+                                chosen_run = Some(a);
+                                ui.close();
+                            }
+                        }
+                    });
                 }
-                let explain = self.can_explain(cx);
-                let (mut new_tab, mut script, mut plan) = (false, false, false);
-                ui.add_enabled_ui(!running, |ui| {
-                    new_tab = kit::icon_button_sized(ui, icon::PLUS, &tip(Action::ExecuteInNewTab), false, 26.0, 14.0).clicked();
-                    script = kit::icon_button_sized(ui, icon::FAST_FORWARD, &tip(Action::ExecuteScript), false, 26.0, 14.0).clicked();
-                    plan = explain && kit::icon_button_sized(ui, icon::TREE_STRUCTURE, &tip(Action::ExplainPlan), false, 26.0, 14.0).clicked();
-                });
-                if new_tab {
-                    self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None });
+                match chosen_run {
+                    Some(Action::ExecuteStatement) => self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None }),
+                    Some(Action::ExecuteInNewTab) => self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None }),
+                    Some(Action::ExecuteScript) => self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None }),
+                    Some(Action::ExplainPlan) => self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None }),
+                    _ => {}
                 }
-                if script {
-                    self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None });
-                }
-                if plan {
-                    self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None });
-                }
-                if self.is_sql(cx) && kit::icon_button_sized(ui, icon::TEXT_AA, &tip(Action::FormatSql), false, 26.0, 14.0).clicked() {
+                // Format SQL; in a narrow editor it moves into "⋯" first.
+                let sql = self.is_sql(cx);
+                if sql && !narrow && kit::icon_button_sized(ui, icon::TEXT_INDENT, &tip(Action::FormatSql), false, 26.0, 14.0).clicked() {
                     self.format(cx);
                 }
                 let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More editor commands"), false, 26.0, 14.0);
+                let mut format = false;
                 egui::Popup::menu(&more).gap(4.0).show(|ui| {
                     kit::menu_look(ui, 260.0);
+                    if sql && narrow {
+                        if kit::menu_item(ui, Some(icon::TEXT_INDENT), crate::keys::action_label(Action::FormatSql), &crate::keys::label(cx.keymap, Action::FormatSql)).clicked() {
+                            format = true;
+                            ui.close();
+                        }
+                        kit::menu_separator(ui);
+                    }
                     for a in [
                         Action::NextStatement,
                         Action::PreviousStatement,
@@ -1380,6 +1437,9 @@ impl SqlEditorTab {
                         }
                     }
                 });
+                if format {
+                    self.format(cx);
+                }
                 // Transaction controls, for databases that have transactions.
                 let transactions = self.has_transactions(cx);
                 let tx = match &self.session {
@@ -1388,11 +1448,17 @@ impl SqlEditorTab {
                 };
                 let manual = tx.as_ref().is_some_and(|t| t.mode == TransactionMode::Manual);
                 let pending = tx.as_ref().map(|t| t.log.len()).unwrap_or(0);
+                let open_tx = pending > 0 || tx.as_ref().is_some_and(|t| t.in_transaction);
                 if transactions {
                     kit::vdivider(ui, 18.0);
                     // Auto-commit: a quiet check; Manual commit: the soft accent with a pause.
+                    // Narrow: the mode's short name (a bare check read as "OK").
                     let (ic, label, kind) = if manual { (icon::PAUSE, tr("Manual commit"), kit::Kind::Soft) } else { (icon::CHECK, tr("Auto-commit"), kit::Kind::Ghost) };
-                    let shown = if narrow { "" } else { label };
+                    let shown = match (narrow, manual) {
+                        (false, _) => label,
+                        (true, true) => tr("Manual"),
+                        (true, false) => tr("Auto"),
+                    };
                     let toggled = ui
                         .add_enabled_ui(tx.is_some(), |ui| {
                             kit::button_full(ui, kind, Some(ic), shown, true, false).on_hover_text(format!("{label} · {}", tip(Action::ToggleAutoCommit))).clicked()
@@ -1402,16 +1468,21 @@ impl SqlEditorTab {
                         self.set_tx_mode(cx, if manual { TransactionMode::Auto } else { TransactionMode::Manual });
                     }
                 }
+                // Manual commit: Roll back, then Commit (filled while statements are pending; the
+                // count is on the Transaction log tab and in the status bar).
                 if manual {
-                    if kit::button_full(ui, kit::Kind::Secondary, Some(icon::CHECK_CIRCLE), tr("Commit"), true, false).on_hover_text(tip(Action::Commit)).clicked() {
-                        self.commit(cx, true);
-                    }
-                    if kit::button_full(ui, kit::Kind::Ghost, Some(icon::ARROW_LEFT), tr("Rollback"), true, false).on_hover_text(tip(Action::Rollback)).clicked() {
-                        self.commit(cx, false);
-                    }
-                    if pending > 0 && kit::button_full(ui, kit::Kind::Ghost, None, &trf("{} pending", &[&pending]), true, false).on_hover_text(tr("Transaction log")).clicked() {
-                        self.bottom = Bottom::Transaction;
-                        self.show_results = true;
+                    let (rollback, commit) = ui
+                        .add_enabled_ui(open_tx, |ui| {
+                            let rollback = kit::button_full(ui, kit::Kind::Secondary, Some(icon::ARROW_U_UP_LEFT), tr("Roll back"), true, false)
+                                .on_hover_text(tip(Action::Rollback))
+                                .clicked();
+                            let kind = if pending > 0 { kit::Kind::Primary } else { kit::Kind::Secondary };
+                            let commit = kit::button_full(ui, kind, Some(icon::CHECK), tr("Commit"), true, false).on_hover_text(tip(Action::Commit)).clicked();
+                            (rollback, commit)
+                        })
+                        .inner;
+                    if rollback || commit {
+                        self.commit(cx, commit);
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1419,13 +1490,17 @@ impl SqlEditorTab {
                     if kit::icon_button_sized(ui, icon::LIST_BULLETS, tr("Outline"), self.show_outline, 28.0, 15.0).clicked() {
                         self.show_outline = !self.show_outline;
                     }
-                    if kit::icon_button_sized(ui, icon::TERMINAL_WINDOW, tr("Terminal mode: print results as text"), self.terminal, 28.0, 15.0).clicked() {
+                    if kit::icon_button_sized(ui, icon::TERMINAL, tr("Terminal mode: print results as text"), self.terminal, 28.0, 15.0).clicked() {
                         self.terminal = !self.terminal;
                     }
                     if kit::icon_button_sized(ui, icon::ROWS, &tip(Action::ToggleResultsPanel), self.show_results, 28.0, 15.0).clicked() {
                         self.show_results = !self.show_results;
                     }
-                    if running && let Some(e) = &self.exec {
+                    // The running time; the banner over the results has it when they show.
+                    if running
+                        && !self.show_results
+                        && let Some(e) = &self.exec
+                    {
                         ui.add_space(6.0);
                         ui.label(RichText::new(crate::widgets::format_duration(e.started.elapsed())).size(12.0).color(p.text_muted));
                         ui.add(egui::Spinner::new().size(12.0).color(p.accent_text));
@@ -1453,12 +1528,14 @@ impl SqlEditorTab {
             egui::Frame::new().fill(pal.accent_soft).inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    // As high as the button from the start, so the text sits on its centre.
+                    ui.set_min_height(ternarygrid_ui::style::SMALL_H);
                     ui.add(egui::Spinner::new().size(14.0).color(pal.accent_text));
                     ui.label(RichText::new(what).font(ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()))).color(pal.text));
                     ui.label(RichText::new(elapsed).size(12.5).color(pal.text_muted));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let keys = crate::keys::label(cx.keymap, Action::CancelQuery);
-                        cancel = kit::button_kbd(ui, kit::Kind::Danger, Some(icon::STOP), tr("Cancel"), &keys, true)
+                        cancel = kit::button_kbd(ui, kit::Kind::Danger, Some(icon::STOP_CIRCLE), tr("Stop"), &keys, true)
                             .on_hover_text(crate::keys::action_label(Action::CancelQuery))
                             .clicked();
                     });
@@ -1482,6 +1559,14 @@ impl SqlEditorTab {
                 let label = if dirty { format!("● {label}") } else { label };
                 let rows = self.result_rows(i).map(|n| ternarygrid_grid::format::group_thousands(&n.to_string()));
                 let r = kit::underline_tab(ui, Some(ic), &label, rows.as_deref(), self.bottom == Bottom::Result(i), TAB_H);
+                // An error's icon in the error colour, selected or not (the kit paints a tab's
+                // icon in the accent or faint): painted over, where the kit put it.
+                if matches!(self.results[i], ResultItem::Error { .. }) {
+                    let size = ternarygrid_ui::style::body_size(ui.ctx());
+                    let g = ui.painter().layout_no_wrap(ic.to_string(), ternarygrid_ui::style::icon_font(size + 1.0), ternarygrid_ui::pal(ui).err);
+                    let pos = egui::pos2(r.rect.left() + 6.0, r.rect.center().y - g.size().y / 2.0);
+                    ui.painter().galley(pos, g, ternarygrid_ui::pal(ui).err);
+                }
                 if r.clicked() {
                     self.bottom = Bottom::Result(i);
                 }
@@ -1499,7 +1584,7 @@ impl SqlEditorTab {
             if !self.stats.is_empty() && kit::underline_tab(ui, Some(icon::LIST_NUMBERS), tr("Statistics"), None, self.bottom == Bottom::Statistics, TAB_H).clicked() {
                 self.bottom = Bottom::Statistics;
             }
-            if kit::underline_tab(ui, Some(icon::TERMINAL_WINDOW), tr("Output"), None, self.bottom == Bottom::Output, TAB_H).clicked() {
+            if kit::underline_tab(ui, Some(icon::SCROLL), tr("Output"), None, self.bottom == Bottom::Output, TAB_H).clicked() {
                 self.bottom = Bottom::Output;
             }
             // The statements a manual transaction holds, as a count on its tab.
@@ -1508,7 +1593,7 @@ impl SqlEditorTab {
                 _ => 0,
             };
             let pending = (pending > 0).then(|| pending.to_string());
-            if kit::underline_tab(ui, Some(icon::CLOCK_COUNTER_CLOCKWISE), tr("Transaction log"), pending.as_deref(), self.bottom == Bottom::Transaction, TAB_H).clicked() {
+            if kit::underline_tab(ui, Some(icon::LIST_DASHES), tr("Transaction log"), pending.as_deref(), self.bottom == Bottom::Transaction, TAB_H).clicked() {
                 self.bottom = Bottom::Transaction;
             }
             let vars = (!self.variables.is_empty()).then(|| self.variables.len().to_string());
@@ -1568,10 +1653,16 @@ impl SqlEditorTab {
                         PlanView::Text => ternarygrid_visual::plan::show_plan_text(ui, plan),
                     }
                 }
-                Some(ResultItem::Error { sql, text }) if error_card(ui, sql, text) => {
-                    cx.push(AppCommand::AskAi { connection: self.conn.clone(), sql: sql.clone(), error: Some(text.clone()) });
-                }
-                Some(ResultItem::Error { .. }) | None => {}
+                Some(ResultItem::Error { sql, text, at }) => match error_card(ui, sql, text, *at) {
+                    ErrorCardAction::Fix => cx.push(AppCommand::AskAi { connection: self.conn.clone(), sql: sql.clone(), error: Some(text.clone()) }),
+                    ErrorCardAction::Goto(line, column) => {
+                        let ctx = ui.ctx().clone();
+                        self.editor.goto_line_col(&ctx, line, column);
+                        self.request_focus = true;
+                    }
+                    ErrorCardAction::None => {}
+                },
+                None => {}
             },
             Bottom::Statistics => {
                 let rows: Vec<Vec<String>> = self
@@ -1662,40 +1753,26 @@ impl SqlEditorTab {
                     ui.label(RichText::new(tr("No uncommitted statements.")).color(ternarygrid_ui::pal(ui).text_muted));
                 } else {
                     // What is pending, and the two ways out, above the log.
+                    // What is pending (Roll back and Commit are on the toolbar).
                     if manual {
                         let pal = ternarygrid_ui::pal(ui);
-                        let mut decision = None;
                         egui::Frame::new()
                             .fill(pal.modified)
                             .corner_radius(8)
-                            .inner_margin(egui::Margin::symmetric(12, 7))
+                            .inner_margin(egui::Margin::symmetric(12, 9))
                             .outer_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 0 })
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 10.0;
                                     ui.label(RichText::new(icon::PAUSE).font(ternarygrid_ui::style::icon_font(16.0)).color(pal.warn));
-                                    ui.label(
-                                        RichText::new(trf("{} statements are not committed yet.", &[&log.len()]))
-                                            .font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0))
-                                            .color(pal.text),
-                                    );
-                                    ui.label(RichText::new(tr("Other sessions do not see them until you commit.")).color(pal.text));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.spacing_mut().item_spacing.x = 8.0;
-                                        let keys = crate::keys::label(cx.keymap, Action::Commit);
-                                        if kit::button_kbd(ui, kit::Kind::Primary, Some(icon::CHECK), tr("Commit"), &keys, true).clicked() {
-                                            decision = Some(true);
-                                        }
-                                        if kit::button_full(ui, kit::Kind::Ghost, None, tr("Rollback"), true, false).clicked() {
-                                            decision = Some(false);
-                                        }
-                                    });
+                                    let n = log.len();
+                                    let what = ternarygrid_core::trn(n, "1 statement is not committed yet.", "{} statements are not committed yet.");
+                                    ui.label(RichText::new(what).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
+                                    let rest = if n == 1 { tr("Other sessions do not see it until you commit.") } else { tr("Other sessions do not see them until you commit.") };
+                                    ui.label(RichText::new(rest).color(pal.text_muted));
                                 });
                             });
-                        if let Some(commit) = decision {
-                            self.commit(cx, commit);
-                        }
                         ui.add_space(8.0);
                     }
                     // The design's log: Time, Statement, Rows, Duration (and whether it went
@@ -1954,21 +2031,6 @@ fn result_title(sql: &str, n: usize) -> String {
 }
 
 impl TabView for SqlEditorTab {
-    fn status_summary(&self) -> Option<String> {
-        let rows = match self.bottom {
-            Bottom::Result(i) => self.result_rows(i),
-            _ => None,
-        };
-        let mut parts = Vec::new();
-        if let Some(n) = rows {
-            parts.push(ternarygrid_core::trf("{} rows", &[&ternarygrid_grid::format::group_thousands(&n.to_string())]));
-        }
-        if let Some((_, d)) = self.last_run {
-            parts.push(ternarygrid_grid::toolbar::duration_text(d));
-        }
-        (!parts.is_empty()).then(|| parts.join(" · "))
-    }
-
     fn title(&self) -> String {
         self.title.clone()
     }
@@ -2260,29 +2322,7 @@ impl TabView for SqlEditorTab {
         self.poll_exec(&ctx, cx);
         ui.spacing_mut().item_spacing.y = 0.0;
         self.toolbar(ui, cx);
-        // Status line: 22 points under a hairline, "11:1 · last run 286 ms" in faint small text.
         let pal = ternarygrid_ui::pal(ui);
-        let status_frame = egui::Frame::new().fill(pal.canvas).inner_margin(egui::Margin { left: 12, right: 12, top: 1, bottom: 0 });
-        egui::Panel::bottom(egui::Id::new(("sql_status", self.editor.id()))).exact_size(23.0).frame(status_frame).show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                let (l, c) = self.editor.line_col();
-                let mut parts = vec![format!("{l}:{c}")];
-                if let Some(sel) = self.editor.selected_text() {
-                    parts.push(trf("{} selected", &[&sel.chars().count()]));
-                }
-                let failed = matches!(self.bottom, Bottom::Result(i) if matches!(self.results.get(i), Some(ResultItem::Error { .. })));
-                if self.exec.is_some() {
-                    parts.push(tr("running").to_string());
-                } else if let Some((_, d)) = self.last_run {
-                    let d = crate::widgets::format_duration(d);
-                    parts.push(if failed { trf("failed after {}", &[&d]) } else { trf("last run {}", &[&d]) });
-                }
-                if self.editor.is_modified() && !self.console {
-                    parts.push(tr("modified").to_string());
-                }
-                ui.label(RichText::new(parts.join(" · ")).size(11.5).color(pal.text_faint));
-            });
-        });
         let results_visible = self.show_results;
         if results_visible && self.maximized {
             self.results_ui(ui, cx);
@@ -2317,7 +2357,23 @@ impl TabView for SqlEditorTab {
             self.editor.request_focus(&ctx);
         }
         let editor_frame = egui::Frame::new().fill(pal.surface);
-        let resp = egui::CentralPanel::default().frame(editor_frame).show(ui, |ui| SqlEditor::new(&mut self.editor, &self.lang, &opts, &theme).show(ui)).inner;
+        let status = self.status_line();
+        let editor_id = self.editor.id();
+        let resp = egui::CentralPanel::default()
+            .frame(editor_frame)
+            .show(ui, |ui| {
+                // The cursor's line and column (the selection, unsaved changes) at the editor's own
+                // bottom edge, 22 points in faint small text; the results' footer has the run's
+                // rows and time.
+                let status_frame = egui::Frame::new().fill(pal.surface).inner_margin(egui::Margin { left: 12, right: 12, top: 0, bottom: 0 });
+                egui::Panel::bottom(egui::Id::new(("sql_status", editor_id))).exact_size(22.0).show_separator_line(false).frame(status_frame).show(ui, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(status).size(11.5).color(pal.text_faint));
+                    });
+                });
+                SqlEditor::new(&mut self.editor, &self.lang, &opts, &theme).show(ui)
+            })
+            .inner;
         if resp.changed {
             self.changed_at = Some(Instant::now());
         }
@@ -2342,6 +2398,21 @@ impl TabView for SqlEditorTab {
 }
 
 /// Inspection and dialog helpers for headless tests.
+impl SqlEditorTab {
+    /// The editor's status line: the cursor's line and column, what is selected, unsaved.
+    fn status_line(&self) -> String {
+        let (l, c) = self.editor.line_col();
+        let mut parts = vec![trf("Ln {}, Col {}", &[&l, &c])];
+        if let Some(sel) = self.editor.selected_text() {
+            parts.push(ternarygrid_core::trn(sel.chars().count(), "1 character selected", "{} characters selected"));
+        }
+        if self.editor.is_modified() && !self.console {
+            parts.push(tr("Modified").to_string());
+        }
+        parts.join(" · ")
+    }
+}
+
 #[doc(hidden)]
 impl SqlEditorTab {
     pub fn is_running(&self) -> bool {
@@ -2443,14 +2514,25 @@ impl SqlEditorTab {
     }
 }
 
+/// What a click on the error card asks for.
+enum ErrorCardAction {
+    None,
+    /// "Fix error": the AI assistant.
+    Fix,
+    /// The error's place: move the caret to this line and column.
+    Goto(usize, usize),
+}
+
 /// A failed statement: the first line of the error with its SQLSTATE and Copy, the rest of the
-/// message (position, hint), and "Fix error" (the AI assistant). Returns true when it is clicked.
-fn error_card(ui: &mut Ui, sql: &str, text: &str) -> bool {
+/// message (hint, context), where it is in the editor as a link ("Line 8, column 7", the last
+/// line of `text` when `at` is known), and "Fix error" (the AI assistant).
+fn error_card(ui: &mut Ui, sql: &str, text: &str, at: Option<(usize, usize)>) -> ErrorCardAction {
     let pal = ternarygrid_ui::pal(ui);
-    let mut fix = false;
+    let mut action = ErrorCardAction::None;
     let mut lines = text.lines();
     let first = lines.next().unwrap_or("");
-    let rest: Vec<&str> = lines.collect();
+    let mut rest: Vec<&str> = lines.collect();
+    let place = at.and_then(|_| rest.pop());
     let state = text.find("SQLSTATE").map(|i| text[i..].chars().take(14).collect::<String>().trim_end_matches([')', ']', '.', ',']).to_string());
     let edge = if ui.visuals().dark_mode { egui::Color32::from_rgb(0x5a, 0x3b, 0x40) } else { egui::Color32::from_rgb(0xf3, 0xc7, 0xc2) };
     egui::Frame::new()
@@ -2478,11 +2560,102 @@ fn error_card(ui: &mut Ui, sql: &str, text: &str) -> bool {
                 let mono = egui::FontId::monospace(12.5);
                 ui.add(egui::Label::new(RichText::new(rest.join("\n")).font(mono).color(pal.text)).wrap().selectable(true));
             }
+            if let (Some(place), Some((line, column))) = (place, at) {
+                let link = ui.add(egui::Label::new(RichText::new(format!("{}  {place}", icon::ARROW_BEND_DOWN_RIGHT)).color(pal.accent_text)).sense(egui::Sense::click()));
+                let link = link.on_hover_text(tr("Show it in the editor"));
+                if link.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    ui.painter().hline(link.rect.x_range(), link.rect.bottom(), egui::Stroke::new(1.0, pal.accent_text));
+                }
+                if link.clicked() {
+                    action = ErrorCardAction::Goto(line, column);
+                }
+            }
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                fix = kit::button_full(ui, kit::Kind::Soft, Some(icon::SPARKLE), tr("Fix error"), true, false).on_hover_text(sql.lines().next().unwrap_or("")).clicked();
+                if kit::button_full(ui, kit::Kind::Soft, Some(icon::SPARKLE), tr("Fix error"), true, false).on_hover_text(sql.lines().next().unwrap_or("")).clicked() {
+                    action = ErrorCardAction::Fix;
+                }
                 ui.label(RichText::new(tr("The AI assistant reads the statement and the error and proposes a fix.")).size(12.5).color(pal.text_muted));
             });
         });
-    fix
+    action
+}
+
+/// Run as a split button (filled, 26 points high): the main part runs the statement, the caret
+/// after a hairline opens the other ways to run. Returns (main, caret).
+fn run_split_button(ui: &mut Ui, id: egui::Id, tip: &str) -> (egui::Response, egui::Response) {
+    let p = ternarygrid_ui::pal(ui);
+    let size = ternarygrid_ui::style::body_size(ui.ctx()) - 0.5;
+    let play = ui.painter().layout_no_wrap(icon::PLAY.to_string(), ternarygrid_ui::style::icon_font(size + 1.0), p.on_accent);
+    let text = ui.painter().layout_no_wrap(tr("Run").to_string(), ternarygrid_ui::style::medium(ui.ctx(), size), p.on_accent);
+    let caret = ui.painter().layout_no_wrap(icon::CARET_DOWN.to_string(), ternarygrid_ui::style::icon_font(11.0), p.on_accent);
+    let (h, pad, caret_w) = (ternarygrid_ui::style::SMALL_H, 10.0, 22.0);
+    let main_w = pad + play.size().x + 6.0 + text.size().x + pad;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(main_w + caret_w, h), egui::Sense::hover());
+    let main_r = egui::Rect::from_min_size(rect.min, egui::vec2(main_w, h));
+    let caret_r = egui::Rect::from_min_max(egui::pos2(main_r.right(), rect.top()), rect.max);
+    let main = ui.interact(main_r, id.with("main"), egui::Sense::click()).on_hover_text(tip);
+    let more = ui.interact(caret_r, id.with("more"), egui::Sense::click()).on_hover_text(tr("More ways to run"));
+    main.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("Run")));
+    more.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("More ways to run")));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let r = ternarygrid_ui::style::RADIUS;
+        let fill = |resp: &egui::Response| if resp.is_pointer_button_down_on() || resp.hovered() { p.accent_hover } else { p.accent };
+        painter.rect_filled(main_r, egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 }, fill(&main));
+        painter.rect_filled(caret_r, egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }, fill(&more));
+        painter.vline(main_r.right(), (rect.top() + 6.0)..=(rect.bottom() - 6.0), egui::Stroke::new(1.0, p.on_accent.gamma_multiply(0.35)));
+        let x = main_r.left() + pad;
+        let play_w = play.size().x;
+        painter.galley(egui::pos2(x, main_r.center().y - play.size().y / 2.0), play, p.on_accent);
+        painter.galley(egui::pos2(x + play_w + 6.0, main_r.center().y - text.size().y / 2.0), text, p.on_accent);
+        painter.galley(caret_r.center() - caret.size() / 2.0, caret, p.on_accent);
+        for resp in [&main, &more] {
+            if resp.has_focus() {
+                painter.rect_stroke(resp.rect.expand(2.0), egui::CornerRadius::same(r + 2), egui::Stroke::new(1.5, p.accent), egui::StrokeKind::Outside);
+            }
+        }
+    }
+    (main, more)
+}
+
+/// The editor's connection, as the top bar's crumb: the connection type's stripe (Production)
+/// at its left edge, the database's logo, the name and a faint chevron; 28 points high, framed
+/// only when hovered.
+fn connection_chip(ui: &mut Ui, kind: Option<ternarygrid_core::DbKind>, marker: Option<egui::Color32>, name: &str, tip: &str) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let galley = ui.painter().layout_no_wrap(name.to_string(), egui::FontId::proportional(13.0), p.text);
+    let caret = ui.painter().layout_no_wrap(icon::CARET_DOWN.to_string(), ternarygrid_ui::style::icon_font(11.0), p.text_faint);
+    let (pad, lead, gap) = (if marker.is_some() { 11.0 } else { 8.0 }, 16.0, 6.0);
+    let width = pad + lead + gap + galley.size().x + gap + caret.size().x + 8.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    let resp = resp.on_hover_text(tip);
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if resp.hovered() || resp.is_pointer_button_down_on() {
+            painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, p.hover);
+        }
+        if resp.has_focus() {
+            painter.rect_stroke(rect, ternarygrid_ui::style::RADIUS, egui::Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
+        }
+        let cy = rect.center().y;
+        if let Some(m) = marker {
+            let stripe = egui::Rect::from_min_size(egui::pos2(rect.left() + 3.0, cy - 8.0), egui::vec2(3.0, 16.0));
+            painter.rect_filled(stripe, 2.0, m);
+        }
+        let logo = egui::Rect::from_min_size(egui::pos2(rect.left() + pad, cy - 8.0), egui::vec2(lead, lead));
+        let dark = ui.visuals().dark_mode;
+        let drawn = kind.is_some_and(|k| crate::dblogo::paint(ui, k, logo, crate::theme::legible_on(crate::theme::logo_color(k, dark), p.surface)));
+        if !drawn {
+            let glyph = kind.map_or(icon::PLUG, crate::nav::db_icon);
+            painter.text(logo.center(), egui::Align2::CENTER_CENTER, glyph, ternarygrid_ui::style::icon_font(14.0), p.text_muted);
+        }
+        let x = logo.right() + gap;
+        let w = galley.size().x;
+        painter.galley(egui::pos2(x, cy - galley.size().y / 2.0), galley, p.text);
+        painter.galley(egui::pos2(x + w + gap, cy - caret.size().y / 2.0), caret, p.text_faint);
+    }
+    resp
 }

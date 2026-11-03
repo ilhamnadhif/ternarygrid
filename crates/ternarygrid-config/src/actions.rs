@@ -112,105 +112,105 @@ macro_rules! actions {
 
 actions! {
     /// Run the statement under the cursor (or the selection).
-    ExecuteStatement => ("sql.execute_statement", "Execute Statement", Sql, SqlEditor),
+    ExecuteStatement => ("sql.execute_statement", "Run statement", Sql, SqlEditor),
     /// Run the whole script.
-    ExecuteScript => ("sql.execute_script", "Execute Script", Sql, SqlEditor),
+    ExecuteScript => ("sql.execute_script", "Run script", Sql, SqlEditor),
     /// Run only the selected text.
-    ExecuteSelection => ("sql.execute_selection", "Execute Selection", Sql, SqlEditor),
+    ExecuteSelection => ("sql.execute_selection", "Run selection", Sql, SqlEditor),
     /// Run the current statement and show its results in a new tab.
-    ExecuteInNewTab => ("sql.execute_in_new_tab", "Execute in New Tab", Sql, SqlEditor),
+    ExecuteInNewTab => ("sql.execute_in_new_tab", "Run in new tab", Sql, SqlEditor),
     /// EXPLAIN the current statement.
-    ExplainPlan => ("sql.explain_plan", "Explain Execution Plan", Sql, SqlEditor),
+    ExplainPlan => ("sql.explain_plan", "Explain execution plan", Sql, SqlEditor),
     /// EXPLAIN ANALYZE the current statement.
-    ExplainAnalyze => ("sql.explain_analyze", "Explain Analyze", Sql, SqlEditor),
+    ExplainAnalyze => ("sql.explain_analyze", "Explain analyze", Sql, SqlEditor),
     /// Show the plan of the current statement as a diagram.
-    ShowPlanDiagram => ("sql.show_plan_diagram", "Show Plan Diagram", Sql, SqlEditor),
+    ShowPlanDiagram => ("sql.show_plan_diagram", "Show plan diagram", Sql, SqlEditor),
     /// Cancel the running query of the active editor.
-    CancelQuery => ("sql.cancel_query", "Cancel Query", Sql, Global),
+    CancelQuery => ("sql.cancel_query", "Stop query", Sql, Global),
     /// New SQL script for the selected connection.
-    NewSqlEditor => ("sql.new_editor", "New SQL Editor", Sql, Global),
+    NewSqlEditor => ("sql.new_editor", "New SQL editor", Sql, Global),
     /// Open a SQL console (not saved as a file).
-    OpenSqlConsole => ("sql.open_console", "Open SQL Console", Sql, Global),
+    OpenSqlConsole => ("sql.open_console", "New SQL console", Sql, Global),
     /// Choose the active connection of the editor.
-    SelectConnection => ("sql.select_connection", "Select Active Connection", Sql, Global),
+    SelectConnection => ("sql.select_connection", "Select active connection", Sql, Global),
     /// Choose the active schema / database of the editor.
-    SelectSchema => ("sql.select_schema", "Select Active Schema", Sql, Global),
+    SelectSchema => ("sql.select_schema", "Select active schema", Sql, Global),
     /// Show or hide the results panel.
-    ToggleResultsPanel => ("sql.toggle_results_panel", "Toggle Results Panel", View, Global),
+    ToggleResultsPanel => ("sql.toggle_results_panel", "Toggle results panel", View, Global),
     /// Maximize or restore the results panel.
-    MaximizeResults => ("sql.maximize_results", "Maximize Results Panel", View, Global),
+    MaximizeResults => ("sql.maximize_results", "Maximize results panel", View, Global),
     /// Format the SQL text.
     FormatSql => ("editor.format_sql", "Format SQL", Editor, SqlEditor),
     /// Move the cursor to the start of the next statement.
-    NextStatement => ("editor.next_statement", "Next Statement", Editor, SqlEditor),
+    NextStatement => ("editor.next_statement", "Next statement", Editor, SqlEditor),
     /// Move the cursor to the start of the previous statement.
-    PreviousStatement => ("editor.previous_statement", "Previous Statement", Editor, SqlEditor),
+    PreviousStatement => ("editor.previous_statement", "Previous statement", Editor, SqlEditor),
     /// Copy the statement under the cursor (or the selection).
-    CopyStatement => ("sql.copy_statement", "Copy Current Statement", Sql, SqlEditor),
+    CopyStatement => ("sql.copy_statement", "Copy current statement", Sql, SqlEditor),
     /// Count the rows the statement under the cursor returns.
-    SelectRowCount => ("sql.select_row_count", "Count Rows of the Query", Sql, SqlEditor),
+    SelectRowCount => ("sql.select_row_count", "Count rows of the query", Sql, SqlEditor),
     /// Evaluate the selected expression (`SELECT <expression>`).
-    EvaluateExpression => ("sql.evaluate_expression", "Evaluate Expression", Sql, SqlEditor),
+    EvaluateExpression => ("sql.evaluate_expression", "Evaluate expression", Sql, SqlEditor),
     /// Open the table or view under the cursor.
-    OpenDeclaration => ("editor.open_declaration", "Open Declaration", Editor, SqlEditor),
+    OpenDeclaration => ("editor.open_declaration", "Open declaration", Editor, SqlEditor),
     /// Turn the selected lines into a quoted, comma separated list.
-    MorphToDelimited => ("editor.morph_delimited", "Morph to Delimited List", Editor, SqlEditor),
+    MorphToDelimited => ("editor.morph_delimited", "Morph to delimited list", Editor, SqlEditor),
     /// Remove trailing whitespace (selection or whole script).
-    TrimTrailingSpaces => ("editor.trim_trailing_spaces", "Trim Trailing Spaces", Editor, SqlEditor),
+    TrimTrailingSpaces => ("editor.trim_trailing_spaces", "Trim trailing spaces", Editor, SqlEditor),
     /// Open an execution plan saved earlier.
-    LoadExecutionPlan => ("sql.load_plan", "Load Execution Plan", Sql, SqlEditor),
+    LoadExecutionPlan => ("sql.load_plan", "Load execution plan…", Sql, SqlEditor),
     /// Collapse or expand the fold at the cursor.
-    ToggleFold => ("editor.toggle_fold", "Toggle Folding", Editor, SqlEditor),
+    ToggleFold => ("editor.toggle_fold", "Toggle folding", Editor, SqlEditor),
     /// Collapse every statement and block comment.
-    CollapseAllFolds => ("editor.collapse_all_folds", "Collapse All Foldings", Editor, SqlEditor),
+    CollapseAllFolds => ("editor.collapse_all_folds", "Collapse all folds", Editor, SqlEditor),
     /// Expand every folded region.
-    ExpandAllFolds => ("editor.expand_all_folds", "Expand All Foldings", Editor, SqlEditor),
+    ExpandAllFolds => ("editor.expand_all_folds", "Expand all folds", Editor, SqlEditor),
     /// Search the selection or the word under the cursor on the web.
-    SearchWeb => ("editor.search_web", "Search on the Web", Editor, SqlEditor),
+    SearchWeb => ("editor.search_web", "Search on the web", Editor, SqlEditor),
     /// Save the script.
     Save => ("editor.save", "Save", Editor, SqlEditor),
     /// Find text.
     Find => ("editor.find", "Find", Editor, SqlEditor),
     /// Find the next match.
-    FindNext => ("editor.find_next", "Find Next", Editor, SqlEditor),
+    FindNext => ("editor.find_next", "Find next", Editor, SqlEditor),
     /// Find the previous match.
-    FindPrevious => ("editor.find_previous", "Find Previous", Editor, SqlEditor),
+    FindPrevious => ("editor.find_previous", "Find previous", Editor, SqlEditor),
     /// Find and replace.
     Replace => ("editor.replace", "Replace", Editor, SqlEditor),
     /// Jump to a line number.
-    GoToLine => ("editor.go_to_line", "Go to Line", Editor, SqlEditor),
+    GoToLine => ("editor.go_to_line", "Go to line", Editor, SqlEditor),
     /// Comment or uncomment the selected lines (`--`).
-    ToggleComment => ("editor.toggle_comment", "Toggle Line Comment", Editor, SqlEditor),
+    ToggleComment => ("editor.toggle_comment", "Toggle line comment", Editor, SqlEditor),
     /// Wrap the selection in a block comment (`/* */`).
-    ToggleBlockComment => ("editor.toggle_block_comment", "Toggle Block Comment", Editor, SqlEditor),
+    ToggleBlockComment => ("editor.toggle_block_comment", "Toggle block comment", Editor, SqlEditor),
     /// Open the completion popup.
     Autocomplete => ("editor.autocomplete", "Autocomplete", Editor, SqlEditor),
     /// Upper-case the selection.
-    UpperCase => ("editor.upper_case", "To Upper Case", Editor, SqlEditor),
+    UpperCase => ("editor.upper_case", "To upper case", Editor, SqlEditor),
     /// Lower-case the selection.
-    LowerCase => ("editor.lower_case", "To Lower Case", Editor, SqlEditor),
+    LowerCase => ("editor.lower_case", "To lower case", Editor, SqlEditor),
     /// Save pending data changes of the grid.
-    SaveData => ("data.save", "Save Data Changes", Data, ResultsGrid),
+    SaveData => ("data.save", "Save data changes", Data, ResultsGrid),
     /// Discard pending data changes of the grid.
-    CancelDataChanges => ("data.cancel_changes", "Cancel Data Changes", Data, ResultsGrid),
+    CancelDataChanges => ("data.cancel_changes", "Discard data changes", Data, ResultsGrid),
     /// Export data.
-    Export => ("data.export", "Export Data", Data, Global),
+    Export => ("data.export", "Export data…", Data, Global),
     /// Import data.
-    Import => ("data.import", "Import Data", Data, Global),
+    Import => ("data.import", "Import data…", Data, Global),
     /// Commit the open transaction.
     Commit => ("tx.commit", "Commit", Transactions, Global),
     /// Roll back the open transaction.
-    Rollback => ("tx.rollback", "Rollback", Transactions, Global),
+    Rollback => ("tx.rollback", "Roll back", Transactions, Global),
     /// Switch between auto-commit and manual commit.
-    ToggleAutoCommit => ("tx.toggle_auto_commit", "Toggle Auto-Commit", Transactions, Global),
+    ToggleAutoCommit => ("tx.toggle_auto_commit", "Toggle auto-commit", Transactions, Global),
     /// List the connections with uncommitted changes (commit / roll back).
-    PendingTransactions => ("tx.pending", "Pending Transactions", Transactions, Global),
+    PendingTransactions => ("tx.pending", "Pending transactions…", Transactions, Global),
     /// Create a connection.
-    NewConnection => ("conn.new", "New Connection", Connections, Global),
+    NewConnection => ("conn.new", "New connection…", Connections, Global),
     /// Create a database on the selected connection's server.
-    NewDatabase => ("conn.new_database", "New Database", Connections, Global),
+    NewDatabase => ("conn.new_database", "New database…", Connections, Global),
     /// Edit the selected connection.
-    EditConnection => ("conn.edit", "Edit Connection", Connections, Global),
+    EditConnection => ("conn.edit", "Edit connection…", Connections, Global),
     /// Connect the selected connection.
     Connect => ("conn.connect", "Connect", Connections, Global),
     /// Disconnect the selected connection.
@@ -220,39 +220,39 @@ actions! {
     /// Refresh the selected navigator node or result set.
     Refresh => ("view.refresh", "Refresh", View, Global),
     /// Show or hide the navigator.
-    ToggleNavigator => ("view.toggle_navigator", "Toggle Navigator", View, Global),
+    ToggleNavigator => ("view.toggle_navigator", "Toggle navigator", View, Global),
     /// Show the properties of the selected navigator object.
-    ToggleProperties => ("view.toggle_properties", "Toggle Properties Panel", View, Global),
+    ToggleProperties => ("view.toggle_properties", "Toggle properties panel", View, Global),
     /// Show the results below or to the right of the editor.
-    ToggleResultsLayout => ("view.toggle_results_layout", "Toggle Results Layout", View, Global),
+    ToggleResultsLayout => ("view.toggle_results_layout", "Toggle results layout", View, Global),
     /// Switch between the light and the dark theme.
-    ToggleTheme => ("view.toggle_theme", "Toggle Light / Dark Theme", View, Global),
+    ToggleTheme => ("view.toggle_theme", "Toggle light / dark theme", View, Global),
     /// Increase the font size.
-    ZoomIn => ("view.zoom_in", "Zoom In", View, Global),
+    ZoomIn => ("view.zoom_in", "Zoom in", View, Global),
     /// Decrease the font size.
-    ZoomOut => ("view.zoom_out", "Zoom Out", View, Global),
+    ZoomOut => ("view.zoom_out", "Zoom out", View, Global),
     /// Reset the font size.
-    ResetZoom => ("view.reset_zoom", "Reset Zoom", View, Global),
+    ResetZoom => ("view.reset_zoom", "Reset zoom", View, Global),
     /// Close the active tab.
-    CloseTab => ("tab.close", "Close Tab", Navigation, Global),
+    CloseTab => ("tab.close", "Close tab", Navigation, Global),
     /// Activate the next tab.
-    NextTab => ("tab.next", "Next Tab", Navigation, Global),
+    NextTab => ("tab.next", "Next tab", Navigation, Global),
     /// Activate the previous tab.
-    PrevTab => ("tab.previous", "Previous Tab", Navigation, Global),
+    PrevTab => ("tab.previous", "Previous tab", Navigation, Global),
     /// Find a table, view or routine by name and open it.
-    OpenDatabaseObject => ("app.open_database_object", "Open Database Object", Navigation, Global),
+    OpenDatabaseObject => ("app.open_database_object", "Open database object", Navigation, Global),
     /// Open the command palette.
-    CommandPalette => ("app.command_palette", "Command Palette", Navigation, Global),
+    CommandPalette => ("app.command_palette", "Command palette", Navigation, Global),
     /// Open the query manager (history).
-    OpenHistory => ("tools.query_history", "Query History", Tools, Global),
+    OpenHistory => ("tools.query_history", "Query history", Tools, Global),
     /// Open an ER diagram.
     OpenErDiagram => ("tools.er_diagram", "ER Diagram", Tools, Global),
     /// Open the task manager.
     OpenTasks => ("tools.tasks", "Tasks", Tools, Global),
     /// Open the session manager.
-    OpenSessionManager => ("tools.session_manager", "Session Manager", Tools, Global),
+    OpenSessionManager => ("tools.session_manager", "Session manager", Tools, Global),
     /// Open the AI assistant.
-    AiAssistant => ("tools.ai_assistant", "AI Assistant", Tools, Global),
+    AiAssistant => ("tools.ai_assistant", "AI assistant", Tools, Global),
     /// Open the settings.
     OpenSettings => ("app.settings", "Settings", Application, Global),
     /// Quit TernaryGrid.
@@ -260,13 +260,13 @@ actions! {
     /// Open the documentation.
     Help => ("help.contents", "Help", Help, Global),
     /// Show all keyboard shortcuts.
-    ShowShortcuts => ("help.shortcuts", "Keyboard Shortcuts", Help, Global),
+    ShowShortcuts => ("help.shortcuts", "Keyboard shortcuts", Help, Global),
     /// The application log (errors and warnings).
-    ShowErrorLog => ("help.error_log", "Error Log", Help, Global),
+    ShowErrorLog => ("help.error_log", "Error log", Help, Global),
     /// Show a tip about a feature.
-    TipOfTheDay => ("help.tip_of_the_day", "Tip of the Day", Help, Global),
+    TipOfTheDay => ("help.tip_of_the_day", "Tip of the day", Help, Global),
     /// Save the log, settings and system information (no secrets) as a zip file.
-    CollectDiagnostics => ("help.collect_diagnostics", "Collect Diagnostic Info", Help, Global),
+    CollectDiagnostics => ("help.collect_diagnostics", "Collect diagnostic info", Help, Global),
 }
 
 impl Action {

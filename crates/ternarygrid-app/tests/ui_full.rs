@@ -655,7 +655,7 @@ fn menus_actions_commands_and_dialogs() {
     pause(&mut h);
     nav_row(&h, &dup).unwrap().click_secondary();
     frames(&mut h, 2);
-    click(&mut h, "Delete");
+    click(&mut h, "Delete connection…");
     frames(&mut h, 2);
     let delete_buttons: Vec<String> = labels(&h).into_iter().filter(|l| l.contains("Delete")).collect();
     pause(&mut h);
@@ -1108,9 +1108,10 @@ fn tool_tabs_run() {
     h.event(egui::Event::Text("code".into()));
     frames(&mut h, 2);
     click(&mut h, "Create table…");
-    assert!(has(&h, "Execute"), "designer confirmation: {:?}", labels(&h));
+    // The confirmation's button is named after what it does.
+    assert!(h.query_all_by_label("Create table").next().is_some(), "designer confirmation: {:?}", labels(&h));
     pause(&mut h);
-    h.query_all_by_label_contains("Execute").last().unwrap().click();
+    h.query_all_by_label("Create table").last().unwrap().click();
     wait(&mut h, "table created", |_| query_one(&db, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'zz_designed'") == "1");
     settle(&mut h, "table designer");
     let ddl = query_one(&db, "SELECT sql FROM sqlite_master WHERE name = 'zz_designed'");
@@ -1594,9 +1595,10 @@ fn workspace_from_dbeaver() {
     // The rail shows the projects, then the navigator again.
     click(&mut h, "Projects and scripts");
     assert!(has(&h, "Scripts"), "the projects view: {:?}", labels(&h));
-    click(&mut h, "Database Navigator");
-    wait(&mut h, "the navigator", |h| nav_row(h, "Tables").is_some() || has(h, "Database Navigator"));
-    // A SQL editor: its connection in the top bar, its transaction mode and result in the status bar.
+    click(&mut h, "Database navigator");
+    wait(&mut h, "the navigator", |h| nav_row(h, "Tables").is_some() || has(h, "Database navigator"));
+    // A SQL editor: its connection in the top bar, its transaction mode in the status bar, the
+    // result in the results' footer.
     h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: Some("select * from customer".into()) });
     frames(&mut h, 3);
     wait(&mut h, "editor session", |h| focused_editor(h).session_ready());
@@ -1605,7 +1607,7 @@ fn workspace_from_dbeaver() {
     wait(&mut h, "the result", |h| !focused_editor(h).is_running() && focused_editor(h).result_count() > 0);
     frames(&mut h, 2);
     assert!(has(&h, "Auto-commit"), "transaction mode in the status bar: {:?}", labels(&h));
-    assert!(labels(&h).iter().any(|l| l.contains(" rows")), "the result in the status bar: {:?}", labels(&h));
+    assert!(labels(&h).iter().any(|l| l.contains(" rows")), "the result in the footer: {:?}", labels(&h));
     settle(&mut h, "top bar, rail and status bar");
 
     // Production: reading runs without a question, changing data asks.

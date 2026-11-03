@@ -97,12 +97,10 @@ impl TernaryGridApp {
         }
         let p = ternarygrid_ui::pal(ui);
 
-        // Right: update, AI, theme, settings (laid out first: the search box goes between).
+        // Right: update, AI, theme (laid out first: the search box goes between). The settings
+        // are on the rail, which shows when they are open.
         let mut right = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::right_to_left(egui::Align::Center)));
         right.spacing_mut().item_spacing.x = 2.0;
-        if kit::icon_button_sized(&mut right, icon::GEAR_SIX, tr("Settings"), false, 30.0, 16.0).clicked() {
-            self.commands.push(AppCommand::OpenSettings);
-        }
         let dark = right.visuals().dark_mode;
         let (theme_icon, theme_tip) = if dark { (icon::SUN, tr("Switch to the light theme")) } else { (icon::MOON, tr("Switch to the dark theme")) };
         if kit::icon_button_sized(&mut right, theme_icon, theme_tip, false, 30.0, 16.0).clicked() {
@@ -151,10 +149,16 @@ impl TernaryGridApp {
         let mut console = false;
         let keys = |a: crate::keys::Action| crate::keys::label(&self.keymap, a);
         let (editor_keys, conn_keys) = (keys(crate::keys::Action::NewSqlEditor), keys(crate::keys::Action::NewConnection));
+        let (database_why, schema_why) = (self.cannot_create(false), self.cannot_create(true));
         egui::Popup::menu(&resp).gap(4.0).show(|ui| {
             kit::menu_look(ui, 230.0);
-            let mut item = |ui: &mut Ui, enabled: bool, glyph: &str, text: &str, keys: &str, action: Option<M>| {
-                if ui.add_enabled_ui(enabled, |ui| kit::menu_item(ui, Some(glyph), text, keys)).inner.clicked() {
+            let mut item = |ui: &mut Ui, why: Option<&str>, glyph: &str, text: &str, keys: &str, action: Option<M>| {
+                let r = ui.add_enabled_ui(why.is_none(), |ui| kit::menu_item(ui, Some(glyph), text, keys)).inner;
+                let r = match why {
+                    Some(why) => r.on_disabled_hover_text(why),
+                    None => r,
+                };
+                if r.clicked() {
                     match action {
                         Some(a) => chosen = Some(a),
                         None => console = true,
@@ -162,15 +166,15 @@ impl TernaryGridApp {
                     ui.close();
                 }
             };
-            item(ui, true, icon::FILE_CODE, tr("SQL editor"), &editor_keys, Some(M::NewSqlEditor));
-            item(ui, true, icon::TERMINAL_WINDOW, tr("SQL console"), "", None);
+            item(ui, None, icon::FILE_CODE, tr("SQL editor"), &editor_keys, Some(M::NewSqlEditor));
+            item(ui, None, icon::TERMINAL_WINDOW, tr("SQL console"), "", None);
             kit::menu_separator(ui);
-            item(ui, true, icon::PLUG, tr("Connection…"), &conn_keys, Some(M::NewConnection));
-            item(ui, state.new_database, icon::DATABASE, tr("Database…"), "", Some(M::NewDatabase));
-            item(ui, state.new_schema, icon::STACK, tr("Schema…"), "", Some(M::NewSchema));
+            item(ui, None, icon::PLUG, tr("Connection…"), &conn_keys, Some(M::NewConnection));
+            item(ui, database_why.as_deref().filter(|_| !state.new_database), icon::DATABASE, tr("Database…"), "", Some(M::NewDatabase));
+            item(ui, schema_why.as_deref().filter(|_| !state.new_schema), icon::STACK, tr("Schema…"), "", Some(M::NewSchema));
             kit::menu_separator(ui);
-            item(ui, true, icon::DOWNLOAD_SIMPLE, tr("Import connections…"), "", Some(M::ImportConnections));
-            item(ui, true, icon::PACKAGE, tr("Sample database"), "", Some(M::CreateSampleDatabase));
+            item(ui, None, icon::DOWNLOAD_SIMPLE, tr("Import connections…"), "", Some(M::ImportConnections));
+            item(ui, None, crate::tabs::welcome::SAMPLE_ICON, tr("Sample database"), "", Some(M::CreateSampleDatabase));
         });
         if console {
             self.commands.push(AppCommand::Action(crate::keys::Action::OpenSqlConsole));
@@ -181,18 +185,30 @@ impl TernaryGridApp {
         }
     }
 
+    /// Why New › Database… (`schema`: Schema…) is off, for its tooltip: no connection selected,
+    /// not connected, or a server that has none to create.
+    pub(super) fn cannot_create(&self, schema: bool) -> Option<String> {
+        let Some(conn) = self.selected_connection() else {
+            return Some(tr("Select a connection in the navigator first.").to_string());
+        };
+        let Some(live) = self.conns.live(&conn) else {
+            let name = self.conns.config(&conn).map(|c| c.name.clone()).unwrap_or_default();
+            return Some(ternarygrid_core::trf("Connect to {} first.", &[&name]));
+        };
+        let product = live.config.kind.display_name();
+        Some(if schema { ternarygrid_core::trf("{} has no schemas to create.", &[&product]) } else { ternarygrid_core::trf("{} has no databases to create.", &[&product]) })
+    }
+
     /// Connection › database › schema of the active tab (in a SQL editor a
     /// click chooses another; elsewhere it shows the place in the navigator),
     /// and the connection's type when it has a colour (Production).
     fn location_crumbs(&mut self, ui: &mut Ui, p: &ternarygrid_ui::Palette, pill_limit: f32) {
         let active = self.dock.find_active_focused();
-        let location = active.as_ref().and_then(|(_, t)| crate::tabs::tab_location(t.view.as_ref(), &self.conns));
         let object = active.as_ref().and_then(|(_, t)| t.view.navigator_object());
         let in_editor = active.as_ref().is_some_and(|(_, t)| t.view.as_any().is::<crate::tabs::sql_editor::SqlEditorTab>());
-        let Some(loc) = location else {
-            ui.label(RichText::new(tr("No active connection")).size(13.0).color(p.text_faint));
-            return;
-        };
+        // A tab that works nowhere (the start page, the settings): nothing, or the connection
+        // selected in the navigator, which New and the other commands use.
+        let Some(loc) = self.location() else { return };
         let conn_tip = format!("{}: {}", tr("Connection"), loc.name);
         let mut clicked_place = false;
         let clicked_conn = bar_button(ui, Lead::Logo(loc.kind), &loc.name, &conn_tip, false).clicked();
@@ -225,6 +241,22 @@ impl TernaryGridApp {
                 None => self.nav.select(crate::nav::NavNode::Connection(loc.conn)),
             }
         }
+    }
+
+    /// Where the active tab works; for a tab without a connection, the connection selected in
+    /// the navigator (what New and the menus act on).
+    pub(super) fn location(&mut self) -> Option<crate::tabs::TabLocation> {
+        let active = self.dock.find_active_focused();
+        if let Some(loc) = active.as_ref().and_then(|(_, t)| crate::tabs::tab_location(t.view.as_ref(), &self.conns)) {
+            return Some(loc);
+        }
+        // A tab on a connection that is gone, or an editor without one (its toolbar says so).
+        if active.as_ref().is_some_and(|(_, t)| t.view.connection_id().is_some() || t.view.as_any().is::<crate::tabs::sql_editor::SqlEditorTab>()) {
+            return None;
+        }
+        let conn = self.nav.selected.as_ref().and_then(|n| n.connection())?;
+        let cfg = self.conns.config(conn)?;
+        Some(crate::tabs::TabLocation { conn: conn.to_string(), name: cfg.name.clone(), kind: cfg.kind, place: None, database: None, schema: None })
     }
 
     /// The box that opens the command palette (objects, scripts, commands): 30 points high,
@@ -279,7 +311,7 @@ impl TernaryGridApp {
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.add_space(8.0);
             let nav_on = self.show_nav && !self.show_project;
-            if kit::icon_button_sized(ui, icon::DATABASE, tr("Database Navigator"), nav_on && place == Place::Panel, side, glyph).clicked() {
+            if kit::icon_button_sized(ui, icon::DATABASE, tr("Database navigator"), nav_on && place == Place::Panel, side, glyph).clicked() {
                 if nav_on {
                     self.show_nav = false;
                 } else {
@@ -296,7 +328,7 @@ impl TernaryGridApp {
                     self.show_project = true;
                 }
             }
-            if kit::icon_button_sized(ui, icon::CLOCK, tr("Query history"), place == Place::History, side, glyph).clicked() {
+            if kit::icon_button_sized(ui, icon::CLOCK_COUNTER_CLOCKWISE, tr("Query history"), place == Place::History, side, glyph).clicked() {
                 self.commands.push(AppCommand::Action(Action::OpenHistory));
             }
             if kit::icon_button_sized(ui, icon::LIST_CHECKS, tr("Tasks"), place == Place::Tasks, side, glyph).clicked() {
@@ -311,7 +343,7 @@ impl TernaryGridApp {
             }
             let running = self.ops.running();
             let tip = if running > 0 { ternarygrid_core::trf("Background operations ({} running)", &[&running]) } else { tr("Background operations").to_string() };
-            let ops = kit::icon_button_sized(ui, icon::CLOCK_COUNTER_CLOCKWISE, &tip, self.ops.panel_open, side, glyph);
+            let ops = kit::icon_button_sized(ui, icon::ACTIVITY, &tip, self.ops.panel_open, side, glyph);
             if running > 0 {
                 let p = ternarygrid_ui::pal(ui);
                 ui.painter().circle_filled(ops.rect.right_top() + egui::vec2(-9.5, 9.5), 3.5, p.accent_text);
@@ -322,8 +354,9 @@ impl TernaryGridApp {
         });
     }
 
-    /// The status bar: where the active tab works (connection · schema ·
-    /// transaction mode · result), the time zone and memory.
+    /// The status bar: the state of the connection the active tab works on (the top bar names
+    /// it, the results' footer counts the rows): a dot, the server, the transaction mode; the
+    /// time zone and memory.
     pub(super) fn status_bar(&mut self, ui: &mut Ui) {
         let p = ternarygrid_ui::pal(ui);
         let small = egui::FontId::proportional(11.5);
@@ -332,27 +365,34 @@ impl TernaryGridApp {
             let sep = |ui: &mut Ui| {
                 ui.label(RichText::new("·").font(small.clone()).color(p.border_strong));
             };
+            let location = self.location();
             let active = self.dock.find_active_focused();
-            let location = active.as_ref().and_then(|(_, t)| crate::tabs::tab_location(t.view.as_ref(), &self.conns));
             match location {
                 Some(loc) => {
-                    let connected = self.conns.is_connected(&loc.conn);
-                    let dot = if connected { p.ok } else { p.text_faint };
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                    ui.painter().circle_filled(r.center(), 3.5, dot);
-                    let server = match self.conns.live(&loc.conn) {
+                    let (dot, server) = match self.conns.live(&loc.conn) {
                         // `version()` texts repeat the product ("PostgreSQL 16.4 on …"): show the number.
                         Some(live) => {
                             let number = live.server.version.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit())).unwrap_or("");
-                            format!("{} {number}", live.server.product)
+                            (p.ok, format!("{} {number}", live.server.product).trim().to_string())
                         }
-                        None => tr("not connected").to_string(),
+                        None => match self.conns.status(&loc.conn) {
+                            crate::conn::ConnStatus::Connecting => (p.warn, tr("Connecting…").to_string()),
+                            crate::conn::ConnStatus::Failed(_) => (p.err, tr("Connection failed").to_string()),
+                            _ => (p.text_faint, tr("Not connected").to_string()),
+                        },
                     };
-                    ui.label(RichText::new(&loc.name).font(small.clone()).color(p.text)).on_hover_text(server);
-                    if let Some(place) = &loc.place {
-                        sep(ui);
-                        ui.label(RichText::new(place).font(small.clone()).color(p.text_muted));
-                    }
+                    let tip = match &loc.place {
+                        Some(place) => format!("{} · {place}", loc.name),
+                        None => loc.name.clone(),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                        ui.painter().circle_filled(r.center(), 3.5, dot);
+                        ui.label(RichText::new(&server).font(small.clone()).color(p.text_muted));
+                    })
+                    .response
+                    .on_hover_text(tip);
                     // Transaction mode of the tab's session (Manual: what is pending).
                     if let Some(session) = active.as_ref().and_then(|(_, t)| t.view.transaction_session()) {
                         let tx = session.tx_state();
@@ -369,17 +409,10 @@ impl TernaryGridApp {
                             self.commands.push(AppCommand::Action(crate::keys::Action::PendingTransactions));
                         }
                     }
-                    if let Some(summary) = active.as_ref().and_then(|(_, t)| t.view.status_summary()) {
-                        // "192 rows · 286 ms": each part after its own separator.
-                        for part in summary.split(" · ") {
-                            sep(ui);
-                            ui.label(RichText::new(part).font(small.clone()).color(p.text_muted));
-                        }
-                    }
                 }
                 None => {
                     ui.add_space(-2.0);
-                    ui.label(RichText::new(tr("No active connection")).font(small.clone()).color(p.text_muted));
+                    ui.label(RichText::new(tr("No connection")).font(small.clone()).color(p.text_faint));
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

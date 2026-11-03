@@ -357,11 +357,12 @@ pub fn brand_color(kind: ternarygrid_core::DbKind) -> Color32 {
     }
 }
 
-/// A one-colour database logo's colour: the brand colour, a little lighter
-/// on dark backgrounds (coloured logos keep their own colours).
+/// A one-colour database logo's colour: the brand colour; on dark backgrounds a light tint of
+/// it (MySQL's dark teal, drawn in thin strokes at 15 points, vanished on the dark canvas).
+/// Coloured logos keep their own colours (see `dblogo`'s dark variants).
 pub fn logo_color(kind: ternarygrid_core::DbKind, dark_mode: bool) -> Color32 {
     let c = brand_color(kind);
-    if dark_mode { crate::theme::lighten(c, 0.2) } else { c }
+    if dark_mode { crate::theme::lighten(c, 0.5) } else { c }
 }
 
 /// `c` mixed with white by `t` (0 … 1).
