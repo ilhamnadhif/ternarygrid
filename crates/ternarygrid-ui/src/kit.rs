@@ -575,6 +575,18 @@ pub fn combo_caret(ui: &Ui, rect: Rect, visuals: &egui::style::WidgetVisuals, op
     ui.painter().add(egui::Shape::line(points, Stroke::new(1.4, color)));
 }
 
+/// A `Ui` filling `ui` whose contents cannot make it wider. A side panel takes the width of what
+/// is drawn in it; a row that takes the panel's width as its own and a little more would widen
+/// the panel a bit further each frame. `ui` keeps the width it was given (with nothing in it, the
+/// panel would shrink to its smallest).
+pub fn fixed_width_body(ui: &mut Ui) -> Ui {
+    let rect = ui.max_rect();
+    ui.expand_to_include_rect(rect);
+    let mut body = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+    body.expand_to_include_rect(rect);
+    body
+}
+
 /// A thin vertical divider between toolbar groups.
 pub fn vdivider(ui: &mut Ui, height: f32) {
     let p = style::pal(ui);

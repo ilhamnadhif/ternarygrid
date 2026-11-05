@@ -1942,6 +1942,8 @@ impl eframe::App for TernaryGridApp {
             // high over a hairline, the title at 14, its buttons 8 from the edge.
             let frame = egui::Frame::new().fill(ternarygrid_ui::pal(ui).canvas).inner_margin(egui::Margin { left: 0, right: 1, top: 0, bottom: 0 });
             let nav_panel = egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(273.0).size_range(180.0..=600.0).frame(frame).show(ui, |ui| {
+                let mut body = kit::fixed_width_body(ui);
+                let ui = &mut body;
                 let title = if self.show_project { tr("Projects") } else { tr("Database navigator") };
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 38.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1983,6 +1985,8 @@ impl eframe::App for TernaryGridApp {
             let frame = egui::Frame::new().fill(pal.canvas);
             // 460 points as in the design, plus the panel's 1 point edge.
             egui::Panel::right("ternarygrid_ai").resizable(true).default_size(461.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
+                let mut body = kit::fixed_width_body(ui);
+                let ui = &mut body;
                 // Header: the sparkle, the name and ×, 40 points over a hairline (no item gap
                 // between them).
                 let spacing = ui.spacing().item_spacing.y;
