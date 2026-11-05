@@ -19,7 +19,7 @@ use crate::conn::session::SessionHandle;
 use crate::cx::AppContext;
 use crate::sqllang::SqlLanguage;
 use crate::tabs::TabView;
-use crate::tabs::ai_agent::{self, Agent, AgentEvent, ToolStep};
+use crate::tabs::ai_agent::{self, Agent, AgentEvent, Approval, StepKind, ToolStep};
 use crate::tabs::ai_history::{ConversationStore, SavedConversation, title_of};
 use crate::tabs::table_designer::pick;
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType, vec2};
@@ -471,6 +471,8 @@ impl Turn {
                 self.running = None;
                 self.steps.push((self.answer.len(), step));
             }
+            // Kept by the panel, see `Pending::approval`.
+            Event::Agent(AgentEvent::Approval(_)) => {}
         }
     }
 
@@ -512,6 +514,8 @@ struct Pending {
     job: Job<DbResult<ChatResponse>>,
     rx: mpsc::Receiver<Event>,
     cancel: CancellationToken,
+    /// The statement waiting for the user's answer.
+    approval: Option<Approval>,
 }
 
 /// Database work done before a request (in the background).
@@ -606,6 +610,8 @@ pub struct AiAssistantTab {
     saved: Option<Vec<SavedConversation>>,
     /// An answer finished since the conversation was saved.
     unsaved: bool,
+    /// A statement the user allowed ran: the navigator's metadata may be old.
+    schema_changed: bool,
     /// The history's popup was open in the last frame (its button shows it on).
     history_open: bool,
     /// "Clear history…" asks first: the number of conversations it deletes.
@@ -648,6 +654,7 @@ impl AiAssistantTab {
             conversation: uuid::Uuid::new_v4().to_string(),
             saved: None,
             unsaved: false,
+            schema_changed: false,
             history_open: false,
             confirm_clear: None,
         }
@@ -847,8 +854,11 @@ impl AiAssistantTab {
             Some(l) if ai.agent_queries => {
                 let schema = self.schema.clone().unwrap_or_default();
                 // Read-only for the driver too (ClickHouse `readonly`, the NoSQL drivers), besides the agent's own checks.
-                let opener = l.open_read_only_session_future(format!("{} ({})", l.config.name, tr("AI assistant")), schema.database);
-                Some(Agent::new(l.kind(), l.main.dialect().syntax().clone(), schema.schema, Box::pin(opener)))
+                let label = format!("{} ({})", l.config.name, tr("AI assistant"));
+                let opener = l.open_read_only_session_future(label.clone(), schema.database.clone());
+                let agent = Agent::new(l.kind(), l.main.dialect().syntax().clone(), schema.schema, Box::pin(opener));
+                // Statements wait for the user's answer in the chat; a read-only connection has none.
+                Some(if l.config.read_only { agent } else { agent.with_writer(Box::pin(l.open_session_future(label, schema.database))) })
             }
             _ => None,
         };
@@ -885,7 +895,7 @@ impl AiAssistantTab {
             ai_agent::converse(req, agent, &token, stream, on_event).await
         });
         self.turns.push(turn);
-        self.pending = Some(Pending { turn: self.turns.len() - 1, job, rx, cancel });
+        self.pending = Some(Pending { turn: self.turns.len() - 1, job, rx, cancel, approval: None });
         // Keep the SQL for follow-ups; clear free text.
         if !action.takes_sql() {
             self.input.clear();
@@ -899,14 +909,23 @@ impl AiAssistantTab {
             self.pending = None;
             return false;
         };
-        while let Ok(ev) = p.rx.try_recv() {
-            turn.apply(ev);
-        }
+        let take_events = |turn: &mut Turn, approval: &mut Option<Approval>, changed: &mut bool| {
+            while let Ok(ev) = p.rx.try_recv() {
+                match ev {
+                    Event::Agent(AgentEvent::Approval(a)) => *approval = Some(a),
+                    Event::Agent(AgentEvent::Step(step)) => {
+                        *changed |= step.ok && step.kind == StepKind::Statement;
+                        turn.apply(Event::Agent(AgentEvent::Step(step)));
+                    }
+                    ev => turn.apply(ev),
+                }
+            }
+        };
+        take_events(turn, &mut p.approval, &mut self.schema_changed);
         let Some(result) = p.job.poll() else { return false };
         // Deltas sent before the result arrived.
-        while let Ok(ev) = p.rx.try_recv() {
-            turn.apply(ev);
-        }
+        take_events(turn, &mut p.approval, &mut self.schema_changed);
+        p.approval = None;
         turn.running = None;
         match result {
             Ok(r) => {
@@ -944,6 +963,11 @@ impl AiAssistantTab {
     }
 
     /// Test helper: add a finished exchange without contacting any service.
+    #[doc(hidden)]
+    pub fn last_answer(&self) -> Option<&str> {
+        self.turns.last().filter(|_| self.pending.is_none()).map(|t| t.answer.as_str())
+    }
+
     #[doc(hidden)]
     pub fn push_exchange(&mut self, action: QuickAction, question: &str, answer: &str) {
         let mut t = Turn::new(action, question.to_string());
@@ -1028,6 +1052,7 @@ impl AiAssistantTab {
                     self.schema_picker(ui, cx, &c);
                 }
             });
+            Self::permission_row(ui, cx);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.set_min_height(24.0);
@@ -1048,6 +1073,30 @@ impl AiAssistantTab {
             });
         });
         parts::hline(ui);
+    }
+
+    /// What the assistant may do, for every connection: the switch of reading rows (the same
+    /// setting as in Settings › AI), and that changes always ask.
+    fn permission_row(ui: &mut Ui, cx: &mut AppContext) {
+        let p = ternarygrid_ui::pal(ui);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let on = cx.settings.ai.agent_queries;
+            let tip = if on {
+                tr("The assistant runs read-only queries and their rows are sent to the AI service. Click to stop it.")
+            } else {
+                tr("The assistant only knows table and column names. Click to let it run read-only queries: their rows are sent to the AI service.")
+            };
+            let (glyph, label) = if on { (icon::EYE, tr("Can read data")) } else { (icon::EYE_SLASH, tr("Cannot read data")) };
+            let kind = if on { kit::Kind::Soft } else { kit::Kind::Secondary };
+            if kit::button_ex(ui, kind, Some(glyph), label, true).on_hover_text(tip).clicked() {
+                cx.settings.ai.agent_queries = !on;
+                cx.push(AppCommand::SettingsChanged);
+            }
+            if on {
+                ui.add(egui::Label::new(RichText::new(tr("Changes ask you first")).size(11.5).color(p.text_faint)).truncate());
+            }
+        });
     }
 
     /// The connection, its database's logo in front; true when another one was chosen.
@@ -1373,6 +1422,42 @@ impl AiAssistantTab {
         });
     }
 
+    /// A statement the assistant wants to run: nothing happens before the user allows it.
+    fn approval_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, sql: &str, danger: Option<&str>, id: (u64, usize, usize, usize)) {
+        let p = ternarygrid_ui::pal(ui);
+        let conn = self.conn.clone().unwrap_or_default();
+        let name = cx.conns.config(&conn).map(|c| c.name.clone()).unwrap_or_default();
+        let marked = cx.conns.type_of(&conn).confirm_execute;
+        let border = if danger.is_some() || marked { p.err } else { p.warn };
+        let mut answer = None;
+        egui::Frame::new().stroke(Stroke::new(1.0, border)).corner_radius(CornerRadius::same(8)).inner_margin(Margin::same(10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+            kit::semibold_label(ui, tr("Run this statement?"), 13.0, p.text);
+            self.code_block(ui, cx, id, "", sql, true, false);
+            if let Some(d) = danger {
+                ui.label(RichText::new(kit::with_icon(icon::WARNING, tr(d))).size(12.5).color(p.err));
+            }
+            let place = trf("On {}, committed at once.", &[&name]);
+            ui.label(RichText::new(place).size(12.0).color(if marked { p.err } else { p.text_muted }));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let kind = if danger.is_some() || marked { kit::Kind::DangerFilled } else { kit::Kind::Primary };
+                if kit::button_ex(ui, kind, None, tr("Run statement"), false).clicked() {
+                    answer = Some(true);
+                }
+                if kit::button_ex(ui, kit::Kind::Secondary, None, tr("Don't run"), false).clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if let Some(allow) = answer
+            && let Some(a) = self.pending.as_mut().and_then(|q| q.approval.take())
+        {
+            a.answer(allow);
+        }
+    }
+
     /// A query the assistant ran: one line ("Ran a query · 3 rows") over its result (open at
     /// first; the line folds it). Its SQL shows with "SQL" at the right of the line (at once
     /// when the query failed or returned no columns).
@@ -1385,7 +1470,12 @@ impl AiAssistantTab {
         egui::Frame::new().stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 8.0;
-            let title = if step.ok { format!("{} · {}", tr("Ran a query"), step.summary) } else { tr("The query did not run").to_string() };
+            let title = match step.kind {
+                StepKind::Declined => format!("{} · {}", tr("Not run"), step.summary),
+                StepKind::Statement if step.ok => format!("{} · {}", tr("Ran a statement"), step.summary),
+                _ if step.ok => format!("{} · {}", tr("Ran a query"), step.summary),
+                _ => tr("The query did not run").to_string(),
+            };
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
             resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, open, &title));
             // "SQL" at the right end of the line: shows or hides the statement.
@@ -1416,10 +1506,15 @@ impl AiAssistantTab {
             let cy = rect.center().y;
             let caret = if open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
             painter.text(egui::pos2(rect.left() + 5.0, cy), Align2::CENTER_CENTER, caret, style::icon_font(11.0), p.text_faint);
-            let (glyph, color) = if step.ok { (icon::DATABASE, p.text_muted) } else { (icon::WARNING, p.warn) };
+            let (glyph, color) = match step.kind {
+                StepKind::Declined => (icon::PROHIBIT, p.text_muted),
+                StepKind::Statement if step.ok => (icon::PENCIL_SIMPLE, p.text_muted),
+                _ if step.ok => (icon::DATABASE, p.text_muted),
+                _ => (icon::WARNING, p.warn),
+            };
             // The design's row: the caret (11), 8, the icon (13), 8, the text.
             painter.text(egui::pos2(rect.left() + 25.5, cy), Align2::CENTER_CENTER, glyph, style::icon_font(13.0), color);
-            let text_color = if !step.ok {
+            let text_color = if !step.ok && step.kind != StepKind::Declined {
                 p.warn
             } else if resp.hovered() {
                 p.text
@@ -1433,7 +1528,9 @@ impl AiAssistantTab {
             if !open {
                 return;
             }
-            if !step.ok {
+            if step.kind == StepKind::Declined {
+                // The title says it.
+            } else if !step.ok {
                 crate::widgets::error_box(ui, &step.summary);
             } else if !step.columns.is_empty() {
                 result_table(ui, ("ai_step_rows", id), &step.columns, &step.rows);
@@ -1523,11 +1620,13 @@ impl AiAssistantTab {
                     ui.label(RichText::new(m).size(11.0).color(p.text_faint));
                 }
             });
+            let waiting = self.pending.as_ref().is_some_and(|q| q.turn == ti && q.approval.is_some());
             match &state {
                 TurnState::Preparing => {
                     parts::spinner_label(ui, tr("Reading from the database…"));
                 }
-                TurnState::Streaming if answer_empty && steps.is_empty() && running.is_none() => {
+                // Not while a statement waits for the user: nothing is going on.
+                TurnState::Streaming if answer_empty && steps.is_empty() && running.is_none() && !waiting => {
                     parts::spinner_label(ui, tr("Thinking…"));
                 }
                 _ => {}
@@ -1539,8 +1638,11 @@ impl AiAssistantTab {
                     self.step_ui(ui, cx, step, (self.uid, ti, pi));
                 }
             }
+            let approval = self.pending.as_ref().filter(|q| q.turn == ti).and_then(|q| q.approval.as_ref()).map(|a| (a.sql.clone(), a.danger));
             if state == TurnState::Streaming {
-                if let Some(sql) = &running {
+                if let Some((sql, danger)) = &approval {
+                    self.approval_ui(ui, cx, sql, *danger, (self.uid, ti, usize::MAX - 1, 0));
+                } else if let Some(sql) = &running {
                     parts::spinner_label(ui, tr("Running a query…"));
                     self.code_block(ui, cx, (self.uid, ti, usize::MAX, 0), "", sql, true, false);
                 } else if after_step {
@@ -1940,6 +2042,12 @@ impl TabView for AiAssistantTab {
         if self.poll() || self.unsaved {
             self.unsaved = false;
             self.save(cx);
+        }
+        // A statement the user allowed changed something: the navigator reads it again.
+        if std::mem::take(&mut self.schema_changed)
+            && let Some(connection) = self.conn.clone()
+        {
+            cx.push(AppCommand::RefreshMetadata { connection, object: None, schema: self.schema.clone() });
         }
         self.sync_language(cx);
         let status = self.status(cx);

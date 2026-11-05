@@ -3,6 +3,21 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.4 — 2026-11-05
+
+A crash fixed, and an AI assistant that reads your data when you let it and asks before changing anything.
+
+### Added
+- **The AI assistant's permission is in its panel**: one button, for every connection, says whether it can read data and switches it (the same setting as Settings › AI assistant). While it can, it answers from read-only queries, whose rows go to the AI service. It stays off until you turn it on.
+- **The assistant asks before it changes anything**: when it needs to insert, update, delete or change the schema, the chat shows the statement with Run statement and Don't run, says on which connection it commits at once and warns of a DELETE or UPDATE without WHERE, a DROP or a TRUNCATE. Nothing runs before you answer, a read-only connection never asks, and the navigator reads the schema again afterwards.
+
+### Fixed
+- **Full CPU use and a crash after the computer slept**, with PostgreSQL results left open: when the connection had died, closing the idle result spun at full speed for ever, taking a CPU core each, and that is where the application crashed. It now stops at once.
+- Settings › AI assistant: Remove API key no longer runs out of its card. The field gets narrower, and in a narrow window the buttons go under it.
+
+### Changed
+- Crash reports name the functions, so that a crash can be traced from the report alone.
+
 ## 0.6.3 — 2026-11-05
 
 Tabs that say where they work, a results footer with the actions in reach, and a navigator that keeps its place.

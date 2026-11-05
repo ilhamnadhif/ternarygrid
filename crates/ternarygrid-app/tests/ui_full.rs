@@ -18,6 +18,9 @@ use ternarygrid_app::services::{Services, Settings};
 use ternarygrid_app::tabs::sql_editor::SqlEditorTab;
 use ternarygrid_app::toasts::ToastKind;
 
+#[path = "support/fake_ai.rs"]
+mod fake_ai;
+
 type H = Harness<'static, TernaryGridApp>;
 
 const CMD: Modifiers = Modifiers { alt: false, ctrl: false, shift: false, mac_cmd: true, command: true };
@@ -1946,6 +1949,7 @@ fn ai_assistant_is_a_side_panel() {
     let ai = h.state_mut().ai_panel.as_mut().unwrap();
     ai.push_exchange(ternarygrid_app::tabs::ai::QuickAction::Chat, "How many customers?", "There are 5.\n\n```sql\nSELECT count(*) AS customers FROM customer\n```");
     ai.push_step(ternarygrid_app::tabs::ai_agent::ToolStep {
+        kind: Default::default(),
         sql: "SELECT count(*) FROM customer".into(),
         ok: true,
         summary: "1 rows".into(),
@@ -2147,4 +2151,121 @@ fn a_connection_stays_at_the_top_of_its_rows() {
     assert!(nav_row(&h, "Tables").is_none(), "folded: {:?}", labels(&h));
     let row = nav_row(&h, &name).expect("the connection, not the rows after it").rect();
     assert!((row.top() - real_top).abs() <= 1.0, "{row:?}");
+}
+
+/// The assistant open on `conn`, answering through `replies`.
+fn assistant(h: &mut H, conn: &str, replies: Vec<String>) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    let (base, requests) = fake_ai::serve(replies);
+    let ai = &mut h.state_mut().settings.ai;
+    ai.enabled = true;
+    ai.provider = ternarygrid_config::settings::AiProvider::OpenAiCompatible;
+    ai.base_url = Some(base);
+    ai.model = "fake".into();
+    let provider = ai.provider.id().to_string();
+    h.state().services.secrets.read().set_ai_api_key(&provider, Some(&ternarygrid_core::Secret::new("test"))).unwrap();
+    h.state_mut().push_command(AppCommand::OpenAiAssistant { connection: Some(conn.to_string()) });
+    frames(h, 4);
+    requests
+}
+
+/// The assistant finished with `text` at the end of its answer.
+fn answered(h: &H, text: &str) -> bool {
+    h.state().ai_panel.as_ref().and_then(|a| a.last_answer()).is_some_and(|a| a.trim_end().ends_with(text))
+}
+
+/// Ask the assistant `question`.
+fn ask(h: &mut H, question: &str) {
+    h.state_mut().ai_panel.as_mut().unwrap().set_input(ternarygrid_app::tabs::ai::QuickAction::Chat, question, "");
+    frames(h, 2);
+    click(h, "Send");
+    frames(h, 2);
+}
+
+#[test]
+fn the_panel_switches_reading_rows_for_every_connection() {
+    let (_dir, mut h, conn) = setup();
+    assistant(&mut h, &conn, Vec::new());
+    assert!(!h.state().settings.ai.agent_queries, "off until asked for");
+    click(&mut h, "Cannot read data");
+    frames(&mut h, 3);
+    assert!(h.state().settings.ai.agent_queries);
+    assert!(has(&h, "Can read data"), "{:?}", labels(&h));
+    click(&mut h, "Can read data");
+    frames(&mut h, 3);
+    assert!(!h.state().settings.ai.agent_queries);
+}
+
+#[test]
+fn the_assistant_reads_rows_only_when_allowed() {
+    let (_dir, mut h, conn) = setup();
+    let requests =
+        assistant(&mut h, &conn, vec![fake_ai::text("Run this yourself."), fake_ai::tool_call("run_query", "SELECT count(*) FROM customer"), fake_ai::text("There are 200.")]);
+    ask(&mut h, "How many customers?");
+    wait(&mut h, "the first answer", |h| answered(h, "Run this yourself."));
+    assert!(!requests.lock().unwrap()[0].contains("run_query"), "no tools without the permission");
+    click(&mut h, "Cannot read data");
+    frames(&mut h, 3);
+    ask(&mut h, "How many customers?");
+    wait(&mut h, "the second answer", |h| answered(h, "There are 200."));
+    assert!(requests.lock().unwrap()[1].contains("run_query"));
+    assert!(requests.lock().unwrap()[2].contains("200"), "the rows went back to the model");
+    assert!(labels(&h).iter().any(|l| l.starts_with("Ran a query")), "{:?}", labels(&h));
+}
+
+#[test]
+fn the_assistant_asks_before_changing_data() {
+    let (_dir, mut h, conn) = setup();
+    let path = sample_db(&h, &conn);
+    let city = || query_one(&path, "SELECT city FROM customer WHERE id = 1");
+    let before = city();
+    let update = "UPDATE customer SET city = 'Changed' WHERE id = 1";
+    let replies =
+        vec![fake_ai::tool_call("execute_statement", update), fake_ai::text("Left as it was."), fake_ai::tool_call("execute_statement", update), fake_ai::text("Changed it.")];
+    let requests = assistant(&mut h, &conn, replies);
+    click(&mut h, "Cannot read data");
+    frames(&mut h, 3);
+    // Declined: nothing runs, and the model is told.
+    ask(&mut h, "Move the first customer");
+    wait(&mut h, "the question", |h| has(h, "Run statement"));
+    assert_eq!(city(), before, "nothing runs before the answer");
+    click(&mut h, "Don't run");
+    wait(&mut h, "the answer", |h| answered(h, "Left as it was."));
+    assert_eq!(city(), before);
+    assert!(requests.lock().unwrap()[1].contains("the user declined"));
+    assert!(!has(&h, "Run statement"), "the question is gone");
+    // Allowed: it runs, and is committed.
+    ask(&mut h, "Move the first customer");
+    wait(&mut h, "the question", |h| has(h, "Run statement"));
+    assert_eq!(city(), before);
+    click(&mut h, "Run statement");
+    wait(&mut h, "the answer", |h| answered(h, "Changed it."));
+    assert_eq!(city(), "Changed");
+    assert!(labels(&h).iter().any(|l| l.starts_with("Ran a statement")), "{:?}", labels(&h));
+    no_errors(&mut h, "the statement");
+}
+
+/// The API key's section of the settings, `width` points wide, with a saved key.
+fn api_key_settings(h: &mut H, width: f32) {
+    let provider = h.state().settings.ai.provider.id().to_string();
+    h.state().services.secrets.read().set_ai_api_key(&provider, Some(&ternarygrid_core::Secret::new("test"))).unwrap();
+    h.set_size(egui::vec2(width, 900.0));
+    h.state_mut().push_command(AppCommand::OpenSettings);
+    frames(h, 4);
+    click(h, "AI assistant");
+    frames(h, 6);
+}
+
+#[test]
+fn the_api_key_buttons_stay_inside_the_window() {
+    let (_dir, mut h, _conn) = setup();
+    api_key_settings(&mut h, 900.0);
+    // Beside the field, under it, and one above the other.
+    for width in [1400.0_f32, 1040.0, 900.0] {
+        h.set_size(egui::vec2(width, 900.0));
+        frames(&mut h, 6);
+        let remove = h.query_all_by_label("Remove API key").next().unwrap_or_else(|| panic!("no Remove API key: {:?}", labels(&h))).rect();
+        let save = h.query_all_by_label("Save API key").next().expect("Save API key").rect();
+        assert!(remove.right() <= width, "{width} wide: Remove API key ends at {}", remove.right());
+        assert!(!remove.intersects(save), "{width} wide: {remove:?} {save:?}");
+    }
 }

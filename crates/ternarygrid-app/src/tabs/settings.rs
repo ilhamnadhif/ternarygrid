@@ -200,7 +200,9 @@ impl Section {
     fn intro(self) -> Option<&'static str> {
         match self {
             Section::NetworkProfiles => Some(tr("Reusable SSH tunnel and proxy settings; connections pick a profile on their SSH page.")),
-            Section::Ai => Some(tr("The assistant sends your question, and optionally schema details, to the provider you configure. Nothing is sent while it is disabled.")),
+            Section::Ai => Some(tr(
+                "The assistant sends your question, and optionally schema details and the rows of its queries, to the provider you configure. Nothing is sent while it is disabled.",
+            )),
             Section::Security => Some(tr("Passwords and API keys are never written to configuration files.")),
             _ => None,
         }
@@ -376,6 +378,9 @@ fn found_dyn(ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui) -> bool) -> 
 
 /// A setting: its label in the label column, then the control (30 points high) 16 points
 /// further.
+/// The API key field's narrowest beside its buttons.
+const API_KEY_MIN_W: f32 = 120.0;
+
 fn row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
     let mut add = Some(add);
     row_dyn(ui, label, None, look::FIELD_H, &mut |ui| add.take().is_some_and(|a| a(ui)))
@@ -1514,39 +1519,75 @@ impl SettingsTab {
         });
         c |= group(ui, tr("What it may send"), |ui| {
             checks(ui, vec![(&mut a.include_schema_context, tr("Send table and column names as context")), (&mut a.send_sample_data, tr("Allow sending sample rows"))])
-                | check_sub(ui, &mut a.agent_queries, tr("Let the assistant run read-only queries"), tr("Their results are sent to the AI service."))
+                | check_sub(
+                    ui,
+                    &mut a.agent_queries,
+                    tr("Let the assistant run read-only queries"),
+                    tr("Their results are sent to the AI service. Statements that change data always ask you first."),
+                )
         });
         group(ui, tr("API key"), |ui| {
-            row(ui, tr("API key"), |ui| {
-                let hint = if self.ai_key_saved { tr("Saved — enter a new key to replace it") } else { tr("Paste your API key") };
-                look::password_field(ui, &mut self.ai_key, 360.0, hint);
-                let can_save = !self.ai_key.trim().is_empty();
-                if ui.add_enabled_ui(can_save, |ui| kit::button_ex(ui, Kind::Primary, None, tr("Save API key"), false)).inner.clicked() {
-                    let key = Secret::new(self.ai_key.trim().to_string());
-                    let r = cx.services.secrets.read().set_ai_api_key(provider.id(), Some(&key));
-                    match r {
-                        Ok(()) => {
-                            self.ai_key.clear();
-                            self.ai_key_saved = true;
-                            cx.toasts.success(tr("API key saved securely"));
-                        }
-                        Err(e) if crate::dialogs::vault::unlock_after_failed_write(cx, &e) => {}
-                        Err(e) => cx.toasts.error(tr("Cannot store the API key"), Some(e.to_string())),
-                    }
+            // The buttons keep their width beside the field. Without room for that the group's
+            // title names the field, and the buttons go under it, one above the other if need be.
+            let width = ui.available_width();
+            let room = width - label_w(ui) - 16.0;
+            let gap = 8.0;
+            let mut buttons = kit::button_width(ui, None, tr("Save API key"), false);
+            if self.ai_key_saved {
+                buttons += gap + kit::button_width(ui, None, tr("Remove API key"), false);
+            }
+            if room >= buttons + gap + API_KEY_MIN_W {
+                row(ui, tr("API key"), |ui| {
+                    self.ai_key_field(ui, (room - buttons - gap).min(360.0));
+                    self.ai_key_buttons(ui, cx, provider);
+                    false
+                });
+            } else {
+                self.ai_key_field(ui, width.min(360.0));
+                if width >= buttons {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        self.ai_key_buttons(ui, cx, provider);
+                    });
+                } else {
+                    self.ai_key_buttons(ui, cx, provider);
                 }
-                if self.ai_key_saved && kit::button_ex(ui, Kind::Danger, None, tr("Remove API key"), false).clicked() {
-                    let r = cx.services.secrets.read().set_ai_api_key(provider.id(), None);
-                    match r {
-                        Ok(()) => self.ai_key_saved = false,
-                        Err(e) => {
-                            crate::dialogs::vault::unlock_after_failed_write(cx, &e);
-                        }
-                    }
-                }
-                false
-            })
+            }
+            false
         });
         c
+    }
+
+    fn ai_key_field(&mut self, ui: &mut Ui, width: f32) {
+        let hint = if self.ai_key_saved { tr("Saved — enter a new key to replace it") } else { tr("Paste your API key") };
+        look::password_field(ui, &mut self.ai_key, width, hint);
+    }
+
+    /// Save API key and, once there is one, Remove API key.
+    fn ai_key_buttons(&mut self, ui: &mut Ui, cx: &mut AppContext, provider: ternarygrid_config::settings::AiProvider) {
+        let can_save = !self.ai_key.trim().is_empty();
+        if ui.add_enabled_ui(can_save, |ui| kit::button_ex(ui, Kind::Primary, None, tr("Save API key"), false)).inner.clicked() {
+            let key = Secret::new(self.ai_key.trim().to_string());
+            let r = cx.services.secrets.read().set_ai_api_key(provider.id(), Some(&key));
+            match r {
+                Ok(()) => {
+                    self.ai_key.clear();
+                    self.ai_key_saved = true;
+                    cx.toasts.success(tr("API key saved securely"));
+                }
+                Err(e) if crate::dialogs::vault::unlock_after_failed_write(cx, &e) => {}
+                Err(e) => cx.toasts.error(tr("Cannot store the API key"), Some(e.to_string())),
+            }
+        }
+        if self.ai_key_saved && kit::button_ex(ui, Kind::Danger, None, tr("Remove API key"), false).clicked() {
+            let r = cx.services.secrets.read().set_ai_api_key(provider.id(), None);
+            match r {
+                Ok(()) => self.ai_key_saved = false,
+                Err(e) => {
+                    crate::dialogs::vault::unlock_after_failed_write(cx, &e);
+                }
+            }
+        }
     }
 
     fn security(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {

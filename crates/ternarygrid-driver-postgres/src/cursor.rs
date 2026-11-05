@@ -172,7 +172,8 @@ fn apply_failure(shared: &SessionShared, info: Option<&StmtInfo>) {
 
 impl Body {
     /// Read and discard everything until the request is complete, keeping
-    /// the transaction state up to date. Cancel safe.
+    /// the transaction state up to date. Cancel safe. Buffered responses are
+    /// ready at once: each step gives way, so that a timeout around this can fire.
     async fn drain(&mut self, shared: &SessionShared) {
         match self {
             Body::Simple(b) => {
@@ -183,16 +184,26 @@ impl Body {
                             b.stmt_index += 1;
                         }
                         Ok(_) => {}
-                        Err(_) => apply_failure(shared, b.script.statements.get(b.stmt_index)),
+                        Err(e) => {
+                            apply_failure(shared, b.script.statements.get(b.stmt_index));
+                            if stream_ended_by(&e) {
+                                break;
+                            }
+                        }
                     }
+                    tokio::task::consume_budget().await;
                 }
             }
             Body::Extended(b) => {
                 let mut failed = false;
                 while let Some(r) = b.stream.next().await {
-                    if r.is_err() {
+                    if let Err(e) = r {
                         failed = true;
+                        if stream_ended_by(&e) {
+                            break;
+                        }
                     }
+                    tokio::task::consume_budget().await;
                 }
                 if failed {
                     apply_failure(shared, Some(&b.info));
@@ -200,11 +211,25 @@ impl Body {
                     apply_success(shared, Some(&b.info));
                 }
             }
-            Body::Copy(b) => while b.stream.next().await.is_some() {},
+            Body::Copy(b) => {
+                while let Some(r) = b.stream.next().await {
+                    if r.as_ref().is_err_and(stream_ended_by) {
+                        break;
+                    }
+                    tokio::task::consume_budget().await;
+                }
+            }
             Body::Empty => {}
         }
         *self = Body::Empty;
     }
+}
+
+/// Whether reading on after `e` is pointless: the server's own errors are followed by the end
+/// of the response, but with the connection gone (or a message that cannot be read) the
+/// stream repeats the error for ever, at once and without ever waiting.
+fn stream_ended_by(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error().is_none()
 }
 
 /// Finish an abandoned statement: drain briefly, cancel if it is still

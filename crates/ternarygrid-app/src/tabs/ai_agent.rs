@@ -10,6 +10,10 @@
 //!   applies it) and made read-only again by statement for PostgreSQL /
 //!   CockroachDB, MySQL / MariaDB and SQLite;
 //! * at most [`MAX_ROWS`] rows, within [`TIMEOUT`].
+//!
+//! Statements that change data or schema go through the `execute_statement` tool
+//! instead: they wait for the user's answer in the chat, and run in a session of
+//! their own that commits at once. A read-only connection does not have the tool.
 
 use crate::conn::session::SessionHandle;
 use std::future::Future;
@@ -18,14 +22,19 @@ use std::time::Duration;
 use ternarygrid_ai::{ChatMessage, ChatRequest, ChatResponse, ToolCall, ToolDef, Usage};
 use ternarygrid_core::{DbError, DbKind, DbResult, ExecOptions, ResultHeader, SqlSyntax, tr, trf};
 use ternarygrid_sql::StatementKind;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 /// The tool's name.
 pub const TOOL: &str = "run_query";
+/// The tool for statements that change something: each waits for the user's answer.
+pub const EXECUTE_TOOL: &str = "execute_statement";
 /// Rows of a result the model gets.
 pub const MAX_ROWS: usize = 100;
 /// Time a query may take.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
+/// Time a statement the user allowed may take.
+pub const EXECUTE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Requests of one answer (each may run queries).
 pub const MAX_ROUNDS: usize = 8;
 /// Characters of one value the model gets.
@@ -183,14 +192,42 @@ pub fn tool() -> ToolDef {
     }
 }
 
-/// What the system prompt says about the tool.
-pub fn system_note() -> String {
+/// The `execute_statement` tool.
+pub fn execute_tool() -> ToolDef {
+    ToolDef {
+        name: EXECUTE_TOOL.into(),
+        description: "Ask the user to run one SQL statement that changes data or schema (INSERT, UPDATE, DELETE, DDL) on their connection. They see the \
+                      statement and decide; if they allow it, it runs and commits at once, and you get its outcome. If they decline, you are told so."
+            .into(),
+        parameters: r#"{"type":"object","properties":{"sql":{"type":"string","description":"The SQL statement, in the database's dialect"}},"required":["sql"]}"#.into(),
+    }
+}
+
+/// What the system prompt says about the tools; `can_execute`: with `execute_statement`.
+pub fn system_note(can_execute: bool) -> String {
+    let changes = if can_execute {
+        format!(
+            "To change data or schema, call `{EXECUTE_TOOL}` with one statement: the user is asked before it runs, and it commits at once. Do it only when the \
+             user asked for the change. When they decline, do not ask again in this answer."
+        )
+    } else {
+        "This connection is read-only: statements that change data or schema cannot run.".to_string()
+    };
     format!(
         "\n\n## Running queries\nYou can run read-only SQL on the user's connection with the `{TOOL}` tool. Use it whenever the question is about \
-         the data (counts, values, examples, checks) instead of guessing, then answer from the results and show the query you ran. One \
-         statement per call; at most {MAX_ROWS} rows come back, so aggregate in SQL. Never try to change data or schema with it: give such \
-         statements to the user to run."
+         the data (counts, values, examples, checks, what databases, schemas or tables exist) instead of guessing, then answer from the results and \
+         show the query you ran. One statement per call; at most {MAX_ROWS} rows come back, so aggregate in SQL. Never try to change data or schema \
+         with it. {changes}"
     )
+}
+
+/// One statement to ask about, with what may be dangerous in it.
+pub fn check_execute(sql: &str, syntax: &SqlSyntax) -> Result<(String, Option<&'static str>), String> {
+    let stmts = ternarygrid_sql::split_and_classify(sql, syntax, &Default::default());
+    let [(span, info)] = stmts.as_slice() else {
+        return Err(tr("Exactly one statement per query").to_string());
+    };
+    Ok((sql[span.start..span.end].trim().to_string(), info.danger.map(|d| d.message())))
 }
 
 /// [`check`] for a connection's language: Redis commands, MongoDB statements
@@ -244,11 +281,61 @@ pub struct Agent {
     pub schema: Option<String>,
     opener: Option<Opener>,
     session: Option<SessionHandle>,
+    /// Opens the session of the statements the user allows (`None`: a read-only connection).
+    writer: Option<Opener>,
+    write_session: Option<SessionHandle>,
 }
 
 impl Agent {
     pub fn new(kind: DbKind, syntax: SqlSyntax, schema: Option<String>, opener: Opener) -> Agent {
-        Agent { kind, syntax, schema, opener: Some(opener), session: None }
+        Agent { kind, syntax, schema, opener: Some(opener), session: None, writer: None, write_session: None }
+    }
+
+    /// With the `execute_statement` tool, its session opened by `opener`.
+    pub fn with_writer(mut self, opener: Opener) -> Agent {
+        self.writer = Some(opener);
+        self
+    }
+
+    fn can_execute(&self) -> bool {
+        self.writer.is_some() || self.write_session.is_some()
+    }
+
+    /// The session of allowed statements, opened at the first: each commits at once.
+    async fn write_session(&mut self) -> DbResult<SessionHandle> {
+        if let Some(s) = &self.write_session {
+            return Ok(s.clone());
+        }
+        let opener = self.writer.take().ok_or_else(|| DbError::connection(tr("The assistant's session could not be opened")))?;
+        let s = opener.await?;
+        s.lock().await.set_transaction_mode(ternarygrid_core::TransactionMode::Auto).await?;
+        if let Some(schema) = &self.schema {
+            let _ = s.lock().await.set_current_schema(schema).await;
+        }
+        self.write_session = Some(s.clone());
+        Ok(s)
+    }
+
+    /// Run a statement the user allowed.
+    async fn execute(&mut self, stmt: String) -> ToolStep {
+        let session = match self.write_session().await {
+            Ok(s) => s,
+            Err(e) => return ToolStep::failed(stmt, e.full_text()),
+        };
+        let options = ExecOptions { timeout: Some(EXECUTE_TIMEOUT), ..Default::default() };
+        let ex = match session.execute(&stmt, &[], &options).await {
+            Ok(ex) => ex,
+            Err(e) => return ToolStep::failed(stmt, e.full_text()),
+        };
+        match ex.header {
+            // RETURNING and the like: committed, with rows to show.
+            Some(ResultHeader::Rows(cols)) => match read_rows(&session, ex.token, &cols).await {
+                Ok((cols, rows, more)) => ToolStep { kind: StepKind::Statement, ..ToolStep::rows(stmt, cols, rows, more) },
+                Err(e) => ToolStep::failed(stmt, e.full_text()),
+            },
+            Some(ResultHeader::Update { rows_affected, tag, .. }) => ToolStep::executed(stmt, rows_affected, tag),
+            _ => ToolStep::executed(stmt, None, None),
+        }
     }
 
     /// The session, opened at the first query and made read-only where the
@@ -303,8 +390,13 @@ impl Agent {
 async fn run(session: &SessionHandle, stmt: &str) -> DbResult<(Vec<String>, Vec<Vec<String>>, bool)> {
     let ex = session.execute(stmt, &[], &ExecOptions { timeout: Some(TIMEOUT), ..Default::default() }).await?;
     let Some(ResultHeader::Rows(cols)) = ex.header else { return Ok((Vec::new(), Vec::new(), false)) };
-    let out = session.fetch(ex.token, MAX_ROWS + 1).await;
-    session.close_cursor_token(ex.token).await;
+    read_rows(session, ex.token, &cols).await
+}
+
+/// The rows of a result, see [`run`].
+async fn read_rows(session: &SessionHandle, token: u64, cols: &[ternarygrid_core::ColumnMeta]) -> DbResult<(Vec<String>, Vec<Vec<String>>, bool)> {
+    let out = session.fetch(token, MAX_ROWS + 1).await;
+    session.close_cursor_token(token).await;
     let out = out?;
     let more = out.rows.len() > MAX_ROWS;
     let rows = out
@@ -323,10 +415,24 @@ async fn run(session: &SessionHandle, stmt: &str) -> DbResult<(Vec<String>, Vec<
     Ok((cols.iter().map(|c| c.name.clone()).collect(), rows, more))
 }
 
+/// What a [`ToolStep`] was.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StepKind {
+    /// A read-only query.
+    #[default]
+    Query,
+    /// A statement the user allowed.
+    Statement,
+    /// A statement the user did not allow.
+    Declined,
+}
+
 /// One query the assistant ran (or wanted to): shown in the chat, its
 /// `for_model` text sent back as the tool's result.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolStep {
+    #[serde(default)]
+    pub kind: StepKind,
     pub sql: String,
     /// Ran and returned this.
     pub ok: bool,
@@ -340,11 +446,11 @@ pub struct ToolStep {
 
 impl ToolStep {
     fn refused(sql: String, why: String) -> ToolStep {
-        ToolStep { sql, ok: false, summary: why.clone(), for_model: format!("Not run: {why}"), columns: Vec::new(), rows: Vec::new() }
+        ToolStep { kind: StepKind::Query, sql, ok: false, summary: why.clone(), for_model: format!("Not run: {why}"), columns: Vec::new(), rows: Vec::new() }
     }
 
     fn failed(sql: String, error: String) -> ToolStep {
-        ToolStep { sql, ok: false, summary: error.clone(), for_model: format!("Error: {error}"), columns: Vec::new(), rows: Vec::new() }
+        ToolStep { kind: StepKind::Query, sql, ok: false, summary: error.clone(), for_model: format!("Error: {error}"), columns: Vec::new(), rows: Vec::new() }
     }
 
     fn rows(sql: String, columns: Vec<String>, rows: Vec<Vec<String>>, more: bool) -> ToolStep {
@@ -355,7 +461,23 @@ impl ToolStep {
         }
         let summary = if more { trf("first {} rows", &[&rows.len()]) } else { ternarygrid_core::trn(rows.len(), "1 row", "{} rows") };
         text.push_str(&if more { format!("\n({} rows shown; there are more)", rows.len()) } else { format!("\n({} rows)", rows.len()) });
-        ToolStep { sql, ok: true, summary, for_model: text, columns, rows }
+        ToolStep { kind: StepKind::Query, sql, ok: true, summary, for_model: text, columns, rows }
+    }
+
+    /// The user did not allow the statement.
+    fn declined(sql: String) -> ToolStep {
+        let for_model = "Not run: the user declined this statement. Do not ask again in this answer.".to_string();
+        ToolStep { kind: StepKind::Declined, sql, ok: false, summary: tr("You did not allow it").to_string(), for_model, columns: Vec::new(), rows: Vec::new() }
+    }
+
+    /// Done: the rows it changed and the server's tag ("INSERT 0 3").
+    fn executed(sql: String, rows: Option<u64>, tag: Option<String>) -> ToolStep {
+        let summary = match rows {
+            Some(n) => ternarygrid_core::trn(n as usize, "1 row changed", "{} rows changed"),
+            None => tag.clone().unwrap_or_else(|| tr("done").to_string()),
+        };
+        let for_model = format!("Done and committed: {}", tag.unwrap_or_else(|| summary.clone()));
+        ToolStep { kind: StepKind::Statement, sql, ok: true, summary, for_model, columns: Vec::new(), rows: Vec::new() }
     }
 }
 
@@ -520,6 +642,133 @@ mod tests {
         assert!(session.execute_update("INSERT INTO charges VALUES (4, 0)", &[]).await.is_err());
     }
 
+    fn ask_to_run(sql: &str) -> ChatResponse {
+        let arguments = serde_json::json!({ "sql": sql }).to_string();
+        ChatResponse { tool_calls: vec![ToolCall { id: "x".into(), name: EXECUTE_TOOL.into(), arguments }], ..Default::default() }
+    }
+
+    /// A table of 3 rows, and what the model's `first` reply leads to when each question is
+    /// answered by `answer`: the requests, the steps, and the rows left.
+    async fn with_a_question(first: ChatResponse, writer: bool, answer: impl Fn(Approval)) -> (Vec<ChatRequest>, Vec<ToolStep>, Vec<(String, Option<&'static str>)>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let setup = sqlite(path.clone()).await.unwrap();
+        setup.execute_update("CREATE TABLE charges (id INTEGER, paid INTEGER)", &[]).await.unwrap();
+        setup.execute_update("INSERT INTO charges VALUES (1, 1), (2, 0), (3, 1)", &[]).await.unwrap();
+        let syntax = crate::driver_registry().dialect(DbKind::Sqlite).syntax().clone();
+        let mut agent = Agent::new(DbKind::Sqlite, syntax, None, Box::pin(sqlite(path.clone())));
+        if writer {
+            agent = agent.with_writer(Box::pin(sqlite(path)));
+        }
+        let mut replies = vec![first, reply("Done.", &[])].into_iter();
+        let (mut sent, mut steps, mut asked) = (Vec::new(), Vec::new(), Vec::new());
+        converse(
+            ChatRequest::new("system", vec![ChatMessage::user("Delete the unpaid charge")]),
+            &mut agent,
+            &CancellationToken::new(),
+            |req| {
+                sent.push(req);
+                let r = replies.next().unwrap();
+                Box::pin(async move { Ok(r) })
+            },
+            |e| match e {
+                AgentEvent::Step(s) => steps.push(s),
+                AgentEvent::Approval(a) => {
+                    asked.push((a.sql.clone(), a.danger));
+                    answer(a);
+                }
+                _ => {}
+            },
+        )
+        .await
+        .unwrap();
+        let left = run(&setup, "SELECT count(*) FROM charges").await.unwrap().1[0][0].clone();
+        (sent, steps, asked, left)
+    }
+
+    #[tokio::test]
+    async fn a_statement_runs_when_the_user_allows_it() {
+        let (sent, steps, asked, left) = with_a_question(ask_to_run("DELETE FROM charges WHERE paid = 0"), true, |a| a.answer(true)).await;
+        assert_eq!(asked, vec![("DELETE FROM charges WHERE paid = 0".to_string(), None)]);
+        assert_eq!(left, "2");
+        assert_eq!((steps[0].kind, steps[0].ok), (StepKind::Statement, true));
+        assert_eq!(steps[0].summary, "1 row changed");
+        assert!(sent[1].messages.last().unwrap().content.starts_with("Done and committed"), "{:?}", sent[1].messages.last());
+        assert!(sent[0].tools.iter().any(|t| t.name == EXECUTE_TOOL));
+    }
+
+    #[tokio::test]
+    async fn a_statement_stays_unrun_when_the_user_declines_or_never_answers() {
+        for allow in [Some(false), None] {
+            let (sent, steps, _, left) = with_a_question(ask_to_run("DELETE FROM charges WHERE paid = 0"), true, |a| match allow {
+                Some(allow) => a.answer(allow),
+                None => drop(a),
+            })
+            .await;
+            assert_eq!(left, "3", "{allow:?}");
+            assert_eq!(steps[0].kind, StepKind::Declined);
+            assert!(sent[1].messages.last().unwrap().content.starts_with("Not run: the user declined"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dangerous_statement_says_why_when_asking() {
+        let (_, _, asked, _) = with_a_question(ask_to_run("DELETE FROM charges"), true, |a| a.answer(false)).await;
+        assert_eq!(asked[0].1, Some("DELETE without WHERE removes every row"));
+    }
+
+    #[tokio::test]
+    async fn only_one_statement_is_asked_about() {
+        let (_, steps, asked, left) = with_a_question(ask_to_run("DELETE FROM charges; DROP TABLE charges"), true, |a| a.answer(true)).await;
+        assert!(asked.is_empty(), "{asked:?}");
+        assert_eq!(left, "3");
+        assert!(!steps[0].ok);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_connection_cannot_be_asked() {
+        let (sent, steps, asked, left) = with_a_question(ask_to_run("DELETE FROM charges"), false, |a| a.answer(true)).await;
+        assert!(sent[0].tools.iter().all(|t| t.name != EXECUTE_TOOL));
+        assert!(sent[0].system.contains("read-only"));
+        assert!(asked.is_empty());
+        assert_eq!(left, "3");
+        assert!(!steps[0].ok);
+    }
+
+    #[tokio::test]
+    async fn stopping_while_asking_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let setup = sqlite(path.clone()).await.unwrap();
+        setup.execute_update("CREATE TABLE charges (id INTEGER)", &[]).await.unwrap();
+        setup.execute_update("INSERT INTO charges VALUES (1)", &[]).await.unwrap();
+        let syntax = crate::driver_registry().dialect(DbKind::Sqlite).syntax().clone();
+        let mut agent = Agent::new(DbKind::Sqlite, syntax, None, Box::pin(sqlite(path.clone()))).with_writer(Box::pin(sqlite(path)));
+        let cancel = CancellationToken::new();
+        let (stop, mut kept) = (cancel.clone(), None);
+        let mut replies = vec![ask_to_run("DELETE FROM charges")].into_iter();
+        let r = converse(
+            ChatRequest::new("system", vec![ChatMessage::user("Delete them")]),
+            &mut agent,
+            &cancel,
+            |_| {
+                let r = replies.next().unwrap();
+                Box::pin(async move { Ok(r) })
+            },
+            |e| {
+                if let AgentEvent::Approval(a) = e {
+                    // Still waiting for an answer when Stop is pressed.
+                    kept = Some(a);
+                    stop.cancel();
+                }
+            },
+        )
+        .await;
+        assert_eq!(r.unwrap_err().kind, ternarygrid_core::ErrorKind::Cancelled);
+        assert_eq!(run(&setup, "SELECT count(*) FROM charges").await.unwrap().1[0][0], "1");
+        drop(kept);
+    }
+
     #[test]
     fn results_for_the_model() {
         let step = ToolStep::rows("SELECT 1".into(), vec!["n".into()], vec![vec!["1".into()], vec!["2".into()]], false);
@@ -538,8 +787,9 @@ where
     S: FnMut(ChatRequest) -> Pin<Box<dyn Future<Output = DbResult<ChatResponse>> + Send + 'a>>,
     F: FnMut(AgentEvent),
 {
-    req.tools = vec![tool()];
-    req.system.push_str(&system_note());
+    let can_execute = agent.can_execute();
+    req.tools = if can_execute { vec![tool(), execute_tool()] } else { vec![tool()] };
+    req.system.push_str(&system_note(can_execute));
     let mut text = String::new();
     let mut usage = Usage::default();
     for round in 1..=MAX_ROUNDS {
@@ -567,10 +817,17 @@ where
         }
         req.messages.push(ChatMessage::assistant_calls(r.text, r.tool_calls.clone(), Some(r.reasoning)));
         for call in &r.tool_calls {
-            on_event(AgentEvent::Running(call_sql(call)));
-            let step = tokio::select! {
-                s = agent.answer(call) => s,
-                _ = cancel.cancelled() => return Err(DbError::cancelled()),
+            let step = if call.name == EXECUTE_TOOL && can_execute {
+                match ask_and_execute(agent, call, cancel, &mut on_event).await {
+                    Some(step) => step,
+                    None => return Err(DbError::cancelled()),
+                }
+            } else {
+                on_event(AgentEvent::Running(call_sql(call)));
+                tokio::select! {
+                    s = agent.answer(call) => s,
+                    _ = cancel.cancelled() => return Err(DbError::cancelled()),
+                }
             };
             req.messages.push(ChatMessage::tool_result(call.id.clone(), step.for_model.clone()));
             on_event(AgentEvent::Step(step));
@@ -579,8 +836,46 @@ where
     unreachable!("the last round returns")
 }
 
+/// A statement waiting for the user's answer: nothing runs before [`Approval::answer`], and
+/// dropping it (a new question, the panel closed) declines it.
+#[derive(Debug)]
+pub struct Approval {
+    pub sql: String,
+    /// What may be dangerous in it (English; through `tr()` for display).
+    pub danger: Option<&'static str>,
+    reply: oneshot::Sender<bool>,
+}
+
+impl Approval {
+    /// The user's answer: run it or not.
+    pub fn answer(self, allow: bool) {
+        let _ = self.reply.send(allow);
+    }
+}
+
+/// `None`: stopped while waiting for the user.
+async fn ask_and_execute<F: FnMut(AgentEvent)>(agent: &mut Agent, call: &ToolCall, cancel: &CancellationToken, on_event: &mut F) -> Option<ToolStep> {
+    let sql = call_sql(call);
+    let (stmt, danger) = match check_execute(&sql, &agent.syntax) {
+        Ok(checked) => checked,
+        Err(why) => return Some(ToolStep::refused(sql, why)),
+    };
+    let (reply, answer) = oneshot::channel();
+    on_event(AgentEvent::Approval(Approval { sql: stmt.clone(), danger, reply }));
+    let allowed = tokio::select! {
+        a = answer => a.unwrap_or(false),
+        _ = cancel.cancelled() => return None,
+    };
+    if !allowed {
+        return Some(ToolStep::declined(stmt));
+    }
+    on_event(AgentEvent::Running(stmt.clone()));
+    // Not cancelled from here: the user allowed it, and it may have started.
+    Some(agent.execute(stmt).await)
+}
+
 /// Progress of [`converse`] besides the streamed text.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum AgentEvent {
     /// Text added between requests.
     Text(String),
@@ -588,6 +883,8 @@ pub enum AgentEvent {
     Running(String),
     /// A query finished (or was refused).
     Step(ToolStep),
+    /// A statement that needs the user's answer.
+    Approval(Approval),
 }
 
 fn call_sql(call: &ToolCall) -> String {
