@@ -287,31 +287,29 @@ impl TernaryGridApp {
         }
     }
 
-    /// The icon rail: the navigator, projects, history, tasks; background operations and
-    /// settings at the bottom (34-point buttons 4 apart, 8 points from the ends).
+    /// The icon rail: two groups with a selection each, the side panel that is open (the
+    /// navigator, projects) and the workspace tab that is active (history, tasks); background
+    /// operations and settings at the bottom (34-point buttons 4 apart, 8 points from the ends).
     pub(super) fn rail(&mut self, ui: &mut Ui) {
         use crate::keys::Action;
         let (side, glyph) = (34.0, 20.0);
-        // The rail shows where one works, as in the design: the query history, the tasks or the
-        // settings while their tab is the active one, else the side panel that is open.
         #[derive(PartialEq)]
         enum Place {
-            Panel,
             History,
             Tasks,
             Settings,
         }
         let place = match self.dock.find_active_focused().map(|(_, t)| t.view.as_any()) {
-            Some(v) if v.is::<crate::tabs::history::HistoryTab>() => Place::History,
-            Some(v) if v.is::<crate::tabs::tasks::TasksTab>() => Place::Tasks,
-            Some(v) if v.is::<crate::tabs::settings::SettingsTab>() => Place::Settings,
-            _ => Place::Panel,
+            Some(v) if v.is::<crate::tabs::history::HistoryTab>() => Some(Place::History),
+            Some(v) if v.is::<crate::tabs::tasks::TasksTab>() => Some(Place::Tasks),
+            Some(v) if v.is::<crate::tabs::settings::SettingsTab>() => Some(Place::Settings),
+            _ => None,
         };
         ui.vertical_centered(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.add_space(8.0);
             let nav_on = self.show_nav && !self.show_project;
-            if kit::icon_button_sized(ui, icon::DATABASE, tr("Database navigator"), nav_on && place == Place::Panel, side, glyph).clicked() {
+            if kit::icon_button_sized(ui, icon::DATABASE, tr("Database navigator"), nav_on, side, glyph).clicked() {
                 if nav_on {
                     self.show_nav = false;
                 } else {
@@ -320,7 +318,7 @@ impl TernaryGridApp {
                 }
             }
             let projects_on = self.show_nav && self.show_project;
-            if kit::icon_button_sized(ui, icon::FILE_TEXT, tr("Projects and scripts"), projects_on && place == Place::Panel, side, glyph).clicked() {
+            if kit::icon_button_sized(ui, icon::FILE_TEXT, tr("Projects and scripts"), projects_on, side, glyph).clicked() {
                 if projects_on {
                     self.show_nav = false;
                 } else {
@@ -328,17 +326,22 @@ impl TernaryGridApp {
                     self.show_project = true;
                 }
             }
-            if kit::icon_button_sized(ui, icon::CLOCK_COUNTER_CLOCKWISE, tr("Query history"), place == Place::History, side, glyph).clicked() {
+            // A hairline between the groups, 6 points clear of the buttons.
+            ui.add_space(2.0);
+            let (line, _) = ui.allocate_exact_size(egui::vec2(20.0, 1.0), egui::Sense::hover());
+            ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border_strong));
+            ui.add_space(2.0);
+            if kit::icon_button_sized(ui, icon::CLOCK_COUNTER_CLOCKWISE, tr("Query history"), place == Some(Place::History), side, glyph).clicked() {
                 self.commands.push(AppCommand::Action(Action::OpenHistory));
             }
-            if kit::icon_button_sized(ui, icon::LIST_CHECKS, tr("Tasks"), place == Place::Tasks, side, glyph).clicked() {
+            if kit::icon_button_sized(ui, icon::LIST_CHECKS, tr("Tasks"), place == Some(Place::Tasks), side, glyph).clicked() {
                 self.commands.push(AppCommand::Action(Action::OpenTasks));
             }
         });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.add_space(8.0);
-            if kit::icon_button_sized(ui, icon::GEAR_SIX, tr("Settings"), place == Place::Settings, side, glyph).clicked() {
+            if kit::icon_button_sized(ui, icon::GEAR_SIX, tr("Settings"), place == Some(Place::Settings), side, glyph).clicked() {
                 self.commands.push(AppCommand::OpenSettings);
             }
             let running = self.ops.running();

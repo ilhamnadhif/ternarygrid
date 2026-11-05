@@ -757,6 +757,14 @@ fn result_screens(s: &mut Shots, conn: &str) {
         p.model.delete_rows(&[3]).unwrap();
     }
     s.frames(2);
+    // The footer gives way as the window narrows; the changes stay in view.
+    for width in [1440.0_f32, 1180.0, 980.0, 780.0, 660.0] {
+        s.h.set_size(egui::vec2(width, 900.0));
+        s.frames(6);
+        s.shot(&format!("res_footer_{width}"));
+    }
+    s.h.set_size(egui::vec2(1440.0, 900.0));
+    s.frames(6);
     s.click_rightmost("Refresh");
     s.frames(20);
     s.shot("res_reload");

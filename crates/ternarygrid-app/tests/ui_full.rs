@@ -1981,3 +1981,170 @@ fn ai_assistant_is_a_side_panel() {
     frames(&mut h, 2);
     assert!(!h.state().ai_open && h.state().ai_panel.is_some(), "hidden, kept");
 }
+
+/// A click at `p`, as egui reads it from the window.
+fn click_at(h: &mut H, p: egui::Pos2) {
+    pause(h);
+    h.event(egui::Event::PointerMoved(p));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+    }
+    frames(h, 4);
+}
+
+/// The wheel at `at`, as a trackpad reports it: at once (time stands still in these tests, and
+/// egui spreads a mouse wheel's big steps over time).
+fn wheel(h: &mut H, at: egui::Pos2, delta: egui::Vec2) {
+    let event = |delta, phase| egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, phase, modifiers: Modifiers::NONE };
+    h.event(egui::Event::PointerMoved(at));
+    frames(h, 2);
+    h.event(event(egui::Vec2::ZERO, egui::TouchPhase::Start));
+    h.event(event(delta, egui::TouchPhase::Move));
+    frames(h, 2);
+    h.event(event(egui::Vec2::ZERO, egui::TouchPhase::End));
+    frames(h, 4);
+}
+
+/// The tab titled `title`.
+fn tab_id(h: &H, title: &str) -> u64 {
+    h.state().dock.iter_all_tabs().find(|(_, t)| t.view.title() == title).map(|(_, t)| t.id).unwrap_or_else(|| panic!("no tab {title:?}: {:?}", tab_titles(h)))
+}
+
+/// Where the × of the tab `id` is.
+fn tab_close_button(h: &H, id: u64) -> egui::Pos2 {
+    let r = h.state().tab_rect(id).expect("the tab's button");
+    egui::pos2(r.right() - 21.0, r.center().y)
+}
+
+fn focused_title(h: &mut H) -> String {
+    h.state_mut().dock.find_active_focused().map(|(_, t)| t.view.title()).unwrap_or_default()
+}
+
+fn new_editor(h: &mut H, conn: &str, title: &str) {
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.to_string()), schema: None, text: None });
+    frames(h, 4);
+    focused_editor(h).set_title(title);
+    frames(h, 2);
+}
+
+#[test]
+fn every_open_tab_can_be_closed_and_the_open_one_stays() {
+    let (_dir, mut h, conn) = setup();
+    for title in ["one.sql", "two.sql", "three.sql"] {
+        new_editor(&mut h, &conn, title);
+    }
+    focus_tab(&mut h, "one.sql");
+    frames(&mut h, 4);
+    assert_eq!(focused_title(&mut h), "one.sql");
+    // The × of a tab in the background: that tab goes, the open one stays open and focused.
+    let (two, three) = (tab_id(&h, "two.sql"), tab_id(&h, "three.sql"));
+    let at = tab_close_button(&h, three);
+    click_at(&mut h, at);
+    assert!(!tab_titles(&h).iter().any(|t| t == "three.sql"), "{:?}", tab_titles(&h));
+    assert_eq!(focused_title(&mut h), "one.sql");
+    let at = tab_close_button(&h, two);
+    click_at(&mut h, at);
+    assert!(!tab_titles(&h).iter().any(|t| t == "two.sql"), "{:?}", tab_titles(&h));
+    assert_eq!(focused_title(&mut h), "one.sql");
+    // The open tab's own ×.
+    let one = tab_id(&h, "one.sql");
+    let at = tab_close_button(&h, one);
+    click_at(&mut h, at);
+    assert!(!tab_titles(&h).iter().any(|t| t == "one.sql"), "{:?}", tab_titles(&h));
+}
+
+#[test]
+fn a_tab_has_the_usual_pointer_and_still_moves() {
+    let (_dir, mut h, conn) = setup();
+    new_editor(&mut h, &conn, "one.sql");
+    new_editor(&mut h, &conn, "two.sql");
+    let r = h.state().tab_rect(tab_id(&h, "one.sql")).unwrap();
+    h.event(egui::Event::PointerMoved(r.center()));
+    frames(&mut h, 3);
+    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Default);
+    // Dragged, it shows the closed hand and changes places.
+    let target = h.state().tab_rect(tab_id(&h, "two.sql")).unwrap().center();
+    h.event(egui::Event::PointerButton { pos: r.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    frames(&mut h, 2);
+    for t in [0.3_f32, 0.6, 1.0] {
+        h.event(egui::Event::PointerMoved(r.center().lerp(target, t)));
+        frames(&mut h, 2);
+    }
+    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Grabbing);
+    h.event(egui::Event::PointerButton { pos: target, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    frames(&mut h, 4);
+    assert_eq!(tab_titles(&h), vec!["two.sql", "one.sql"]);
+}
+
+#[test]
+fn a_long_title_is_never_cut() {
+    let (_dir, mut h, conn) = setup();
+    let long = "reminder_delivery_resolutions_of_every_customer_in_the_last_ninety_days.sql";
+    new_editor(&mut h, &conn, long);
+    new_editor(&mut h, &conn, "other.sql");
+    frames(&mut h, 4);
+    let tab = h.state().tab_rect(tab_id(&h, long)).unwrap();
+    let text = h.ctx.fonts_mut(|f| f.layout_no_wrap(long.to_string(), egui::FontId::proportional(13.0), egui::Color32::WHITE)).size().x;
+    assert!(tab.width() > text, "{} wide for a title of {text}", tab.width());
+}
+
+#[test]
+fn tabs_that_do_not_fit_scroll_and_are_listed() {
+    let (_dir, mut h, conn) = setup();
+    assert!(!has(&h, "All tabs"));
+    h.set_size(egui::vec2(900.0, 700.0));
+    let titles: Vec<String> = (0..10).map(|i| format!("monthly_revenue_per_customer_{i}.sql")).collect();
+    for t in &titles {
+        new_editor(&mut h, &conn, t);
+    }
+    frames(&mut h, 6);
+    assert!(has(&h, "All tabs"), "{:?}", labels(&h));
+    assert!(has(&h, "New SQL editor"), "+ stays");
+    // The focused tab was brought into view.
+    let bar = h.state().chrome.nav.expect("the navigator").right()..=900.0;
+    let last = h.state().tab_rect(tab_id(&h, &titles[9])).unwrap();
+    assert!(last.right() <= *bar.end() && last.left() >= *bar.start(), "{last:?} {bar:?}");
+    // The list reaches a tab scrolled away; choosing it brings it back.
+    click(&mut h, "All tabs");
+    frames(&mut h, 3);
+    click(&mut h, &titles[0]);
+    frames(&mut h, 6);
+    assert_eq!(focused_title(&mut h), titles[0]);
+    let first = h.state().tab_rect(tab_id(&h, &titles[0])).unwrap();
+    assert!(first.left() >= *bar.start() && first.right() <= *bar.end(), "{first:?} {bar:?}");
+    // Wheeling the bar stays where it was put: the focused tab is not pulled back.
+    wheel(&mut h, first.center(), egui::vec2(-300.0, 0.0));
+    let moved = h.state().tab_rect(tab_id(&h, &titles[0])).unwrap();
+    assert!(moved.left() < first.left() - 100.0, "{moved:?} {first:?}");
+}
+
+#[test]
+fn a_connection_stays_at_the_top_of_its_rows() {
+    let (_dir, mut h, _conn) = setup();
+    h.set_size(egui::vec2(1200.0, 420.0));
+    let name = h.state().conns.configs()[0].name.clone();
+    // Many rows under the connection: every table unfolded.
+    nav_double_click(&mut h, "Tables");
+    wait(&mut h, "tables", |h| nav_row(h, "customer").is_some());
+    for table in ["product", "order_line", "order", "customer", "category"] {
+        nav_double_click(&mut h, table);
+        frames(&mut h, 4);
+    }
+    frames(&mut h, 10);
+    let nav = h.state().chrome.nav.unwrap();
+    let real_top = nav_row(&h, &name).unwrap().rect().top();
+    let tables_top = nav_row(&h, "Tables").unwrap().rect().top();
+    wheel(&mut h, nav.center(), egui::vec2(0.0, -180.0));
+    // The rows scrolled by; the connection stays at the top of the tree, over them.
+    let tables_now = nav_row(&h, "Tables").map(|n| n.rect().top());
+    assert!(tables_now.is_none_or(|t| t <= tables_top - 40.0), "the tree did not scroll: {tables_now:?} from {tables_top}");
+    let pinned = nav_row(&h, &name).expect("the connection stays in view").rect();
+    assert!((pinned.top() - real_top).abs() <= 1.0, "pinned at {pinned:?}, the top is {real_top}");
+    // Its caret folds the connection and shows it where it is.
+    let caret = egui::pos2(pinned.left() + 20.0, pinned.center().y);
+    click_at(&mut h, caret);
+    frames(&mut h, 6);
+    assert!(nav_row(&h, "Tables").is_none(), "folded: {:?}", labels(&h));
+    let row = nav_row(&h, &name).expect("the connection, not the rows after it").rect();
+    assert!((row.top() - real_top).abs() <= 1.0, "{row:?}");
+}

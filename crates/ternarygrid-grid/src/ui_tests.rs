@@ -777,6 +777,136 @@ fn nothing_to_copy_is_a_note_not_an_error_pop_up() {
     assert!(v.state.toolbar.error_popup.is_some());
 }
 
+/// The footer's buttons on the bar now (their names, also those shown as icons).
+fn on_footer(v: &Viewer) -> Vec<&'static str> {
+    ["Refresh", "Add row", "Duplicate", "Delete", "Undo", "Export"].into_iter().filter(|name| !v.find_all_exact(name).is_empty()).collect()
+}
+
+/// A viewer `width` points wide, settled.
+fn sized(v: &mut Viewer, width: f32) {
+    v.ui.size = egui::vec2(width, 700.0);
+    v.frame(vec![]);
+    v.frame(vec![]);
+}
+
+#[test]
+fn the_footer_moves_what_does_not_fit_into_its_menu() {
+    let mut v = Viewer::new(editable_model(5));
+    v.frame(vec![]);
+    let all = vec!["Refresh", "Add row", "Duplicate", "Delete", "Undo", "Export"];
+    assert_eq!(on_footer(&v), all, "wide");
+    let wide = v.find_all_exact("Duplicate")[0];
+    // Medium: every button stays, as icons, so the group gets shorter.
+    sized(&mut v, 800.0);
+    assert_eq!(on_footer(&v), all, "medium");
+    assert!(v.find_all_exact("Duplicate")[0].x > wide.x - 400.0);
+    // Narrow: Refresh and Add row stay; the others are one click away in ⋯.
+    sized(&mut v, 520.0);
+    assert_eq!(on_footer(&v), vec!["Refresh", "Add row"], "narrow");
+    let more = v.find_all_exact("More result actions")[0];
+    v.click(more);
+    v.frame(vec![]);
+    for item in ["Duplicate selected rows", "Delete selected rows", "Export…"] {
+        assert!(v.find(item).is_some(), "{item} in ⋯");
+    }
+    assert!(v.find("Fetch next").is_none(), "nothing to fetch here");
+}
+
+#[test]
+fn the_more_menu_has_only_what_the_bar_does_not() {
+    let mut v = Viewer::new(editable_model(5));
+    v.frame(vec![]);
+    let more = v.find_all_exact("More result actions")[0];
+    v.click(more);
+    v.frame(vec![]);
+    for item in ["Add row before", "Copy from row above", "Auto refresh", "Calculate total row count", "Chart"] {
+        assert!(v.find(item).is_some(), "{item} in ⋯");
+    }
+    for item in ["Duplicate selected rows", "Delete selected rows", "Export…"] {
+        assert!(v.find(item).is_none(), "{item} is on the bar");
+    }
+}
+
+#[test]
+fn the_footers_row_buttons_act_like_the_keys() {
+    let mut v = Viewer::new(editable_model(5));
+    v.state.grid.select_cell(1, 1);
+    v.frame(vec![]);
+    // Delete says how many, Undo brings them back.
+    let delete = v.find_all_exact("Delete")[0];
+    v.click(delete);
+    v.frame(vec![]);
+    assert_eq!(v.state.toolbar.notice, Some(("1 row marked for deletion".to_string(), false)));
+    assert!(v.model.has_changes());
+    let undo = v.find_all_exact("Undo")[0];
+    v.click(undo);
+    v.frame(vec![]);
+    assert!(!v.model.has_changes());
+    // Duplicate: a new row, selected.
+    let duplicate = v.find_all_exact("Duplicate")[0];
+    v.click(duplicate);
+    v.frame(vec![]);
+    assert_eq!(v.model.row_count(), 6);
+}
+
+#[test]
+fn a_new_row_from_the_footer_starts_in_the_first_cell_to_fill_in() {
+    let mut v = Viewer::new(crate::test_support::auto_id_model(3));
+    v.state.grid.select_cell(1, 3);
+    v.frame(vec![]);
+    let add = v.find_all_exact("Add row")[0];
+    v.click(add);
+    v.frame(vec![]);
+    assert_eq!(v.model.row_count(), 4);
+    assert_eq!(v.state.grid.active_cell().map(|(_, c)| c), Some(1), "the column after the automatic id");
+}
+
+#[test]
+fn the_footers_edits_wait_while_editing_is_off() {
+    let mut v = Viewer::new(editable_model(3));
+    v.state.grid.select_cell(1, 1);
+    v.options.allow_editing = false;
+    v.frame(vec![]);
+    v.frame(vec![]);
+    for name in ["Add row", "Duplicate", "Delete"] {
+        let p = v.find_all_exact(name)[0];
+        v.click(p);
+        v.frame(vec![]);
+    }
+    assert_eq!(v.model.row_count(), 3);
+    assert!(!v.model.has_changes());
+}
+
+#[test]
+fn pending_changes_keep_their_place_in_a_full_footer() {
+    let mut v = Viewer::new(editable_model(5));
+    v.model.set_cell(1, 1, "changed").unwrap();
+    v.frame(vec![]);
+    v.frame(vec![]);
+    let save = v.find_all_exact("Save")[0];
+    let refresh = v.find_all_exact("Refresh")[0];
+    assert!(save.x < refresh.x, "the pill ends before the buttons start: {save:?} {refresh:?}");
+    // In a narrow footer the buttons give way, not the pill.
+    sized(&mut v, 700.0);
+    let save = v.find_all_exact("Save")[0];
+    let refresh = v.find_all_exact("Refresh")[0];
+    assert!(save.x < refresh.x, "{save:?} {refresh:?}");
+    assert_eq!(on_footer(&v), vec!["Refresh", "Add row"]);
+    // The narrowest: the pill gets shorter and the views move into ⋯, and nothing overlaps.
+    sized(&mut v, 460.0);
+    let (discard, save, refresh) = (v.find_all_exact("Discard")[0], v.find_all_exact("Save")[0], v.find_all_exact("Refresh")[0]);
+    assert!(discard.x > 80.0, "the status stays beside the pill: {discard:?}");
+    assert!(discard.x < save.x && save.x < refresh.x, "{discard:?} {save:?} {refresh:?}");
+    assert!(v.find_all_exact("Grid").is_empty(), "the views are not on the bar");
+    let more = v.find_all_exact("More result actions")[0];
+    v.click(more);
+    v.frame(vec![]);
+    let text = v.find_all_exact("Text").first().copied().expect("the views in ⋯");
+    v.click(text);
+    v.frame(vec![]);
+    assert_eq!(v.state.toolbar.view, ResultViewKind::Text);
+}
+
 #[test]
 fn record_view_keeps_its_values_while_the_store_is_busy() {
     let mut v = Viewer::new(editable_model(5));

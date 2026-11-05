@@ -296,7 +296,7 @@ impl GridFrame<'_> {
                 self.duplicate_selected();
                 ui.close();
             }
-            if kit::menu_item_danger(ui, Some(icon::TRASH), &rows_label(selected_rows, tr("Delete row"), tr("Delete {} rows")), keys("⌫", "Delete")).clicked() {
+            if kit::menu_item_danger(ui, Some(icon::TRASH), &rows_label(selected_rows, tr("Delete row"), tr("Delete {} rows")), keys("fn⌫", "Delete")).clicked() {
                 self.delete_selected();
                 ui.close();
             }

@@ -404,13 +404,14 @@ pub(crate) fn copy_text_and_nulls(model: &ResultModel, state: &DataGridState, op
     Ok((crate::copy::render(&data, &opts, &options.format, dialect), cells, texts, nulls, gaps))
 }
 
-/// Insert a new row after the active row (or at the end) and select it.
-/// Returns the display row.
+/// Insert a new row after the active row (or at the end) and select its first cell to fill in
+/// (as the keys and the context menu do). Returns the display row.
 pub fn add_row(model: &mut ResultModel, state: &mut DataGridState) -> Result<usize, String> {
     let after = state.active_cell().map(|(r, _)| r).or(model.row_count().checked_sub(1));
+    let current = state.active_cell().map_or(0, |(_, c)| c);
     let row = model.add_row(after)?;
-    let col = state.active_cell().map_or(0, |(_, c)| c);
-    state.select_cell(row, col);
+    let col = state.visible_columns().iter().copied().find(|&c| model.can_edit_cell(row, c).is_ok() && model.column_meta(c).is_some_and(|m| m.auto_increment != Some(true)));
+    state.select_cell(row, col.unwrap_or(current));
     Ok(row)
 }
 

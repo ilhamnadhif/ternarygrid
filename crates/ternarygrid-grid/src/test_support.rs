@@ -58,8 +58,19 @@ fn src(col: &str) -> ColumnSource {
 
 /// Editable model: id (key), name, flag (bool), category (dictionary, FK).
 pub(crate) fn editable_model(n: usize) -> ResultModel {
+    editable_model_id(n, None)
+}
+
+/// [`editable_model`] with an automatic id.
+pub(crate) fn auto_id_model(n: usize) -> ResultModel {
+    editable_model_id(n, Some(true))
+}
+
+fn editable_model_id(n: usize, auto_increment: Option<bool>) -> ResultModel {
+    let mut id = ColumnMeta::new("id", "int", DataKind::Int).with_source(src("id"));
+    id.auto_increment = auto_increment;
     let cols = vec![
-        ColumnMeta::new("id", "int", DataKind::Int).with_source(src("id")),
+        id,
         ColumnMeta::new("name", "text", DataKind::Text).with_source(src("name")),
         ColumnMeta::new("flag", "bool", DataKind::Bool).with_source(src("flag")),
         ColumnMeta::new("category", "int", DataKind::Int).with_source(src("category")),

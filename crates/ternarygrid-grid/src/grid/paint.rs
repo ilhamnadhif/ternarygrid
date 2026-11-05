@@ -172,6 +172,8 @@ impl GridFrame<'_> {
         let fk_icon = |color| painter.layout_no_wrap(egui_phosphor::regular::ARROW_SQUARE_OUT.to_string(), FontId::new(font.size * 0.85, font.family.clone()), color);
         let (fk_idle, fk_hot) = (fk_icon(theme.link), fk_icon(theme.link));
         let active_row = (!self.state.rt.selection.is_empty()).then(|| self.state.rt.selection.active().row);
+        // A whole column selected has no row of its own to follow.
+        let current_row = active_row.filter(|_| !self.state.rt.selection.is_column_selected(self.state.rt.selection.active().col));
         let mut tooltip: Option<(Rect, String)> = None;
         let max_tip = options.max_tooltip_chars;
         let striped = options.striped;
@@ -221,6 +223,10 @@ impl GridFrame<'_> {
                         sink.rect_filled(r, 0.0, theme.modified);
                     }
                 }
+            }
+            // The active cell's row, so that it can be followed while scrolling sideways.
+            if current_row == Some(row) {
+                sink.rect_filled(row_rect, 0.0, theme.current_row);
             }
             // Selection segments of this row.
             for r in ranges {
@@ -478,6 +484,9 @@ impl GridFrame<'_> {
         let font = FontId::new(self.font.size * 11.5 / 13.0, self.font.family.clone());
         let model = &*self.model;
         let selection = &self.state.rt.selection;
+        // The active cell's row is marked here too: the number stays in view when the row's
+        // cells are scrolled away.
+        let active_row = (!selection.is_empty() && !selection.is_column_selected(selection.active().col)).then(|| selection.active().row);
         let glyphs = &mut self.state.rt.glyphs_rownum;
         let striped = self.options.striped;
         let mut buf = String::with_capacity(12);
@@ -485,7 +494,8 @@ impl GridFrame<'_> {
             let y0 = geo.row_top(row, sy);
             let r = Rect::from_min_max(pos2(geo.rownums.left(), y0), pos2(geo.rownums.right(), y0 + geo.row_h));
             let state = model.row_state(row);
-            let bg = if selection.is_row_selected(row) {
+            let current = active_row == Some(row);
+            let bg = if selection.is_row_selected(row) || current {
                 Some(theme.header_selected_bg)
             } else {
                 match state {
@@ -506,7 +516,11 @@ impl GridFrame<'_> {
                 let _ = write!(buf, "{}", row + 1);
             }
             let inner = Rect::from_min_max(pos2(r.left() + 4.0, r.top()), pos2(r.right() - PAD, r.bottom()));
-            let color = if state == RowState::Inserted { theme.bool_true } else { theme.rownum_text };
+            let color = match state {
+                RowState::Inserted => theme.bool_true,
+                _ if current => theme.text,
+                _ => theme.rownum_text,
+            };
             if glyphs.place(&painter, &mut batch, &buf, inner, Align::Max, color).is_none() {
                 place_slow(&painter, &font, &buf, inner, Align::Max, color);
             }

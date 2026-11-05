@@ -3,6 +3,32 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.3 — 2026-11-05
+
+Tabs that say where they work, a results footer with the actions in reach, and a navigator that keeps its place.
+
+### Added
+- **Tabs show where they work**: the table's name, with its schema and database under it (`public@bantuin`), so the same table of two databases can be told apart. Names are never cut; the connection is in the tab's tooltip.
+- **Every open tab has its ×**: closing a tab in the background leaves the open tab open and focused.
+- **Too many tabs**: the tab bar scrolls and brings the focused tab into view, ⌄ at its end lists all the tabs, and + stays in reach. The bar no longer takes height from the page when tabs stop fitting.
+- **Results footer**, under a table's data and the SQL editor: Refresh, the row actions (Add row, Duplicate, Delete, Undo), the views and Export in groups. Narrower footers show them as icons, then move them into ⋯, which only lists what the bar does not show.
+- **Navigator toolbar**: Connect / Disconnect, Collapse all and New folder as buttons, as many as fit beside the title; the others are in ⋯.
+- **A connection stays at the top of the navigator** while its objects scroll, until the next connection pushes it out. Its row works as usual: selecting it, its menu, folding it.
+- **The active cell's row is highlighted** in the grid and in the row numbers, so it can be followed while scrolling sideways.
+
+### Changed
+- **Coloured object icons**: tables, views, keys, folders and the other objects have their colours back in the navigator, on tabs, in the command palette and in search results. Toolbars and menus stay monochrome.
+- **The rail has two groups with a selection each**: the side panel that is open (Database navigator, Projects) and the tab that is active (Query history, Tasks).
+- On a table's Data page, Refresh moved from the header to the footer.
+- Tabs show the usual pointer instead of a hand; dragging one still shows the closed hand.
+
+### Fixed
+- Add row, Duplicate and Delete in the footer no longer edit during a save or on a read-only connection.
+- Add row in the footer starts in the first cell to fill in, and Delete says how many rows it marked, as the keys and the context menu do.
+- The pending changes no longer overlap the footer's buttons, and shorten in a narrow footer.
+- The footer's status, the navigator's title and the filter bar's ⋯ no longer run into their neighbours in a narrow window.
+- macOS: Delete rows shows fn⌫ (⌫ edits the cell), and the menus no longer offer an Insert key.
+
 ## 0.6.2 — 2026-11-03
 
 A pass over every screen for clarity and consistency.

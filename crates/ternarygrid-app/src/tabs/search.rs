@@ -518,7 +518,9 @@ impl SearchTab {
                     look::cell_text(ui, RichText::new(&h.conn_name).color(pal.text_muted));
                 });
                 look::cell(row, false, |ui| {
-                    ui.label(RichText::new(crate::nav::kind_icon(h.info.obj.kind)).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.text_muted));
+                    let glyph = crate::nav::kind_icon(h.info.obj.kind);
+                    let color = crate::theme::object_icon_color(glyph, pal.surface).unwrap_or(pal.text_muted);
+                    ui.label(RichText::new(glyph).font(ternarygrid_ui::style::icon_font(14.0)).color(color));
                     look::cell_text(ui, tr(h.info.obj.kind.label()));
                 });
                 look::cell(row, false, |ui| {

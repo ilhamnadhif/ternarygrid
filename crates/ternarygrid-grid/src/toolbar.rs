@@ -248,7 +248,7 @@ impl<'a> FilterBar<'a> {
             let sort = sort_summary(model, grid, state);
             let order_w = sort_chip_width(ui, sort.as_ref()) + 30.0;
             let apply_w = kit::button_width(ui, Some(icon::PLAY), tr("Apply"), false);
-            let flexible = (ui.available_width() - order_w - apply_w - 3.0 * gap).max(160.0);
+            let flexible = (ui.available_width() - order_w - apply_w - 3.0 * gap).max(110.0);
             const WHERE_WORDS: [&str; 10] = ["AND", "OR", "NOT", "IS NULL", "IS NOT NULL", "LIKE", "ILIKE", "IN", "BETWEEN", "NULL"];
             let label = if server { tr("Filter rows in the database") } else { tr("Filter the fetched rows") };
             let field = Field { salt: "filter_where", prefix, label, prefix_tip, hint, width: flexible, keywords: &WHERE_WORDS, history: &state.filter_history };
@@ -596,21 +596,24 @@ fn prefixed_field(
 }
 
 /// The footer of a result, the same under a table's data and the SQL editor: on the left the
-/// status ("400 rows · more available · 286 ms", the time the rows were read in its tooltip),
-/// Fetch next and ⋯ (refresh, auto refresh, fetch all, the total count, row operations, Chart,
-/// Spatial view, the XML view, the panels); in the middle the pending changes with Discard
-/// and Save (only while there are some); on the right the views, Export and the panels.
+/// status ("400 rows · more available · 286 ms", the time the rows were read in its tooltip)
+/// and Fetch next; on the right the pending changes with Discard and Save (only while there
+/// are some), then the buttons in groups: Refresh | the rows (Add, Duplicate, Delete, Undo) |
+/// the views | Export | ⋯ and the panels. What does not fit moves into ⋯ ([`FooterFit`]), which
+/// also has the less used actions (auto refresh, fetch all, the total count, Chart, Spatial
+/// view, the XML view, the panels).
 pub struct ResultToolbar<'a> {
     model: &'a mut ResultModel,
     grid: &'a mut DataGridState,
     state: &'a mut ToolbarState,
     fetch_size: usize,
+    can_edit: bool,
 }
 
 impl<'a> ResultToolbar<'a> {
     /// New toolbar.
     pub fn new(model: &'a mut ResultModel, grid: &'a mut DataGridState, state: &'a mut ToolbarState) -> Self {
-        ResultToolbar { model, grid, state, fetch_size: 0 }
+        ResultToolbar { model, grid, state, fetch_size: 0, can_edit: true }
     }
 
     /// The rows one "Fetch next" reads (its label says how many; 0: "Fetch more").
@@ -619,19 +622,24 @@ impl<'a> ResultToolbar<'a> {
         self
     }
 
+    /// Whether the grid takes edits now (not on a read-only connection or during a save): the
+    /// row buttons stay in place, disabled.
+    pub fn can_edit(mut self, can_edit: bool) -> Self {
+        self.can_edit = can_edit;
+        self
+    }
+
     /// Show it. Returns actions for the application.
     pub fn show(self, ui: &mut Ui) -> Vec<GridAction> {
-        let ResultToolbar { model, grid, state, fetch_size } = self;
+        let ResultToolbar { model, grid, state, fetch_size, can_edit } = self;
+        let can_edit = can_edit && model.is_editable();
         let mut actions = Vec::new();
         auto_refresh_tick(ui, model, grid.is_editing(), state, &mut actions);
         let p = ternarygrid_ui::pal(ui);
-        // A narrow footer (a side panel open, a split editor) keeps the status, the views and
-        // ⋯; Add row and Export move into ⋯ instead of running into the status.
-        let compact = ui.available_width() < COMPACT_W;
-        let row = ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
             ui.set_min_height(FOOTER_H);
             ui.spacing_mut().item_spacing.x = 10.0;
-            // --- status: the row count stands out; Fetch next follows it
+            // --- status: the row count stands out
             let (rows, mut rest) = status_parts(model);
             if state.auto_refresh_secs.is_some() && (model.has_changes() || model.fetch.fetching) {
                 rest.push_str(" · ");
@@ -643,14 +651,35 @@ impl<'a> ResultToolbar<'a> {
             let size = 12.5;
             job.append(&rows, 0.0, egui::TextFormat::simple(ternarygrid_ui::style::medium(ui.ctx(), size), p.text));
             job.append(&rest, 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), p.text_muted));
-            let status = ui.add(egui::Label::new(job).selectable(false));
+            let status_w = ui.painter().layout_job(job.clone()).size().x;
+            // What the right side needs: the read-only note, the pending changes (shorter when
+            // the status would not fit beside them), the buttons at their fewest.
+            let widths = footer_widths(ui, model.is_editable());
+            let locked_w = if model.is_editable() { 0.0 } else { model.read_only_reason().map_or(0.0, |r| read_only_width(ui, r.short_label()) + FOOTER_GAP) };
+            let full = ui.available_width();
+            let needed = widths.minimal + locked_w + FOOTER_SIDE_GAP;
+            let pending = model.pending_counts().total();
+            let pending_label = if pending == 1 { tr("1 change").to_string() } else { trf("{} changes", &[&pending]) };
+            let pill_short = full - needed - status_w < pending_width(ui, &pending_label, false) + FOOTER_GAP;
+            let pending_label = if pill_short { pending.to_string() } else { pending_label };
+            let pending_w = if pending > 0 { pending_width(ui, &pending_label, pill_short) + FOOTER_GAP } else { 0.0 };
+            // Fetch next follows the status, in ⋯ when there is no room for both; the status is
+            // cut only when even that does not make it fit.
+            let fetch_label = if fetch_size > 0 { trf("Fetch next {}", &[&fetch_size]) } else { tr("Fetch more").to_string() };
+            let fetch_w =
+                ui.painter().layout_no_wrap(fetch_label.clone(), ternarygrid_ui::style::medium(ui.ctx(), 12.5), egui::Color32::PLACEHOLDER).size().x + 16.0 + FOOTER_SIDE_GAP;
+            let free = full - needed - pending_w;
+            let fetch_shown = model.fetch.has_more && free - status_w >= fetch_w;
+            let status = ui.scope(|ui| {
+                ui.set_max_width(free.max(60.0));
+                ui.add(egui::Label::new(job).selectable(false).truncate())
+            });
             if let Some(at) = read_at {
-                status.on_hover_text(trf("Read at {}", &[&at]));
+                status.inner.on_hover_text(trf("Read at {}", &[&at]));
             }
             let fetching = model.fetch.fetching;
-            if model.fetch.has_more {
-                let label = if fetch_size > 0 { trf("Fetch next {}", &[&fetch_size]) } else { tr("Fetch more").to_string() };
-                let r = ui.add_enabled_ui(!fetching, |ui| flat_button(ui, None, &label, Flat::Link)).inner.on_hover_text(tr("Fetch next page"));
+            if fetch_shown {
+                let r = ui.add_enabled_ui(!fetching, |ui| flat_button(ui, None, &fetch_label, Flat::Link)).inner.on_hover_text(tr("Fetch next page"));
                 if r.clicked() {
                     actions.push(GridAction::FetchMore);
                 }
@@ -681,97 +710,236 @@ impl<'a> ResultToolbar<'a> {
                     state.dismissed_fetch_error = None;
                 }
             }
-            let left_end = ui.min_rect().right();
-            // --- right, right to left: the panel toggle at the edge, ⋯ (the less used actions,
-            // the last of the result's actions as in every bar), Export, the views, Add row
-            let right_start = ui
-                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    let visible = !state.open_panels.is_empty() && !state.panels_hidden;
-                    if panel_toggle(ui, visible, 28.0).clicked() {
-                        if visible {
-                            state.panels_hidden = true;
-                        } else {
-                            if state.open_panels.is_empty() {
-                                state.set_panel_open(PanelKind::Value, true);
-                            }
-                            state.panels_hidden = false;
+            // --- right, right to left: the panel toggle at the edge, ⋯ (the last of the result's
+            // actions as in every bar), Export, the views, the rows, Refresh, the pending changes
+            let room = ui.max_rect().right() - ui.min_rect().right() - pending_w - locked_w - FOOTER_SIDE_GAP;
+            let fit = FooterFit::choose(room, &widths);
+            let footer = MoreContext { fit, can_edit, fetch: (model.fetch.has_more && !fetch_shown).then_some(fetch_label) };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = FOOTER_GAP;
+                let divide = |ui: &mut Ui| {
+                    if fit >= FooterFit::Icons {
+                        kit::vdivider(ui, 16.0);
+                    }
+                };
+                let visible = !state.open_panels.is_empty() && !state.panels_hidden;
+                if panel_toggle(ui, visible, 28.0).clicked() {
+                    if visible {
+                        state.panels_hidden = true;
+                    } else {
+                        if state.open_panels.is_empty() {
+                            state.set_panel_open(PanelKind::Value, true);
                         }
+                        state.panels_hidden = false;
                     }
-                    let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More result actions"), false, 28.0);
-                    Popup::menu(&more).id(ui.id().with("result_more")).show(|ui| more_menu(ui, model, grid, state, compact, &mut actions));
-                    if !compact {
-                        let export = flat_button(ui, Some(icon::EXPORT), tr("Export"), Flat::Plain);
-                        if export.on_hover_text(tr("Export…")).clicked() {
-                            actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
-                        }
-                    }
-                    if let Some(kind) = view_switch(ui, state.view)
-                        && state.view != kind
-                    {
-                        state.view = kind;
-                        actions.push(GridAction::SwitchView(kind));
-                    }
-                    // Adding a row is the edit people look for under the rows (as in DBeaver's
-                    // footer); the other row operations are in ⋯, the context menu and the keys.
-                    if model.is_editable() && !compact {
-                        let add = flat_button(ui, Some(icon::PLUS), tr("Add row"), Flat::Plain).on_hover_text(tr("Add a row after the selected one (Insert)"));
-                        if add.clicked()
-                            && let Err(e) = grid::add_row(model, grid)
-                        {
-                            actions.push(GridAction::Notify { message: e, error: true });
-                        }
-                    }
-                    if !model.is_editable()
-                        && let Some(r) = model.read_only_reason()
-                    {
-                        // 🔒 No unique key, 5 apart, the reason in the tooltip.
-                        ui.scope(|ui| {
-                            ui.spacing_mut().item_spacing.x = 5.0;
-                            ui.label(RichText::new(r.short_label()).size(12.0).color(p.warn)).on_hover_text(r.message());
-                            ui.label(RichText::new(icon::LOCK_SIMPLE).font(ternarygrid_ui::style::icon_font(13.0)).color(p.warn));
-                        });
-                    }
-                    // Errors open a pop-up (the result viewer); other messages show here.
-                    if let Some((message, _)) = state.notice.clone().filter(|(_, error)| !error) {
-                        if kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 20.0).clicked() {
-                            state.notice = None;
-                        }
-                        ui.add(egui::Label::new(RichText::new(format!("{} {message}", icon::INFO)).size(12.5).color(p.text)).truncate()).on_hover_text(message);
-                    }
-                    ui.min_rect().left()
-                })
-                .inner;
-            (left_end, right_start)
-        });
-        // --- pending changes, between the two sides: only while there are some (Cmd+S saves, as always)
-        let pending = model.pending_counts().total();
-        if pending > 0 {
-            let (left_end, right_start) = row.inner;
-            let count = if pending == 1 { tr("1 change").to_string() } else { trf("{} changes", &[&pending]) };
-            let width = pending_width(ui, &count);
-            let x = (left_end + (right_start - left_end - width) / 2.0).max(left_end + 8.0);
-            let rect = egui::Rect::from_center_size(egui::pos2(x + width / 2.0, row.response.rect.center().y), egui::vec2(width, 32.0));
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
-            match pending_pill(&mut child, &count, pending) {
-                Some(true) => actions.push(grid::save_action(model)),
-                Some(false) => {
-                    // Discard drops them at once: they are only pending.
-                    model.discard_changes();
-                    actions.push(GridAction::ChangesDiscarded);
                 }
-                None => {}
-            }
-        }
+                let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More result actions"), false, 28.0);
+                Popup::menu(&more).id(ui.id().with("result_more")).show(|ui| more_menu(ui, model, grid, state, &footer, &mut actions));
+                divide(ui);
+                if fit >= FooterFit::Icons {
+                    if footer_button(ui, fit, icon::EXPORT, tr("Export"), tr("Export…"), true).clicked() {
+                        actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
+                    }
+                    divide(ui);
+                }
+                if fit >= FooterFit::Essential
+                    && let Some(kind) = view_switch(ui, state.view)
+                    && state.view != kind
+                {
+                    state.view = kind;
+                    actions.push(GridAction::SwitchView(kind));
+                }
+                if model.is_editable() {
+                    divide(ui);
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = FOOTER_INNER_GAP;
+                        row_buttons(ui, fit, can_edit, model, grid, &mut actions);
+                    });
+                } else if let Some(r) = model.read_only_reason() {
+                    // 🔒 No unique key, 5 apart, the reason in the tooltip.
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        ui.label(RichText::new(r.short_label()).size(12.0).color(p.warn)).on_hover_text(r.message());
+                        ui.label(RichText::new(icon::LOCK_SIMPLE).font(ternarygrid_ui::style::icon_font(13.0)).color(p.warn));
+                    });
+                }
+                divide(ui);
+                let refresh_tip = format!("{} ({})", tr("Refresh"), keys("⌘R", "Ctrl+R"));
+                if kit::icon_button_tip(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), &refresh_tip, false, 28.0, 15.0).clicked() {
+                    actions.push(GridAction::Refresh);
+                }
+                // --- pending changes: only while there are some (Cmd+S saves, as always)
+                if pending > 0 {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(pending_w - FOOTER_GAP, FOOTER_H), egui::Sense::hover());
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.expand2(egui::vec2(0.0, 1.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                    match pending_pill(&mut child, &pending_label, pending, pill_short) {
+                        Some(true) => actions.push(grid::save_action(model)),
+                        Some(false) => {
+                            // Discard drops them at once: they are only pending.
+                            model.discard_changes();
+                            actions.push(GridAction::ChangesDiscarded);
+                        }
+                        None => {}
+                    }
+                }
+                // Errors open a pop-up (the result viewer); other messages show here.
+                if let Some((message, _)) = state.notice.clone().filter(|(_, error)| !error) {
+                    if kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 20.0).clicked() {
+                        state.notice = None;
+                    }
+                    ui.add(egui::Label::new(RichText::new(format!("{} {message}", icon::INFO)).size(12.5).color(p.text)).truncate()).on_hover_text(message);
+                }
+            });
+        });
         actions
+    }
+}
+
+/// How much of the footer's buttons fit beside the status and the pending changes, fewest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FooterFit {
+    /// Refresh and Add row; the views and the rest in ⋯.
+    Minimal,
+    /// Refresh, Add row and the views; the rest in ⋯.
+    Essential,
+    /// Every group, as icons.
+    Icons,
+    /// Every group, the rows' buttons and Export with their names.
+    Labels,
+}
+
+/// What the footer's right side needs at each [`FooterFit`].
+struct FooterWidths {
+    minimal: f32,
+    essential: f32,
+    icons: f32,
+    labels: f32,
+}
+
+impl FooterFit {
+    /// The widest that fits in `room`.
+    fn choose(room: f32, widths: &FooterWidths) -> Self {
+        if room >= widths.labels {
+            FooterFit::Labels
+        } else if room >= widths.icons {
+            FooterFit::Icons
+        } else if room >= widths.essential {
+            FooterFit::Essential
+        } else {
+            FooterFit::Minimal
+        }
+    }
+}
+
+/// What ⋯ adds to its own actions, depending on what the bar shows.
+struct MoreContext {
+    fit: FooterFit,
+    can_edit: bool,
+    /// "Fetch next 200", when it is not on the bar.
+    fetch: Option<String>,
+}
+
+/// Gap between the footer's buttons and groups.
+const FOOTER_GAP: f32 = 8.0;
+/// Gap between the status and what follows it.
+const FOOTER_SIDE_GAP: f32 = 10.0;
+/// Gap between the buttons of a group.
+const FOOTER_INNER_GAP: f32 = 2.0;
+/// A footer button without text.
+const FOOTER_BUTTON: f32 = 28.0;
+/// [`kit::vdivider`]'s width.
+const DIVIDER_W: f32 = 9.0;
+/// The view switcher's width: four 30-point views 2 apart, 2 around them.
+const VIEW_SWITCH_W: f32 = 4.0 * 30.0 + 3.0 * 2.0 + 2.0 * 2.0;
+/// A [`Flat::Plain`] button's width, with an icon.
+fn flat_width(ui: &Ui, text: &str) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(12.5), egui::Color32::PLACEHOLDER).size().x + 14.0 + 6.0 + 2.0 * 10.0
+}
+
+/// The read-only note's width: 🔒 and the short reason, 5 apart.
+fn read_only_width(ui: &Ui, text: &str) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(12.0), egui::Color32::PLACEHOLDER).size().x + 5.0 + 13.0
+}
+
+/// The width of a row of `items`, each followed by the gap (the status's is part of it).
+fn row_width(items: &[f32]) -> f32 {
+    items.iter().map(|w| w + FOOTER_GAP).sum()
+}
+
+/// The names of the row buttons.
+const ROW_BUTTONS: [&str; 4] = ["Add row", "Duplicate", "Delete", "Undo"];
+
+/// What the right side of the footer needs (measured: the names differ by language and text
+/// size). A table that cannot be edited has no row buttons.
+fn footer_widths(ui: &Ui, editable: bool) -> FooterWidths {
+    let b = FOOTER_BUTTON;
+    let d = DIVIDER_W;
+    let minimal: &[f32] = if editable { &[b, b, b, b] } else { &[b, b, b] };
+    let rows_icons = ROW_BUTTONS.len() as f32 * (b + FOOTER_INNER_GAP) - FOOTER_INNER_GAP;
+    let rows_labels: f32 = ROW_BUTTONS.iter().map(|n| flat_width(ui, tr(n)) + FOOTER_INNER_GAP).sum::<f32>() - FOOTER_INNER_GAP;
+    let groups = |rows: f32, export: f32| {
+        let common = row_width(&[b, b, d, export, d, VIEW_SWITCH_W, d, b]);
+        if editable { common + row_width(&[rows, d]) } else { common }
+    };
+    FooterWidths {
+        minimal: row_width(minimal),
+        essential: row_width(minimal) + row_width(&[VIEW_SWITCH_W]),
+        icons: groups(rows_icons, b),
+        labels: groups(rows_labels, flat_width(ui, tr("Export"))),
+    }
+}
+
+/// A button of the footer: with its name when it fits, else its icon.
+fn footer_button(ui: &mut Ui, fit: FooterFit, glyph: &str, name: &str, tip: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        if fit == FooterFit::Labels {
+            flat_button(ui, Some(glyph), name, Flat::Plain).on_hover_text(tip)
+        } else {
+            kit::icon_button_tip(ui, glyph, name, tip, false, FOOTER_BUTTON, 15.0)
+        }
+    })
+    .inner
+}
+
+/// The rows' buttons, right to left: Undo, Delete, Duplicate, Add row; only Add row in a narrow
+/// footer. They stay in place, disabled, while they cannot act.
+fn row_buttons(ui: &mut Ui, fit: FooterFit, can_edit: bool, model: &mut ResultModel, grid: &mut DataGridState, actions: &mut Vec<GridAction>) {
+    let notify_error = |r: Result<usize, String>, actions: &mut Vec<GridAction>| {
+        if let Err(message) = r {
+            actions.push(GridAction::Notify { message, error: true });
+        }
+    };
+    if fit >= FooterFit::Icons {
+        let selected = !grid.selection().is_empty();
+        let undo_tip = format!("{} ({})", tr("Undo"), keys("⌘Z", "Ctrl+Z"));
+        if footer_button(ui, fit, icon::ARROW_U_UP_LEFT, tr(ROW_BUTTONS[3]), &undo_tip, can_edit && model.can_undo()).clicked() {
+            model.undo();
+        }
+        let delete_tip = format!("{} ({})", tr("Delete selected rows"), keys("fn⌫", "Delete"));
+        if footer_button(ui, fit, icon::TRASH, tr(ROW_BUTTONS[2]), &delete_tip, can_edit && selected).clicked() {
+            delete_rows(model, grid, actions);
+        }
+        let duplicate_tip = format!("{} ({})", tr("Duplicate selected rows"), keys("⌘D", "Ctrl+D"));
+        if footer_button(ui, fit, icon::ROWS_PLUS_BOTTOM, tr(ROW_BUTTONS[1]), &duplicate_tip, can_edit && selected).clicked() {
+            notify_error(grid::duplicate_selected(model, grid), actions);
+        }
+    }
+    let add_tip = if cfg!(target_os = "macos") { tr("Add a row after the selected one") } else { tr("Add a row after the selected one (Insert)") };
+    if footer_button(ui, fit, icon::PLUS, tr(ROW_BUTTONS[0]), add_tip, can_edit).clicked() {
+        notify_error(grid::add_row(model, grid).map(|_| 0), actions);
+    }
+}
+
+/// Mark the selected rows deleted and say how many (as the keys and the context menu do).
+fn delete_rows(model: &mut ResultModel, grid: &mut DataGridState, actions: &mut Vec<GridAction>) {
+    match grid::delete_selected(model, grid) {
+        Ok(n) => actions.push(GridAction::Notify { message: ternarygrid_core::trn(n, tr("1 row marked for deletion"), tr("{} rows marked for deletion")), error: false }),
+        Err(message) => actions.push(GridAction::Notify { message, error: true }),
     }
 }
 
 /// Height of the footer's row.
 const FOOTER_H: f32 = 30.0;
-
-/// Below this width the footer moves Add row and Export into ⋯.
-const COMPACT_W: f32 = 760.0;
 
 /// The look of a [`flat_button`].
 #[derive(Clone, Copy, PartialEq)]
@@ -889,13 +1057,15 @@ fn view_switch(ui: &mut Ui, current: ResultViewKind) -> Option<ResultViewKind> {
     clicked
 }
 
-/// Width of the pending changes pill: 12 | ● 8 n changes 8 Discard 8 Save ⌘S | 4.
-fn pending_width(ui: &Ui, count: &str) -> f32 {
+/// Width of the pending changes pill: 12 | ● 8 n changes 8 Discard 8 Save ⌘S | 4 (`short`:
+/// without the keys).
+fn pending_width(ui: &Ui, count: &str, short: bool) -> f32 {
     let w = |t: &str, f: egui::FontId| ui.painter().layout_no_wrap(t.to_string(), f, egui::Color32::PLACEHOLDER).size().x;
     let medium = ternarygrid_ui::style::medium(ui.ctx(), 12.5);
     let label = w(count, medium.clone());
     let discard = w(tr("Discard"), egui::FontId::proportional(12.5)) + 20.0;
-    let save = w(tr("Save"), medium) + 8.0 + w(SAVE_KEYS, egui::FontId::proportional(11.0)) + 20.0;
+    let keys = if short { 0.0 } else { 8.0 + w(SAVE_KEYS, egui::FontId::proportional(11.0)) };
+    let save = w(tr("Save"), medium) + keys + 20.0;
     (12.0 + 7.0 + 8.0 + label + 8.0 + discard + 8.0 + save + 4.0).ceil()
 }
 
@@ -903,7 +1073,7 @@ fn pending_width(ui: &Ui, count: &str) -> f32 {
 const SAVE_KEYS: &str = if cfg!(target_os = "macos") { "⌘S" } else { "Ctrl+S" };
 
 /// "● 2 changes  Discard  Save ⌘S" on the changed cells' tint. `Some(true)`: Save, `Some(false)`: Discard.
-fn pending_pill(ui: &mut Ui, count: &str, pending: usize) -> Option<bool> {
+fn pending_pill(ui: &mut Ui, count: &str, pending: usize, short: bool) -> Option<bool> {
     let p = ternarygrid_ui::pal(ui);
     let rect = ui.max_rect();
     let modified = crate::theme::GridTheme::from_visuals(ui.visuals()).modified;
@@ -916,7 +1086,7 @@ fn pending_pill(ui: &mut Ui, count: &str, pending: usize) -> Option<bool> {
     if key_button(ui, None, tr("Discard"), None, false, 26.0).on_hover_text(tr("Discard pending changes")).clicked() {
         out = Some(false);
     }
-    if key_button(ui, None, tr("Save"), Some(SAVE_KEYS), true, 26.0)
+    if key_button(ui, None, tr("Save"), (!short).then_some(SAVE_KEYS), true, 26.0)
         .on_hover_text(ternarygrid_core::trn(pending, tr("Save 1 pending change (⌘S)"), tr("Save {} pending changes (⌘S)")))
         .clicked()
     {
@@ -1001,24 +1171,39 @@ fn panel_items(ui: &mut Ui, state: &ToolbarState, actions: &mut Vec<GridAction>)
     }
 }
 
-/// The footer's ⋯ menu: refresh, auto refresh, fetching, rows, Chart / Spatial view, the XML
-/// view, panels.
-fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, state: &mut ToolbarState, compact: bool, actions: &mut Vec<GridAction>) {
+/// The footer's ⋯ menu: what the bar has no room for, then what is never on it (auto refresh,
+/// fetching, the rows' other operations, Chart / Spatial view, the XML view, the panels).
+fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, state: &mut ToolbarState, footer: &MoreContext, actions: &mut Vec<GridAction>) {
     kit::menu_look(ui, 260.0);
+    let narrow = footer.fit < FooterFit::Icons;
     // What a narrow footer leaves out.
-    if compact {
+    if footer.fit == FooterFit::Minimal {
+        kit::menu_caption(ui, tr("View"));
+        for (kind, _, name) in &VIEWS[..4] {
+            let mut on = state.view == *kind;
+            if kit::menu_check(ui, &mut on, tr(name)).clicked() {
+                state.view = *kind;
+                actions.push(GridAction::SwitchView(*kind));
+                ui.close();
+            }
+        }
+        kit::menu_separator(ui);
+    }
+    if narrow {
         if kit::menu_item(ui, Some(icon::EXPORT), tr("Export…"), "").clicked() {
             actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
             ui.close();
         }
         kit::menu_separator(ui);
     }
-    if kit::menu_item(ui, Some(icon::ARROW_CLOCKWISE), tr("Refresh"), keys("⌘R", "Ctrl+R")).clicked() {
-        actions.push(GridAction::Refresh);
-        ui.close();
-    }
     kit::submenu(ui, Some(icon::TIMER), tr("Auto refresh"), 200.0, &mut |ui| auto_refresh_menu(ui, state, actions));
     let fetching = model.fetch.fetching;
+    if let Some(label) = &footer.fetch
+        && ui.add_enabled_ui(!fetching, |ui| kit::menu_item(ui, Some(icon::ARROW_LINE_DOWN), label, "")).inner.clicked()
+    {
+        actions.push(GridAction::FetchMore);
+        ui.close();
+    }
     if model.fetch.has_more && ui.add_enabled_ui(!fetching, |ui| kit::menu_item(ui, Some(icon::DOWNLOAD_SIMPLE), tr("Fetch all rows"), "")).inner.clicked() {
         actions.push(GridAction::FetchAll);
         ui.close();
@@ -1034,34 +1219,34 @@ fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, sta
                 actions.push(GridAction::Notify { message: e, error: true });
             }
         };
-        if kit::menu_item(ui, Some(icon::PLUS), tr("Add row"), "Insert").clicked() {
-            notify(grid::add_row(model, grid), actions);
-            ui.close();
-        }
-        if kit::menu_item(ui, Some(icon::ROWS_PLUS_TOP), tr("Add row before"), keys("⇧Insert", "Shift+Insert")).clicked() {
-            grid.request(crate::grid::GridCommand::AddRowBefore);
-            ui.close();
-        }
-        if kit::menu_item(ui, Some(icon::COPY), tr("Duplicate selected rows"), keys("⌘D", "Ctrl+D")).clicked() {
-            notify(grid::duplicate_selected(model, grid), actions);
-            ui.close();
-        }
-        if kit::menu_item(ui, Some(icon::ARROW_FAT_LINE_DOWN), tr("Copy from row above"), keys("⌘⌥↑", "Ctrl+Alt+Up")).clicked() {
-            grid.request(crate::grid::GridCommand::CopyFromAbove);
-            ui.close();
-        }
-        if kit::menu_item(ui, Some(icon::ARROW_FAT_LINE_UP), tr("Copy from row below"), keys("⌘⌥↓", "Ctrl+Alt+Down")).clicked() {
-            grid.request(crate::grid::GridCommand::CopyFromBelow);
-            ui.close();
-        }
-        if kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete selected rows"), keys("⌫", "Delete")).clicked() {
-            notify(grid::delete_selected(model, grid), actions);
-            ui.close();
-        }
-        if model.can_undo() && kit::menu_item(ui, Some(icon::ARROW_U_UP_LEFT), tr("Undo"), keys("⌘Z", "Ctrl+Z")).clicked() {
-            model.undo();
-            ui.close();
-        }
+        let selected = !grid.selection().is_empty();
+        ui.add_enabled_ui(footer.can_edit, |ui| {
+            // Macs have no Insert key: no keys to show.
+            if kit::menu_item(ui, Some(icon::ROWS_PLUS_TOP), tr("Add row before"), keys("", "Shift+Insert")).clicked() {
+                grid.request(crate::grid::GridCommand::AddRowBefore);
+                ui.close();
+            }
+            if narrow && ui.add_enabled_ui(selected, |ui| kit::menu_item(ui, Some(icon::ROWS_PLUS_BOTTOM), tr("Duplicate selected rows"), keys("⌘D", "Ctrl+D"))).inner.clicked() {
+                notify(grid::duplicate_selected(model, grid), actions);
+                ui.close();
+            }
+            if kit::menu_item(ui, Some(icon::ARROW_FAT_LINE_DOWN), tr("Copy from row above"), keys("⌘⌥↑", "Ctrl+Alt+Up")).clicked() {
+                grid.request(crate::grid::GridCommand::CopyFromAbove);
+                ui.close();
+            }
+            if kit::menu_item(ui, Some(icon::ARROW_FAT_LINE_UP), tr("Copy from row below"), keys("⌘⌥↓", "Ctrl+Alt+Down")).clicked() {
+                grid.request(crate::grid::GridCommand::CopyFromBelow);
+                ui.close();
+            }
+            if narrow && model.can_undo() && kit::menu_item(ui, Some(icon::ARROW_U_UP_LEFT), tr("Undo"), keys("⌘Z", "Ctrl+Z")).clicked() {
+                model.undo();
+                ui.close();
+            }
+            if narrow && ui.add_enabled_ui(selected, |ui| kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete selected rows"), keys("fn⌫", "Delete"))).inner.clicked() {
+                delete_rows(model, grid, actions);
+                ui.close();
+            }
+        });
     }
     kit::menu_separator(ui);
     if kit::menu_item(ui, Some(icon::CHART_BAR), tr("Chart"), "").clicked() {
@@ -1129,6 +1314,16 @@ fn auto_refresh_tick(ui: &Ui, model: &ResultModel, editing: bool, state: &mut To
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_footer_shows_the_widest_that_fits() {
+        let widths = FooterWidths { minimal: 150.0, essential: 300.0, icons: 500.0, labels: 800.0 };
+        assert_eq!(FooterFit::choose(900.0, &widths), FooterFit::Labels);
+        assert_eq!(FooterFit::choose(800.0, &widths), FooterFit::Labels);
+        assert_eq!(FooterFit::choose(799.0, &widths), FooterFit::Icons);
+        assert_eq!(FooterFit::choose(499.0, &widths), FooterFit::Essential);
+        assert_eq!(FooterFit::choose(299.0, &widths), FooterFit::Minimal);
+    }
 
     #[test]
     fn order_by_parsing() {

@@ -273,7 +273,14 @@ fn row(ui: &mut egui::Ui, it: &Item, hits: &[usize], selected: bool) -> egui::Re
     }
     let painter = ui.painter().clone();
     let cy = rect.center().y;
-    let icon_color = if selected { p.accent_text } else { ternarygrid_icons::color(it.icon).unwrap_or(p.text_muted) };
+    // Objects in their hue, as in the navigator; commands stay quiet.
+    let object = matches!(it.target, Target::Object(..) | Target::Bookmark(..));
+    let bg = if resp.hovered() { p.hover } else { ui.visuals().window_fill };
+    let icon_color = if selected {
+        p.accent_text
+    } else {
+        object.then(|| crate::theme::object_icon_color(it.icon, bg)).flatten().or_else(|| ternarygrid_icons::color(it.icon)).unwrap_or(p.text_muted)
+    };
     // As in the design: the icon 12 points in, the label 12 after it (13.5).
     painter.text(rect.left_center() + egui::vec2(19.5, 0.0), egui::Align2::CENTER_CENTER, it.icon, ternarygrid_ui::style::icon_font(15.0), icon_color);
     let label_x = rect.left() + 39.0;
