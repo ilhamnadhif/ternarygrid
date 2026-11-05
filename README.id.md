@@ -42,7 +42,8 @@ hasil query jutaan baris tidak perlu muat di memori.
   session dan lock manager, dashboard server, serta debugger PostgreSQL.
 - **Asisten AI** (opsional, dengan kunci API Anda sendiri: Anthropic, OpenAI, atau layanan yang
   kompatibel) di panel samping: mengenal skema, menulis dan menjelaskan SQL, menyimpan percakapannya,
-  dan, jika diizinkan, menjalankan query read-only sendiri.
+  dan, jika diizinkan, membaca data dengan query read-only. Setiap statement yang mengubah data
+  selalu meminta izin Anda dulu.
 - Antarmuka modern yang tenang, sama dengan TernaryWire dan TernaryShell: bar atas berisi koneksi ›
   skema yang aktif dan kotak pencarian untuk setiap perintah, objek, dan script (`⇧⌘P`), rail ikon
   (navigator, project, riwayat, task), dan status bar dengan mode transaksi. Antarmuka berbahasa
@@ -79,7 +80,7 @@ curl -fsSL https://raw.githubusercontent.com/ilhamnadhif/ternarygrid/master/scri
 
 Script ini mengunduh rilis terbaru, memeriksanya (SHA-256 yang diterbitkan GitHub, tanda tangan kode,
 bundle id dan versi), memasang `TernaryGrid.app` ke `/Applications`, lalu membukanya. Jalankan lagi untuk
-memperbarui. Untuk memasang versi tertentu, berikan versinya: `… | bash -s -- v0.6.3`.
+memperbarui. Untuk memasang versi tertentu, berikan versinya: `… | bash -s -- v0.6.4`.
 
 **Disk image**: unduh **`TernaryGrid-<versi>.dmg`**, buka, lalu seret **TernaryGrid** ke **Applications**.
 
@@ -216,7 +217,7 @@ Diukur pada build rilis (Apple M1 Pro) dengan `ternarygrid --bench all`:
 
 | | Target | Hasil |
 | --- | --- | --- |
-| Ukuran biner (macOS) | tanpa batas | 50 MB |
+| Ukuran biner (macOS) | tanpa batas | 59 MB |
 | Waktu buka sampai frame pertama | < 1 dtk | ≈ 0,12 dtk |
 | Memori saat diam | < 120 MB | ≈ 88 MB |
 | 3 koneksi + 5 tab hasil | < 250 MB | ≈ 94 MB |

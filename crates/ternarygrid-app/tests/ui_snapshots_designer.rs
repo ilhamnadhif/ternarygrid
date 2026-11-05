@@ -31,6 +31,9 @@ use ternarygrid_app::tabs::table_designer::TableDesignerTab;
 use ternarygrid_config::settings::Theme;
 use ternarygrid_core::meta::SchemaRef;
 
+#[path = "support/fake_ai.rs"]
+mod fake_ai;
+
 type H = Harness<'static, TernaryGridApp>;
 
 /// Pixels per point of the screenshots (a Retina display).
@@ -308,6 +311,7 @@ fn has(h: &H, label: &str) -> bool {
 
 fn step(columns: &[&str], rows: &[[&str; 3]]) -> ToolStep {
     ToolStep {
+        kind: Default::default(),
         sql: "select c.name, count(*) as orders, sum(l.quantity * l.unit_price) as revenue\nfrom customer c join \"order\" o on o.customer_id = c.id\njoin order_line l on l.order_id = o.id\ngroup by c.name order by revenue desc limit 3".into(),
         ok: true,
         summary: format!("{} row(s)", rows.len()),
@@ -476,6 +480,43 @@ fn ui_snapshots_designer() {
             s.frames(4);
             s.park_pointer();
             s.shot("ai_fix");
+            // Reading rows allowed, and statements that wait for the user's answer (a stand-in
+            // for the service asks).
+            s.ai().reset();
+            s.frames(2);
+            let (base, _) = fake_ai::serve(vec![
+                fake_ai::tool_call("execute_statement", "UPDATE customer SET city = 'Jakarta'\nWHERE id = 42"),
+                fake_ai::text("Left as it was."),
+                fake_ai::tool_call("execute_statement", "DELETE FROM order_line"),
+                fake_ai::text("Left as it was."),
+            ]);
+            {
+                let ai = &mut s.h.state_mut().settings.ai;
+                ai.provider = ternarygrid_config::settings::AiProvider::OpenAiCompatible;
+                ai.base_url = Some(base);
+                ai.model = "fast-daily".into();
+                ai.agent_queries = true;
+            }
+            let provider = s.h.state().settings.ai.provider.id().to_string();
+            s.h.state().services.secrets.read().set_ai_api_key(&provider, Some(&ternarygrid_core::Secret::new("test"))).unwrap();
+            s.frames(4);
+            for (shot, question) in [("ai_approval", "Move customer 42 to Jakarta"), ("ai_approval_danger", "Remove every order line")] {
+                s.ai().set_input(QuickAction::Chat, question, "");
+                s.frames(2);
+                s.click("Send");
+                s.wait("the question", |h| {
+                    h.step();
+                    has(h, "Run statement")
+                });
+                s.frames(6);
+                s.park_pointer();
+                s.shot(shot);
+                s.click("Don't run");
+                s.wait("the answer", |h| {
+                    h.step();
+                    !has(h, "Run statement") && h.state().ai_panel.as_ref().is_some_and(|a| a.last_answer().is_some())
+                });
+            }
         }
 
         drop(s);
