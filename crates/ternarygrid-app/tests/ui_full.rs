@@ -2269,3 +2269,76 @@ fn the_api_key_buttons_stay_inside_the_window() {
         assert!(!remove.intersects(save), "{width} wide: {remove:?} {save:?}");
     }
 }
+
+#[test]
+fn creating_a_project_leaves_the_side_panel_as_it_is() {
+    let (_dir, mut h, _conn) = setup();
+    click(&mut h, "Projects and scripts");
+    frames(&mut h, 4);
+    let panel = h.state().chrome.nav.expect("the side panel");
+    assert_eq!(panel.width(), 273.0, "the panel's default width");
+    // The project's select box, the only one in the panel.
+    pause(&mut h);
+    h.get_by_role(egui::accesskit::Role::ComboBox).click();
+    frames(&mut h, 3);
+    click(&mut h, "New project…");
+    frames(&mut h, 30);
+    let now = h.state().chrome.nav.expect("the side panel");
+    assert_eq!(now.width(), panel.width(), "the form widened the panel");
+    // The form stays inside the panel, with the same inset as the rest.
+    let cancel = h.query_all_by_label("Cancel").next().unwrap_or_else(|| panic!("no Cancel: {:?}", labels(&h))).rect();
+    assert!(cancel.right() <= panel.right() - 8.0, "{cancel:?} in {panel:?}");
+    // Typing a name moves nothing either, and Create makes the project.
+    h.query_all_by_role(egui::accesskit::Role::TextInput).find(|n| (n.rect().center().y - cancel.center().y).abs() < 12.0).expect("the name field").focus();
+    frames(&mut h, 3);
+    h.event(egui::Event::Text("A project with a rather long name".into()));
+    frames(&mut h, 10);
+    assert_eq!(h.state().chrome.nav.unwrap().width(), panel.width());
+    click(&mut h, "Create");
+    frames(&mut h, 6);
+    assert_eq!(h.state().services.projects.as_ref().unwrap().active_name(), "A project with a rather long name");
+    assert!(!h.query_all_by_label("Cancel").any(|_| true), "the form closed");
+    assert_eq!(h.state().chrome.nav.unwrap().width(), panel.width());
+}
+
+#[test]
+fn the_ai_panel_keeps_its_width() {
+    let (_dir, mut h, conn) = setup();
+    assistant(&mut h, &conn, Vec::new());
+    frames(&mut h, 6);
+    let row = h.query_all_by_label("Cannot read data").next().expect("the permission button").rect();
+    // As wide as this window lets it be (the tabs keep 640 points), not its smallest, 320.
+    assert!(1400.0 - row.left() > 400.0, "the panel starts near {}", row.left());
+}
+
+/// Drag the side panel's right edge by `dx`.
+fn drag_panel_edge(h: &mut H, dx: f32) {
+    let panel = h.state().chrome.nav.expect("the side panel");
+    let from = egui::pos2(panel.right(), panel.center().y);
+    let to = from + egui::vec2(dx, 0.0);
+    pause(h);
+    h.event(egui::Event::PointerMoved(from));
+    frames(h, 2);
+    h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    frames(h, 2);
+    for t in [0.4_f32, 0.8, 1.0] {
+        h.event(egui::Event::PointerMoved(from.lerp(to, t)));
+        frames(h, 2);
+    }
+    h.event(egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    frames(h, 4);
+}
+
+#[test]
+fn the_side_panel_still_resizes_by_hand() {
+    let (_dir, mut h, _conn) = setup();
+    let start = h.state().chrome.nav.expect("the side panel").width();
+    drag_panel_edge(&mut h, 60.0);
+    let wider = h.state().chrome.nav.unwrap().width();
+    assert!((wider - start - 60.0).abs() <= 2.0, "{start} → {wider}");
+    drag_panel_edge(&mut h, -120.0);
+    let narrower = h.state().chrome.nav.unwrap().width();
+    assert!((narrower - wider + 120.0).abs() <= 2.0, "{wider} → {narrower}");
+    frames(&mut h, 20);
+    assert_eq!(h.state().chrome.nav.unwrap().width(), narrower, "it stays where it was left");
+}

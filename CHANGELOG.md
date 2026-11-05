@@ -3,6 +3,11 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.5 — 2026-11-05
+
+### Fixed
+- **New project no longer widens the side panel**: its row was a little wider than the panel, so the panel grew a bit each frame, up to 600 points, and stayed that wide for the navigator too. The form now fits the panel, in line with the rest, and nothing in the side panel or the AI assistant can widen them any more. A panel left wide by this keeps its width: drag its edge back.
+
 ## 0.6.4 — 2026-11-05
 
 A crash fixed, and an AI assistant that reads your data when you let it and asks before changing anything.

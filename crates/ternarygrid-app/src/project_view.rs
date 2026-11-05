@@ -15,6 +15,9 @@ use ternarygrid_config::project::ScriptFolder;
 use ternarygrid_core::tr;
 use ternarygrid_ui::kit;
 
+/// The new project form's Cancel button.
+const CANCEL_W: f32 = 24.0;
+
 #[derive(Default)]
 pub struct ProjectView {
     scripts: Option<ScriptFolder>,
@@ -120,23 +123,27 @@ impl ProjectView {
             ui.add_space(4.0);
             if let Some(name) = &mut self.new_project {
                 let mut done = false;
-                ui.horizontal(|ui| {
-                    let w = ui.available_width() - 90.0;
-                    let r = look::text_field(ui, name, w, tr("Project name"), false);
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (ternarygrid_ui::kit::button_ex(ui, ternarygrid_ui::kit::Kind::Primary, None, tr("Create"), true).clicked() || enter) && !name.trim().is_empty() {
-                        match pm.create(name.trim()) {
-                            Ok(p) => {
-                                cx.push(AppCommand::SetActiveProject(p.name().to_string()));
-                                self.loaded = None;
-                                done = true;
+                egui::Frame::new().inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 0 }).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        // The field has what the buttons leave.
+                        let w = ui.available_width() - kit::button_width(ui, None, tr("Create"), true) - CANCEL_W - 2.0 * 8.0;
+                        let r = look::text_field(ui, name, w.max(40.0), tr("Project name"), false);
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if (kit::button_ex(ui, kit::Kind::Primary, None, tr("Create"), true).clicked() || enter) && !name.trim().is_empty() {
+                            match pm.create(name.trim()) {
+                                Ok(p) => {
+                                    cx.push(AppCommand::SetActiveProject(p.name().to_string()));
+                                    self.loaded = None;
+                                    done = true;
+                                }
+                                Err(e) => cx.toasts.error(tr("Cannot create the project"), Some(e.to_string())),
                             }
-                            Err(e) => cx.toasts.error(tr("Cannot create the project"), Some(e.to_string())),
                         }
-                    }
-                    if ternarygrid_ui::kit::icon_button_ex(ui, icon::X, tr("Cancel"), false, 24.0).clicked() {
-                        done = true;
-                    }
+                        if kit::icon_button_ex(ui, icon::X, tr("Cancel"), false, CANCEL_W).clicked() {
+                            done = true;
+                        }
+                    });
                 });
                 if done {
                     self.new_project = None;

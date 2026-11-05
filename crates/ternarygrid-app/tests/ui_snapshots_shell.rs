@@ -612,6 +612,21 @@ fn shots(s: &mut Shots) {
     s.click("Projects and scripts");
     s.frames(4);
     s.shot("projects");
+    // The new project form, as wide as the panel.
+    s.pause();
+    {
+        let panel = s.h.state().chrome.nav.expect("the side panel");
+        let n = s.h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| panel.contains(n.rect().center())).expect("the project's select box");
+        n.click();
+    }
+    s.frames(3);
+    {
+        let n = s.h.query_all_by_label_contains("New project…").next().expect("New project…");
+        n.click();
+    }
+    s.frames(10);
+    s.shot("projects_new");
+    s.click("Cancel");
     s.click("Database navigator");
 
     // The navigator's states: filtered, a connection that failed, an empty folder.
