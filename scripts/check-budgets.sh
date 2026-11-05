@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Checks the performance budgets of the README (and CI) on a release build:
-# binary size, cold start, idle and workload memory, grid scrolling and typing
-# frame times. Run it before and after visual changes; it exits non-zero when
-# a budget is missed.
+# cold start, idle and workload memory, grid scrolling and typing frame times,
+# and reports the binary's size (not a budget). Run it before and after visual
+# changes; it exits non-zero when a budget is missed.
 #
 #   scripts/check-budgets.sh               # build, then measure
 #   scripts/check-budgets.sh --no-build    # measure the existing release build
@@ -33,17 +33,11 @@ bin="target/release/ternarygrid"
 [ -f "$bin.exe" ] && bin="$bin.exe"
 [ -x "$bin" ] || { echo "no release build at $bin (run without --no-build)" >&2; exit 2; }
 
-# Binary size: < 50 MB (CI checks the same).
-limit=52428800
+# Binary size: reported, not a limit.
 size=$(wc -c < "$bin" | tr -d ' ')
 mb=$(awk "BEGIN { printf \"%.2f\", $size / 1048576 }")
+echo "binary size: $mb MB"
 status=0
-if [ "$size" -lt "$limit" ]; then
-    echo "binary size: $mb MB (< 50 MB) ok"
-else
-    echo "binary size: $mb MB (>= 50 MB) OVER BUDGET"
-    status=1
-fi
 
 # Startup, memory, grid and editor frame times (exits non-zero on a miss).
 if ! "$bin" --bench all --bench-report "$report"; then

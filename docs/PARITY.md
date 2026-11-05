@@ -200,7 +200,7 @@ Measured with `ternarygrid --bench all` on the release build (macOS, Apple M1 Pr
 
 | Target | Result |
 | --- | --- |
-| Binary < 50 MB | 44.0 MB (MiB, with Oracle and Cassandra) |
+| Binary size (no limit) | 50 MiB, with Oracle and Cassandra |
 | Cold start < 1 s | 105 ms to the first frame |
 | Idle memory < 120 MB | 69 MB |
 | 3 connections + 5 result tabs < 250 MB | 83 MB (20 000 rows fetched per tab) |

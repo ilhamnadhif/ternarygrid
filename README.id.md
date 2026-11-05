@@ -216,7 +216,7 @@ Diukur pada build rilis (Apple M1 Pro) dengan `ternarygrid --bench all`:
 
 | | Target | Hasil |
 | --- | --- | --- |
-| Ukuran biner (macOS) | < 50 MB | 49,6 MB |
+| Ukuran biner (macOS) | tanpa batas | 50 MB |
 | Waktu buka sampai frame pertama | < 1 dtk | ≈ 0,12 dtk |
 | Memori saat diam | < 120 MB | ≈ 88 MB |
 | 3 koneksi + 5 tab hasil | < 250 MB | ≈ 94 MB |

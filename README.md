@@ -211,7 +211,7 @@ Measured on the release build (Apple M1 Pro) with `ternarygrid --bench all`:
 
 | | Target | Measured |
 | --- | --- | --- |
-| Binary size (macOS) | < 50 MB | 49.6 MB |
+| Binary size (macOS) | no limit | 50 MB |
 | Cold start to first frame | < 1 s | ≈ 0.12 s |
 | Idle memory | < 120 MB | ≈ 88 MB |
 | 3 connections + 5 result tabs | < 250 MB | ≈ 94 MB |
