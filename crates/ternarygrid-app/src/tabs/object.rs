@@ -609,7 +609,8 @@ const HEADER_H: f32 = 36.0;
 
 impl ObjectEditorTab {
     /// The header, one line: the pages, underlined, with the counts of columns and indexes;
-    /// at the right Back / Forward of foreign key navigation, Refresh and ⋯. The object's name
+    /// at the right Back / Forward of foreign key navigation, Refresh (the data page's is in its
+    /// footer) and ⋯. The object's name
     /// is the tab's title (its full path, signature included, the tab's tooltip), its size and
     /// row estimate on the Statistics page.
     fn header_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
@@ -622,15 +623,11 @@ impl ObjectEditorTab {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More actions"), false, 28.0);
                 egui::Popup::menu(&more).show(|ui| crate::nav::object_menu(ui, cx, &self.conn.clone(), &self.obj.clone(), false));
-                if kit::icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 28.0).clicked() {
+                // The data page has Refresh in its footer, with the other actions on the rows.
+                if self.page != ObjectPage::Data && kit::icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 28.0).clicked() {
                     self.refresh();
-                    match (self.page, self.diagram.as_mut(), self.data.as_mut()) {
-                        (ObjectPage::Diagram, Some(d), _) => d.reload(cx),
-                        // The data page reloads its rows (asking first when edits are pending).
-                        (ObjectPage::Data, _, Some(d)) => {
-                            let _ = d.on_action(crate::keys::Action::Refresh, cx);
-                        }
-                        _ => {}
+                    if let (ObjectPage::Diagram, Some(d)) = (self.page, self.diagram.as_mut()) {
+                        d.reload(cx);
                     }
                     cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: Some(self.obj.clone()), schema: None });
                 }

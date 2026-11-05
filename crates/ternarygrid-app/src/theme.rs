@@ -247,16 +247,20 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     let v = &style.visuals;
     let p = ternarygrid_ui::palette(v.dark_mode);
     let top = CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
-    // The design's tab bar: 38 points with the hairline under it (painted by the viewer, 1
-    // point thick), the tabs 8 points from its ends and 2 apart; the active tab reaches up
-    // to the top bar's hairline and opens onto the content.
+    // The tab bar: two lines of text with the hairline under it (painted by the viewer, 1
+    // point thick), the tabs 8 points from its left end and 2 apart, room for "+" and the
+    // list of tabs at the right; the active tab reaches up to the top bar's hairline and
+    // opens onto the content.
     s.tab_bar.bg_fill = p.chrome;
     // Square, as in the design: egui_dock rounds the bar's top corners and the body's by
     // default, and nothing is painted behind them (the window's clear colour shows through).
     s.tab_bar.corner_radius = CornerRadius::ZERO;
     s.tab_bar.hline_color = Color32::TRANSPARENT;
     s.tab_bar.height = crate::tabs::TAB_BAR_H;
-    s.tab_bar.inner_margin = egui::Margin { left: 8, right: 8, top: -1, bottom: 0 };
+    s.tab_bar.inner_margin = egui::Margin { left: 8, right: 8 + crate::tabs::TAB_BAR_END as i8, top: -1, bottom: 0 };
+    // Too many tabs scroll under the wheel; the list of tabs reaches them all. egui_dock's bar
+    // would take height from the page each time the tabs stop fitting.
+    s.tab_bar.show_scroll_bar_on_overflow = false;
     s.tab.spacing = 2.0;
     s.tab.minimum_width = None;
     s.tab.hline_below_active_tab_name = false;
@@ -412,6 +416,12 @@ pub fn legible_on(c: Color32, bg: Color32) -> Color32 {
     } else {
         Color32::BLACK
     })
+}
+
+/// The colour of a database object's icon on `bg` (see [`ternarygrid_icons::object_hue`]):
+/// thin lines, so as legible as a logo in both themes, hovered and tinted rows included.
+pub fn object_icon_color(glyph: &str, bg: Color32) -> Option<Color32> {
+    ternarygrid_icons::object_hue(glyph).map(|hue| legible_on(hue, bg))
 }
 
 pub fn success_color(dark_mode: bool) -> Color32 {

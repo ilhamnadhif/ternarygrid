@@ -177,37 +177,33 @@ pub struct DockViewer<'a, 'b> {
     pub active_tab: Option<u64>,
     /// For the tab titles (a coloured icon and the title).
     pub style: std::sync::Arc<egui::Style>,
-    /// Titles that several tabs share, with what tells them apart (see [`tab_suffixes`]).
-    pub suffixes: std::collections::HashMap<u64, String>,
     /// Where each tab's button was drawn (filled while the tabs are shown).
     pub tab_rects: std::collections::HashMap<u64, egui::Rect>,
-    /// The tabs shown in their leaf (each leaf's open tab).
-    pub open_tabs: std::collections::HashSet<u64>,
+    /// The open tab of each tab's leaf, as it was before the tabs were shown: a click on a
+    /// tab makes it the open one before [`egui_dock::TabViewer::on_tab_button`] runs.
+    pub leaf_open: std::collections::HashMap<u64, u64>,
 }
 
-/// Height of the tab bar: 37 points and the hairline under it.
-pub const TAB_BAR_H: f32 = 38.0;
-/// Room kept at the right of the open tab's title for its × (8, the 20-point button, 10).
+/// Height of the tab bar: 41 points and the hairline under it (two lines of text).
+pub const TAB_BAR_H: f32 = 42.0;
+/// Room at the bar's right end for "+" and the list of tabs while tabs overflow (a 26-point
+/// button each, 2 apart, 8 from the edge, 2 from the tabs; the 8 at the end is the bar's own).
+pub const TAB_BAR_END: f32 = 56.0;
+/// Room kept at the right of a tab's text for its × (8, the 20-point button, 10).
 const TAB_CLOSE_ROOM: f32 = 30.0;
+/// The tab's icon slot and the gap after it: where the text starts after the leading room.
+const TAB_ICON_ROOM: f32 = 22.0;
 
-/// Tabs with the same title ("product" of two connections) get what tells them
-/// apart after it: the connection's name, or schema@database within one connection.
-pub fn tab_suffixes<'t>(tabs: impl Iterator<Item = &'t Tab>, conns: &crate::conn::ConnectionManager) -> std::collections::HashMap<u64, String> {
-    let mut by_title: std::collections::HashMap<String, Vec<(u64, Option<TabLocation>)>> = std::collections::HashMap::new();
-    for t in tabs {
-        by_title.entry(t.view.title()).or_default().push((t.id, tab_location(t.view.as_ref(), conns)));
+/// How far to scroll a tab bar (added to its scroll, which is negative or 0) to bring the tab
+/// at `rect` between `left` and `right`; the left end wins for a tab wider than that.
+pub fn tab_reveal_delta(rect: egui::Rect, left: f32, right: f32) -> f32 {
+    if rect.left() < left || rect.width() > right - left {
+        left - rect.left()
+    } else if rect.right() > right {
+        right - rect.right()
+    } else {
+        0.0
     }
-    let mut out = std::collections::HashMap::new();
-    for same in by_title.into_values().filter(|v| v.len() > 1) {
-        let conns_differ = same.iter().map(|(_, l)| l.as_ref().map(|l| l.conn.clone())).collect::<std::collections::HashSet<_>>().len() > 1;
-        for (id, loc) in same {
-            let suffix = loc.and_then(|l| if conns_differ { Some(l.name) } else { l.place });
-            if let Some(s) = suffix {
-                out.insert(id, s);
-            }
-        }
-    }
-    out
 }
 
 /// Where a tab works: its connection and database / schema (main toolbar,
@@ -262,6 +258,13 @@ fn place_label(at: SchemaRef, current: &SchemaRef, two_levels: bool) -> Option<S
     }
 }
 
+impl DockViewer<'_, '_> {
+    /// Is the tab the one shown in its leaf?
+    fn is_open(&self, id: u64) -> bool {
+        self.leaf_open.get(&id) == Some(&id)
+    }
+}
+
 impl egui_dock::TabViewer for DockViewer<'_, '_> {
     type Tab = Tab;
 
@@ -269,29 +272,37 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         Id::new(("ternarygrid_tab", tab.id))
     }
 
-    /// The tab's icon and title as in the design: 14 points from the tab's left edge, the
-    /// icon (muted on the open tab, faint on the others), 8 points, the title (the medium
-    /// weight on the open tab); the open tab keeps room for its × at the right.
+    /// The tab in two lines, never cut (a tab bar that is too short scrolls): the icon and the
+    /// title (the medium weight on the open tab), under it where the tab works, the schema and
+    /// the database, so that the same table of two databases can be told apart. Tabs of no
+    /// connection have the first line only. Every tab keeps room for its × at the right.
     fn title(&mut self, tab: &mut Tab) -> WidgetText {
         let dirty = if tab.view.is_dirty() { "● " } else { "" };
-        let mut title = format!("{dirty}{}", tab.view.title());
-        if let Some(s) = self.suffixes.get(&tab.id) {
-            title = format!("{title} · {s}");
-        }
-        if title.chars().count() > 46 {
-            title = title.chars().take(44).collect::<String>() + "…";
-        }
+        let title = format!("{dirty}{}", tab.view.title());
         let p = ternarygrid_ui::palette(self.style.visuals.dark_mode);
-        let open = self.open_tabs.contains(&tab.id);
+        let open = self.is_open(tab.id);
         let size = self.style.text_styles.get(&egui::TextStyle::Body).map_or(13.0, |f| f.size);
         let format = |font: egui::FontId, color: egui::Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
+        let location = tab_location(tab.view.as_ref(), self.cx.conns);
+        // An object's icon in its hue on the tab's background; other tabs stay quiet.
+        let quiet = if open { p.text_muted } else { p.text_faint };
+        let icon_color = location.as_ref().and_then(|_| crate::theme::object_icon_color(tab.view.icon(), if open { p.canvas } else { p.chrome })).unwrap_or(quiet);
         let mut job = egui::text::LayoutJob::default();
         // egui_dock pads the title by 8 points: 6 more on the left (7 inside the open tab's
         // hairline), the icon in a 14-point slot, 8 points, the title, then the × room.
-        job.append(tab.view.icon(), if open { 7.0 } else { 6.0 }, format(ternarygrid_ui::style::icon_font(14.0), if open { p.text_muted } else { p.text_faint }));
+        let lead = if open { 7.0 } else { 6.0 };
+        let end = "\u{200b}";
+        job.append(tab.view.icon(), lead, format(ternarygrid_ui::style::icon_font(14.0), icon_color));
         let font = if open { egui::FontId::new(size, egui::FontFamily::Name(ternarygrid_ui::style::MEDIUM.into())) } else { egui::FontId::proportional(size) };
-        job.append(&title, 8.0 + 14.0 * (1.0 - ternarygrid_ui::style::ICON_SCALE), format(font, egui::Color32::PLACEHOLDER));
-        job.append("\u{200b}", if open { TAB_CLOSE_ROOM + 1.0 } else { 4.0 }, format(egui::FontId::proportional(size), egui::Color32::PLACEHOLDER));
+        job.append(&title, TAB_ICON_ROOM - 14.0 * ternarygrid_ui::style::ICON_SCALE, format(font, egui::Color32::PLACEHOLDER));
+        let close_room = TAB_CLOSE_ROOM + 1.0;
+        job.append(end, close_room, format(egui::FontId::proportional(size), egui::Color32::PLACEHOLDER));
+        if let Some(place) = location.and_then(|l| l.place) {
+            let small = egui::FontId::proportional(size - 2.0);
+            job.append("\n", 0.0, format(small.clone(), quiet));
+            job.append(&place, lead + TAB_ICON_ROOM, format(small.clone(), quiet));
+            job.append(end, close_room, format(small, quiet));
+        }
         job.into()
     }
 
@@ -305,6 +316,11 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
     }
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        // The usual pointer over a tab: egui_dock's open hand reads as a link. Dragging one
+        // still shows the closed hand.
+        if response.hovered() && response.ctx.dragged_id().is_none() {
+            response.ctx.set_cursor_icon(egui::CursorIcon::Default);
+        }
         // The tab's own text, then its connection and schema@database.
         let location = tab_location(tab.view.as_ref(), self.cx.conns).map(|l| match l.place {
             Some(p) => format!("{} · {p}", l.name),
@@ -319,10 +335,11 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         }
         self.tab_rects.insert(tab.id, response.rect);
         let p = ternarygrid_ui::palette(self.style.visuals.dark_mode);
-        let open = self.open_tabs.contains(&tab.id);
+        let open = self.is_open(tab.id);
         let r = response.rect;
-        // The tab reaches up to the top bar's hairline: what it paints starts a point below.
-        let painter = response.ctx.layer_painter(response.layer_id).with_clip_rect(r.with_min_y(r.top() + 1.0));
+        // The tab reaches up to the top bar's hairline: what it paints starts a point below. Only
+        // the part of the tab inside the bar: a tab scrolled away paints nothing over the panels.
+        let painter = response.ctx.layer_painter(response.layer_id).with_clip_rect(response.interact_rect.with_min_y(r.top() + 1.0));
         // A line along the top: the connection type's colour on every tab of a marked
         // connection (Production stays visible), else the accent on the focused tab.
         let marker = tab.view.connection_id().and_then(|c| self.cx.conns.color_of(c)).and_then(|c| crate::theme::marker(c, self.style.visuals.dark_mode));
@@ -332,17 +349,20 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
             let line = egui::Rect::from_min_max(egui::pos2(r.left() + 8.0, top), egui::pos2(r.right() - 8.0, top + thick));
             painter.rect_filled(line, egui::CornerRadius { nw: 0, ne: 0, sw: 2, se: 2 }, color);
         }
-        // The open tab's ×: 20 points, 10 from its right hairline.
-        if open {
-            let x = egui::Rect::from_center_size(egui::pos2(r.right() - 21.0, r.center().y + 0.5), egui::vec2(20.0, 20.0));
-            let hover = response.ctx.input(|i| i.pointer.hover_pos()).is_some_and(|q| x.contains(q)) && response.hovered();
-            if hover {
-                painter.rect_filled(x, ternarygrid_ui::style::RADIUS, p.hover);
-            }
-            painter.text(x.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::X, ternarygrid_ui::style::icon_font(12.0), if hover { p.text } else { p.text_muted });
-            if response.clicked() && response.interact_pointer_pos().is_some_and(|q| x.contains(q)) {
-                self.cx.commands.push(crate::command::AppCommand::CloseTab(tab.id));
-            }
+        // Every tab's ×: 20 points, 10 from its right edge.
+        let x = egui::Rect::from_center_size(egui::pos2(r.right() - 21.0, r.center().y + 0.5), egui::vec2(20.0, 20.0));
+        let hover = response.ctx.input(|i| i.pointer.hover_pos()).is_some_and(|q| x.contains(q)) && response.hovered();
+        if hover {
+            painter.rect_filled(x, ternarygrid_ui::style::RADIUS, p.hover);
+        }
+        painter.text(x.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::X, ternarygrid_ui::style::icon_font(12.0), if hover { p.text } else { p.text_muted });
+        if response.clicked() && response.interact_pointer_pos().is_some_and(|q| x.contains(q)) {
+            // The click also opened the tab: closing one in the background keeps what was open.
+            let command = match self.leaf_open.get(&tab.id).copied().filter(|keep| *keep != tab.id) {
+                Some(keep_open) => crate::command::AppCommand::CloseBackgroundTab { id: tab.id, keep_open, keep_focused: self.active_tab },
+                None => crate::command::AppCommand::CloseTab(tab.id),
+            };
+            self.cx.commands.push(command);
         }
     }
 
@@ -440,8 +460,17 @@ pub fn code(ui: &mut Ui, cx: &mut AppContext, conn: &str, id: impl std::hash::Ha
 
 #[cfg(test)]
 mod tests {
-    use super::place_label;
+    use super::{place_label, tab_reveal_delta};
     use ternarygrid_core::SchemaRef;
+
+    #[test]
+    fn a_focused_tab_scrolls_into_the_bar() {
+        let tab = |left: f32, right: f32| egui::Rect::from_min_max(egui::pos2(left, 0.0), egui::pos2(right, 40.0));
+        assert_eq!(tab_reveal_delta(tab(120.0, 220.0), 100.0, 500.0), 0.0, "in view");
+        assert_eq!(tab_reveal_delta(tab(450.0, 550.0), 100.0, 500.0), -50.0, "past the right end");
+        assert_eq!(tab_reveal_delta(tab(40.0, 140.0), 100.0, 500.0), 60.0, "past the left end");
+        assert_eq!(tab_reveal_delta(tab(150.0, 750.0), 100.0, 500.0), -50.0, "wider than the bar: its start");
+    }
 
     fn at(database: Option<&str>, schema: Option<&str>) -> SchemaRef {
         SchemaRef::new(database.map(Into::into), schema.map(Into::into))

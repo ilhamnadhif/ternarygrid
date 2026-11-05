@@ -625,4 +625,56 @@ fn shots(s: &mut Shots) {
     s.h.state_mut().nav.filter.clear();
     s.frames(6);
     s.shot("nav_failed");
+    bars(s, &conn);
+}
+
+/// The wheel at `at`, `dy` points.
+fn wheel(s: &mut Shots, at: egui::Pos2, dy: f32) {
+    s.h.event(egui::Event::PointerMoved(at));
+    s.h.event(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, dy), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE });
+    s.frames(40);
+}
+
+/// The rail's two selections, tabs that overflow, the navigator's toolbar as the panel
+/// narrows, a connection pinned over its rows.
+fn bars(s: &mut Shots, conn: &str) {
+    s.close_tabs();
+    s.command(AppCommand::OpenObject { connection: conn.to_string(), object: table("customer"), page: ObjectPage::Data });
+    s.action(Action::OpenTasks);
+    s.frames(10);
+    s.shot("rail_groups");
+    s.close_tabs();
+
+    // Tabs: the same table of a connection, names that are long, more than fit.
+    for t in ["category", "customer", "order", "order_line", "product"] {
+        s.command(AppCommand::OpenObject { connection: conn.to_string(), object: table(t), page: ObjectPage::Data });
+    }
+    s.frames(6);
+    s.shot("tabs_fit");
+    for i in 0..5 {
+        s.editor(conn, &format!("monthly_revenue_per_customer_{i}.sql"), "select 1;");
+    }
+    s.frames(6);
+    s.shot("tabs_overflow");
+    s.click("All tabs");
+    s.frames(6);
+    s.shot("tabs_list");
+    s.escape();
+    s.close_tabs();
+
+    // Enough connections to scroll the tree, in a low window.
+    for i in 0..14 {
+        let mut c = ConnectionConfig::new(DbKind::Sqlite, format!("zz-archive-{i:02}.db"));
+        c.file_path = Some(format!("/nonexistent/archive/{i}.db"));
+        s.h.state_mut().conns.upsert(c);
+    }
+    s.h.set_size(egui::vec2(1440.0, 520.0));
+    s.frames(6);
+    let tree = s.h.state().chrome.nav.expect("the navigator").center();
+    wheel(s, tree, -150.0);
+    s.shot_at("nav_sticky", Some(egui::pos2(1439.0, 519.0)));
+    wheel(s, tree, -188.0);
+    s.shot_at("nav_sticky_push", Some(egui::pos2(1439.0, 519.0)));
+    wheel(s, tree, -60.0);
+    s.shot_at("nav_sticky_next", Some(egui::pos2(1439.0, 519.0)));
 }

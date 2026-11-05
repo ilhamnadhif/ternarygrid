@@ -24,6 +24,14 @@ pub enum AppCommand {
     // ------------------------------------------------------------------ tabs
     OpenTab(Box<dyn TabView>),
     CloseTab(u64),
+    /// Close a tab that was not the open one of its leaf and bring back what was.
+    CloseBackgroundTab {
+        id: u64,
+        keep_open: u64,
+        keep_focused: Option<u64>,
+    },
+    /// Make a tab the open one of its leaf and that leaf the focused one.
+    FocusTab(u64),
     CloseOtherTabs(u64),
     CloseAllTabs,
 

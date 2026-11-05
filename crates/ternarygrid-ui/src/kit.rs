@@ -186,11 +186,17 @@ pub fn icon_button_ex(ui: &mut Ui, icon: &str, tooltip: &str, on: bool, side: f3
 
 /// [`icon_button_ex`] with the icon at `glyph` points.
 pub fn icon_button_sized(ui: &mut Ui, icon: &str, tooltip: &str, on: bool, side: f32, glyph: f32) -> Response {
+    icon_button_tip(ui, icon, tooltip, tooltip, on, side, glyph)
+}
+
+/// [`icon_button_sized`] whose tooltip says more than its accessible `name` (its keys, what it
+/// acts on).
+pub fn icon_button_tip(ui: &mut Ui, icon: &str, name: &str, tooltip: &str, on: bool, side: f32, glyph: f32) -> Response {
     let p = style::pal(ui);
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
     let resp = if tooltip.is_empty() { resp } else { resp.on_hover_text(tooltip) };
     let enabled = ui.is_enabled();
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, enabled, on, tooltip));
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, enabled, on, name));
     if ui.is_rect_visible(rect) {
         let hovered = enabled && resp.hovered();
         let painter = ui.painter();
@@ -586,6 +592,19 @@ pub fn semibold_label(ui: &mut Ui, text: &str, size: f32, color: Color32) -> Res
         paint_semibold(ui.painter(), rect.min, galley, color);
     }
     resp
+}
+
+/// [`semibold_label`] cut with "…" at `max_width` (the whole text in its tooltip then).
+pub fn semibold_label_cut(ui: &mut Ui, text: &str, size: f32, color: Color32, max_width: f32) -> Response {
+    let rich = RichText::new(text).font(style::medium(ui.ctx(), size)).color(color);
+    let galley = egui::WidgetText::from(rich).into_galley(ui, Some(egui::TextWrapMode::Truncate), max_width.max(0.0), egui::TextStyle::Body);
+    let cut = galley.elided;
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(EMBOLDEN, 0.0), Sense::hover());
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    if ui.is_rect_visible(rect) {
+        paint_semibold(ui.painter(), rect.min, galley, color);
+    }
+    if cut { resp.on_hover_text(text) } else { resp }
 }
 
 /// How far apart [`paint_semibold`] paints the two copies (points).

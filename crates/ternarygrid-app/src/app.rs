@@ -91,6 +91,8 @@ pub struct TernaryGridApp {
     /// Exit after the first frame (startup benchmark).
     pub exit_after_first_frame: bool,
     active_tab: Option<u64>,
+    /// The focused tab that [`Self::reveal_focused_tab`] brought into view last, and its width.
+    revealed_tab: Option<(u64, f32)>,
     /// Title last given to the window.
     window_title: String,
     /// Benchmark mode: quit after this instant.
@@ -178,6 +180,7 @@ impl TernaryGridApp {
             first_frame: true,
             exit_after_first_frame: false,
             active_tab: None,
+            revealed_tab: None,
             window_title: "TernaryGrid".into(),
             exit_at: std::env::var("TERNARYGRID_BENCH_EXIT_AFTER_SECS").ok().and_then(|v| v.parse::<u64>().ok()).map(|s| Instant::now() + std::time::Duration::from_secs(s)),
             pending_generate: Vec::new(),
@@ -212,8 +215,9 @@ impl TernaryGridApp {
         app
     }
 
-    /// What the design's tab bars have besides the tabs: the hairline under the bar (1 point,
-    /// open under the open tab) and "+" (a new SQL editor) after the last tab.
+    /// What the tab bars have besides the tabs: the hairline under the bar (1 point, open under
+    /// the open tab), "+" (a new SQL editor) after the last tab, at the bar's end when the tabs
+    /// do not fit, and then the list of all the tabs.
     fn tab_bar_extras(ui: &mut Ui, dock: &DockState<Tab>, tab_rects: &std::collections::HashMap<u64, egui::Rect>, cx: &mut AppContext) {
         let p = ternarygrid_ui::pal(ui);
         for (path, leaf) in dock.iter_leaves() {
@@ -234,13 +238,38 @@ impl TernaryGridApp {
                     painter.hline(bar.x_range(), y, stroke);
                 }
             }
-            let last = leaf.tabs.iter().filter_map(|t| tab_rects.get(&t.id)).map(|r| r.right()).fold(f32::NEG_INFINITY, f32::max);
-            let at = egui::Rect::from_min_size(egui::pos2(last + 2.0, bar.top() + 6.0), egui::vec2(26.0, 26.0));
-            if last.is_finite() && at.right() <= bar.right() - 8.0 {
-                let mut b = ui.new_child(egui::UiBuilder::new().max_rect(at).id_salt(("tab_bar_new", path.node)));
-                if kit::icon_button_sized(&mut b, icon::PLUS, tr("New SQL editor"), false, 26.0, 14.0).clicked() {
-                    cx.commands.push(AppCommand::Action(crate::keys::Action::NewSqlEditor));
-                }
+            let rects = || leaf.tabs.iter().filter_map(|t| tab_rects.get(&t.id));
+            let last = rects().map(|r| r.right()).fold(f32::NEG_INFINITY, f32::max);
+            let first = rects().map(|r| r.left()).fold(f32::INFINITY, f32::min);
+            if !last.is_finite() {
+                continue;
+            }
+            // The tabs end 8 points before the room kept for these two.
+            let strip_right = bar.right() - 8.0 - crate::tabs::TAB_BAR_END;
+            let button = |x: f32| egui::Rect::from_min_size(egui::pos2(x, bar.top() + (crate::tabs::TAB_BAR_H - 27.0) / 2.0), egui::vec2(26.0, 26.0));
+            let plus = button((last + 2.0).min(strip_right + 2.0));
+            let mut b = ui.new_child(egui::UiBuilder::new().max_rect(plus).id_salt(("tab_bar_new", path.node)));
+            if kit::icon_button_sized(&mut b, icon::PLUS, tr("New SQL editor"), false, 26.0, 14.0).clicked() {
+                cx.commands.push(AppCommand::Action(crate::keys::Action::NewSqlEditor));
+            }
+            // Tabs that do not fit: all of them in a list.
+            if last > strip_right + 0.5 || first < bar.left() + 7.5 {
+                let at = button(bar.right() - 8.0 - 26.0);
+                let mut b = ui.new_child(egui::UiBuilder::new().max_rect(at).id_salt(("tab_bar_list", path.node)));
+                let list = kit::icon_button_sized(&mut b, icon::CARET_DOWN, tr("All tabs"), false, 26.0, 14.0);
+                egui::Popup::menu(&list).gap(8.0).show(|ui| {
+                    kit::menu_look(ui, 300.0);
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        for (i, t) in leaf.tabs.iter().enumerate() {
+                            let place = crate::tabs::tab_location(t.view.as_ref(), cx.conns).and_then(|l| l.place).unwrap_or_default();
+                            let glyph = if i == leaf.active.0 { icon::CHECK } else { t.view.icon() };
+                            if kit::menu_item(ui, Some(glyph), &t.view.title(), &place).clicked() {
+                                cx.commands.push(AppCommand::FocusTab(t.id));
+                                ui.close();
+                            }
+                        }
+                    });
+                });
             }
         }
     }
@@ -306,6 +335,32 @@ impl TernaryGridApp {
     pub(crate) fn focus_tab_path(&mut self, path: egui_dock::TabPath) {
         let _ = self.dock.set_active_tab(path);
         self.dock.set_focused_node_and_surface(path.node_path());
+    }
+
+    /// [`Self::focus_tab_path`] of the tab `id`, if it is still there.
+    fn focus_tab(&mut self, id: u64) {
+        if let Some(path) = self.dock.find_tab_from(|t| t.id == id) {
+            self.focus_tab_path(path);
+        }
+    }
+
+    /// The tab that became the focused one scrolled into the tab bar, once: wheeling the bar
+    /// afterwards leaves it where it is. A new tab has no place yet: the next frame does it. A
+    /// tab that changes width (saved under a longer name) is brought in again.
+    fn reveal_focused_tab(dock: &mut DockState<Tab>, tab_rects: &std::collections::HashMap<u64, egui::Rect>, active: Option<u64>, revealed: &mut Option<(u64, f32)>) {
+        let Some(id) = active else {
+            *revealed = None;
+            return;
+        };
+        let Some(rect) = tab_rects.get(&id).copied() else { return };
+        if *revealed == Some((id, rect.width())) {
+            return;
+        }
+        if let Some((_, leaf)) = dock.iter_leaves_mut().find(|(_, l)| l.tabs.iter().any(|t| t.id == id)) {
+            // egui_dock keeps the scroll within the tabs' width.
+            leaf.scroll += crate::tabs::tab_reveal_delta(rect, leaf.rect.left() + 8.0, leaf.rect.right() - 8.0 - crate::tabs::TAB_BAR_END);
+        }
+        *revealed = Some((id, rect.width()));
     }
 
     /// Keep a focused leaf whenever tabs exist (no focus right after start or
@@ -569,6 +624,14 @@ impl TernaryGridApp {
                 self.open_tab(view);
             }
             AppCommand::CloseTab(id) => self.close_tab(id),
+            AppCommand::CloseBackgroundTab { id, keep_open, keep_focused } => {
+                self.close_tab(id);
+                // The open tab of the leaf first, then the focus (it may be in another leaf).
+                for keep in std::iter::once(keep_open).chain(keep_focused) {
+                    self.focus_tab(keep);
+                }
+            }
+            AppCommand::FocusTab(id) => self.focus_tab(id),
             AppCommand::CloseOtherTabs(keep) => {
                 let ids: Vec<u64> = self.dock.iter_all_tabs().map(|(_, t)| t.id).filter(|i| *i != keep).collect();
                 for id in ids {
@@ -1881,17 +1944,21 @@ impl eframe::App for TernaryGridApp {
             let nav_panel = egui::Panel::left("ternarygrid_navigator").resizable(true).default_size(273.0).size_range(180.0..=600.0).frame(frame).show(ui, |ui| {
                 let title = if self.show_project { tr("Projects") } else { tr("Database navigator") };
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 38.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 38.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.set_min_height(38.0);
-                    ui.add_space(14.0);
-                    kit::semibold_label(ui, title, 13.0, ternarygrid_ui::pal(ui).text);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(8.0);
-                        if self.show_project {
-                            self.project.toolbar_ui(ui, &mut cx);
-                        } else {
-                            self.nav.toolbar_ui(ui, &mut cx);
-                        }
+                    ui.add_space(8.0);
+                    // The buttons first: as many as fit beside the whole title. The title has
+                    // what is left (cut with "…" in the narrowest panel).
+                    let color = ternarygrid_ui::pal(ui).text;
+                    let title_w = ui.painter().layout_no_wrap(title.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 13.0), color).size().x;
+                    if self.show_project {
+                        self.project.toolbar_ui(ui, &mut cx);
+                    } else {
+                        self.nav.toolbar_ui(ui, &mut cx, ui.available_width() - 14.0 - title_w - 8.0);
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_space(14.0);
+                        kit::semibold_label_cut(ui, title, 13.0, color, ui.available_width() - 6.0);
                     });
                 });
                 ternarygrid_ui::parts::hline(ui);
@@ -1939,6 +2006,7 @@ impl eframe::App for TernaryGridApp {
             });
         }
         self.active_tab = self.dock.find_active_focused().map(|(_, t)| t.id);
+        Self::reveal_focused_tab(&mut self.dock, &self.tab_rects, self.active_tab, &mut self.revealed_tab);
         // The window is named after the active tab, as in DBeaver ("TernaryGrid - orders"):
         // windows are told apart in the Dock, Mission Control and ⌘-Tab.
         let title = self.dock.find_active_focused().map(|(_, t)| format!("TernaryGrid - {}", t.view.title())).unwrap_or_else(|| "TernaryGrid".into());
@@ -1956,25 +2024,24 @@ impl eframe::App for TernaryGridApp {
             // A tab too wide for the space left (toolbars, grids) is cut at its edge
             // instead of painting over the AI assistant.
             ui.shrink_clip_rect(ui.max_rect());
-            let suffixes = crate::tabs::tab_suffixes(self.dock.iter_all_tabs().map(|(_, t)| t), cx.conns);
             // Without tabs the editor area is the start page (as in DBeaver), not a tab.
             if self.dock.iter_all_tabs().next().is_none() {
                 ui.painter().rect_filled(ui.max_rect(), 0.0, ui.visuals().window_fill);
                 crate::tabs::welcome::show(ui, &mut cx);
                 return;
             }
-            let open_tabs = self.dock.iter_leaves().filter_map(|(_, l)| l.tabs.get(l.active.0).map(|t| t.id)).collect();
+            let leaf_open =
+                self.dock.iter_leaves().filter_map(|(_, l)| Some((l, l.tabs.get(l.active.0)?.id))).flat_map(|(l, open)| l.tabs.iter().map(move |t| (t.id, open))).collect();
             let mut viewer = DockViewer {
                 cx: &mut cx,
                 close_vetoed: Vec::new(),
                 close_confirm: Vec::new(),
                 active_tab: self.active_tab,
                 style: ui.style().clone(),
-                suffixes,
                 tab_rects: Default::default(),
-                open_tabs,
+                leaf_open,
             };
-            // The open tab's × is the viewer's (the others have none, as in the design).
+            // Every tab's × is the viewer's.
             DockArea::new(&mut self.dock)
                 .style(crate::theme::dock_style(ui.style()))
                 .show_leaf_collapse_buttons(false)

@@ -1169,10 +1169,10 @@ impl Navigator {
         });
     }
 
-    /// The tree's buttons, right-aligned in `ui`'s row as in the design: New connection,
-    /// Refresh and "⋯" (a new folder, connect / disconnect the selected connection, collapse
-    /// all, the properties panel, link with editor).
-    pub fn toolbar_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+    /// The tree's buttons, right-aligned in `ui`'s row: as many of ⋯, New connection, Refresh,
+    /// Connect / Disconnect, Collapse all and New folder (in that order) as fit in `room`
+    /// points; ⋯ has the others, importing and exporting connections, and the panel's options.
+    pub fn toolbar_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, room: f32) {
         use ternarygrid_ui::kit;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
@@ -1180,34 +1180,46 @@ impl Navigator {
             let connected = sel_conn.as_deref().is_some_and(|c| cx.conns.is_connected(c));
             let failed = sel_conn.as_deref().is_some_and(|c| matches!(cx.conns.status(c), ConnStatus::Failed(_)));
             let sel_name = sel_conn.as_deref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_default();
+            // No connections (the empty state): New connection and "⋯" only.
+            let has_connections = !cx.conns.configs().is_empty();
+            let on_bar = |priority: usize| has_connections && priority < toolbar_buttons(room);
+            let (show_refresh, show_plug, show_collapse, show_folder) = (on_bar(2), on_bar(3), on_bar(4), on_bar(5));
+            let (plug, plug_label) = if connected {
+                (icon::PLUGS, ternarygrid_core::trf("Disconnect {}", &[&sel_name]))
+            } else if sel_conn.is_some() {
+                (icon::PLUGS_CONNECTED, ternarygrid_core::trf("Connect {}", &[&sel_name]))
+            } else {
+                (icon::PLUGS_CONNECTED, tr("Connect").to_string())
+            };
+            let plug_command = |c: &str| if connected { AppCommand::Disconnect(c.to_string()) } else { AppCommand::Connect(c.to_string()) };
+            // Refresh; for a connection that failed, connect again.
+            let refresh_tip = if failed { tr("Connect again") } else { tr("Refresh") };
+            let can_refresh = connected || failed;
             let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More"), false, 26.0, 15.0);
             egui::Popup::menu(&more).gap(4.0).show(|ui| {
                 kit::menu_look(ui, 200.0);
-                // A new folder inside the selected folder, else at the top level.
-                if kit::menu_item(ui, Some(icon::FOLDER), tr("New folder…"), "").clicked() {
-                    let parent = match &self.selected {
-                        Some(NavNode::Folder(f)) => Some(f.clone()),
-                        _ => None,
-                    };
-                    cx.push(AppCommand::NewFolder { parent });
+                if !show_folder && kit::menu_item(ui, Some(icon::FOLDER_PLUS), tr("New folder…"), "").clicked() {
+                    self.new_folder(cx);
                     ui.close();
                 }
-                if let Some(c) = &sel_conn {
-                    let (plug, label) = if connected {
-                        (icon::PLUGS, ternarygrid_core::trf("Disconnect {}", &[&sel_name]))
-                    } else {
-                        (icon::PLUGS_CONNECTED, ternarygrid_core::trf("Connect {}", &[&sel_name]))
-                    };
-                    if kit::menu_item(ui, Some(plug), &label, "").clicked() {
-                        cx.push(if connected { AppCommand::Disconnect(c.clone()) } else { AppCommand::Connect(c.clone()) });
-                        ui.close();
-                    }
+                if !show_refresh && has_connections && ui.add_enabled_ui(can_refresh, |ui| kit::menu_item(ui, Some(icon::ARROW_CLOCKWISE), refresh_tip, "")).inner.clicked() {
+                    self.refresh_or_reconnect(failed, sel_conn.as_deref(), cx);
+                    ui.close();
                 }
-                if kit::menu_item(ui, Some(icon::ARROWS_IN_SIMPLE), tr("Collapse all"), "").clicked() {
+                if !show_plug
+                    && let Some(c) = &sel_conn
+                    && kit::menu_item(ui, Some(plug), &plug_label, "").clicked()
+                {
+                    cx.push(plug_command(c));
+                    ui.close();
+                }
+                if !show_collapse && kit::menu_item(ui, Some(icon::ARROWS_IN_SIMPLE), tr("Collapse all"), "").clicked() {
                     self.collapse_all();
                     ui.close();
                 }
-                kit::menu_separator(ui);
+                if !(show_folder && show_collapse) {
+                    kit::menu_separator(ui);
+                }
                 if kit::menu_item(ui, Some(icon::DOWNLOAD_SIMPLE), tr("Import connections…"), "").clicked() {
                     cx.push(AppCommand::ImportConnections);
                     ui.close();
@@ -1228,21 +1240,43 @@ impl Navigator {
                     cx.push(AppCommand::SettingsChanged);
                 }
             });
-            // No connections (the empty state): New connection and "⋯" only, as in the design.
-            // Refresh; for a connection that failed, connect again.
-            let tip = if failed { tr("Connect again") } else { tr("Refresh") };
-            if !cx.conns.configs().is_empty()
-                && ui.add_enabled_ui(connected || failed, |ui| kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tip, false, 26.0, 15.0)).inner.clicked()
+            if show_collapse && kit::icon_button_sized(ui, icon::ARROWS_IN_SIMPLE, tr("Collapse all"), false, 26.0, 15.0).clicked() {
+                self.collapse_all();
+            }
+            // In place without a connection selected: the buttons do not move with the selection.
+            if show_plug
+                && ui.add_enabled_ui(sel_conn.is_some(), |ui| kit::icon_button_sized(ui, plug, &plug_label, false, 26.0, 15.0)).inner.clicked()
+                && let Some(c) = &sel_conn
             {
-                match &sel_conn {
-                    Some(c) if failed => cx.push(AppCommand::Connect(c.clone())),
-                    _ => self.refresh_selected(cx),
-                }
+                cx.push(plug_command(c));
+            }
+            if show_refresh && ui.add_enabled_ui(can_refresh, |ui| kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, refresh_tip, false, 26.0, 15.0)).inner.clicked() {
+                self.refresh_or_reconnect(failed, sel_conn.as_deref(), cx);
+            }
+            if show_folder && kit::icon_button_sized(ui, icon::FOLDER_PLUS, tr("New folder…"), false, 26.0, 15.0).clicked() {
+                self.new_folder(cx);
             }
             if kit::icon_button_sized(ui, icon::PLUS, tr("New connection"), false, 26.0, 15.0).clicked() {
                 cx.push(AppCommand::Action(crate::keys::Action::NewConnection));
             }
         });
+    }
+
+    /// A new folder inside the selected folder, else at the top level.
+    fn new_folder(&self, cx: &mut AppContext) {
+        let parent = match &self.selected {
+            Some(NavNode::Folder(f)) => Some(f.clone()),
+            _ => None,
+        };
+        cx.push(AppCommand::NewFolder { parent });
+    }
+
+    /// The toolbar's Refresh: the selected node, or connecting again where that failed.
+    fn refresh_or_reconnect(&mut self, failed: bool, connection: Option<&str>, cx: &mut AppContext) {
+        match connection {
+            Some(c) if failed => cx.push(AppCommand::Connect(c.to_string())),
+            _ => self.refresh_selected(cx),
+        }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
@@ -1311,9 +1345,7 @@ impl Navigator {
                 _ => vec![r],
             })
             .collect();
-        let mut clicked: Option<(usize, bool)> = None; // (row, double)
-        let mut toggled: Option<usize> = None;
-        let mut context: Option<(usize, egui::Response)> = None;
+        let mut picked = RowPick::default();
         let mut scroll_target = None;
         if self.scroll_to_selected {
             scroll_target = rows.iter().position(|r| Some(&r.node) == self.selected.as_ref());
@@ -1331,51 +1363,31 @@ impl Navigator {
         let full = ui.available_rect_before_wrap();
         let mut area = ui.new_child(egui::UiBuilder::new().max_rect(full).layout(egui::Layout::top_down(egui::Align::Min)));
         area.spacing_mut().item_spacing.y = 0.0;
-        sa.show_rows(&mut area, pitch, rows.len(), |ui, range| {
+        let mut content_top = None;
+        let shown = sa.show_rows(&mut area, pitch, rows.len(), |ui, range| {
+            // Where the content starts, for the frame being drawn (the output's offset already
+            // has this frame's wheel, which moves the rows only in the next one).
+            content_top = Some(ui.max_rect().top() - range.start as f32 * pitch);
             for i in range {
                 let r = &rows[i];
                 let (slot, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(200.0), pitch), Sense::hover());
                 let rect = egui::Rect::from_min_size(slot.min, egui::vec2(slot.width(), row_h));
-                let resp = ui.interact(rect, ui.id().with(("nav_row", i)), Sense::click());
-                let selected = r.kind == RowKind::Node && Some(&r.node) == self.selected.as_ref();
+                let row_id = ui.id().with(("nav_row", i));
+                if r.kind == RowKind::Node {
+                    self.node_row(ui, cx, r, i, rect, row_id, &mut picked);
+                    continue;
+                }
+                let resp = ui.interact(rect, row_id, Sense::click());
                 resp.widget_info(|| match &r.kind {
-                    RowKind::Node => egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &r.label),
+                    RowKind::Node => unreachable!("drawn by node_row"),
                     RowKind::Loading => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, tr("Loading…")),
                     RowKind::Error(e) => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, e),
                     RowKind::Empty => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, tr("(empty)")),
                     RowKind::Failed { message, .. } => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, message),
                 });
                 let inner = rect.shrink2(egui::vec2(6.0, 0.0));
-                let is_node = r.kind == RowKind::Node;
-                let fill = if selected {
-                    Some(p.accent_soft)
-                } else if is_node && resp.hovered() {
-                    Some(p.hover)
-                } else {
-                    None
-                };
-                if let Some(fill) = fill {
-                    ui.painter().rect_filled(inner, ternarygrid_ui::style::RADIUS, fill);
-                }
-                // A marked connection type (Production): a stripe on the row's left edge.
-                if let Some(t) = r.tint {
-                    let stripe = egui::Rect::from_min_max(egui::pos2(inner.left(), inner.top() + 4.0), egui::pos2(inner.left() + 3.0, inner.bottom() - 4.0));
-                    ui.painter().rect_filled(stripe, 2.0, t);
-                }
-                let row_bg = fill.unwrap_or(p.canvas);
-                let mut x = inner.left() + 8.0 + r.depth as f32 * 14.0;
+                let x = inner.left() + 8.0 + r.depth as f32 * 14.0 + 18.0;
                 let y = inner.center().y;
-                let text_color = if selected { p.accent_text } else { p.text };
-                let size = ternarygrid_ui::style::body_size(ui.ctx());
-                if r.expandable {
-                    let arrow = if r.expanded { icon::CARET_DOWN } else { icon::CARET_RIGHT };
-                    let arrow_rect = egui::Rect::from_center_size(egui::pos2(x + 6.0, y), egui::vec2(16.0, row_h));
-                    ui.painter().text(arrow_rect.center(), egui::Align2::CENTER_CENTER, arrow, ternarygrid_ui::style::icon_font(12.0), p.text_faint);
-                    if resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| arrow_rect.contains(q)) {
-                        toggled = Some(i);
-                    }
-                }
-                x += 18.0;
                 let small = egui::FontId::proportional(12.5);
                 match &r.kind {
                     RowKind::Loading => {
@@ -1458,83 +1470,32 @@ impl Navigator {
                     }
                     RowKind::Node => {}
                 }
-                let resp = match &r.node {
-                    NavNode::Connection(id) if matches!(cx.conns.status(id), ConnStatus::Lost) => {
-                        resp.on_hover_text(tr("The connection to the server was lost: unfold it to reconnect"))
-                    }
-                    _ => resp,
-                };
-                let icol = if selected { p.accent_text } else { r.icon_color.or_else(|| ternarygrid_icons::color(r.icon)).unwrap_or(p.text_muted) };
-                // A connection: its database's logo (the icon when there is none).
-                let logo_rect = egui::Rect::from_center_size(egui::pos2(x + 7.5, y), egui::vec2(15.0, 15.0));
-                let drawn = r.logo.is_some_and(|kind| crate::dblogo::paint(ui, kind, logo_rect, crate::theme::legible_on(icol, row_bg)));
-                if !drawn {
-                    ui.painter().text(egui::pos2(x + 7.5, y), egui::Align2::CENTER_CENTER, r.icon, ternarygrid_ui::style::icon_font(15.0), icol);
-                }
-                x += 21.0;
-                // Name and detail cut with "…" at the panel's edge (or the size).
-                let mut right = inner.right() - 10.0;
-                let fit =
-                    |ui: &Ui, text: egui::RichText, width: f32| egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), width, egui::TextStyle::Body);
-                let is_conn = matches!(r.node, NavNode::Connection(_));
-                // At the right: the size of a table, the count of a folder, an object's detail.
-                let right_text = r.size.as_ref().map(|(short, _)| short.clone()).or_else(|| r.detail.clone().filter(|_| !is_conn));
-                let resp = match right_text {
-                    Some(text) if right - x > 110.0 => {
-                        let g = fit(ui, RichText::new(text).size(11.5).color(p.text_faint), 90.0);
-                        let left = right - g.size().x;
-                        ui.painter().galley(egui::pos2(left, y - g.size().y / 2.0), g, p.text_faint);
-                        right = left - 8.0;
-                        match &r.size {
-                            Some((_, tip)) => resp.on_hover_text(tip),
-                            None => resp,
-                        }
-                    }
-                    _ => resp,
-                };
-                let font = if selected || r.depth == 0 { ternarygrid_ui::style::medium(ui.ctx(), size) } else { egui::FontId::proportional(size) };
-                let room = (right - x - if r.badge.is_some() { 14.0 } else { 0.0 }).max(30.0);
-                let galley = fit(ui, RichText::new(&r.label).font(font).color(text_color), room);
-                let w = galley.size().x;
-                ui.painter().galley(egui::pos2(x, y - galley.size().y / 2.0), galley, text_color);
-                let mut after = x + w;
-                // The connection's state: a dot after its name.
-                if let Some(badge) = r.badge {
-                    ui.painter().circle_filled(egui::pos2(after + 9.5, y), 3.5, badge);
-                    after += 16.0;
-                }
-                // A connection's detail (the server, the file) only where enough of it shows:
-                // 70 points, or the whole of a short one; else its tooltip has it.
-                let detail_room = right - (after + 8.0);
-                if is_conn
-                    && let Some(d) = &r.detail
-                    && (detail_room >= 70.0 || ui.painter().layout_no_wrap(d.clone(), egui::FontId::proportional(11.5), p.text_faint).size().x <= detail_room)
-                {
-                    let g = fit(ui, RichText::new(d).size(11.5).color(p.text_faint), right - (after + 8.0));
-                    ui.painter().galley(egui::pos2(after + 8.0, y - g.size().y / 2.0), g, p.text_faint);
-                }
-                if resp.double_clicked() {
-                    clicked = Some((i, true));
-                } else if resp.clicked() && toggled != Some(i) {
-                    clicked = Some((i, false));
-                }
-                if resp.secondary_clicked() {
-                    self.selected = Some(r.node.clone());
-                }
-                let node = r.node.clone();
-                if resp.context_menu_opened() || resp.secondary_clicked() {
-                    context = Some((i, resp.clone()));
-                }
-                resp.context_menu(|ui| self.context_menu(ui, cx, &node));
             }
         });
+        // The connection whose objects are scrolled through stays at the top, until the next
+        // connection pushes it out.
+        if let Some(top) = content_top
+            && let Some(pin) = pinned_row(&rows, shown.inner_rect.top() - top, pitch)
+        {
+            let view = shown.inner_rect;
+            let band = egui::Rect::from_min_size(view.min + egui::vec2(0.0, pin.shift), egui::vec2(view.width(), pitch));
+            let mut pinned = area.new_child(egui::UiBuilder::new().max_rect(band).layout(egui::Layout::top_down(egui::Align::Min)));
+            pinned.set_clip_rect(view);
+            pinned.painter().rect_filled(band, 0.0, p.canvas);
+            let rect = egui::Rect::from_min_size(band.min, egui::vec2(band.width().max(200.0), row_h));
+            self.node_row(&mut pinned, cx, &rows[pin.row], pin.row, rect, egui::Id::new("nav_pinned"), &mut picked);
+            pinned.painter().hline(band.x_range(), band.bottom() - 0.5, egui::Stroke::new(1.0, p.border));
+            // Folded from here, the rows under it shift: back to the connection.
+            if picked.toggled == Some(pin.row) || picked.clicked == Some((pin.row, true)) {
+                self.scroll_to_selected = true;
+            }
+        }
         ui.spacing_mut().item_spacing.y = item_gap;
-        let _ = context;
-        if let Some(i) = toggled {
+        if let Some(i) = picked.toggled {
             self.toggle(&rows[i].node, cx);
             self.selected = Some(rows[i].node.clone());
         }
-        if let Some((i, double)) = clicked {
+        if let Some((i, double)) = picked.clicked {
             let node = rows[i].node.clone();
             self.selected = Some(node.clone());
             if double {
@@ -1543,6 +1504,113 @@ impl Navigator {
         }
         self.rows = rows;
         self.keyboard(ui, cx);
+    }
+
+    /// A node's row (`i` in the rows), in the list or pinned at the top: its fill, the type's
+    /// stripe, the caret, the logo or icon, the name, the state and the details, its clicks and
+    /// its menu.
+    #[allow(clippy::too_many_arguments)]
+    fn node_row(&mut self, ui: &mut Ui, cx: &mut AppContext, r: &Row, i: usize, rect: egui::Rect, id: egui::Id, picked: &mut RowPick) {
+        let p = ternarygrid_ui::pal(ui);
+        let resp = ui.interact(rect, id, Sense::click());
+        let selected = Some(&r.node) == self.selected.as_ref();
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &r.label));
+        let inner = rect.shrink2(egui::vec2(6.0, 0.0));
+        let fill = if selected {
+            Some(p.accent_soft)
+        } else if resp.hovered() {
+            Some(p.hover)
+        } else {
+            None
+        };
+        if let Some(fill) = fill {
+            ui.painter().rect_filled(inner, ternarygrid_ui::style::RADIUS, fill);
+        }
+        // A marked connection type (Production): a stripe on the row's left edge.
+        if let Some(t) = r.tint {
+            let stripe = egui::Rect::from_min_max(egui::pos2(inner.left(), inner.top() + 4.0), egui::pos2(inner.left() + 3.0, inner.bottom() - 4.0));
+            ui.painter().rect_filled(stripe, 2.0, t);
+        }
+        let row_bg = fill.unwrap_or(p.canvas);
+        let mut x = inner.left() + 8.0 + r.depth as f32 * 14.0;
+        let y = inner.center().y;
+        let text_color = if selected { p.accent_text } else { p.text };
+        let size = ternarygrid_ui::style::body_size(ui.ctx());
+        if r.expandable {
+            let arrow = if r.expanded { icon::CARET_DOWN } else { icon::CARET_RIGHT };
+            let arrow_rect = egui::Rect::from_center_size(egui::pos2(x + 6.0, y), egui::vec2(16.0, rect.height()));
+            ui.painter().text(arrow_rect.center(), egui::Align2::CENTER_CENTER, arrow, ternarygrid_ui::style::icon_font(12.0), p.text_faint);
+            if resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| arrow_rect.contains(q)) {
+                picked.toggled = Some(i);
+            }
+        }
+        x += 18.0;
+        let resp = match &r.node {
+            NavNode::Connection(id) if matches!(cx.conns.status(id), ConnStatus::Lost) => resp.on_hover_text(tr("The connection to the server was lost: unfold it to reconnect")),
+            _ => resp,
+        };
+        let icol = if selected {
+            p.accent_text
+        } else {
+            r.icon_color.or_else(|| crate::theme::object_icon_color(r.icon, row_bg)).or_else(|| ternarygrid_icons::color(r.icon)).unwrap_or(p.text_muted)
+        };
+        // A connection: its database's logo (the icon when there is none).
+        let logo_rect = egui::Rect::from_center_size(egui::pos2(x + 7.5, y), egui::vec2(15.0, 15.0));
+        let drawn = r.logo.is_some_and(|kind| crate::dblogo::paint(ui, kind, logo_rect, crate::theme::legible_on(icol, row_bg)));
+        if !drawn {
+            ui.painter().text(egui::pos2(x + 7.5, y), egui::Align2::CENTER_CENTER, r.icon, ternarygrid_ui::style::icon_font(15.0), icol);
+        }
+        x += 21.0;
+        // Name and detail cut with "…" at the panel's edge (or the size).
+        let mut right = inner.right() - 10.0;
+        let fit = |ui: &Ui, text: egui::RichText, width: f32| egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), width, egui::TextStyle::Body);
+        let is_conn = matches!(r.node, NavNode::Connection(_));
+        // At the right: the size of a table, the count of a folder, an object's detail.
+        let right_text = r.size.as_ref().map(|(short, _)| short.clone()).or_else(|| r.detail.clone().filter(|_| !is_conn));
+        let resp = match right_text {
+            Some(text) if right - x > 110.0 => {
+                let g = fit(ui, RichText::new(text).size(11.5).color(p.text_faint), 90.0);
+                let left = right - g.size().x;
+                ui.painter().galley(egui::pos2(left, y - g.size().y / 2.0), g, p.text_faint);
+                right = left - 8.0;
+                match &r.size {
+                    Some((_, tip)) => resp.on_hover_text(tip),
+                    None => resp,
+                }
+            }
+            _ => resp,
+        };
+        let font = if selected || r.depth == 0 { ternarygrid_ui::style::medium(ui.ctx(), size) } else { egui::FontId::proportional(size) };
+        let room = (right - x - if r.badge.is_some() { 14.0 } else { 0.0 }).max(30.0);
+        let galley = fit(ui, RichText::new(&r.label).font(font).color(text_color), room);
+        let w = galley.size().x;
+        ui.painter().galley(egui::pos2(x, y - galley.size().y / 2.0), galley, text_color);
+        let mut after = x + w;
+        // The connection's state: a dot after its name.
+        if let Some(badge) = r.badge {
+            ui.painter().circle_filled(egui::pos2(after + 9.5, y), 3.5, badge);
+            after += 16.0;
+        }
+        // A connection's detail (the server, the file) only where enough of it shows:
+        // 70 points, or the whole of a short one; else its tooltip has it.
+        let detail_room = right - (after + 8.0);
+        if is_conn
+            && let Some(d) = &r.detail
+            && (detail_room >= 70.0 || ui.painter().layout_no_wrap(d.clone(), egui::FontId::proportional(11.5), p.text_faint).size().x <= detail_room)
+        {
+            let g = fit(ui, RichText::new(d).size(11.5).color(p.text_faint), right - (after + 8.0));
+            ui.painter().galley(egui::pos2(after + 8.0, y - g.size().y / 2.0), g, p.text_faint);
+        }
+        if resp.double_clicked() {
+            picked.clicked = Some((i, true));
+        } else if resp.clicked() && picked.toggled != Some(i) {
+            picked.clicked = Some((i, false));
+        }
+        if resp.secondary_clicked() {
+            self.selected = Some(r.node.clone());
+        }
+        let node = r.node.clone();
+        resp.context_menu(|ui| self.context_menu(ui, cx, &node));
     }
 
     /// Follow where the user clicks: the navigator, or somewhere else.
@@ -1970,6 +2038,50 @@ pub fn catalog_icon(i: CatalogIcon) -> &'static str {
     }
 }
 
+/// What the rows reported this frame.
+#[derive(Default)]
+struct RowPick {
+    /// (row, double click)
+    clicked: Option<(usize, bool)>,
+    /// Its caret was clicked.
+    toggled: Option<usize>,
+}
+
+/// The connection row kept at the top of the tree.
+#[derive(Debug, PartialEq)]
+struct Pinned {
+    row: usize,
+    /// How far above the top it is drawn: the next connection pushes it out.
+    shift: f32,
+}
+
+/// The expanded connection whose rows are at the top of the tree scrolled by `offset`, while
+/// its own row is above the top.
+fn pinned_row(rows: &[Row], offset: f32, pitch: f32) -> Option<Pinned> {
+    if offset <= 0.0 {
+        return None;
+    }
+    let top = ((offset / pitch).floor() as usize).min(rows.len().checked_sub(1)?);
+    // Failed connections' message rows carry the connection too: only the real row.
+    let row = (0..=top).rev().find(|&i| rows[i].kind == RowKind::Node && matches!(rows[i].node, NavNode::Connection(_)))?;
+    let depth = rows[row].depth;
+    if !rows[row].expanded {
+        return None;
+    }
+    // Rows of the connection end at the next one at its level (a connection, a folder).
+    let end = rows[row + 1..].iter().position(|r| r.depth <= depth).map_or(rows.len(), |k| row + 1 + k);
+    if end <= top {
+        return None;
+    }
+    Some(Pinned { row, shift: (end as f32 * pitch - offset - pitch).min(0.0) })
+}
+
+/// How many of the navigator's toolbar buttons (26 points, 2 apart) fit in `room`: always ⋯ and
+/// New connection, at most the six there are.
+fn toolbar_buttons(room: f32) -> usize {
+    (((room + 2.0) / 28.0).floor() as usize).clamp(2, 6)
+}
+
 fn placeholder(depth: usize, kind: RowKind) -> Row {
     Row {
         node: NavNode::Folder(String::new()),
@@ -2285,5 +2397,84 @@ mod size_tests {
         assert_eq!(short_size(1_288_490_189), "1.2G");
         assert_eq!(long_size(2_516_582), "2.4 MB");
         assert_eq!(long_size(812), "812 bytes");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PITCH: f32 = 27.0;
+
+    fn node(depth: usize, node: NavNode, expanded: bool) -> Row {
+        let mut r = placeholder(depth, RowKind::Node);
+        r.node = node;
+        r.expanded = expanded;
+        r
+    }
+
+    fn conn(depth: usize, id: &str, expanded: bool) -> Row {
+        node(depth, NavNode::Connection(id.to_string()), expanded)
+    }
+
+    fn child(depth: usize) -> Row {
+        node(depth, NavNode::Folder("x".to_string()), false)
+    }
+
+    /// Two connections, the first with `n` rows.
+    fn two_connections(n: usize) -> Vec<Row> {
+        let mut rows = vec![conn(0, "a", true)];
+        rows.extend((0..n).map(|_| child(1)));
+        rows.push(conn(0, "b", true));
+        rows.push(child(1));
+        rows
+    }
+
+    #[test]
+    fn a_connection_stays_at_the_top_while_its_rows_scroll() {
+        let rows = two_connections(10);
+        assert_eq!(pinned_row(&rows, 0.0, PITCH), None, "nothing to pin at the top");
+        assert_eq!(pinned_row(&rows, 3.0 * PITCH, PITCH), Some(Pinned { row: 0, shift: 0.0 }));
+    }
+
+    #[test]
+    fn the_next_connection_pushes_it_out() {
+        let rows = two_connections(10);
+        // b's row is at 11: at 10 rows down a is still in place, then b pushes it up.
+        assert_eq!(pinned_row(&rows, 10.0 * PITCH, PITCH), Some(Pinned { row: 0, shift: 0.0 }));
+        assert_eq!(pinned_row(&rows, 10.5 * PITCH, PITCH), Some(Pinned { row: 0, shift: -0.5 * PITCH }));
+        // Past b's row: b is the one pinned.
+        assert_eq!(pinned_row(&rows, 11.5 * PITCH, PITCH), Some(Pinned { row: 11, shift: 0.0 }));
+    }
+
+    #[test]
+    fn only_expanded_connections_are_pinned() {
+        let rows = vec![conn(0, "a", false), conn(0, "b", false), conn(0, "c", false)];
+        assert_eq!(pinned_row(&rows, 1.5 * PITCH, PITCH), None);
+    }
+
+    #[test]
+    fn a_connection_in_a_folder_ends_at_the_next_folder() {
+        let rows = vec![node(0, NavNode::Folder("f".to_string()), true), conn(1, "a", true), child(2), child(2), node(0, NavNode::Folder("g".to_string()), true), child(1)];
+        assert_eq!(pinned_row(&rows, 2.5 * PITCH, PITCH).map(|p| p.row), Some(1));
+        // The second folder at the top: it belongs to no connection.
+        assert_eq!(pinned_row(&rows, 4.5 * PITCH, PITCH), None);
+    }
+
+    #[test]
+    fn a_failed_connections_message_rows_are_not_the_connection() {
+        let mut message = placeholder(1, RowKind::Failed { conn: "b".to_string(), message: "refused".to_string(), part: 0 });
+        message.node = NavNode::Connection("b".to_string());
+        let rows = vec![conn(0, "a", true), child(1), conn(0, "b", false), message.clone(), message];
+        assert_eq!(pinned_row(&rows, 3.5 * PITCH, PITCH), None, "b is not expanded: its message scrolls away");
+    }
+
+    #[test]
+    fn the_toolbar_gives_way_in_order() {
+        assert_eq!(toolbar_buttons(0.0), 2, "⋯ and New connection are always there");
+        assert_eq!(toolbar_buttons(-40.0), 2);
+        assert_eq!(toolbar_buttons(111.0), 4, "Refresh and Disconnect at the default width");
+        assert_eq!(toolbar_buttons(138.0), 5);
+        assert_eq!(toolbar_buttons(400.0), 6);
     }
 }

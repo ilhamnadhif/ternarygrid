@@ -259,7 +259,7 @@ impl<'a> ResultViewer<'a> {
         // "Filter by value" in server mode adds to the WHERE the filter box shows.
         state.grid.set_server_filter(&state.toolbar.filter_text);
         let footer = Panel::bottom(id.with("toolbar")).frame(footer_frame).show_separator_line(false).show(ui, |ui| {
-            actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).fetch_size(options.fetch_more_threshold).show(ui));
+            actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).fetch_size(options.fetch_more_threshold).can_edit(options.allow_editing).show(ui));
         });
         ui.painter().hline(footer.response.rect.x_range(), footer.response.rect.top() + 0.5, line);
         // Errors in a pop-up: a refused edit or a failed save each time, a failed fetch once.

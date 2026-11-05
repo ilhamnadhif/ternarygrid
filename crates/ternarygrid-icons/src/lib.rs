@@ -45,12 +45,11 @@ pub const BROWN: Color32 = rgb(0xA16207);
 pub const VIOLET: Color32 = rgb(0x8B5CF6);
 pub const SKY: Color32 = rgb(0x0284C7);
 
-/// The colour of an icon glyph (`egui_phosphor::regular`), `None` for icons
-/// drawn in the text colour.
-pub fn color(glyph: &str) -> Option<Color32> {
-    if !colored() {
-        return meaning(glyph);
-    }
+/// The hue of a database object's glyph, whichever the style of the application: the navigator
+/// and what names an object elsewhere (tabs, the palette, search) tell tables from views, keys
+/// and folders at a glance, while toolbars and menus stay monochrome. Hues are for both themes:
+/// make them legible on what is behind them (`theme::object_icon_color`).
+pub fn object_hue(glyph: &str) -> Option<Color32> {
     Some(match glyph {
         // Folders and groups.
         i::FOLDER | i::FOLDER_OPEN | i::FOLDER_SIMPLE | i::FOLDERS | i::FOLDER_PLUS => ORANGE,
@@ -73,24 +72,33 @@ pub fn color(glyph: &str) -> Option<Color32> {
         i::USER | i::USERS => INDIGO,
         i::HARD_DRIVES | i::HARD_DRIVE => BROWN,
         i::SHIELD_CHECK => GREEN,
-        i::WRENCH => SLATE,
+        i::WRENCH | i::SLIDERS | i::ENGINE => SLATE,
+        i::ARROW_BEND_UP_RIGHT | i::ARROW_BEND_DOWN_RIGHT => SLATE,
         i::INFO => SKY,
-        i::SLIDERS => SLATE,
         i::PLUG | i::PLUGS_CONNECTED => GREEN,
-        i::PLUGS => RED,
-        i::CODE => VIOLET,
+        i::CHECK_SQUARE => GREEN,
+        i::CODE | i::TEXT_AA => VIOLET,
         i::GAUGE | i::CHART_BAR | i::CHART_LINE | i::CHART_PIE => ORANGE,
         i::FILE_SQL | i::TERMINAL => SKY,
         i::FILE_ZIP | i::FILE_CSV | i::FILE_TEXT => BROWN,
         i::GRAPH | i::TREE_STRUCTURE => PURPLE,
+        _ => return None,
+    })
+}
+
+/// The colour of an icon glyph (`egui_phosphor::regular`), `None` for icons
+/// drawn in the text colour.
+pub fn color(glyph: &str) -> Option<Color32> {
+    if !colored() {
+        return meaning(glyph);
+    }
+    if let Some(hue) = object_hue(glyph) {
+        return Some(hue);
+    }
+    Some(match glyph {
+        i::PLUGS => RED,
         // Actions.
-        i::PLUS
-        | i::PLUS_CIRCLE
-        | i::PLAY
-        | i::PLAY_CIRCLE
-        | i::CHECK
-        | i::CHECK_CIRCLE
-        | i::CHECK_SQUARE => GREEN,
+        i::PLUS | i::PLUS_CIRCLE | i::PLAY | i::PLAY_CIRCLE | i::CHECK | i::CHECK_CIRCLE => GREEN,
         i::TRASH
         | i::STOP
         | i::STOP_CIRCLE
@@ -149,6 +157,10 @@ mod tests {
         assert_eq!(color(i::PLAY), None);
         assert_eq!(color(i::TRASH), Some(RED));
         assert_eq!(color(i::WARNING), Some(ORANGE));
+        // Objects keep their hue in the monochrome style.
+        assert_eq!(object_hue(i::TABLE), Some(BLUE));
+        assert_eq!(object_hue(i::FOLDER_SIMPLE), Some(ORANGE));
+        assert_eq!(object_hue(i::TRASH), None);
         set_colored(true);
     }
 }

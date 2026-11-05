@@ -37,6 +37,9 @@ pub struct GridTheme {
     pub null: Color32,
     /// Selected cells overlay.
     pub selection: Color32,
+    /// The active cell's whole row, translucent: what the row already shows (new, deleted,
+    /// changed, a highlight rule) stays visible under it.
+    pub current_row: Color32,
     /// Active cell border.
     pub active_border: Color32,
     /// Modified cell background.
@@ -85,6 +88,7 @@ impl GridTheme {
             weak: p.text_faint,
             null: p.text_faint,
             selection: sel,
+            current_row: sel.gamma_multiply(if dark { 0.6 } else { 0.55 }),
             active_border: p.accent,
             modified: p.modified,
             inserted: rgb(0x1f3a2b, 0xe6f4ea),
