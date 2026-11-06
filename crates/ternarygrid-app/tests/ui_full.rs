@@ -2244,6 +2244,225 @@ fn the_assistant_asks_before_changing_data() {
     no_errors(&mut h, "the statement");
 }
 
+/// The connection the assistant works on.
+fn ai_connection(h: &H) -> Option<String> {
+    h.state().ai_panel.as_ref().and_then(|a| ternarygrid_app::tabs::TabView::connection_id(a).map(str::to_string))
+}
+
+/// Focus the tab `id`, as a click on it does.
+fn focus_tab_id(h: &mut H, id: u64) {
+    h.state_mut().push_command(AppCommand::FocusTab(id));
+    frames(h, 3);
+}
+
+/// The ids of the open tabs, oldest first.
+fn tab_ids(h: &H) -> Vec<u64> {
+    h.state().dock.iter_all_tabs().map(|(_, t)| t.id).collect()
+}
+
+#[test]
+fn the_assistant_works_where_the_tab_in_use_works() {
+    let (_dir, mut h, conn) = setup();
+    // A second connection, on a copy of the sample database.
+    let path = sample_db(&h, &conn);
+    let copy = path.with_file_name("second.sqlite");
+    std::fs::copy(&path, &copy).unwrap();
+    let mut cfg = ternarygrid_core::config::ConnectionConfig::new(ternarygrid_core::DbKind::Sqlite, "second");
+    cfg.file_path = Some(copy.display().to_string());
+    let other = cfg.id.clone();
+    {
+        let app = h.state_mut();
+        app.conns.upsert(cfg);
+        let backend = app.backend.clone();
+        app.conns.connect(&backend, &other, Default::default()).unwrap();
+    }
+    wait(&mut h, "the second connection", |h| h.state().conns.is_connected(&other));
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: None });
+    frames(&mut h, 3);
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(other.clone()), schema: None, text: None });
+    frames(&mut h, 3);
+    let tabs = tab_ids(&h);
+    // Opened for the navigator's connection: the tab in use wins.
+    assistant(&mut h, &conn, Vec::new());
+    assert_eq!(ai_connection(&h).as_deref(), Some(other.as_str()));
+    // It moves with the tabs, while the panel stays open.
+    focus_tab_id(&mut h, tabs[0]);
+    assert_eq!(ai_connection(&h).as_deref(), Some(conn.as_str()));
+    focus_tab_id(&mut h, tabs[1]);
+    assert_eq!(ai_connection(&h).as_deref(), Some(other.as_str()));
+    // A tab without a connection leaves it where it is.
+    h.state_mut().push_command(AppCommand::OpenSettings);
+    frames(&mut h, 3);
+    assert_eq!(ai_connection(&h).as_deref(), Some(other.as_str()));
+    no_errors(&mut h, "following the tabs");
+}
+
+#[test]
+fn a_narrow_editor_stays_beside_the_assistant() {
+    let (_dir, mut h, conn) = setup();
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: Some("select 1".into()) });
+    frames(&mut h, 3);
+    assistant(&mut h, &conn, Vec::new());
+    // The navigator, the assistant at its smallest and less room than the editor's toolbar needs.
+    h.set_size(egui::vec2(980.0, 900.0));
+    frames(&mut h, 8);
+    let panel = h.query_all_by_label("Can read data").chain(h.query_all_by_label("Cannot read data")).next().expect("the assistant").rect().left();
+    let editor = h.query_all_by_role(egui::accesskit::Role::MultilineTextInput).find(|n| n.rect().left() < panel).expect("the editor").rect();
+    assert!(editor.right() <= panel, "the editor reaches {} over the assistant at {panel}", editor.right());
+}
+
+/// Choose `name` in the select at the top of the assistant, the `index`th from the left.
+fn ai_select(h: &mut H, index: usize, name: &str) {
+    pause(h);
+    {
+        // The panel, not the editor's selects at the left of it.
+        let mut selects = h.query_all_by_role(egui::accesskit::Role::ComboBox).filter(|n| n.rect().left() > 900.0);
+        selects.nth(index).unwrap_or_else(|| panic!("no select {index}: {:?}", labels(h))).click();
+    }
+    frames(h, 3);
+    pause(h);
+    {
+        let item = h.query_all_by_label(name).rfind(|n| !in_nav(h, n));
+        item.unwrap_or_else(|| panic!("no item {name:?}: {:?}", labels(h))).click();
+    }
+    frames(h, 3);
+}
+
+/// The assistant on a real PostgreSQL server with two databases (TERNARYGRID_TEST_PG): it works in
+/// the database of the tab in use, describes all of its schemas, and reads and writes there.
+#[test]
+fn the_assistant_reads_and_writes_in_the_database_of_the_tab() {
+    let Some(url) = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.trim().is_empty()) else { return };
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = Dir(std::env::temp_dir().join(format!("ternarygrid-ui-{}", uuid::Uuid::new_v4().simple())), guard);
+    std::fs::create_dir_all(&dir.0).unwrap();
+    // SAFETY: the walkthroughs run one at a time (SERIAL).
+    unsafe {
+        std::env::set_var("HOME", &dir.0);
+        std::env::set_var("USERPROFILE", &dir.0);
+        std::env::set_var("TERNARYGRID_UPDATE_URL", "off");
+    }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let (mut cfg, password) = ternarygrid_config::parse_connection_url(&url).unwrap();
+    cfg.name = "pg-ai".into();
+    cfg.save_password = true;
+    let own = cfg.database.clone().unwrap_or_else(|| "postgres".into());
+
+    // The other database: a row in a schema that is not `public`.
+    let db = format!("ternarygrid_ai_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let backend = Backend::new().unwrap();
+    let driver = ternarygrid_app::driver_registry().get(ternarygrid_core::DbKind::Postgres).unwrap();
+    let mut admin = backend.block_on(driver.connect(&ternarygrid_core::ConnectParams::from_config(&cfg, password.clone()))).unwrap();
+    backend.block_on(ternarygrid_core::driver::execute_update(admin.as_mut(), &format!("CREATE DATABASE {db}"), &[])).unwrap();
+    let mut there = cfg.clone();
+    there.database = Some(db.clone());
+    let mut s = backend.block_on(driver.connect(&ternarygrid_core::ConnectParams::from_config(&there, password.clone()))).unwrap();
+    for sql in
+        ["CREATE SCHEMA sales", "CREATE TABLE sales.orders (id int PRIMARY KEY, total int)", "INSERT INTO sales.orders VALUES (1, 4242)", "CREATE TABLE public.notes (id int)"]
+    {
+        backend.block_on(ternarygrid_core::driver::execute_update(s.as_mut(), sql, &[])).unwrap();
+    }
+    let total = |s: &mut Box<dyn ternarygrid_core::Session>| {
+        backend.block_on(ternarygrid_core::driver::query_scalar(s.as_mut(), "SELECT total FROM sales.orders WHERE id = 1", &[])).unwrap().to_text().into_owned()
+    };
+
+    let secrets = Arc::new(MemorySecrets::default());
+    if let Some(pw) = &password {
+        ternarygrid_app::conn::SecretSource::set(secrets.as_ref(), &ternarygrid_core::config::secret_key(&cfg.id, ternarygrid_core::config::SecretSlot::Password), pw).unwrap();
+    }
+    let mut conns = ConnectionManager::new(ternarygrid_app::driver_registry(), secrets, Arc::new(DirectNet));
+    let id = cfg.id.clone();
+    conns.upsert(cfg.clone());
+    let mut settings = Settings::default();
+    settings.updates.check_automatically = Some(false);
+    let mut h = harness_conns(&dir.0, settings, conns);
+    frames(&mut h, 3);
+    h.state_mut().push_command(AppCommand::Connect(id.clone()));
+    wait(&mut h, "connected", |h| h.state().conns.is_connected(&id));
+
+    // A tab in each database.
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(id.clone()), schema: None, text: None });
+    frames(&mut h, 3);
+    let schema = ternarygrid_core::meta::SchemaRef::new(Some(db.clone()), Some("sales".into()));
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(id.clone()), schema: Some(schema), text: None });
+    frames(&mut h, 3);
+    let tabs = tab_ids(&h);
+    let database = |h: &H| h.state().ai_panel.as_ref().and_then(|a| a.scope()).and_then(|s| s.database.clone());
+    let replies = vec![
+        fake_ai::tool_call("run_query", "SELECT total FROM sales.orders"),
+        fake_ai::text("It is 4242."),
+        fake_ai::tool_call("execute_statement", "UPDATE sales.orders SET total = 5 WHERE id = 1"),
+        fake_ai::text("Changed it."),
+        fake_ai::text("Add an index."),
+    ];
+    let requests = assistant(&mut h, &id, replies);
+    click(&mut h, "Cannot read data");
+
+    // Opened on the tab's database, without a schema to pick; all its schemas are read.
+    wait(&mut h, "the tab's database", |h| database(h).as_deref() == Some(db.as_str()));
+    assert_eq!(h.state().ai_panel.as_ref().unwrap().scope().unwrap().schema, None);
+    assert!(!has(&h, "Schema…"), "{:?}", labels(&h));
+    wait(&mut h, "both schemas", |h| has(h, "Schema context: 2 tables"));
+    // It moves with the tabs.
+    focus_tab_id(&mut h, tabs[0]);
+    wait(&mut h, "the connection's database", |h| database(h).as_deref() == Some(own.as_str()));
+    focus_tab_id(&mut h, tabs[1]);
+    wait(&mut h, "the tab's database again", |h| database(h).as_deref() == Some(db.as_str()));
+    wait(&mut h, "both schemas again", |h| has(h, "Schema context: 2 tables"));
+
+    // The question goes with the structure of that database, and the query runs there.
+    ask(&mut h, "What is the total?");
+    wait(&mut h, "the answer", |h| answered(h, "It is 4242."));
+    {
+        let sent = requests.lock().unwrap();
+        assert!(sent[0].contains(&format!("-- Database: {db}")), "{}", sent[0]);
+        assert!(sent[0].contains("sales.orders") && sent[0].contains("public.notes"), "{}", sent[0]);
+        assert!(sent[1].contains("4242"), "the row of the other database: {}", sent[1]);
+    }
+    // A change asks, says where, and is made there.
+    ask(&mut h, "Set it to 5");
+    wait(&mut h, "the question", |h| has(h, "Run statement"));
+    assert!(has(&h, &format!("On pg-ai / {db}, committed at once.")), "{:?}", labels(&h));
+    assert_eq!(total(&mut s), "4242");
+    click(&mut h, "Run statement");
+    wait(&mut h, "the change", |h| answered(h, "Changed it."));
+    assert_eq!(total(&mut s), "5");
+    // A plan comes from that database too: the table is not in the connection's own.
+    h.state_mut().ai_panel.as_mut().unwrap().set_input(ternarygrid_app::tabs::ai::QuickAction::Optimize, "SELECT total FROM sales.orders", "");
+    frames(&mut h, 2);
+    click(&mut h, "Send");
+    wait(&mut h, "the advice", |h| answered(h, "Add an index."));
+    assert!(requests.lock().unwrap().last().unwrap().contains("Seq Scan"), "the plan went with the question");
+
+    // A conversation keeps its database, a new one follows again.
+    focus_tab_id(&mut h, tabs[0]);
+    frames(&mut h, 3);
+    assert_eq!(database(&h).as_deref(), Some(db.as_str()));
+    h.state_mut().ai_panel.as_mut().unwrap().reset();
+    wait(&mut h, "the tab in use", |h| database(h).as_deref() == Some(own.as_str()));
+    // Chosen by hand, it stays when the tab changes.
+    wait(&mut h, "the list of databases", |h| has(h, "Schema context:"));
+    ai_select(&mut h, 1, &db);
+    assert_eq!(database(&h).as_deref(), Some(db.as_str()));
+    focus_tab_id(&mut h, tabs[1]);
+    focus_tab_id(&mut h, tabs[0]);
+    frames(&mut h, 3);
+    assert_eq!(database(&h).as_deref(), Some(db.as_str()));
+    no_errors(&mut h, "the assistant's database");
+
+    // Clean up on a separate session.
+    drop(s);
+    drop(h);
+    backend
+        .block_on(ternarygrid_core::driver::query_all(
+            admin.as_mut(),
+            &format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db}' AND pid <> pg_backend_pid()"),
+            &[],
+        ))
+        .unwrap();
+    backend.block_on(ternarygrid_core::driver::execute_update(admin.as_mut(), &format!("DROP DATABASE {db}"), &[])).unwrap();
+}
+
 /// The API key's section of the settings, `width` points wide, with a saved key.
 fn api_key_settings(h: &mut H, width: f32) {
     let provider = h.state().settings.ai.provider.id().to_string();

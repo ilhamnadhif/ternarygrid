@@ -202,6 +202,8 @@ pub enum AppCommand {
     /// "Explain query" without (sent at once).
     AskAi {
         connection: Option<String>,
+        /// Where the statement ran (see `tabs::ai::scope_of`).
+        scope: Option<SchemaRef>,
         sql: String,
         error: Option<String>,
     },

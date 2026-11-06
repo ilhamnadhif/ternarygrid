@@ -135,6 +135,11 @@ impl MetadataCache {
         self.schemas.entry(db_key(database)).or_default()
     }
 
+    /// The schemas of `database`, once read.
+    pub fn schema_list(&self, database: Option<&str>) -> Option<&[SchemaInfo]> {
+        self.schemas.get(&db_key(database)).and_then(|l| l.get()).map(Vec::as_slice)
+    }
+
     pub fn request_schemas(&mut self, backend: &Backend, session: &SessionHandle, database: Option<&str>) {
         let entry = self.schemas.entry(db_key(database)).or_default();
         if entry.is_not_loaded() {

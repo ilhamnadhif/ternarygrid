@@ -250,6 +250,13 @@ impl Shots {
         self.h.state_mut().ai_panel.as_mut().expect("the AI assistant")
     }
 
+    /// An empty conversation in the assistant, if it was opened before.
+    fn ai_reset_if_open(&mut self) {
+        if let Some(ai) = self.h.state_mut().ai_panel.as_mut() {
+            ai.reset();
+        }
+    }
+
     /// Click the last widget labelled `label`.
     fn click(&mut self, label: &str) {
         {
@@ -517,6 +524,78 @@ fn ui_snapshots_designer() {
                     !has(h, "Run statement") && h.state().ai_panel.as_ref().is_some_and(|a| a.last_answer().is_some())
                 });
             }
+        }
+
+        // The assistant on a server with several databases (needs TERNARYGRID_TEST_PG): opened in
+        // the database of the tab in use, its list open, at the panel's smallest width.
+        if want("ai_database")
+            && let Ok(url) = std::env::var("TERNARYGRID_TEST_PG")
+        {
+            let (mut cfg, password) = ternarygrid_config::parse_connection_url(&url).unwrap();
+            cfg.name = "postgres_laos".into();
+            cfg.init.show_all_databases = true;
+            let id = cfg.id.clone();
+            let own = cfg.database.clone();
+            {
+                let app = s.h.state_mut();
+                app.conns.upsert(cfg);
+                let backend = app.backend.clone();
+                let creds = ternarygrid_app::conn::Credentials { password, ..Default::default() };
+                app.conns.connect(&backend, &id, creds).unwrap();
+            }
+            s.wait("connected", |h| {
+                h.step();
+                h.state().conns.is_connected(&id)
+            });
+            s.wait("the databases", |h| {
+                h.step();
+                h.state().conns.live(&id).is_some_and(|l| l.meta.databases.get().is_some())
+            });
+            let other = s.h.state().conns.live(&id).and_then(|l| l.meta.databases.get()?.iter().map(|d| d.name.clone()).rfind(|d| Some(d) != own.as_ref()));
+            s.h.state_mut().push_command(AppCommand::CloseAllTabs);
+            s.frames(4);
+            let schema = Some(ternarygrid_core::meta::SchemaRef::new(other, None));
+            s.h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(id.clone()), schema, text: Some("select * from sales.orders;\n".into()) });
+            s.frames(3);
+            let ai = &mut s.h.state_mut().settings.ai;
+            ai.enabled = true;
+            ai.agent_queries = true;
+            let provider = ai.provider.id().to_string();
+            s.h.state().services.secrets.read().set_ai_api_key(&provider, Some(&ternarygrid_core::Secret::new("test"))).unwrap();
+            if s.h.state().ai_open {
+                s.h.state_mut().ai_open = false;
+                s.frames(2);
+            }
+            s.ai_reset_if_open();
+            s.h.state_mut().push_command(AppCommand::OpenAiAssistant { connection: None });
+            s.wait("the structure", |h| {
+                h.step();
+                has(h, "Schema context:")
+            });
+            s.park_pointer();
+            s.shot("ai_database");
+            {
+                let select = s.h.query_all_by_role(egui::accesskit::Role::ComboBox).filter(|n| n.rect().left() > 800.0).nth(1).expect("the database select");
+                select.click();
+            }
+            s.frames(4);
+            s.park_pointer();
+            s.shot("ai_database_list");
+            s.h.key_press(egui::Key::Escape);
+            s.frames(3);
+            let size = s.h.ctx.content_rect().size();
+            s.h.set_size(egui::vec2(980.0, size.y));
+            s.frames(6);
+            s.park_pointer();
+            s.shot("ai_database_narrow");
+            let database = s.h.state().ai_panel.as_ref().and_then(|a| a.scope()).and_then(|s| s.database.clone());
+            let object = ternarygrid_core::ObjectRef::table(Some("sales".into()), "orders").with_database(database);
+            s.h.state_mut().push_command(AppCommand::OpenObject { connection: id.clone(), object, page: ternarygrid_app::command::ObjectPage::Data });
+            s.frames(40);
+            s.park_pointer();
+            s.shot("ai_database_table");
+            s.h.set_size(size);
+            s.frames(3);
         }
 
         drop(s);

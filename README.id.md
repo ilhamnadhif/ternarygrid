@@ -41,9 +41,9 @@ hasil query jutaan baris tidak perlu muat di memori.
   data compare (dengan output Liquibase), desainer tabel, task dan penjadwal, backup / restore,
   session dan lock manager, dashboard server, serta debugger PostgreSQL.
 - **Asisten AI** (opsional, dengan kunci API Anda sendiri: Anthropic, OpenAI, atau layanan yang
-  kompatibel) di panel samping: mengenal skema, menulis dan menjelaskan SQL, menyimpan percakapannya,
-  dan, jika diizinkan, membaca data dengan query read-only. Setiap statement yang mengubah data
-  selalu meminta izin Anda dulu.
+  kompatibel) di panel samping: terbuka di database tab yang sedang dipakai, mengenal semua skemanya,
+  menulis dan menjelaskan SQL, menyimpan percakapannya, dan, jika diizinkan, membaca data dengan
+  query read-only. Setiap statement yang mengubah data selalu meminta izin Anda dulu.
 - Antarmuka modern yang tenang, sama dengan TernaryWire dan TernaryShell: bar atas berisi koneksi ›
   skema yang aktif dan kotak pencarian untuk setiap perintah, objek, dan script (`⇧⌘P`), rail ikon
   (navigator, project, riwayat, task), dan status bar dengan mode transaksi. Antarmuka berbahasa

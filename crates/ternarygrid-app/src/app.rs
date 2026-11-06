@@ -837,8 +837,8 @@ impl TernaryGridApp {
                     self.ai_open = true;
                 }
             },
-            AppCommand::AskAi { connection, sql, error } => {
-                self.ai_panel = Some(crate::tabs::ai::AiAssistantTab::ask_about(connection, sql, error));
+            AppCommand::AskAi { connection, scope, sql, error } => {
+                self.ai_panel = Some(crate::tabs::ai::AiAssistantTab::ask_about(connection, scope, sql, error));
                 self.ai_open = true;
             }
             AppCommand::OpenDataCompare { connection, table } => {
@@ -1980,6 +1980,7 @@ impl eframe::App for TernaryGridApp {
         if self.ai_open
             && let Some(ai) = self.ai_panel.as_mut()
         {
+            ai.follow_tab(self.dock.find_active_focused().and_then(|(_, t)| crate::tabs::tab_location(t.view.as_ref(), cx.conns)));
             let max = (ui.available_width() - 640.0).clamp(320.0, 720.0);
             let pal = ternarygrid_ui::pal(ui);
             let frame = egui::Frame::new().fill(pal.canvas);

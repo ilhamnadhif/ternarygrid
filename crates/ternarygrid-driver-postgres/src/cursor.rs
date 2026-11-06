@@ -29,6 +29,7 @@ use std::time::Duration;
 use ternarygrid_core::{ColumnMeta, DataKind, DbError, DbResult, QueryCursor, ResultHeader, Row, ServerMessage, Value};
 use tokio::runtime::Handle;
 use tokio::sync::OwnedMutexGuard;
+use tokio_postgres::error::Severity;
 use tokio_postgres::{CopyOutStream, RowStream, SimpleQueryMessage, SimpleQueryStream};
 
 /// Time spent draining buffered messages before a cancel request is sent.
@@ -225,11 +226,12 @@ impl Body {
     }
 }
 
-/// Whether reading on after `e` is pointless: the server's own errors are followed by the end
-/// of the response, but with the connection gone (or a message that cannot be read) the
-/// stream repeats the error for ever, at once and without ever waiting.
+/// Whether reading on after `e` is pointless. A server's error is followed by the end of the
+/// response, except FATAL and PANIC: the server closes the connection instead, and the stream
+/// waits until the socket says so (a minute on macOS). With the connection gone (or a message
+/// that cannot be read) the stream repeats the error for ever, at once and without ever waiting.
 fn stream_ended_by(e: &tokio_postgres::Error) -> bool {
-    e.as_db_error().is_none()
+    e.as_db_error().is_none_or(|db| matches!(db.parsed_severity(), Some(Severity::Fatal | Severity::Panic)))
 }
 
 /// Finish an abandoned statement: drain briefly, cancel if it is still

@@ -6427,7 +6427,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-ai"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -6443,7 +6443,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-app"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6507,7 +6507,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-compare"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6523,7 +6523,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-config"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "aes",
  "argon2",
@@ -6550,7 +6550,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-core"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6569,7 +6569,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-cassandra"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6587,7 +6587,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-clickhouse"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6606,7 +6606,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-elasticsearch"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6622,7 +6622,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-mongodb"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6639,7 +6639,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-mssql"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6656,7 +6656,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-mysql"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6674,7 +6674,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-oracle"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6689,7 +6689,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-postgres"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6718,7 +6718,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-redis"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "redis",
@@ -6731,7 +6731,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-driver-sqlite"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6748,7 +6748,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-editor"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "eframe",
  "egui",
@@ -6763,7 +6763,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-grid"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "chrono",
  "eframe",
@@ -6782,7 +6782,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-icons"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "egui",
  "egui-phosphor",
@@ -6790,7 +6790,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-net"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "base64 0.23.1",
  "directories",
@@ -6810,7 +6810,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-sql"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "flate2",
  "serde",
@@ -6822,7 +6822,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-tasks"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6841,7 +6841,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-transfer"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6867,7 +6867,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-ui"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "egui",
  "egui-phosphor",
@@ -6875,7 +6875,7 @@ dependencies = [
 
 [[package]]
 name = "ternarygrid-visual"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "chrono",
  "eframe",

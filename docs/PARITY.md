@@ -174,6 +174,7 @@ Legend: ✅ implemented and tested · 🟡 implemented, partially tested ·
 | --- | --- | --- | --- |
 | Chat, query suggestions, explanations, error fixes, object descriptions | ✅ | `ternarygrid-ai`, `tabs/ai.rs` | `ternarygrid-ai` tests (mock HTTP server), `ternarygrid-app::tabs_smoke` (prompt assembly) |
 | Several model providers | ✅ | Anthropic, OpenAI-compatible servers | `ternarygrid-ai` tests |
+| Works on a database chosen in the panel, all its schemas described; follows the tab in use | ✅ | `tabs/ai.rs` | `tabs::ai::scope_tests`, `ternarygrid-app::ui_full` (a server with two databases, *env `TERNARYGRID_TEST_PG`*) |
 
 ## Databases (PRD §7)
 
