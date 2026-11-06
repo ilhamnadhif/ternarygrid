@@ -46,7 +46,12 @@ pub const SAMPLE_ROWS: u64 = 5;
 /// Longest value text of a sample row.
 const SAMPLE_VALUE_CHARS: usize = 120;
 
-/// Height of the connection and schema selects at the top of the panel (as designed).
+/// Schemas of a database described with a question, the rest are only named: past this many
+/// the budget is spent long before, and each schema read holds up the navigator's own reads.
+pub const MAX_CONTEXT_SCHEMAS: usize = 40;
+/// Schemas left out that are named to the model.
+const MAX_NAMED_SCHEMAS: usize = 100;
+/// Height of the connection and database selects at the top of the panel (as designed).
 const PICKER_H: f32 = 28.0;
 
 /// Fence tags treated as SQL (same list as `ternarygrid_ai::extract_sql_blocks`).
@@ -227,20 +232,37 @@ pub struct RequestContext<'a> {
     pub kind: DbKind,
     /// Server version string ("" when unknown).
     pub server_version: &'a str,
-    /// Light snapshot of the selected schema.
-    pub snapshot: Option<&'a SchemaSnapshot>,
+    /// Light snapshots of the schemas the assistant works in.
+    pub snapshots: &'a [Arc<SchemaSnapshot>],
+    /// The database they are in, where databases hold schemas.
+    pub database: Option<&'a str>,
+    /// The schemas of that database left out of `snapshots`.
+    pub other_schemas: &'a [String],
     /// `AiSettings::include_schema_context`.
     pub include_schema: bool,
+}
+
+/// The structure sent with `question`: the tables and views most related to it, under the
+/// database's name, and the names of the schemas left out.
+fn context_text(ctx: &RequestContext<'_>, question: &str) -> String {
+    let mut text = String::new();
+    if let Some(d) = ctx.database {
+        text.push_str(&format!("-- Database: {d}\n"));
+    }
+    text.push_str(&SchemaContextBuilder::new().snapshots(ctx.snapshots.iter().map(Arc::as_ref)).question(question).budget(SCHEMA_CONTEXT_BUDGET).build());
+    if !ctx.other_schemas.is_empty() {
+        let names = ctx.other_schemas.iter().take(MAX_NAMED_SCHEMAS).map(String::as_str).collect::<Vec<_>>().join(", ");
+        let more = if ctx.other_schemas.len() > MAX_NAMED_SCHEMAS { ", …" } else { "" };
+        text.push_str(&format!("-- {} more schemas not described: {names}{more}\n", ctx.other_schemas.len()));
+    }
+    text
 }
 
 /// The complete request: system prompt (instructions, dialect, schema
 /// context ranked by `question`), earlier exchanges that fit
 /// [`HISTORY_BUDGET`] and the new user message last.
 pub fn build_request(ctx: &RequestContext<'_>, history: &[(ChatMessage, String)], message: ChatMessage, question: &str) -> ChatRequest {
-    let schema_text = match (ctx.include_schema, ctx.snapshot) {
-        (true, Some(s)) => SchemaContextBuilder::new().snapshot(s).question(question).budget(SCHEMA_CONTEXT_BUDGET).build(),
-        _ => String::new(),
-    };
+    let schema_text = if ctx.include_schema { context_text(ctx, question) } else { String::new() };
     let system = prompts::system_prompt(ctx.kind, ctx.server_version, &schema_text);
     let mut used = message.content.len();
     let mut kept: Vec<(&ChatMessage, &String)> = Vec::new();
@@ -516,6 +538,8 @@ struct Pending {
     cancel: CancellationToken,
     /// The statement waiting for the user's answer.
     approval: Option<Approval>,
+    /// Where it would run: the database or schema of the question, whatever is chosen meanwhile.
+    place: Option<String>,
 }
 
 /// Database work done before a request (in the background).
@@ -587,7 +611,11 @@ pub enum AiStatus {
 pub struct AiAssistantTab {
     uid: u64,
     conn: Option<String>,
-    schema: Option<SchemaRef>,
+    /// Where the assistant works: the database where databases hold schemas (all of them count),
+    /// otherwise the one level the server has.
+    scope: Option<SchemaRef>,
+    /// The connection or database was chosen by hand: the tabs are no longer followed.
+    scope_chosen: bool,
     action: QuickAction,
     input: String,
     error_input: String,
@@ -635,7 +663,8 @@ impl AiAssistantTab {
         AiAssistantTab {
             uid: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             conn,
-            schema: None,
+            scope: None,
+            scope_chosen: false,
             action: QuickAction::Chat,
             input: String::new(),
             error_input: String::new(),
@@ -663,8 +692,10 @@ impl AiAssistantTab {
     /// A new conversation about `sql`: "Fix error" when `error` is given,
     /// "Explain query" otherwise. The question is sent as soon as the
     /// assistant is enabled and configured (the user asked for it).
-    pub fn ask_about(conn: Option<String>, sql: String, error: Option<String>) -> Self {
+    pub fn ask_about(conn: Option<String>, scope: Option<SchemaRef>, sql: String, error: Option<String>) -> Self {
         let mut t = AiAssistantTab::new(conn);
+        t.scope = scope;
+        t.scope_chosen = true;
         t.dedupe = false;
         t.action = if error.is_some() { QuickAction::FixError } else { QuickAction::Explain };
         t.input = sql;
@@ -682,16 +713,40 @@ impl AiAssistantTab {
         t
     }
 
-    /// Opened again for `conn`: an empty conversation follows the connection
+    /// Opened again for `conn`: an empty conversation follows the connection and the tabs again
     /// (one under way keeps its own); the question box gets the focus.
     pub fn follow(&mut self, conn: Option<String>) {
-        if self.turns.is_empty() && conn.is_some() && conn != self.conn {
-            self.conn = conn;
-            self.schema = None;
-            self.object = None;
-            self.lang = None;
+        if self.turns.is_empty() {
+            self.scope_chosen = false;
+            if conn.is_some() && conn != self.conn {
+                self.conn = conn;
+                self.scope = None;
+                self.object = None;
+                self.lang = None;
+            }
         }
         self.focus_input = true;
+    }
+
+    /// While the conversation is empty and nothing was chosen by hand, the assistant works where
+    /// the tab in use works. A tab without a connection leaves it where it is.
+    pub fn follow_tab(&mut self, at: Option<crate::tabs::TabLocation>) {
+        let Some(at) = at else { return };
+        if !self.turns.is_empty() || self.scope_chosen {
+            return;
+        }
+        let conn = at.conn.clone();
+        let scope = scope_of(at);
+        let same_conn = self.conn.as_deref() == Some(conn.as_str());
+        if same_conn && (scope.is_none() || scope == self.scope) {
+            return;
+        }
+        if !same_conn {
+            self.conn = Some(conn);
+            self.lang = None;
+        }
+        self.scope = scope;
+        self.object = None;
     }
 
     fn kind(&self, cx: &AppContext) -> DbKind {
@@ -748,6 +803,7 @@ impl AiAssistantTab {
         self.pending = None;
         self.turns.clear();
         self.notice = None;
+        self.scope_chosen = false;
         self.conversation = uuid::Uuid::new_v4().to_string();
     }
 
@@ -763,7 +819,7 @@ impl AiAssistantTab {
             id: self.conversation.clone(),
             title: title_of(&first.shown),
             connection: self.conn.clone(),
-            schema: self.schema.clone(),
+            schema: self.scope.clone(),
             updated: chrono::Utc::now().timestamp(),
             turns,
         };
@@ -780,7 +836,7 @@ impl AiAssistantTab {
         self.turns = c.turns;
         if let Some(conn) = c.connection.filter(|id| cx.conns.config(id).is_some()) {
             self.conn = Some(conn);
-            self.schema = c.schema;
+            self.scope = c.schema;
             self.object = None;
             self.lang = None;
         }
@@ -792,9 +848,15 @@ impl AiAssistantTab {
         }
     }
 
-    fn snapshot(&self, cx: &AppContext) -> Option<Arc<SchemaSnapshot>> {
-        let live = cx.conns.live(self.conn.as_ref()?)?;
-        live.meta.snapshot(self.schema.as_ref()?)
+    /// The structure read so far of the schemas described with a question.
+    fn snapshots(&self, cx: &AppContext) -> Vec<Arc<SchemaSnapshot>> {
+        let (Some(live), Some(scope)) = (self.conn.as_ref().and_then(|c| cx.conns.live(c)), self.scope.as_ref()) else { return Vec::new() };
+        context_schemas(live, scope).0.iter().filter_map(|s| live.meta.snapshot(s)).collect()
+    }
+
+    /// The name of where the assistant works.
+    fn place(&self) -> Option<String> {
+        self.scope.as_ref().and_then(|s| s.database.clone().or_else(|| s.schema.clone()))
     }
 
     /// Validate the inputs, start the background request and add the turn.
@@ -825,7 +887,9 @@ impl AiAssistantTab {
         let action = self.action;
         let mut input = ActionInput { text: self.input.clone(), error: self.error_input.clone(), ..Default::default() };
         let live = self.conn.as_ref().and_then(|c| cx.conns.live(c));
-        let session = live.map(|l| l.main.clone());
+        // Plans and definitions come from the assistant's database, whichever the connection's is.
+        let database = self.scope.as_ref().and_then(|s| s.database.clone());
+        let session = live.and_then(|l| l.session_for(database.as_deref()));
         let object = if action == QuickAction::Describe { self.object.clone() } else { None };
         let prep = match (action, &session) {
             (QuickAction::Optimize, Some(s)) if self.include_plan && !input.text.trim().is_empty() => Prep::Plan { session: s.clone(), sql: input.text.trim().to_string() },
@@ -845,14 +909,19 @@ impl AiAssistantTab {
         }
         let kind = live.map(|l| l.kind()).unwrap_or(DbKind::Generic);
         let version = live.map(|l| l.server.version.clone()).unwrap_or_default();
-        let snapshot = if ai.include_schema_context { self.snapshot(cx) } else { None };
+        let snapshots = if ai.include_schema_context { self.snapshots(cx) } else { Vec::new() };
+        let other_schemas = match (live, &self.scope) {
+            (Some(l), Some(s)) if ai.include_schema_context => context_schemas(l, s).1,
+            _ => Vec::new(),
+        };
+        let place = self.place();
         let history = self.history();
         let question = format!("{} {}", input.text, input.error);
         let include_schema = ai.include_schema_context;
         let preparing = !matches!(prep, Prep::None);
         let mut agent = match live {
             Some(l) if ai.agent_queries => {
-                let schema = self.schema.clone().unwrap_or_default();
+                let schema = self.scope.clone().unwrap_or_default();
                 // Read-only for the driver too (ClickHouse `readonly`, the NoSQL drivers), besides the agent's own checks.
                 let label = format!("{} ({})", l.config.name, tr("AI assistant"));
                 let opener = l.open_read_only_session_future(label.clone(), schema.database.clone());
@@ -874,7 +943,7 @@ impl AiAssistantTab {
                 return Err(DbError::cancelled());
             }
             let message = user_message(action, &input)?;
-            let ctx = RequestContext { kind, server_version: &version, snapshot: snapshot.as_deref(), include_schema };
+            let ctx = RequestContext { kind, server_version: &version, snapshots: &snapshots, database: database.as_deref(), other_schemas: &other_schemas, include_schema };
             let req = build_request(&ctx, &history, message.clone(), &question);
             let _ = tx.send(Event::Prepared(message));
             repaint.request();
@@ -895,7 +964,7 @@ impl AiAssistantTab {
             ai_agent::converse(req, agent, &token, stream, on_event).await
         });
         self.turns.push(turn);
-        self.pending = Some(Pending { turn: self.turns.len() - 1, job, rx, cancel, approval: None });
+        self.pending = Some(Pending { turn: self.turns.len() - 1, job, rx, cancel, approval: None, place });
         // Keep the SQL for follow-ups; clear free text.
         if !action.takes_sql() {
             self.input.clear();
@@ -959,7 +1028,13 @@ impl AiAssistantTab {
 
     /// Open SQL in a new editor bound to the assistant's connection and schema.
     pub fn open_in_editor(&self, cx: &mut AppContext, sql: &str) {
-        cx.push(AppCommand::NewSqlEditor { connection: self.conn.clone(), schema: self.schema.clone(), text: Some(editor_text(sql)) });
+        cx.push(AppCommand::NewSqlEditor { connection: self.conn.clone(), schema: self.scope.clone(), text: Some(editor_text(sql)) });
+    }
+
+    /// Where the assistant works.
+    #[doc(hidden)]
+    pub fn scope(&self) -> Option<&SchemaRef> {
+        self.scope.as_ref()
     }
 
     /// Test helper: add a finished exchange without contacting any service.
@@ -1032,7 +1107,7 @@ impl AiAssistantTab {
         self.lang = Some((kind, SqlLanguage::new(dialect)));
     }
 
-    /// The connection and schema the assistant works with, what is sent with a question
+    /// The connection and database the assistant works with, what is sent with a question
     /// and the actions (settings, new conversation, history), above the conversation.
     fn header(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let p = ternarygrid_ui::pal(ui);
@@ -1042,26 +1117,34 @@ impl AiAssistantTab {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.set_min_height(PICKER_H);
                 if self.connection_picker(ui, cx) {
-                    self.schema = None;
+                    self.scope = None;
+                    self.scope_chosen = true;
                     self.object = None;
                     self.lang = None;
                 }
                 if let Some(c) = self.conn.clone()
                     && cx.conns.is_connected(&c)
                 {
-                    self.schema_picker(ui, cx, &c);
+                    if cx.conns.live(&c).is_some_and(|l| l.multiple_databases()) {
+                        self.database_picker(ui, cx, &c);
+                    } else {
+                        self.schema_picker(ui, cx, &c);
+                    }
                 }
             });
             Self::permission_row(ui, cx);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.set_min_height(24.0);
-                icon_box(ui, icon::DATABASE, 13.0, p.text_muted);
-                self.context_status(ui, cx);
+                // The buttons first, the status in what is left: it never runs under them.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // 8 apart, as the design's row.
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.add(egui::Label::new(RichText::new(cx.settings.ai.model.clone()).size(11.0).color(p.text_faint)).truncate());
+                    let room = ui.available_width() / 3.0;
+                    ui.scope(|ui| {
+                        ui.set_max_width(room);
+                        ui.add(egui::Label::new(RichText::new(cx.settings.ai.model.clone()).size(11.0).color(p.text_faint)).truncate());
+                    });
                     self.history_button(ui, cx);
                     if ui.add_enabled_ui(!self.turns.is_empty(), |ui| kit::icon_button_ex(ui, icon::PLUS, tr("New conversation"), false, 24.0)).inner.clicked() {
                         self.reset();
@@ -1069,6 +1152,11 @@ impl AiAssistantTab {
                     if kit::icon_button_ex(ui, icon::GEAR, tr("AI settings"), false, 24.0).clicked() {
                         cx.push(AppCommand::OpenSettings);
                     }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+                        icon_box(ui, icon::DATABASE, 13.0, p.text_muted);
+                        self.context_status(ui, cx);
+                    });
                 });
             });
         });
@@ -1142,6 +1230,51 @@ impl AiAssistantTab {
         true
     }
 
+    /// The database of a connection whose server hosts several (its current one until another
+    /// is chosen). Its schemas all count, so there is no schema to pick.
+    fn database_picker(&mut self, ui: &mut Ui, cx: &mut AppContext, conn: &str) {
+        let backend = cx.backend;
+        let Some(live) = cx.conns.live_mut(conn) else { return };
+        let main = live.main.clone();
+        live.meta.request_databases(backend, &main);
+        let loading = live.meta.databases.is_loading();
+        let current = live.current_database.clone();
+        let filter = &live.config.filters.databases;
+        let mut names: Vec<String> =
+            live.meta.databases.get().map(|v| v.iter().filter(|d| !d.is_system && filter.matches(&d.name)).map(|d| d.name.clone()).collect()).unwrap_or_default();
+        if let Some(c) = current.as_ref().filter(|c| !names.contains(c)) {
+            names.insert(0, c.clone());
+        }
+        // Also a conversation saved when a schema was chosen here.
+        let database = self.scope.as_ref().and_then(|s| s.database.clone()).or(current).or_else(|| names.first().cloned());
+        let scope = database.clone().map(|d| SchemaRef::new(Some(d), None));
+        if self.scope != scope {
+            self.scope = scope;
+            self.object = None;
+        }
+        // Plans and definitions need a session there, also without schema context.
+        live.ensure_session(backend, database.as_deref().filter(|d| Some(*d) != live.current_database.as_deref()));
+        let label = database.unwrap_or_else(|| tr("Database…").to_string());
+        let w = (ui.painter().layout_no_wrap(label.clone(), egui::FontId::proportional(13.0), Color32::PLACEHOLDER).size().x + 41.0).clamp(130.0, 220.0).min(ui.available_width());
+        let mut chosen: Option<String> = None;
+        crate::tabs::table_designer::select(ui, ("ai_database", self.uid), label.clone(), w, PICKER_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            for n in &names {
+                let on = *n == label;
+                if pick(ui, on, n) && !on {
+                    chosen = Some(n.clone());
+                }
+            }
+        });
+        if let Some(n) = chosen {
+            self.scope = Some(SchemaRef::new(Some(n), None));
+            self.scope_chosen = true;
+            self.object = None;
+        }
+        if loading {
+            ui.add(egui::Spinner::new().size(14.0));
+        }
+    }
+
     /// The schema of a connected connection (its current one until another is chosen).
     fn schema_picker(&mut self, ui: &mut Ui, cx: &mut AppContext, conn: &str) {
         let backend = cx.backend;
@@ -1156,24 +1289,25 @@ impl AiAssistantTab {
         {
             names.insert(0, f);
         }
-        if self.schema.is_none()
+        if self.scope.is_none()
             && let Some(f) = fallback.or_else(|| names.first().map(|n| SchemaRef::new(None, Some(n.clone()))))
         {
-            self.schema = Some(f);
+            self.scope = Some(f);
             self.object = None;
         }
-        let label = self.schema.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
+        let label = self.scope.as_ref().and_then(|s| s.schema.clone()).unwrap_or_else(|| tr("Schema…").to_string());
         let mut chosen: Option<String> = None;
         crate::tabs::table_designer::select(ui, ("ai_schema", self.uid), label, 130.0, PICKER_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
             for n in &names {
-                let on = self.schema.as_ref().and_then(|s| s.schema.as_deref()) == Some(n.as_str());
+                let on = self.scope.as_ref().and_then(|s| s.schema.as_deref()) == Some(n.as_str());
                 if pick(ui, on, n) && !on {
                     chosen = Some(n.clone());
                 }
             }
         });
         if let Some(n) = chosen {
-            self.schema = Some(SchemaRef::new(None, Some(n)));
+            self.scope = Some(SchemaRef::new(None, Some(n)));
+            self.scope_chosen = true;
             self.object = None;
         }
         if loading {
@@ -1288,32 +1422,33 @@ impl AiAssistantTab {
             ui.label(faint(tr("Schema context: off")));
             return;
         }
-        let (Some(conn), Some(schema)) = (self.conn.clone(), self.schema.clone()) else {
+        let (Some(conn), Some(scope)) = (self.conn.clone(), self.scope.clone()) else {
             ui.label(faint(tr("Schema context: none")));
             return;
         };
         let backend = cx.backend;
         let Some(live) = cx.conns.live_mut(&conn) else { return };
-        let main = live.main.clone();
-        live.meta.request_snapshot(backend, &main, &schema);
-        match live.meta.snapshots.get(&schema) {
-            Some(l) if l.is_loading() => {
-                ui.add(egui::Spinner::new().size(12.0).color(p.accent_text));
-                ui.label(faint(tr("Reading the schema…")));
+        let read = load_context(backend, live, &scope);
+        if !read.finished {
+            ui.add(egui::Spinner::new().size(12.0).color(p.accent_text));
+            let text = if read.total > 1 { trf("Reading the schemas… {} of {}", &[&read.done, &read.total]) } else { tr("Reading the schema…").to_string() };
+            ui.add(egui::Label::new(faint(&text)).truncate());
+        } else if let (0, Some(e)) = (read.described, &read.error) {
+            ui.label(RichText::new(kit::with_icon(icon::WARNING, tr("No schema context"))).size(12.0).color(p.warn)).on_hover_text(e);
+        } else if read.described == 0 {
+            ui.label(faint(tr("Schema context: none")));
+        } else {
+            let tables = ternarygrid_core::trn(read.tables, "1 table", "{} tables");
+            let views = ternarygrid_core::trn(read.views, "1 view", "{} views");
+            let mut tip = ternarygrid_core::trn(
+                read.described,
+                "Table and column names of this schema are sent with each question. No data rows are sent.",
+                "Table and column names of {} schemas are sent with each question. No data rows are sent.",
+            );
+            if read.others > 0 {
+                tip = format!("{tip} {}", trf("{} more schemas are only named.", &[&read.others]));
             }
-            Some(l) if l.error().is_some() => {
-                let e = l.error().map(|e| e.full_text()).unwrap_or_default();
-                ui.label(RichText::new(kit::with_icon(icon::WARNING, tr("No schema context"))).size(12.0).color(p.warn)).on_hover_text(e);
-            }
-            Some(l) => {
-                if let Some(s) = l.get() {
-                    let tables = ternarygrid_core::trn(s.tables.len(), "1 table", "{} tables");
-                    let views = ternarygrid_core::trn(s.views.len(), "1 view", "{} views");
-                    ui.add(egui::Label::new(faint(&trf("Schema context: {}, {}", &[&tables, &views]))).truncate())
-                        .on_hover_text(tr("Table and column names of this schema are sent with each question. No data rows are sent."));
-                }
-            }
-            None => {}
+            ui.add(egui::Label::new(faint(&trf("Schema context: {}, {}", &[&tables, &views]))).truncate()).on_hover_text(tip);
         }
         if cx.settings.ai.send_sample_data {
             ui.label(faint(tr("· sample rows on")));
@@ -1401,7 +1536,7 @@ impl AiAssistantTab {
                                 && self.conn.is_some()
                                 && kit::button_full(ui, kit::Kind::Ghost, Some(icon::PLAY), tr("Run"), true, true).on_hover_text(tr("Run in a new SQL editor")).clicked()
                             {
-                                cx.push(AppCommand::RunSqlInEditor { connection: self.conn.clone(), schema: self.schema.clone(), text: editor_text(code) });
+                                cx.push(AppCommand::RunSqlInEditor { connection: self.conn.clone(), schema: self.scope.clone(), text: editor_text(code) });
                             }
                         });
                     });
@@ -1426,7 +1561,10 @@ impl AiAssistantTab {
     fn approval_ui(&mut self, ui: &mut Ui, cx: &mut AppContext, sql: &str, danger: Option<&str>, id: (u64, usize, usize, usize)) {
         let p = ternarygrid_ui::pal(ui);
         let conn = self.conn.clone().unwrap_or_default();
-        let name = cx.conns.config(&conn).map(|c| c.name.clone()).unwrap_or_default();
+        let mut name = cx.conns.config(&conn).map(|c| c.name.clone()).unwrap_or_default();
+        if let Some(place) = self.pending.as_ref().and_then(|q| q.place.as_deref()) {
+            name = format!("{name} / {place}");
+        }
         let marked = cx.conns.type_of(&conn).confirm_execute;
         let border = if danger.is_some() || marked { p.err } else { p.warn };
         let mut answer = None;
@@ -1759,8 +1897,8 @@ impl AiAssistantTab {
             }
             Some(c) => {
                 !cx.settings.ai.include_schema_context
-                    || match (&self.schema, cx.conns.live(&c)) {
-                        (Some(s), Some(l)) => l.meta.snapshots.get(s).is_some_and(|x| !x.is_loading()),
+                    || match (&self.scope, cx.conns.live(&c)) {
+                        (Some(s), Some(l)) => context_state(l, s).finished,
                         _ => false,
                     }
             }
@@ -1773,27 +1911,43 @@ impl AiAssistantTab {
 
     fn object_picker(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let p = ternarygrid_ui::pal(ui);
-        let Some(snap) = self.snapshot(cx) else {
-            ui.label(RichText::new(tr("Choose a schema to pick an object, or paste its definition below.")).size(12.5).color(p.text_faint));
+        let snaps = self.snapshots(cx);
+        if snaps.is_empty() {
+            ui.label(RichText::new(tr("Choose a database or schema to pick an object, or paste its definition below.")).size(12.5).color(p.text_faint));
             return;
+        }
+        // Named as the sessions name it: the connection's own database has no name there.
+        let db = match (&self.conn, &self.scope) {
+            (Some(c), Some(s)) => cx.conns.live(c).and_then(|l| cache_database(l, s)),
+            _ => None,
+        };
+        // In their schema where there are several.
+        let qualified = snaps.len() > 1;
+        let shown = |o: &ObjectRef| match o.schema.as_deref().filter(|_| qualified) {
+            Some(schema) => format!("{schema}.{}", o.name),
+            None => o.name.clone(),
         };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.set_min_height(style::CONTROL_H);
             ui.label(RichText::new(tr("Object:")).color(p.text_muted));
-            let label = self.object.as_ref().map(|o| o.name.clone()).unwrap_or_else(|| tr("(paste a definition)").to_string());
+            let label = self.object.as_ref().map(shown).unwrap_or_else(|| tr("(paste a definition)").to_string());
             crate::tabs::table_designer::select(ui, ("ai_obj", self.uid), label, 240.0, style::CONTROL_H, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                 if pick(ui, self.object.is_none(), tr("(paste a definition)")) {
                     self.object = None;
                 }
-                let db = self.schema.as_ref().and_then(|s| s.database.clone());
-                let items = snap.tables.iter().map(|t| ObjectRef::table(snap.schema.clone(), t.name.clone())).chain(
-                    snap.views.iter().map(|v| ObjectRef::new(if v.materialized { ObjectKind::MaterializedView } else { ObjectKind::View }, snap.schema.clone(), v.name.clone())),
-                );
+                let items = snaps.iter().flat_map(|snap| {
+                    snap.tables.iter().map(|t| ObjectRef::table(snap.schema.clone(), t.name.clone())).chain(
+                        snap.views
+                            .iter()
+                            .map(|v| ObjectRef::new(if v.materialized { ObjectKind::MaterializedView } else { ObjectKind::View }, snap.schema.clone(), v.name.clone())),
+                    )
+                });
                 for o in items {
                     let o = o.with_database(db.clone());
                     let on = self.object.as_ref() == Some(&o);
-                    let clicked = if on { pick(ui, true, &o.name) } else { kit::menu_item(ui, Some(crate::nav::kind_icon(o.kind)), &o.name, "").clicked() };
+                    let name = shown(&o);
+                    let clicked = if on { pick(ui, true, &name) } else { kit::menu_item(ui, Some(crate::nav::kind_icon(o.kind)), &name, "").clicked() };
                     if clicked {
                         self.object = Some(o);
                     }
@@ -1804,6 +1958,114 @@ impl AiAssistantTab {
             }
         });
     }
+}
+
+/// Where the tab at `at` puts the assistant: its database where databases hold schemas (the
+/// schema does not matter then), otherwise the one level the server has.
+pub fn scope_of(at: crate::tabs::TabLocation) -> Option<SchemaRef> {
+    match (at.database, at.schema) {
+        (Some(d), _) => Some(SchemaRef::new(Some(d), None)),
+        (None, Some(s)) => Some(SchemaRef::new(None, Some(s))),
+        (None, None) => None,
+    }
+}
+
+/// `scope`'s database as the metadata cache and the navigator name it: the connection's own
+/// database goes without a name.
+fn cache_database(live: &crate::conn::LiveConnection, scope: &SchemaRef) -> Option<String> {
+    scope.database.clone().filter(|d| Some(d) != live.current_database.as_ref())
+}
+
+/// The schemas to describe first (`first`, the connection's own, at the front) and those left
+/// out, for [`MAX_CONTEXT_SCHEMAS`].
+fn context_order(mut names: Vec<String>, first: Option<&str>) -> (Vec<String>, Vec<String>) {
+    if let Some(i) = first.and_then(|f| names.iter().position(|n| n == f)) {
+        let name = names.remove(i);
+        names.insert(0, name);
+    }
+    let rest = names.split_off(names.len().min(MAX_CONTEXT_SCHEMAS));
+    (names, rest)
+}
+
+/// The schemas described with a question and the names of those left out: every schema of a
+/// database that was read, without the system's and what the connection filters out; where the
+/// server has one level, that one.
+fn context_schemas(live: &crate::conn::LiveConnection, scope: &SchemaRef) -> (Vec<SchemaRef>, Vec<String>) {
+    if !live.multiple_databases() {
+        return (vec![scope.clone()], Vec::new());
+    }
+    let db = cache_database(live, scope);
+    let list = live.meta.schema_list(db.as_deref()).unwrap_or_default();
+    let filter = &live.config.filters.schemas;
+    let names = list.iter().filter(|s| !s.is_system && filter.matches(&s.name)).map(|s| s.name.clone()).collect();
+    let (described, others) = context_order(names, live.current_schema.as_deref());
+    (described.into_iter().map(|n| SchemaRef::new(db.clone(), Some(n))).collect(), others)
+}
+
+/// How far the structure of the assistant's place was read.
+#[derive(Default)]
+struct ContextState {
+    /// Schemas to read.
+    total: usize,
+    /// Those finished, read or not.
+    done: usize,
+    /// Those read.
+    described: usize,
+    /// Schemas only named.
+    others: usize,
+    tables: usize,
+    views: usize,
+    /// Everything that can be read was.
+    finished: bool,
+    /// Why something was not read.
+    error: Option<String>,
+}
+
+fn context_state(live: &crate::conn::LiveConnection, scope: &SchemaRef) -> ContextState {
+    let db = cache_database(live, scope);
+    let two_levels = live.multiple_databases();
+    let error = live.session_error(db.as_deref()).or_else(|| {
+        let list = live.meta.schemas.get(db.as_deref().unwrap_or(""));
+        list.filter(|_| two_levels).and_then(|l| l.error()).map(|e| e.full_text())
+    });
+    if error.is_some() {
+        return ContextState { finished: true, error, ..Default::default() };
+    }
+    if two_levels && live.meta.schema_list(db.as_deref()).is_none() {
+        return ContextState::default();
+    }
+    let (schemas, others) = context_schemas(live, scope);
+    let mut state = ContextState { total: schemas.len(), others: others.len(), ..Default::default() };
+    for s in &schemas {
+        let Some(load) = live.meta.snapshots.get(s).filter(|l| !l.is_loading() && !l.is_not_loaded()) else { continue };
+        state.done += 1;
+        if let Some(snap) = load.get() {
+            state.described += 1;
+            state.tables += snap.tables.len();
+            state.views += snap.views.len();
+        } else if state.error.is_none() {
+            state.error = load.error().map(|e| e.full_text());
+        }
+    }
+    state.finished = state.done == state.total;
+    state
+}
+
+/// Read what is missing of the assistant's place, one schema at a time: the navigator reads over
+/// the same session and would wait behind them all.
+fn load_context(backend: &crate::backend::Backend, live: &mut crate::conn::LiveConnection, scope: &SchemaRef) -> ContextState {
+    let db = cache_database(live, scope);
+    if let Some(session) = live.ensure_session(backend, db.as_deref()) {
+        if live.multiple_databases() {
+            live.meta.request_schemas(backend, &session, db.as_deref());
+        }
+        let (schemas, _) = context_schemas(live, scope);
+        let reading = schemas.iter().any(|s| live.meta.snapshots.get(s).is_some_and(|l| l.is_loading()));
+        if !reading && let Some(next) = schemas.iter().find(|s| !live.meta.snapshots.contains_key(*s)) {
+            live.meta.request_snapshot(backend, &session, next);
+        }
+    }
+    context_state(live, scope)
 }
 
 /// `n` with its thousands grouped by commas (token counts).
@@ -2047,7 +2309,7 @@ impl TabView for AiAssistantTab {
         if std::mem::take(&mut self.schema_changed)
             && let Some(connection) = self.conn.clone()
         {
-            cx.push(AppCommand::RefreshMetadata { connection, object: None, schema: self.schema.clone() });
+            cx.push(AppCommand::RefreshMetadata { connection, object: None, schema: self.scope.clone() });
         }
         self.sync_language(cx);
         let status = self.status(cx);
@@ -2077,6 +2339,118 @@ impl TabView for AiAssistantTab {
     }
 
     crate::impl_tab_any!();
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use crate::tabs::TabLocation;
+
+    fn snapshot(schema: &str, table: &str) -> Arc<SchemaSnapshot> {
+        let tables = vec![ternarygrid_core::ddl::TableDef { schema: Some(schema.into()), name: table.into(), ..Default::default() }];
+        Arc::new(SchemaSnapshot { schema: Some(schema.into()), tables, ..Default::default() })
+    }
+
+    fn system(ctx: &RequestContext<'_>) -> String {
+        build_request(ctx, &[], ChatMessage::user("question"), "question").system
+    }
+
+    fn at(conn: &str, database: Option<&str>, schema: Option<&str>) -> TabLocation {
+        TabLocation { conn: conn.into(), name: conn.into(), kind: DbKind::Postgres, place: None, database: database.map(Into::into), schema: schema.map(Into::into) }
+    }
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("s{i}")).collect()
+    }
+
+    #[test]
+    fn every_schema_of_the_database_is_described() {
+        let snapshots = [snapshot("public", "notes"), snapshot("sales", "orders")];
+        let others = ["tenant_1".to_string(), "tenant_2".to_string()];
+        let ctx = RequestContext { kind: DbKind::Postgres, server_version: "16", snapshots: &snapshots, database: Some("reports"), other_schemas: &others, include_schema: true };
+        let text = system(&ctx);
+        assert!(text.contains("-- Database: reports"), "{text}");
+        assert!(text.contains("table public.notes") && text.contains("table sales.orders"), "{text}");
+        assert!(text.contains("-- 2 more schemas not described: tenant_1, tenant_2"), "{text}");
+    }
+
+    #[test]
+    fn the_structure_stays_home_when_turned_off() {
+        let snapshots = [snapshot("sales", "orders")];
+        let others = ["tenant_1".to_string()];
+        let ctx = RequestContext { kind: DbKind::Postgres, server_version: "16", snapshots: &snapshots, database: Some("reports"), other_schemas: &others, include_schema: false };
+        let text = system(&ctx);
+        assert!(!text.contains("reports") && !text.contains("orders") && !text.contains("tenant_1"), "{text}");
+    }
+
+    #[test]
+    fn a_long_list_of_schemas_stays_short() {
+        let others = names(MAX_NAMED_SCHEMAS + 1);
+        let ctx = RequestContext { kind: DbKind::Postgres, server_version: "16", snapshots: &[], database: None, other_schemas: &others, include_schema: true };
+        let text = system(&ctx);
+        assert!(text.contains(&format!("-- {} more schemas not described: s0,", others.len())), "{text}");
+        assert!(text.contains(&format!("s{}, …", MAX_NAMED_SCHEMAS - 1)) && !text.contains(&format!("s{MAX_NAMED_SCHEMAS}")), "{text}");
+    }
+
+    #[test]
+    fn the_connections_own_schema_goes_first_and_the_rest_are_only_named() {
+        let (described, others) = context_order(vec!["a".into(), "public".into(), "z".into()], Some("public"));
+        assert_eq!(described, ["public", "a", "z"]);
+        assert!(others.is_empty());
+        let (described, others) = context_order(names(MAX_CONTEXT_SCHEMAS + 3), Some("s41"));
+        assert_eq!(described.len(), MAX_CONTEXT_SCHEMAS);
+        assert_eq!(described[0], "s41");
+        // Moved to the front, it pushes the last one described out.
+        assert_eq!(others, ["s39", "s40", "s42"]);
+        // A schema the database does not have (the connection's own is elsewhere).
+        assert_eq!(context_order(vec!["a".into()], Some("public")).0, ["a"]);
+    }
+
+    #[test]
+    fn a_tab_gives_its_database_not_its_schema() {
+        assert_eq!(scope_of(at("c", Some("reports"), Some("sales"))), Some(SchemaRef::new(Some("reports".into()), None)));
+        assert_eq!(scope_of(at("c", Some("reports"), None)), Some(SchemaRef::new(Some("reports".into()), None)));
+        // MySQL, SQLite: the one level there is.
+        assert_eq!(scope_of(at("c", None, Some("shop"))), Some(SchemaRef::new(None, Some("shop".into()))));
+        assert_eq!(scope_of(at("c", None, None)), None);
+    }
+
+    #[test]
+    fn the_tabs_are_followed_until_the_conversation_starts_or_a_choice_is_made() {
+        let database = |name: &str| Some(SchemaRef::new(Some(name.into()), None));
+        let mut ai = AiAssistantTab::new(None);
+        ai.follow_tab(Some(at("c1", Some("reports"), Some("sales"))));
+        assert_eq!((ai.conn.as_deref(), ai.scope.clone()), (Some("c1"), database("reports")));
+        // Other tabs of the server, other servers; a tab without a connection changes nothing.
+        ai.follow_tab(Some(at("c1", Some("billing"), None)));
+        assert_eq!(ai.scope, database("billing"));
+        ai.follow_tab(Some(at("c2", Some("crm"), None)));
+        assert_eq!((ai.conn.as_deref(), ai.scope.clone()), (Some("c2"), database("crm")));
+        ai.follow_tab(None);
+        assert_eq!(ai.scope, database("crm"));
+        // What was chosen by hand stays, until the panel is opened again.
+        ai.scope_chosen = true;
+        ai.follow_tab(Some(at("c1", Some("reports"), None)));
+        assert_eq!((ai.conn.as_deref(), ai.scope.clone()), (Some("c2"), database("crm")));
+        ai.follow(None);
+        ai.follow_tab(Some(at("c1", Some("reports"), None)));
+        assert_eq!((ai.conn.as_deref(), ai.scope.clone()), (Some("c1"), database("reports")));
+        // A conversation keeps its database, a new one follows again.
+        ai.turns.push(Turn::new(QuickAction::Chat, "question".into()));
+        ai.follow_tab(Some(at("c2", Some("crm"), None)));
+        assert_eq!((ai.conn.as_deref(), ai.scope.clone()), (Some("c1"), database("reports")));
+        ai.reset();
+        ai.follow_tab(Some(at("c2", Some("crm"), None)));
+        assert_eq!((ai.conn.as_deref(), ai.scope.clone()), (Some("c2"), database("crm")));
+    }
+
+    #[test]
+    fn the_editors_question_stays_where_it_was_asked() {
+        let scope = SchemaRef::new(Some("reports".into()), None);
+        let mut ai = AiAssistantTab::ask_about(Some("c1".into()), Some(scope.clone()), "select 1".into(), None);
+        ai.follow_tab(Some(at("c2", Some("crm"), None)));
+        assert_eq!((ai.conn.as_deref(), ai.scope.as_ref()), (Some("c1"), Some(&scope)));
+    }
 }
 
 #[cfg(test)]

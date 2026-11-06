@@ -3,6 +3,23 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.6 — 2026-11-06
+
+The AI assistant works on a whole database, and opens on the one you are working in.
+
+### Added
+- **The AI assistant chooses a database, not a schema**: on PostgreSQL and SQL Server the second list at the top of its panel holds the server's databases, so a table in another database is one click away instead of a new connection. It reads and changes only the database chosen. Databases with one level (MySQL, MariaDB, SQLite and the others) keep the list they had.
+- **Every schema of that database is described with a question**, the tables closest to the question first and within the same limit as before. Up to 40 schemas are read; the others are named, and the assistant can still query them if it may read data.
+- **The assistant follows the tab in use**: while its conversation is empty it works in the connection and database of the active tab, also when you change tabs with the panel open. A conversation under way keeps its database, and a database you choose by hand stays until you open the panel again or start a new conversation.
+
+### Changed
+- Fix error, Explain query and Optimize query work in the assistant's database, and the question before a change names it: "On postgres_laos / unitel, committed at once."
+
+### Fixed
+- A narrow SQL editor no longer paints over the AI assistant: its toolbar made the whole tab wider than the room it had. What does not fit is now cut at the edge.
+- In a narrow AI assistant the buttons no longer cover the text about the schema context.
+- Closing a PostgreSQL result on a connection the server had just ended could take a minute. It now ends at once.
+
 ## 0.6.5 — 2026-11-05
 
 ### Fixed

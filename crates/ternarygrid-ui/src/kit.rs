@@ -575,6 +575,18 @@ pub fn combo_caret(ui: &Ui, rect: Rect, visuals: &egui::style::WidgetVisuals, op
     ui.painter().add(egui::Shape::line(points, Stroke::new(1.4, color)));
 }
 
+/// A row of `ui`'s width that cannot widen it: what does not fit is cut at the edge. A toolbar
+/// over panels needs it, as a row that runs over its `ui` widens the panels under it too, which
+/// then paint over what is beside them.
+pub fn clipped_row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let rect = ui.available_rect_before_wrap();
+    let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+    row.set_clip_rect(row.clip_rect().intersect(rect));
+    let out = add(&mut row);
+    ui.advance_cursor_after_rect(rect.with_max_y(row.min_rect().bottom()));
+    out
+}
+
 /// A `Ui` filling `ui` whose contents cannot make it wider. A side panel takes the width of what
 /// is drawn in it; a row that takes the panel's width as its own and a little more would widen
 /// the panel a bit further each frame. `ui` keeps the width it was given (with nothing in it, the

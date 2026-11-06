@@ -221,13 +221,16 @@ pub struct TabLocation {
 }
 
 pub fn tab_location(view: &dyn TabView, conns: &crate::conn::ConnectionManager) -> Option<TabLocation> {
-    let conn = view.connection_id()?;
+    location_at(view.connection_id()?, view.schema_context().unwrap_or_default(), conns)
+}
+
+/// [`tab_location`] of something working at `at` on the connection `conn`.
+pub fn location_at(conn: &str, at: SchemaRef, conns: &crate::conn::ConnectionManager) -> Option<TabLocation> {
     let cfg = conns.config(conn)?;
     let live = conns.live(conn);
     // PostgreSQL, SQL Server: databases hold schemas. Elsewhere one level.
     let two_levels = live.is_some_and(|l| l.multiple_databases());
     let current = live.map(|l| SchemaRef::new(l.current_database.clone(), l.current_schema.clone())).unwrap_or_default();
-    let at = view.schema_context().unwrap_or_default();
     let place = place_label(at.clone(), &current, two_levels);
     let (database, schema) = place_parts(at, &current, two_levels);
     Some(TabLocation { conn: conn.to_string(), name: cfg.name.clone(), kind: cfg.kind, place, database, schema })

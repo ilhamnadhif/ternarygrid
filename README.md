@@ -42,8 +42,9 @@ millions of rows never have to fit in memory.
   (with Liquibase output), table designer, tasks and scheduler, backup / restore, session and lock
   manager, server dashboard and PostgreSQL debugger.
 - **AI assistant** (optional, with your own API key: Anthropic, OpenAI or any compatible service) in a
-  side panel: it knows the schema, writes and explains SQL, keeps its conversations and, if you
-  allow it, reads data with read-only queries. It asks before each statement that changes anything.
+  side panel: it opens on the database of the tab in use, knows all its schemas, writes and explains
+  SQL, keeps its conversations and, if you allow it, reads data with read-only queries. It asks
+  before each statement that changes anything.
 - A quiet, modern interface shared with TernaryWire and TernaryShell: a top bar with the active
   connection › schema and a search box for every command, object and script (`⇧⌘P`), an icon rail
   (navigator, projects, history, tasks), and a status bar with the transaction mode. Light and dark

@@ -217,7 +217,8 @@ pub fn system_note(can_execute: bool) -> String {
         "\n\n## Running queries\nYou can run read-only SQL on the user's connection with the `{TOOL}` tool. Use it whenever the question is about \
          the data (counts, values, examples, checks, what databases, schemas or tables exist) instead of guessing, then answer from the results and \
          show the query you ran. One statement per call; at most {MAX_ROWS} rows come back, so aggregate in SQL. Never try to change data or schema \
-         with it. {changes}"
+         with it. Every schema of this database is within reach, also the ones not described above. When the user asks about another database of the \
+         server that you cannot reach from here, tell them to choose it in the list at the top of this panel. {changes}"
     )
 }
 

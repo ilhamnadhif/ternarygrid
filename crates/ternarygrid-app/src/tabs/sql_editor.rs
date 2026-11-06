@@ -1660,7 +1660,10 @@ impl SqlEditorTab {
                     }
                 }
                 Some(ResultItem::Error { sql, text, at }) => match error_card(ui, sql, text, *at) {
-                    ErrorCardAction::Fix => cx.push(AppCommand::AskAi { connection: self.conn.clone(), sql: sql.clone(), error: Some(text.clone()) }),
+                    ErrorCardAction::Fix => {
+                        let at = self.conn.as_deref().and_then(|c| crate::tabs::location_at(c, self.schema.clone().unwrap_or_default(), cx.conns));
+                        cx.push(AppCommand::AskAi { connection: self.conn.clone(), scope: at.and_then(crate::tabs::ai::scope_of), sql: sql.clone(), error: Some(text.clone()) });
+                    }
                     ErrorCardAction::Goto(line, column) => {
                         let ctx = ui.ctx().clone();
                         self.editor.goto_line_col(&ctx, line, column);
@@ -2327,7 +2330,7 @@ impl TabView for SqlEditorTab {
         }
         self.poll_exec(&ctx, cx);
         ui.spacing_mut().item_spacing.y = 0.0;
-        self.toolbar(ui, cx);
+        ternarygrid_ui::kit::clipped_row(ui, |ui| self.toolbar(ui, cx));
         let pal = ternarygrid_ui::pal(ui);
         let results_visible = self.show_results;
         if results_visible && self.maximized {
