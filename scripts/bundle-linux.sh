@@ -25,6 +25,10 @@ cd "$ROOT"
 NFPM_VERSION=2.47.0
 APPIMAGETOOL_VERSION=1.9.1
 
+# GitHub's release downloads fail now and then (502, 504, a dropped connection): a
+# failed one is tried again instead of failing the release after the whole build.
+fetch() { curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 "$@"; }
+
 BUILD=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -72,7 +76,7 @@ tar -C "$STAGE/tar" -czf "$DIST/$NAME-$ARCH.tar.gz" "$NAME-$ARCH"
 echo "==> $NAME-$ARCH.AppImage"
 APPIMAGETOOL="$TOOLS/appimagetool-$APPIMAGETOOL_VERSION-$ARCH.AppImage"
 if [[ ! -x "$APPIMAGETOOL" ]]; then
-  curl -fsSL -o "$APPIMAGETOOL" "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$ARCH.AppImage"
+  fetch -o "$APPIMAGETOOL" "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$ARCH.AppImage"
   chmod +x "$APPIMAGETOOL"
 fi
 APPDIR="$STAGE/TernaryGrid.AppDir"
@@ -88,7 +92,7 @@ NFPM="$TOOLS/nfpm-$NFPM_VERSION"
 if [[ ! -x "$NFPM" ]]; then
   case "$ARCH" in x86_64) NFPM_TAR="nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" ;; aarch64) NFPM_TAR="nfpm_${NFPM_VERSION}_Linux_arm64.tar.gz" ;; esac
   BASE="https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION"
-  (cd "$TOOLS" && curl -fsSLO "$BASE/$NFPM_TAR" && curl -fsSL -o "nfpm-$NFPM_VERSION-checksums.txt" "$BASE/checksums.txt" \
+  (cd "$TOOLS" && fetch -O "$BASE/$NFPM_TAR" && fetch -o "nfpm-$NFPM_VERSION-checksums.txt" "$BASE/checksums.txt" \
     && grep " $NFPM_TAR\$" "nfpm-$NFPM_VERSION-checksums.txt" | sha256sum --check --quiet \
     && tar -xzf "$NFPM_TAR" nfpm && mv nfpm "nfpm-$NFPM_VERSION" && rm "$NFPM_TAR")
 fi
