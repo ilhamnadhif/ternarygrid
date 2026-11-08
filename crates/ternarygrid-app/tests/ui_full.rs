@@ -206,18 +206,24 @@ fn editor_execute_sort_and_edit() {
     no_errors(&mut h, "execute");
     assert!(has(&h, "Data grid,"), "grid shown: {:?}", labels(&h));
 
-    // Header click: ascending → descending → unsorted.
+    // A header click selects the column; its sort button sorts: ascending → descending.
     let body = h.query_all_by_label_contains("Data grid,").next().unwrap().rect();
     let header = egui::pos2(body.left() + 12.0, body.top() - 8.0);
-    for _ in 0..2 {
+    h.event(egui::Event::PointerMoved(header));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos: header, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+    }
+    frames(&mut h, 4);
+    assert!(has(&h, "Sort ascending: id"), "the header click did not sort: {:?}", labels(&h));
+    for label in ["Sort ascending: id", "Sort descending: id"] {
         h.event(egui::Event::PointerMoved(header));
-        for pressed in [true, false] {
-            h.event(egui::Event::PointerButton { pos: header, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
-        }
+        frames(&mut h, 2);
+        h.query_all_by_label(label).next().unwrap_or_else(|| panic!("{label}: {:?}", labels(&h))).click();
         frames(&mut h, 4);
         std::thread::sleep(Duration::from_millis(400));
         frames(&mut h, 4);
     }
+    assert!(has(&h, "Clear sorting: id"), "sorted descending: {:?}", labels(&h));
     no_errors(&mut h, "sort");
 
     // Back to the editor: format, explain, script execution.
@@ -1687,6 +1693,18 @@ fn workspace_from_dbeaver() {
     wait(&mut h, "editor session", |h| focused_editor(h).session_ready());
     run(&mut h, Action::ToggleAutoCommit);
     let ctx = h.ctx.clone();
+    // Reads alone (manual commit opens a transaction for them too) leave nothing to commit:
+    // nothing pending in the status bar or in Pending transactions.
+    focused_editor(&mut h).set_text(&ctx, "select 1;");
+    frames(&mut h, 2);
+    run(&mut h, Action::ExecuteStatement);
+    wait(&mut h, "a select in manual commit", |h| {
+        let e = focused_editor(h);
+        !e.is_running() && e.result_count() == 1
+    });
+    frames(&mut h, 2);
+    assert!(ternarygrid_app::pending_tx::collect(&h.state().dock, &h.state().conns).is_empty());
+    assert!(has(&h, "Manual commit") && h.query_all_by_label_contains("Manual commit ·").next().is_none(), "{:?}", labels(&h));
     focused_editor(&mut h).set_text(&ctx, "create table tx_probe (id integer);\ninsert into tx_probe values (1);");
     frames(&mut h, 2);
     run(&mut h, Action::ExecuteScript);
@@ -1694,6 +1712,8 @@ fn workspace_from_dbeaver() {
         let app = h.state();
         !ternarygrid_app::pending_tx::collect(&app.dock, &app.conns).is_empty()
     });
+    frames(&mut h, 2);
+    assert!(has(&h, "Manual commit · 2 changes pending"), "{:?}", labels(&h));
     run(&mut h, Action::PendingTransactions);
     assert!(has(&h, "Pending transactions") && has(&h, "Commit all"), "{:?}", labels(&h));
     assert!(h.query_all_by_label(&name).count() >= 2, "the connection is listed: {:?}", labels(&h));

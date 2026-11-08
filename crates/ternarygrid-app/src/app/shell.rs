@@ -399,11 +399,15 @@ impl TernaryGridApp {
                     // Transaction mode of the tab's session (Manual: what is pending).
                     if let Some(session) = active.as_ref().and_then(|(_, t)| t.view.transaction_session()) {
                         let tx = session.tx_state();
+                        // A lost session's changes were rolled back by the server.
+                        let changes = if session.is_closed() { 0 } else { tx.pending_writes() };
                         sep(ui);
                         let (text, color) = match tx.mode {
                             ternarygrid_core::TransactionMode::Auto => (tr("Auto-commit").to_string(), p.text_muted),
-                            ternarygrid_core::TransactionMode::Manual if tx.in_transaction && !tx.log.is_empty() => {
-                                (ternarygrid_core::trf("Manual commit · {} pending", &[&tx.log.len()]), p.warn)
+                            // The changes to commit, as Pending transactions lists them (a SELECT
+                            // also opens a transaction, with nothing to commit).
+                            ternarygrid_core::TransactionMode::Manual if changes > 0 => {
+                                (ternarygrid_core::trn(changes, tr("Manual commit · 1 change pending"), tr("Manual commit · {} changes pending")), p.warn)
                             }
                             ternarygrid_core::TransactionMode::Manual => (tr("Manual commit").to_string(), p.text_muted),
                         };

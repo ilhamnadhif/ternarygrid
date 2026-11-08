@@ -150,21 +150,55 @@ fn fetch_more_is_emitted_near_the_end() {
 }
 
 #[test]
-fn header_sort_client_and_server() {
+fn a_header_click_selects_the_whole_column() {
     let mut h = GridHarness::new(editable_model(50));
-    // Click the header of column "id" twice: ascending then descending.
-    let border = h.header_border(0);
-    let zone = egui::pos2(border.x - 26.0, border.y);
-    h.click_at(zone, PointerButton::Primary, Modifiers::NONE);
+    h.click_at(h.header_name(1), PointerButton::Primary, Modifiers::NONE);
+    let sel = h.state.selection();
+    assert!(sel.is_column_selected(1));
+    assert!(sel.contains(0, 1) && sel.contains(49, 1), "every row of the column");
+    assert!(!sel.contains(0, 0) && !sel.contains(0, 2));
+    assert!(h.state.sort.is_empty(), "a header click does not sort");
+    // Shift: up to that column; ⌘: added.
+    h.click_at(h.header_name(3), PointerButton::Primary, Modifiers::SHIFT);
+    assert_eq!(h.state.selection().columns(4), vec![1, 2, 3]);
+    h.click_at(h.header_name(0), PointerButton::Primary, Modifiers::COMMAND);
+    assert_eq!(h.state.selection().columns(4), vec![0, 1, 2, 3]);
+    assert!(h.state.sort.is_empty());
+    // A second click on a selected header keeps it selected (no toggling, no sort).
+    h.click_at(h.header_name(2), PointerButton::Primary, Modifiers::NONE);
+    h.click_at(h.header_name(2), PointerButton::Primary, Modifiers::NONE);
+    assert_eq!(h.state.selection().columns(4), vec![2]);
+    assert!(h.state.sort.is_empty());
+}
+
+#[test]
+fn the_sort_button_sorts_client_and_server() {
+    let mut h = GridHarness::new(editable_model(50));
+    h.click_at(h.header_name(2), PointerButton::Primary, Modifiers::NONE);
+    // The sort button of "id": ascending, then descending; the selection stays.
+    let button = h.sort_button(0);
+    h.click_at(button, PointerButton::Primary, Modifiers::NONE);
     h.wait_view_job();
     assert_eq!(h.state.sort, vec![crate::view::SortKey::asc(0)]);
-    h.click_at(zone, PointerButton::Primary, Modifiers::NONE);
+    assert_eq!(h.state.selection().columns(4), vec![2], "the sort button does not select");
+    // Sorted, the arrow stays without hovering.
+    h.frame(vec![Event::PointerGone]);
+    assert!(h.state.rt.sort_buttons.iter().any(|(c, _)| *c == 0));
+    let button = h.sort_button(0);
+    h.click_at(button, PointerButton::Primary, Modifiers::NONE);
     h.wait_view_job();
     assert_eq!(h.state.sort, vec![crate::view::SortKey::desc(0)]);
     assert_eq!(h.model.cell(0, 0), Some(Value::Int(49)), "client sort applied");
-    // Server mode emits ORDER BY.
+    // Shift adds a column to the sort.
+    let button = h.sort_button(1);
+    h.click_at(button, PointerButton::Primary, Modifiers::SHIFT);
+    h.wait_view_job();
+    assert_eq!(h.state.sort, vec![crate::view::SortKey::desc(0), crate::view::SortKey::asc(1)]);
+    // Server mode emits ORDER BY; a third click clears the column's sort.
     h.state.mode = DataMode::Server;
-    h.click_at(zone, PointerButton::Primary, Modifiers::NONE);
+    h.state.sort = vec![crate::view::SortKey::desc(0)];
+    let button = h.sort_button(0);
+    h.click_at(button, PointerButton::Primary, Modifiers::NONE);
     let order = h.actions.iter().find_map(|a| match a {
         GridAction::ServerQueryChanged { order_by, .. } => order_by.clone(),
         _ => None,
@@ -551,9 +585,8 @@ fn a_hovered_header_summarises_its_loaded_values() {
     let mut m = editable_model(10);
     m.set_value(4, 1, Value::Null).unwrap();
     let mut h = GridHarness::new(m);
-    let (_, header, _, _) = h.geometry();
-    let x = h.header_border(1).x - h.state.column_width(1) / 2.0;
-    h.frame(vec![egui::Event::PointerMoved(egui::pos2(x, header.center().y))]);
+    // On its name (its sort button has a tooltip of its own).
+    h.frame(vec![egui::Event::PointerMoved(h.header_name(1))]);
     let (col, _, text) = h.state.rt.column_summary.clone().expect("summary of the hovered column");
     assert_eq!(col, 1);
     assert!(text.contains("Loaded rows: 10 · NULLs: 1 · Distinct: 9"), "{text}");

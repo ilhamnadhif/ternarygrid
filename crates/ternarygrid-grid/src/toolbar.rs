@@ -430,7 +430,7 @@ struct SortSummary {
     more: usize,
 }
 
-/// The ordering in effect: the ORDER BY text, else the grid's own sort (header clicks).
+/// The ordering in effect: the ORDER BY text, else the grid's own sort (the headers' sort buttons).
 fn sort_summary(model: &ResultModel, grid: &DataGridState, state: &ToolbarState) -> Option<SortSummary> {
     let text = state.order_text.trim();
     if !text.is_empty() {

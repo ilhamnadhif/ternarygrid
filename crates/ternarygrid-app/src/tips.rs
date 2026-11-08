@@ -20,7 +20,7 @@ pub const TIPS: &[&str] = &[
     "Use :name or ${name} in a script: TernaryGrid asks for the values when it runs.",
     "Double-click a cell in the results to edit it; changes are saved with ⌘S / Ctrl+S or the Save button.",
     "Right-click a column header to filter, hide, pin or highlight rows with a value.",
-    "Click a column header to sort: ascending, descending, then back to the original order.",
+    "Click a column header to select the whole column; the arrow after its name sorts: ascending, descending, then back to the original order.",
     "Connection types (development, test, production) colour the connection and can require confirmation before data changes.",
     "In manual commit mode, Database › Pending transactions lists every connection with uncommitted changes.",
     "Navigator › Link with editor selects the table of the active tab in the tree.",

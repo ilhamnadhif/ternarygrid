@@ -534,101 +534,138 @@ impl GridFrame<'_> {
         }
     }
 
-    /// The header: per column its name in semibold, the key / link icon and the sort arrow
-    /// after it, the database type faint at the right (▾ of the column menu there on hover).
+    /// One header cell laid out: its name in semibold, the key / link icon and the sort
+    /// button after it, the database type faint at the right (▾ of the column menu there
+    /// while hovered). [`Self::paint_header`] paints it; input finds the sort button with
+    /// the same layout.
+    pub(super) fn header_cell(&self, painter: &Painter, geo: &Geo, pos: usize, hover: Option<Pos2>) -> HeaderCell {
+        let theme = self.theme;
+        let sx = self.state.rt.scroll_x;
+        let col = geo.cols[pos];
+        let rect = Rect::from_min_max(pos2(geo.col_left(pos, sx), geo.header.top()), pos2(geo.col_left(pos + 1, sx), geo.header.bottom() - 1.0));
+        let hovered = hover.is_some_and(|p| rect.contains(p));
+        let menu_open = self.state.rt.header_popup.is_some_and(|(c, ..)| c == col);
+        let show_menu = menu_open || hovered;
+        let scale = self.font.size / 13.0;
+        let name_font = ternarygrid_ui::style::semibold(&self.ctx, (12.5 * scale * 2.0).round() / 2.0);
+        let type_font = FontId::monospace((10.5 * scale * 2.0).round() / 2.0);
+        let icon_w = (13.0 * scale).round();
+        let key = if self.model.editability().as_ref().is_ok_and(|t| t.key_columns.contains(&col)) {
+            Some((egui_phosphor::regular::KEY, theme.warn))
+        } else if self.model.foreign_key_for_column(col).is_some() {
+            Some((egui_phosphor::regular::LINK_SIMPLE, theme.weak))
+        } else {
+            None
+        };
+        // The sort button: the arrow of a sorted column, and a faint one on the hovered
+        // header to sort by it (a click elsewhere on the header selects the column).
+        let sort_key = self.state.sort.iter().position(|k| k.column == col).map(|i| (i, self.state.sort[i]));
+        let sort_shown = sort_key.is_some() || hovered;
+        let icons_w = (usize::from(key.is_some()) + usize::from(sort_shown)) as f32 * (icon_w + 6.0);
+        // The type at the right while it fits next to the name; ▾ instead while hovered.
+        let inner_w = rect.width() - 2.0 * PAD;
+        let name = self.model.column_name(col);
+        let name_g = painter.layout_no_wrap(name.to_string(), name_font.clone(), theme.header_text);
+        let ty = self.model.column_meta(col).map(|m| m.type_name.as_str()).unwrap_or_default();
+        // In lower case, as the mockups write every type (SQLite and MySQL report TEXT, VARCHAR).
+        let type_g = (!ty.is_empty() && !show_menu).then(|| painter.layout_no_wrap(ty.to_ascii_lowercase(), type_font, theme.weak));
+        let right_w = if show_menu { MENU_ZONE - PAD + 6.0 } else { type_g.as_ref().map_or(0.0, |g| g.size().x + 8.0) };
+        let type_fits = type_g.is_some() && name_g.size().x + icons_w + right_w <= inner_w;
+        let name_max = (inner_w - icons_w - if type_fits || show_menu { right_w } else { 0.0 }).max(0.0);
+        let is_virtual = self.model.is_virtual_column(col);
+        let cy = rect.center().y;
+        let mut left = rect.left() + PAD;
+        let mut name_at = None;
+        if name_max > 4.0 {
+            let g = if name_g.size().x <= name_max && !is_virtual {
+                name_g
+            } else {
+                let mut job = LayoutJob::single_section(name.to_string(), TextFormat { font_id: name_font, color: theme.header_text, italics: is_virtual, ..Default::default() });
+                job.wrap = TextWrapping { max_width: name_max, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                painter.layout_job(job)
+            };
+            let w = g.size().x;
+            name_at = Some((pos2(left, cy - g.size().y / 2.0), g));
+            left += w + 6.0;
+        }
+        let mut key_at = None;
+        if let Some((icon, color)) = key
+            && left + icon_w <= rect.right() - PAD
+        {
+            key_at = Some((icon, color, pos2(left + icon_w / 2.0, cy)));
+            left += icon_w + 6.0;
+        }
+        // Clear of ▾, which takes the right end of a hovered header.
+        let limit = if show_menu && rect.width() > MENU_ZONE + 8.0 { rect.right() - MENU_ZONE } else { rect.right() - PAD };
+        let sort = (sort_shown && left + icon_w <= limit).then(|| {
+            let center = pos2(left + icon_w / 2.0, cy);
+            let mut hit = Rect::from_center_size(center, vec2(icon_w + 8.0, icon_w + 9.0));
+            hit.max.x = hit.max.x.min(limit);
+            SortButton { center, hit, key: sort_key }
+        });
+        let type_at = type_g.filter(|_| type_fits).map(|g| (pos2(rect.right() - PAD - g.size().x, cy - g.size().y / 2.0), g));
+        HeaderCell { rect, hovered, menu_open, show_menu, name: name_at, key: key_at, sort, type_g: type_at }
+    }
+
+    /// The header, a [`Self::header_cell`] per visible column.
     fn paint_header(&mut self, ui: &Ui, geo: &Geo) {
         let painter = ui.painter_at(geo.header);
         let theme = self.theme;
         painter.rect_filled(geo.header, 0.0, theme.header_bg);
         let sx = self.state.rt.scroll_x;
         let cols = geo.visible_cols(sx);
-        let hover = ui.input(|i| i.pointer.hover_pos()).filter(|p| geo.header.contains(*p));
-        let key_cols: Vec<usize> = self.model.editability().as_ref().map(|t| t.key_columns.clone()).unwrap_or_default();
+        let hover = header_hover(ui, geo);
         let multi_sort = self.state.sort.len() > 1;
         let scale = self.font.size / 13.0;
         let name_font = ternarygrid_ui::style::semibold(ui.ctx(), (12.5 * scale * 2.0).round() / 2.0);
-        let type_font = FontId::monospace((10.5 * scale * 2.0).round() / 2.0);
         let icon_font = ternarygrid_ui::style::icon_font((13.0 * scale).round());
         let icon_w = (13.0 * scale).round();
         for pos in cols.clone() {
-            let col = geo.cols[pos];
-            let x0 = geo.col_left(pos, sx);
-            let x1 = geo.col_left(pos + 1, sx);
-            let r = Rect::from_min_max(pos2(x0, geo.header.top()), pos2(x1, geo.header.bottom() - 1.0));
-            let header_hover = hover.is_some_and(|p| r.contains(p));
+            let cell = self.header_cell(&painter, geo, pos, hover);
+            let r = cell.rect;
             if self.state.rt.selection.is_column_selected(pos) {
                 painter.rect_filled(r, 0.0, theme.header_selected_bg);
-            } else if header_hover {
+            } else if cell.hovered {
                 painter.rect_filled(r, 0.0, mix(theme.header_bg, theme.text, 0.05));
             }
-            let menu = Rect::from_min_max(pos2(r.right() - MENU_ZONE, r.top()), r.max);
-            let menu_open = self.state.rt.header_popup.is_some_and(|(c, ..)| c == col);
-            // The icons after the name: key or link, the sort arrow (and its rank).
-            let mut icons: [Option<(&str, Color32)>; 2] = [None, None];
-            if key_cols.contains(&col) {
-                icons[0] = Some((egui_phosphor::regular::KEY, theme.warn));
-            } else if self.model.foreign_key_for_column(col).is_some() {
-                icons[0] = Some((egui_phosphor::regular::LINK_SIMPLE, theme.weak));
-            }
-            let sort_idx = self.state.sort.iter().position(|k| k.column == col);
-            if let Some(i) = sort_idx {
-                let arrow = if self.state.sort[i].descending { egui_phosphor::regular::ARROW_DOWN } else { egui_phosphor::regular::ARROW_UP };
-                icons[1] = Some((arrow, theme.link));
-            }
-            let icons_w: f32 = icons.iter().flatten().count() as f32 * (icon_w + 6.0);
-            // The type at the right while it fits next to the name; ▾ instead while hovered.
-            let inner_w = r.width() - 2.0 * PAD;
-            let name = self.model.column_name(col);
-            let name_g = painter.layout_no_wrap(name.to_string(), name_font.clone(), theme.header_text);
-            let ty = self.model.column_meta(col).map(|m| m.type_name.as_str()).unwrap_or_default();
-            let show_menu = menu_open || header_hover;
-            // In lower case, as the mockups write every type (SQLite and MySQL report TEXT, VARCHAR).
-            let type_g = (!ty.is_empty() && !show_menu).then(|| painter.layout_no_wrap(ty.to_ascii_lowercase(), type_font.clone(), theme.weak));
-            let right_w = if show_menu { MENU_ZONE - PAD + 6.0 } else { type_g.as_ref().map_or(0.0, |g| g.size().x + 8.0) };
-            let type_fits = type_g.is_some() && name_g.size().x + icons_w + right_w <= inner_w;
-            let name_max = (inner_w - icons_w - if type_fits || show_menu { right_w } else { 0.0 }).max(0.0);
-            let is_virtual = self.model.is_virtual_column(col);
-            let mut left = r.left() + PAD;
-            if name_max > 4.0 {
-                let g = if name_g.size().x <= name_max && !is_virtual {
-                    name_g
-                } else {
-                    let mut job =
-                        LayoutJob::single_section(name.to_string(), TextFormat { font_id: name_font.clone(), color: theme.header_text, italics: is_virtual, ..Default::default() });
-                    job.wrap = TextWrapping { max_width: name_max, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-                    painter.layout_job(job)
-                };
-                let w = g.size().x;
+            if let Some((at, g)) = cell.name {
                 // The name in the mockups' semibold.
-                ternarygrid_ui::kit::paint_semibold(&painter, pos2(left, r.center().y - g.size().y / 2.0), g, theme.header_text);
-                left += w + 6.0;
+                ternarygrid_ui::kit::paint_semibold(&painter, at, g, theme.header_text);
             }
-            for (icon, color) in icons.into_iter().flatten() {
-                if left + icon_w > r.right() - PAD {
-                    break;
+            if let Some((icon, color, at)) = cell.key {
+                painter.text(at, Align2::CENTER_CENTER, icon, icon_font.clone(), color);
+            }
+            if let Some(button) = &cell.sort {
+                let over = hover.is_some_and(|p| button.hit.contains(p));
+                if over {
+                    painter.rect_filled(button.hit, CornerRadius::same(4), mix(theme.header_bg, theme.text, 0.10));
                 }
-                painter.text(pos2(left + icon_w / 2.0, r.center().y), Align2::CENTER_CENTER, icon, icon_font.clone(), color);
-                if multi_sort && icon != egui_phosphor::regular::KEY && icon != egui_phosphor::regular::LINK_SIMPLE {
+                let (icon, color) = match button.key {
+                    Some((_, k)) => (if k.descending { egui_phosphor::regular::ARROW_DOWN } else { egui_phosphor::regular::ARROW_UP }, theme.link),
+                    None => (egui_phosphor::regular::ARROWS_DOWN_UP, if over { theme.header_text } else { theme.weak }),
+                };
+                painter.text(button.center, Align2::CENTER_CENTER, icon, icon_font.clone(), color);
+                // Its rank in a sort by several columns.
+                if multi_sort && let Some((i, _)) = button.key {
                     let tiny = FontId::new(self.font.size * 0.6, self.font.family.clone());
-                    let n = sort_idx.map_or(0, |i| i + 1);
-                    painter.text(pos2(left + icon_w + 1.0, r.bottom() - 6.0), Align2::LEFT_BOTTOM, n.to_string(), tiny, theme.weak);
+                    painter.text(pos2(button.center.x + icon_w / 2.0 + 1.0, r.bottom() - 6.0), Align2::LEFT_BOTTOM, (i + 1).to_string(), tiny, theme.weak);
                 }
-                left += icon_w + 6.0;
             }
-            if type_fits && let Some(g) = type_g {
-                painter.galley(pos2(r.right() - PAD - g.size().x, r.center().y - g.size().y / 2.0), g, theme.weak);
+            if let Some((at, g)) = cell.type_g {
+                painter.galley(at, g, theme.weak);
             }
             // Column menu button (▾), while the header is hovered or its menu open.
-            if show_menu && r.width() > MENU_ZONE + 8.0 {
+            if cell.show_menu && r.width() > MENU_ZONE + 8.0 {
+                let menu = Rect::from_min_max(pos2(r.right() - MENU_ZONE, r.top()), r.max);
                 let menu_hover = hover.is_some_and(|p| menu.contains(p));
-                if menu_open || menu_hover {
+                if cell.menu_open || menu_hover {
                     painter.rect_filled(menu.shrink(4.0), CornerRadius::same(4), mix(theme.header_bg, theme.text, 0.10));
                 }
                 let small = FontId::new(self.font.size * 0.8, self.font.family.clone());
-                let color = if menu_open || menu_hover { theme.header_text } else { theme.weak };
+                let color = if cell.menu_open || menu_hover { theme.header_text } else { theme.weak };
                 painter.text(menu.center(), Align2::CENTER_CENTER, egui_phosphor::regular::CARET_DOWN, small, color);
             }
-            painter.vline((x1 - 0.5).round() + 0.5, r.y_range(), Stroke::new(1.0, theme.line));
+            painter.vline((r.right() - 0.5).round() + 0.5, r.y_range(), Stroke::new(1.0, theme.line));
         }
         painter.hline(geo.header.x_range(), geo.header.bottom() - 0.5, Stroke::new(1.0, theme.border));
         // Ghost of a column being moved.
@@ -780,4 +817,33 @@ fn place_text(glyphs: &mut GlyphCache, sink: &mut Sink<'_>, batch: &mut TextBatc
             placed
         }
     }
+}
+
+/// A header cell laid out by [`GridFrame::header_cell`].
+pub(super) struct HeaderCell {
+    pub rect: Rect,
+    pub hovered: bool,
+    pub menu_open: bool,
+    /// ▾ shows at the right (hovered, or its menu open) instead of the type.
+    pub show_menu: bool,
+    /// The name (cut with … to the room it has) and where it goes.
+    pub name: Option<(Pos2, std::sync::Arc<egui::Galley>)>,
+    /// The key or link icon, its colour and centre.
+    pub key: Option<(&'static str, Color32, Pos2)>,
+    pub sort: Option<SortButton>,
+    pub type_g: Option<(Pos2, std::sync::Arc<egui::Galley>)>,
+}
+
+/// The sort button of a header: the arrow of a sorted column, faint on a hovered one.
+pub(super) struct SortButton {
+    pub center: Pos2,
+    /// The area a click sorts in.
+    pub hit: Rect,
+    /// Its rank and key when the column is sorted.
+    pub key: Option<(usize, crate::view::SortKey)>,
+}
+
+/// The pointer over the header, if it is.
+pub(super) fn header_hover(ui: &Ui, geo: &Geo) -> Option<Pos2> {
+    ui.input(|i| i.pointer.hover_pos()).filter(|p| geo.header.contains(*p))
 }
