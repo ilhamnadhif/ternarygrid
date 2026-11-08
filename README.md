@@ -151,8 +151,9 @@ pwsh scripts/bundle-windows.ps1                        # Windows: installer and 
 1. **New connection** (or **Import connections from DBeaver**) on the welcome page — or click
    **Create sample database** to try everything on a small SQLite shop database.
 2. Open a SQL editor with `⌘]`, type a query and press `⌘↩`.
-3. Double-click a table in the navigator to edit its data; click a column header to sort it
-   (ascending → descending → off); `⌘S` saves the changes.
+3. Double-click a table in the navigator to edit its data; click a column header to select the
+   whole column, and the arrow after its name to sort it (ascending → descending → off); `⌘S`
+   saves the changes.
 
 ## Updates
 

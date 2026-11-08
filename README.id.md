@@ -153,8 +153,9 @@ pwsh scripts/bundle-windows.ps1                        # Windows: installer dan 
 1. Klik **New connection** (atau **Import connections from DBeaver**) di halaman awal — atau
    **Create sample database** untuk mencoba semua fitur dengan database toko SQLite kecil.
 2. Buka editor SQL dengan `⌘]`, ketik query, tekan `⌘↩`.
-3. Klik dua kali tabel di navigator untuk mengedit datanya; klik header kolom untuk mengurutkan
-   (naik → turun → mati); `⌘S` menyimpan perubahan.
+3. Klik dua kali tabel di navigator untuk mengedit datanya; klik header kolom untuk memilih
+   seluruh kolom, dan panah setelah namanya untuk mengurutkan (naik → turun → mati); `⌘S`
+   menyimpan perubahan.
 
 Tema diatur di **Settings → General**.
 

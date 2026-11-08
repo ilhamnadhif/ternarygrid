@@ -1449,6 +1449,8 @@ impl SqlEditorTab {
                 let manual = tx.as_ref().is_some_and(|t| t.mode == TransactionMode::Manual);
                 let pending = tx.as_ref().map(|t| t.log.len()).unwrap_or(0);
                 let open_tx = pending > 0 || tx.as_ref().is_some_and(|t| t.in_transaction);
+                // Reads alone (manual commit opens a transaction for a SELECT too) leave nothing to commit.
+                let changes = tx.as_ref().map_or(0, |t| t.pending_writes());
                 if transactions {
                     kit::vdivider(ui, 18.0);
                     // Auto-commit: a quiet check; Manual commit: the soft accent with a pause.
@@ -1468,15 +1470,15 @@ impl SqlEditorTab {
                         self.set_tx_mode(cx, if manual { TransactionMode::Auto } else { TransactionMode::Manual });
                     }
                 }
-                // Manual commit: Roll back, then Commit (filled while statements are pending; the
-                // count is on the Transaction log tab and in the status bar).
+                // Manual commit: Roll back, then Commit (filled while changes are pending; the
+                // count is in the status bar, the statements on the Transaction log tab).
                 if manual {
                     let (rollback, commit) = ui
                         .add_enabled_ui(open_tx, |ui| {
                             let rollback = kit::button_full(ui, kit::Kind::Secondary, Some(icon::ARROW_U_UP_LEFT), tr("Roll back"), true, false)
                                 .on_hover_text(tip(Action::Rollback))
                                 .clicked();
-                            let kind = if pending > 0 { kit::Kind::Primary } else { kit::Kind::Secondary };
+                            let kind = if changes > 0 { kit::Kind::Primary } else { kit::Kind::Secondary };
                             let commit = kit::button_full(ui, kind, Some(icon::CHECK), tr("Commit"), true, false).on_hover_text(tip(Action::Commit)).clicked();
                             (rollback, commit)
                         })
@@ -1750,20 +1752,21 @@ impl SqlEditorTab {
                 });
             }
             Bottom::Transaction => {
-                let (log, manual) = match &self.session {
+                let (log, manual, changes) = match &self.session {
                     SessionSlot::Ready(s) => {
                         let st = s.tx_state();
-                        (st.log, st.mode == TransactionMode::Manual)
+                        let changes = st.pending_writes();
+                        (st.log, st.mode == TransactionMode::Manual, changes)
                     }
-                    _ => (Vec::new(), false),
+                    _ => (Vec::new(), false, 0),
                 };
                 if log.is_empty() {
                     ui.add_space(8.0);
                     ui.label(RichText::new(tr("No uncommitted statements.")).color(ternarygrid_ui::pal(ui).text_muted));
                 } else {
-                    // What is pending, and the two ways out, above the log.
-                    // What is pending (Roll back and Commit are on the toolbar).
-                    if manual {
+                    // What is pending, above the log (Roll back and Commit are on the toolbar):
+                    // the changes, not the reads around them.
+                    if manual && changes > 0 {
                         let pal = ternarygrid_ui::pal(ui);
                         egui::Frame::new()
                             .fill(pal.modified)
@@ -1775,8 +1778,8 @@ impl SqlEditorTab {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 10.0;
                                     ui.label(RichText::new(icon::PAUSE).font(ternarygrid_ui::style::icon_font(16.0)).color(pal.warn));
-                                    let n = log.len();
-                                    let what = ternarygrid_core::trn(n, "1 statement is not committed yet.", "{} statements are not committed yet.");
+                                    let n = changes;
+                                    let what = ternarygrid_core::trn(n, "1 change is not committed yet.", "{} changes are not committed yet.");
                                     ui.label(RichText::new(what).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
                                     let rest = if n == 1 { tr("Other sessions do not see it until you commit.") } else { tr("Other sessions do not see them until you commit.") };
                                     ui.label(RichText::new(rest).color(pal.text_muted));

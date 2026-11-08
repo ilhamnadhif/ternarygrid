@@ -25,8 +25,8 @@ pub struct PendingTx {
     /// The tab (or "Navigator / data editor") owning the session.
     pub owner: String,
     pub session: SessionHandle,
-    /// Statements executed in the transaction.
-    pub statements: usize,
+    /// Writing statements in the transaction (its reads are nothing to commit).
+    pub changes: usize,
     pub since: Option<chrono::DateTime<chrono::Local>>,
 }
 
@@ -43,7 +43,7 @@ pub fn collect(dock: &DockState<Tab>, conns: &ConnectionManager) -> Vec<PendingT
         }
         let tx = s.tx_state();
         let conn_name = conns.config(conn).map(|c| c.name.clone()).unwrap_or_else(|| conn.to_string());
-        out.push(PendingTx { conn: conn.to_string(), conn_name, owner, statements: tx.log.len(), since: tx.log.first().map(|e| e.at), session: s });
+        out.push(PendingTx { conn: conn.to_string(), conn_name, owner, changes: tx.pending_writes(), since: tx.log.first().map(|e| e.at), session: s });
     };
     for (_, tab) in dock.iter_all_tabs() {
         if let (Some(conn), Some(s)) = (tab.view.connection_id(), tab.view.transaction_session()) {
@@ -110,8 +110,8 @@ impl PendingTxDialog {
         let mut open = true;
         let action: Cell<Option<(Option<usize>, bool)>> = Cell::new(None);
         let busy = self.busy();
-        let statements: usize = items.iter().map(|p| p.statements).sum();
-        let summary = trf("{} in {}", &[&trn(statements, "1 statement", "{} statements"), &trn(items.len(), "1 transaction", "{} transactions")]);
+        let changes: usize = items.iter().map(|p| p.changes).sum();
+        let summary = trf("{} in {}", &[&trn(changes, "1 change", "{} changes"), &trn(items.len(), "1 transaction", "{} transactions")]);
         let (resp, _) = Dialog::new(tr("Pending transactions")).icon(icon::PAUSE).width(dialogs::WIDTH_L).body_padding(egui::Margin::symmetric(20, 16)).show_window(
             ctx,
             egui::Id::new("pending_transactions"),
@@ -126,7 +126,7 @@ impl PendingTxDialog {
                 let cols = [
                     Column::new(tr("Connection"), W::Fr(1.6)),
                     Column::new(tr("Opened by"), W::Fr(1.0)),
-                    Column::new(tr("Statements"), W::Fr(0.7)).right(),
+                    Column::new(tr("Changes"), W::Fr(0.7)).right(),
                     Column::new(tr("Since"), W::Fr(0.7)),
                     Column::new("", W::Px(220.0)),
                 ];
@@ -145,7 +145,7 @@ impl PendingTxDialog {
                         0 => cell(ui, &tx.conn_name),
                         1 => cell(ui, &tx.owner),
                         2 => {
-                            ui.label(RichText::new(tx.statements.to_string()).color(p.text));
+                            ui.label(RichText::new(tx.changes.to_string()).color(p.text));
                         }
                         3 => {
                             ui.label(RichText::new(tx.since.map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_else(|| "—".into())).color(p.text));

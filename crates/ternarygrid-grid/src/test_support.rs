@@ -144,6 +144,22 @@ impl GridHarness {
         Pos2::new(header.left() + x - sx, header.center().y)
     }
 
+    /// A point on the name of the header at `pos` (left of its icons).
+    pub fn header_name(&self, pos: usize) -> Pos2 {
+        let (_, header, _, _) = self.geometry();
+        let left = if pos == 0 { header.left() } else { self.header_border(pos - 1).x };
+        Pos2::new(left + 10.0, header.center().y)
+    }
+
+    /// Centre of the sort button of the header at `pos`, hovering the header first (an
+    /// unsorted column shows its button only then).
+    pub fn sort_button(&mut self, pos: usize) -> Pos2 {
+        let p = self.header_name(pos);
+        self.frame(vec![Event::PointerMoved(p)]);
+        let col = self.state.visible_columns()[pos];
+        self.state.rt.sort_buttons.iter().find(|(c, _)| *c == col).map(|(_, r)| r.center()).expect("the hovered header shows its sort button")
+    }
+
     pub fn click_at(&mut self, p: Pos2, button: PointerButton, modifiers: Modifiers) {
         self.frame_mods(vec![Event::PointerMoved(p)], modifiers);
         self.frame_mods(vec![press(p, button, modifiers)], modifiers);

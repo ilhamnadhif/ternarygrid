@@ -61,7 +61,8 @@ Status: ☐ open · ☑ done (with the test that covers it).
   — `ternarygrid-grid::grid::tests::insert_before_copy_adjacent_uuid_and_columns`, `…::fit_hide_empty_highlight_and_zoom`, menu sweep in `ternarygrid-app::ui_full`
 - ☑ Save the current filter / order as the table's default and reset it (project virtual model)
   — `ternarygrid-app::data_edit_e2e::default_filter_per_table`
-- ☑ Toggle the sort order of a column: click the header (ascending → descending → off)
+- ☑ Toggle the sort order of a column: click the arrow after its name in the header (ascending → descending → off); a click on the header selects the column
+  — `ternarygrid-grid::grid::tests::the_sort_button_sorts_client_and_server`, `…::a_header_click_selects_the_whole_column`
 
 ## 5. Workspace and layout
 

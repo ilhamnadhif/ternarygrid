@@ -3,6 +3,19 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.7 — 2026-11-08
+
+A click on a column header selects the whole column, and the status bar counts only the changes that wait for a commit.
+
+### Changed
+- **A click on a column header selects the whole column**, down to the last row, as in a spreadsheet: Shift-click selects up to that column, ⌘-click adds it, and a drag still moves it. Sorting has its own button, the arrow after the column's name: faint while the pointer is over the header, in colour while the column is sorted. A click on it sorts ascending, descending, then back to the original order; Shift-click adds the column to the sort. The column menu (▾ or right-click) still sorts too.
+
+### Fixed
+- **"Manual commit · 2 pending" with nothing to commit**: the status bar counted every statement of the open transaction, SELECTs included (manual commit mode opens a transaction for a read too), while Pending transactions lists only changes, so a click on it found none. It now counts the statements that change data, as Pending transactions does (its column is now Changes, counted the same way); reads alone show "Manual commit".
+- In the SQL editor, Commit was highlighted and the Transaction log said "statements are not committed yet" after reads alone. Both now follow the changes.
+- A change made early in a long manual transaction was forgotten once 2,000 more statements had run: the transaction log keeps the last 2,000, and with the change gone from it, Pending transactions did not list it and closing the tab or quitting did not warn. Changes are now counted apart from the log.
+- The status bar no longer shows changes pending on a session whose connection was lost: the server rolled them back.
+
 ## 0.6.6 — 2026-11-06
 
 The AI assistant works on a whole database, and opens on the one you are working in.

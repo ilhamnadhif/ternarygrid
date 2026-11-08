@@ -22,6 +22,18 @@ pub struct TxState {
     pub mode: TransactionMode,
     pub in_transaction: bool,
     pub log: Vec<TxLogEntry>,
+    /// Writing statements logged in the transaction. Counted apart from the log, which
+    /// drops its oldest entries: an early INSERT stays pending after many SELECTs.
+    pub writes: usize,
+}
+
+impl TxState {
+    /// Changes waiting for a commit or a rollback: the writing statements of the open
+    /// transaction. Manual commit mode opens one for a SELECT too, which leaves nothing
+    /// to commit.
+    pub fn pending_writes(&self) -> usize {
+        if self.in_transaction { self.writes } else { 0 }
+    }
 }
 
 struct OpenCursor {
@@ -188,8 +200,7 @@ impl SessionHandle {
 
     /// An open transaction with changes (manual commit mode opens one for a SELECT too).
     pub fn has_uncommitted_writes(&self) -> bool {
-        let tx = self.inner.tx.lock();
-        tx.in_transaction && tx.log.iter().any(|e| ternarygrid_sql::classify(&e.sql, self.inner.dialect.syntax()).is_write)
+        self.inner.tx.lock().pending_writes() > 0
     }
 
     pub fn clear_tx_log(&self) {
@@ -249,6 +260,7 @@ impl SessionHandle {
         tx.in_transaction = s.in_transaction();
         if !tx.in_transaction {
             tx.log.clear();
+            tx.writes = 0;
         }
         if s.is_closed() {
             self.inner.closed.store(true, Ordering::Relaxed);
@@ -258,7 +270,11 @@ impl SessionHandle {
     fn log_tx(&self, sql: &str, started: Instant, rows: Option<u64>, ok: bool) {
         let mut tx = self.inner.tx.lock();
         if tx.in_transaction || tx.mode == TransactionMode::Manual {
-            tx.log.push(TxLogEntry { sql: sql.chars().take(4000).collect(), at: chrono::Local::now(), duration: started.elapsed(), rows, ok });
+            let sql: String = sql.chars().take(4000).collect();
+            if ternarygrid_sql::classify(&sql, self.inner.dialect.syntax()).is_write {
+                tx.writes += 1;
+            }
+            tx.log.push(TxLogEntry { sql, at: chrono::Local::now(), duration: started.elapsed(), rows, ok });
             if tx.log.len() > 2000 {
                 tx.log.remove(0);
             }
@@ -832,6 +848,38 @@ mod tests {
         // One statement is all or nothing by itself.
         let (n, committed) = h.apply_changes(&stmts[..1]).await.unwrap();
         assert_eq!((n, committed), (1, false));
+    }
+
+    #[tokio::test]
+    async fn pending_changes_are_the_writes_and_outlive_the_log() {
+        let h = SessionHandle::new(sqlite("pending").await, "pending", None);
+        h.execute_update("CREATE TABLE t (id INTEGER)", &[]).await.unwrap();
+        h.set_transaction_mode(TransactionMode::Manual).await.unwrap();
+        let select = |h: &SessionHandle| {
+            let h = h.clone();
+            async move {
+                h.execute("SELECT 1", &[], &ExecOptions::default()).await.unwrap();
+                h.close_cursor().await;
+            }
+        };
+        // Reads alone leave nothing to commit, logged or not.
+        select(&h).await;
+        select(&h).await;
+        assert_eq!(h.tx_state().pending_writes(), 0);
+        assert!(!h.has_uncommitted_writes());
+        h.execute_update("INSERT INTO t VALUES (1)", &[]).await.unwrap();
+        assert_eq!(h.tx_state().pending_writes(), 1);
+        // The log keeps the last 2000 statements: the INSERT leaves it, and stays pending.
+        for _ in 0..2001 {
+            select(&h).await;
+        }
+        let tx = h.tx_state();
+        assert!(tx.log.iter().all(|e| !e.sql.starts_with("INSERT")), "the INSERT left the log");
+        assert_eq!(tx.pending_writes(), 1);
+        assert!(h.has_uncommitted_writes());
+        h.commit().await.unwrap();
+        assert_eq!(h.tx_state().pending_writes(), 0);
+        assert!(!h.has_uncommitted_writes());
     }
 
     #[tokio::test]

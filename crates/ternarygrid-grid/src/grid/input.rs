@@ -14,8 +14,6 @@ use egui::{CursorIcon, Event, EventFilter, Key, Response, Sense, Ui, vec2};
 
 /// Width of the column resize grab zone (each side of the border).
 const RESIZE_GRAB: f32 = 4.0;
-/// Width of the sort indicator zone at the right of a header cell.
-pub(super) const SORT_ZONE: f32 = 16.0;
 /// Width of the column menu button (▾) at the right of a header.
 pub(super) const MENU_ZONE: f32 = 24.0;
 
@@ -26,6 +24,7 @@ impl GridFrame<'_> {
         let body = ui.interact(self.geo.body, id, Sense::click_and_drag());
         let header = ui.interact(self.geo.header, id.with("header"), Sense::click_and_drag());
         self.header_menu_buttons(ui);
+        let sort_buttons = self.header_sort_buttons(ui);
         let rownums = ui.interact(self.geo.rownums, id.with("rownums"), Sense::click_and_drag());
         let corner = ui.interact(self.geo.corner, id.with("corner"), Sense::click());
         if std::mem::take(&mut self.state.rt.focus_request) {
@@ -49,7 +48,7 @@ impl GridFrame<'_> {
             self.wheel(ui);
         }
         self.scrollbars(ui);
-        self.header_input(ui, &header);
+        self.header_input(ui, &header, &sort_buttons);
         self.rownum_input(ui, &rownums);
         self.body_input(ui, &body);
         if corner.clicked() {
@@ -190,7 +189,54 @@ impl GridFrame<'_> {
         }
     }
 
-    fn header_input(&mut self, ui: &mut Ui, header: &Response) {
+    /// The sort button of every visible header that shows one (the arrow of a sorted
+    /// column, a faint one on the hovered header): a click sorts ascending → descending →
+    /// unsorted, Shift / ⌘ add the column to the sort. Returns their areas: a press there
+    /// does not select the column.
+    fn header_sort_buttons(&mut self, ui: &mut Ui) -> Vec<egui::Rect> {
+        let sx = self.state.rt.scroll_x;
+        let hover = super::paint::header_hover(ui, &self.geo);
+        let painter = ui.painter().clone();
+        let range = self.geo.visible_cols(sx);
+        let mut buttons = Vec::new();
+        for pos in range.start..range.end.min(self.geo.cols.len()) {
+            let col = self.geo.cols[pos];
+            let hovered = hover.is_some_and(|p| (self.geo.col_left(pos, sx)..self.geo.col_left(pos + 1, sx)).contains(&p.x));
+            if !hovered && !self.state.sort.iter().any(|k| k.column == col) {
+                continue;
+            }
+            if let Some(b) = self.header_cell(&painter, &self.geo, pos, hover).sort {
+                let hit = b.hit.intersect(self.geo.header);
+                if hit.width() > 0.0 && hit.height() > 0.0 {
+                    buttons.push((col, hit, b.key.map(|(_, k)| k)));
+                }
+            }
+        }
+        self.state.rt.sort_buttons = buttons.iter().map(|&(col, hit, _)| (col, hit)).collect();
+        let mods = ui.input(|i| i.modifiers);
+        for &(col, hit, key) in &buttons {
+            let resp = ui.interact(hit, self.id.with(("column_sort", col)), Sense::click());
+            let action = match key {
+                None => tr("Sort ascending"),
+                Some(k) if !k.descending => tr("Sort descending"),
+                Some(_) => tr("Clear sorting"),
+            };
+            let name = self.model.column_name(col).to_string();
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{action}: {name}")));
+            if resp.clicked() {
+                ui.memory_mut(|m| m.request_focus(self.id));
+                let keys = next_sort(&self.state.sort, col, mods.shift || mods.command);
+                apply_sort(self.model, self.state, self.options, keys, &self.ctx, &mut self.actions);
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            resp.on_hover_text(format!("{action}\n{}", tr("Shift-click to sort by several columns")));
+        }
+        buttons.into_iter().map(|(_, hit, _)| hit).collect()
+    }
+
+    fn header_input(&mut self, ui: &mut Ui, header: &Response, sort_buttons: &[egui::Rect]) {
         let sx = self.state.rt.scroll_x;
         let hover = header.hover_pos().or_else(|| header.interact_pointer_pos());
         // Resize zone near column borders.
@@ -212,6 +258,7 @@ impl GridFrame<'_> {
         } else if let Some(p) = hover
             && matches!(self.state.rt.drag, Drag::None)
             && self.state.rt.header_popup.is_none()
+            && !sort_buttons.iter().any(|r| r.contains(p))
             && let Some(pos) = self.geo.col_at(p.x, sx, false)
         {
             // The hovered header's name and database type (the icon shows only
@@ -236,8 +283,11 @@ impl GridFrame<'_> {
                 let col = self.geo.cols[pos];
                 self.state.rt.drag = Drag::Resize { col, start_width: self.state.column_width(col), start_x: p.x };
             } else if let Some(pos) = self.geo.col_at(p.x, sx, false) {
-                let right = self.geo.col_left(pos + 1, sx);
-                if p.x < right - SORT_ZONE - MENU_ZONE {
+                // A press on the header selects its whole column (Shift: up to it, ⌘: added)
+                // and may start moving it; not on its sort button or ▾.
+                let (left, right) = (self.geo.col_left(pos, sx), self.geo.col_left(pos + 1, sx));
+                let on_menu = right - left > MENU_ZONE + 8.0 && p.x >= right - MENU_ZONE;
+                if !on_menu && !sort_buttons.iter().any(|r| r.contains(p)) {
                     let sel = &mut self.state.rt.selection;
                     if mods.shift {
                         let anchor = sel.anchor().col;
@@ -294,19 +344,6 @@ impl GridFrame<'_> {
         {
             let col = self.geo.cols[pos];
             self.autosize_column(ui, col);
-        }
-        // A click on a header (not a drag, not on a resize border) cycles the
-        // sort of that column: ascending → descending → unsorted. Shift / ⌘
-        // add the column to the existing sort. (The ▾ buttons on top of the
-        // header open the column menu.)
-        if header.clicked()
-            && let Some(p) = header.interact_pointer_pos()
-            && let Some(pos) = self.geo.col_at(p.x, sx, false)
-            && resize_target(self, p.x).is_none()
-        {
-            let col = self.geo.cols[pos];
-            let keys = next_sort(&self.state.sort, col, mods.shift || mods.command);
-            apply_sort(self.model, self.state, self.options, keys, &self.ctx, &mut self.actions);
         }
     }
 
@@ -1194,7 +1231,7 @@ const FIT_SAMPLE_ROWS: usize = 100;
 const HIDE_EMPTY_CHUNK: usize = 4096;
 const HIDE_EMPTY_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Next sort keys after clicking the sort indicator of `col`:
+/// Next sort keys after clicking the sort button of `col`:
 /// ascending → descending → none. `add` keeps other keys (multi-column sort).
 pub(crate) fn next_sort(current: &[SortKey], col: usize, add: bool) -> Vec<SortKey> {
     let existing = current.iter().find(|k| k.column == col).copied();

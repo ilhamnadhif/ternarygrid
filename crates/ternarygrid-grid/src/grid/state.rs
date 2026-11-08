@@ -149,6 +149,8 @@ pub(crate) struct Runtime {
     pub last_selection_label: String,
     /// Geometry of the last frame: body, header, row numbers, row height.
     pub last_geometry: Option<(egui::Rect, egui::Rect, egui::Rect, f32)>,
+    /// The sort buttons the headers showed on the last frame: (column, area).
+    pub sort_buttons: Vec<(usize, egui::Rect)>,
     /// Body shapes of the last frame, repeated when the store is busy.
     pub body_cache: Option<BodyCache>,
     /// Column whose header menu (▾) is open, its anchor and whether it was
