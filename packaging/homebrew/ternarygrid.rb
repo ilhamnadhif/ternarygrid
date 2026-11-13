@@ -3,8 +3,8 @@
 # then update `version` and `sha256` (printed by the script). Install it with:
 #   brew install --cask ./packaging/homebrew/ternarygrid.rb
 cask "ternarygrid" do
-  version "0.6.7"
-  sha256 "6417584c4de79bc6d73bc2d92632a9ff26ec5be851544e5377ab7e53f7c89737"
+  version "0.6.8"
+  sha256 "372f733367d4fa4b9b3b35a50ed4a4e9947ae869e09cfbba78001ecfb51d3f03"
 
   url "https://github.com/ilhamnadhif/ternarygrid/releases/download/v#{version}/TernaryGrid-#{version}.dmg"
   name "TernaryGrid"
