@@ -902,13 +902,13 @@ impl DocLayout {
         let n = self.lines.len();
         let mut first_changed = n;
         let mut r = 0;
-        for l in 0..n {
+        for (l, line) in self.lines.iter_mut().enumerate() {
             while r < ranges.len() && ranges[r].end <= l {
                 r += 1;
             }
             let hide = r < ranges.len() && ranges[r].contains(&l);
-            if self.lines[l].hidden != hide {
-                self.lines[l].hidden = hide;
+            if line.hidden != hide {
+                line.hidden = hide;
                 first_changed = first_changed.min(l);
             }
         }

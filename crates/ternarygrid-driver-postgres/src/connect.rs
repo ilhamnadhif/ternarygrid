@@ -434,13 +434,7 @@ fn set_user_timeout(tcp: &TcpStream, t: Duration) -> io::Result<()> {
     let secs = t.as_secs().clamp(1, i32::MAX as u64) as libc::c_int;
     // SAFETY: a valid socket descriptor and a pointer to an int of the size given.
     let r = unsafe {
-        libc::setsockopt(
-            tcp.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            TCP_RXT_CONNDROPTIME,
-            (&secs as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
+        libc::setsockopt(tcp.as_raw_fd(), libc::IPPROTO_TCP, TCP_RXT_CONNDROPTIME, (&secs as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t)
     };
     if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }

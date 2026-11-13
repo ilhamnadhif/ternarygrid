@@ -413,10 +413,8 @@ fn read_raw(format: &str, head: &ResponseHead, body: crate::http::BodyReader, tx
     {
         return Err(e);
     }
-    if !batch.is_empty() && !emit(tx, state, Event::Rows(batch)) {
-        return Ok(false);
-    }
-    Ok(true)
+    // The last rows, unless the reader is gone.
+    Ok(batch.is_empty() || emit(tx, state, Event::Rows(batch)))
 }
 
 // ------------------------------------------------------------------ cursor

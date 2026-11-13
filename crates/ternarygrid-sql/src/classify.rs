@@ -1070,8 +1070,8 @@ impl<'a> Sig<'a> {
     /// Index of the `)` matching the `(` at `i`.
     fn close_paren(&self, i: usize) -> usize {
         let mut depth = 0i32;
-        for j in i..self.t.len() {
-            match self.t[j].kind {
+        for (j, t) in self.t.iter().enumerate().skip(i) {
+            match t.kind {
                 TokenKind::LParen => depth += 1,
                 TokenKind::RParen => {
                     depth -= 1;
@@ -1088,8 +1088,8 @@ impl<'a> Sig<'a> {
     /// First index >= `from` at parenthesis depth 0 satisfying `pred`.
     fn find_top(&self, from: usize, pred: impl Fn(usize) -> bool) -> Option<usize> {
         let mut depth = 0i32;
-        for j in from..self.t.len() {
-            match self.t[j].kind {
+        for (j, t) in self.t.iter().enumerate().skip(from) {
+            match t.kind {
                 TokenKind::LParen => depth += 1,
                 TokenKind::RParen => depth -= 1,
                 _ if depth <= 0 && pred(j) => return Some(j),

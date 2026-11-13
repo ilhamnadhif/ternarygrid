@@ -14,6 +14,10 @@ After the computer sleeps, a connection's dot tells the truth, and an open table
 - **SSH tunnels**: an SSH session that stopped answering after a sleep was replaced, but the connections it carried stayed open with nothing behind them. They now end at once, and their sessions open again.
 - **PostgreSQL**: a statement sent on a connection that died fails within a minute instead of after the system's retransmissions (minutes); the `tcp_user_timeout` property sets it in milliseconds, as in libpq, and 0 leaves it to the system. A navigator read waiting on a dead connection ends when the connection is given up, and closing a session no longer leaves its connection running in the background.
 
+### Security
+- The SQLite built into TernaryGrid is updated for CVE-2026-119375 (RUSTSEC-2026-0459).
+- The SSH library is updated to 0.65 (RUSTSEC-2026-0495; the flaw is in its agent server, which TernaryGrid does not use).
+
 ## 0.6.7 — 2026-11-08
 
 A click on a column header selects the whole column, and the status bar counts only the changes that wait for a commit.

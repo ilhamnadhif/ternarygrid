@@ -203,11 +203,7 @@ impl SessionHandle {
 
     /// The error of an operation ended because the session was closed or given up.
     fn closed_error(&self) -> DbError {
-        if self.inner.closed_here.load(Ordering::Relaxed) {
-            DbError::connection("The session was closed")
-        } else {
-            DbError::connection("The connection to the server was lost")
-        }
+        if self.inner.closed_here.load(Ordering::Relaxed) { DbError::connection("The session was closed") } else { DbError::connection("The connection to the server was lost") }
     }
 
     /// `op`, or a connection error as soon as the session is given up.
@@ -376,33 +372,34 @@ impl SessionHandle {
     pub async fn execute(&self, sql: &str, params: &[Value], opts: &ExecOptions) -> DbResult<Executed> {
         let started = Instant::now();
         let busy = self.busy();
-        let res = self.killable(async {
-            let mut guard = self.lock().await;
-            let was_in_tx = guard.in_transaction();
-            let mut cursor = guard.execute(sql, params, opts).await?;
-            let header = cursor.next_result().await;
-            let messages = cursor.take_messages();
-            self.refresh_tx(guard.as_ref());
-            // A ROLLBACK typed in an editor ends the transaction like the Rollback button:
-            // results saved inside it reload.
-            if was_in_tx && !guard.in_transaction() && ends_with_rollback(sql) {
-                self.inner.rollbacks.fetch_add(1, Ordering::Relaxed);
-            }
-            let header = header?;
-            let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
-            // Store the cursor before releasing the session so no other
-            // operation can slip in while the cursor owns the connection.
-            let rows = matches!(header, Some(ResultHeader::Rows(_)));
-            *self.inner.cursor.lock().await = Some(OpenCursor { token, cursor });
-            *self.inner.cursor_used.lock() = Instant::now();
-            drop(guard);
-            // Rows left to read hold the cursor open (an INSERT's is gone at once).
-            if rows {
-                self.watch_idle_cursor();
-            }
-            Ok(Executed { token, header, messages })
-        })
-        .await;
+        let res = self
+            .killable(async {
+                let mut guard = self.lock().await;
+                let was_in_tx = guard.in_transaction();
+                let mut cursor = guard.execute(sql, params, opts).await?;
+                let header = cursor.next_result().await;
+                let messages = cursor.take_messages();
+                self.refresh_tx(guard.as_ref());
+                // A ROLLBACK typed in an editor ends the transaction like the Rollback button:
+                // results saved inside it reload.
+                if was_in_tx && !guard.in_transaction() && ends_with_rollback(sql) {
+                    self.inner.rollbacks.fetch_add(1, Ordering::Relaxed);
+                }
+                let header = header?;
+                let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
+                // Store the cursor before releasing the session so no other
+                // operation can slip in while the cursor owns the connection.
+                let rows = matches!(header, Some(ResultHeader::Rows(_)));
+                *self.inner.cursor.lock().await = Some(OpenCursor { token, cursor });
+                *self.inner.cursor_used.lock() = Instant::now();
+                drop(guard);
+                // Rows left to read hold the cursor open (an INSERT's is gone at once).
+                if rows {
+                    self.watch_idle_cursor();
+                }
+                Ok(Executed { token, header, messages })
+            })
+            .await;
         drop(busy);
         match &res {
             Ok(ex) => {

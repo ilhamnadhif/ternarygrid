@@ -264,7 +264,7 @@ fn open_connection(cfg: &OpenConfig) -> DbResult<Connection> {
     conn.map_err(|e| open_error(e, cfg))
 }
 
-fn configure(conn: &Connection, cfg: &OpenConfig, shared: &Arc<Shared>) -> DbResult<()> {
+fn configure(conn: &mut Connection, cfg: &OpenConfig, shared: &Arc<Shared>) -> DbResult<()> {
     conn.busy_handler(Some(busy_handler as fn(i32) -> bool))
         .db()?;
     let progress_shared = Arc::clone(shared);
@@ -377,7 +377,7 @@ pub(crate) fn run(
     ready: oneshot::Sender<DbResult<(Arc<Shared>, ServerInfo, String)>>,
 ) {
     BUSY_TIMEOUT_MS.set(u64::try_from(cfg.busy_timeout.as_millis()).unwrap_or(u64::MAX));
-    let conn = match open_connection(&cfg) {
+    let mut conn = match open_connection(&cfg) {
         Ok(c) => c,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -393,7 +393,7 @@ pub(crate) fn run(
     });
     THREAD_SHARED.with(|s| *s.borrow_mut() = Some(Arc::clone(&shared)));
     let _guard = AliveGuard(Arc::clone(&shared));
-    if let Err(e) = configure(&conn, &cfg, &shared) {
+    if let Err(e) = configure(&mut conn, &cfg, &shared) {
         let _ = ready.send(Err(e));
         return;
     }
@@ -777,12 +777,10 @@ impl Worker {
     ) -> (Vec<ColumnMeta>, Vec<Conv>, Vec<bool>) {
         let decls: Vec<(String, Option<String>)> = stmt
             .columns()
-            .iter()
             .map(|c| (c.name().to_string(), c.decl_type().map(str::to_string)))
             .collect();
         let origins: Vec<(Option<String>, Option<String>, Option<String>)> = stmt
             .columns_with_metadata()
-            .iter()
             .map(|m| {
                 (
                     m.database_name().map(str::to_string),

@@ -880,7 +880,10 @@ async fn black_holed_session_is_replaced() {
     // waiting for ever (no keepalives here) on a session that does not answer.
     let mut rest = Vec::new();
     let ended = tokio::time::timeout(Duration::from_secs(10), kept.read_to_end(&mut rest)).await;
-    assert!(ended.is_ok(), "the connection over the replaced session ended");
+    assert!(
+        ended.is_ok(),
+        "the connection over the replaced session ended"
+    );
 
     // ensure_connected() also detects an unresponsive session.
     relay.freeze_existing();
