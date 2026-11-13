@@ -376,7 +376,13 @@ impl TernaryGridApp {
                         // `version()` texts repeat the product ("PostgreSQL 16.4 on …"): show the number.
                         Some(live) => {
                             let number = live.server.version.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit())).unwrap_or("");
-                            (p.ok, format!("{} {number}", live.server.product).trim().to_string())
+                            let server = format!("{} {number}", live.server.product).trim().to_string();
+                            match self.conns.status(&loc.conn) {
+                                // Lost: it connects again by itself; checking: the computer slept.
+                                crate::conn::ConnStatus::Lost => (p.err, format!("{server} · {}", tr("Connection lost, reconnecting…"))),
+                                crate::conn::ConnStatus::Checking => (p.warn, format!("{server} · {}", tr("Checking the connection…"))),
+                                _ => (p.ok, server),
+                            }
                         }
                         None => match self.conns.status(&loc.conn) {
                             crate::conn::ConnStatus::Connecting => (p.warn, tr("Connecting…").to_string()),

@@ -10,7 +10,8 @@ use session::SessionHandle;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant, SystemTime};
 use ternarygrid_config::ConnectionStore;
 use ternarygrid_config::settings::TimeZoneChoice;
 use ternarygrid_core::config::{AuthMethod, ConnectionConfig, ConnectionType, SecretSlot};
@@ -42,7 +43,13 @@ pub struct TunnelGuard {
     pub local_port: u16,
     pub alive: Box<dyn Fn() -> bool + Send + Sync>,
     pub guard: Box<dyn std::any::Any + Send + Sync>,
+    /// Makes sure the tunnel still carries traffic (after the computer slept): SSH
+    /// sessions that no longer answer are replaced, and what went through them ends.
+    pub check: Option<TunnelCheck>,
 }
+
+/// See [`TunnelGuard::check`].
+pub type TunnelCheck = Box<dyn Fn() -> futures::future::BoxFuture<'static, DbResult<()>> + Send + Sync>;
 
 /// Credentials collected before connecting (from the secret store or prompts).
 #[derive(Clone, Default)]
@@ -67,9 +74,35 @@ pub enum ConnStatus {
     Disconnected,
     Connecting,
     Connected,
+    /// Connected, and being checked (the computer slept: its connections may be dead
+    /// without knowing it yet).
+    Checking,
     Failed(String),
-    /// The connection broke after being established.
+    /// The connection broke after being established (it connects again by itself).
     Lost,
+}
+
+/// Every connection made and every revive gets a new number: a tab whose session
+/// failed tries again by itself once its connection's number changed.
+static EPOCHS: AtomicU64 = AtomicU64::new(0);
+
+fn next_epoch() -> u64 {
+    EPOCHS.fetch_add(1, AtomicOrdering::Relaxed) + 1
+}
+
+/// How long a connection being checked may take to answer before it counts as lost.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The computer slept (or TernaryGrid did not run) between two polls at `prev` and
+/// `now`: the wall clock moved on more than the monotonic one (which stops during
+/// sleep on macOS and Linux), or the polls, due every few seconds while connections
+/// are open, were more than a minute apart (Windows' monotonic clock counts sleep).
+/// A false alarm only costs a check of the connections.
+pub fn slept(prev: (Instant, SystemTime), now: (Instant, SystemTime)) -> bool {
+    let mono = now.0.saturating_duration_since(prev.0);
+    // A clock set back is no sleep.
+    let Ok(wall) = now.1.duration_since(prev.1) else { return false };
+    wall > mono + Duration::from_secs(10) || wall > Duration::from_secs(60)
 }
 
 /// A connected connection.
@@ -88,11 +121,12 @@ pub struct LiveConnection {
     /// Sessions opened for tabs (editors, data tabs): closed on disconnect too,
     /// so that none keeps running with the old settings, transactions or locks.
     tab_sessions: Arc<parking_lot::Mutex<Vec<crate::conn::session::WeakSession>>>,
-    /// A ping of `main` after another session of the connection was lost (is the
-    /// server gone or just that session?).
-    health_probe: Option<Job<DbResult<()>>>,
     /// Opens `main` again after it was lost.
     revive: Revive,
+    /// The connection is being checked ([`ConnectionManager::check_all`]).
+    verify: Option<Job<()>>,
+    /// Changes when the connection is opened again (see [`EPOCHS`]).
+    epoch: u64,
     pub server: ServerInfo,
     pub meta: MetadataCache,
     pub connected_at: Instant,
@@ -169,6 +203,14 @@ async fn keep_alive_loop(session: session::WeakSession, secs: u32, stop: tokio_u
 }
 
 impl LiveConnection {
+    /// Every open session of the connection: main, other databases', tabs'.
+    fn sessions(&self) -> Vec<SessionHandle> {
+        let mut out = vec![self.main.clone()];
+        out.extend(self.db_sessions.values().filter_map(|l| l.get().cloned()));
+        out.extend(self.tab_sessions.lock().iter().filter_map(|w| w.upgrade()));
+        out
+    }
+
     /// A catalog folder of this connection's dialect.
     pub fn catalog_folder(&self, id: &str) -> Option<&ternarygrid_core::catalog::CatalogFolder> {
         self.catalog_folders.iter().find(|f| f.id == id)
@@ -234,14 +276,9 @@ impl LiveConnection {
     }
 
     /// When a session of a tab or of another database lost its connection (the data
-    /// tab's insert failed with "connection closed"), ping the main session: if the
-    /// server is gone, the connection shows as lost (red) instead of connected.
-    fn check_health(&mut self, backend: &Backend) {
-        if let Some(job) = self.health_probe.as_mut()
-            && job.poll().is_some()
-        {
-            self.health_probe = None;
-        }
+    /// tab's insert failed with "connection closed"), the connection is checked: if the
+    /// server is gone, it shows as lost (red) instead of connected.
+    fn check_health(&mut self, backend: &Backend, timeout: Duration) {
         // Each closed session is looked at once: tab sessions are forgotten, a closed
         // session of another database is opened again on its next use.
         let mut lost = {
@@ -257,9 +294,8 @@ impl LiveConnection {
             }
             _ => true,
         });
-        if lost > 0 && self.health_probe.is_none() && !self.main.is_closed() {
-            let main = self.main.clone();
-            self.health_probe = Some(backend.spawn(async move { main.ping().await }));
+        if lost > 0 && !self.main.is_closed() {
+            self.start_verify(backend, timeout);
         }
         self.revive_main(backend);
     }
@@ -292,6 +328,7 @@ impl LiveConnection {
                     }
                     self._keepalive = KeepAlive::start(backend, &s, self.config.init.keep_alive_secs);
                     self.main = s;
+                    self.epoch = next_epoch();
                     self.revive.next = None;
                     self.revive.failures = 0;
                     // What failed to load meanwhile loads again.
@@ -325,6 +362,20 @@ impl LiveConnection {
             init_session(s.as_mut(), &cfg, &params).await?;
             Ok(SessionHandle::new(s, format!("{} (main)", cfg.name), database))
         })));
+    }
+
+    /// Check the connection's sessions now (see [`verify_sessions`]); a check already
+    /// running is not repeated.
+    fn start_verify(&mut self, backend: &Backend, timeout: Duration) {
+        if self.verify.is_some() || self.main.is_closed() {
+            return;
+        }
+        let mut others: Vec<SessionHandle> = self.db_sessions.values().filter_map(|l| l.get().cloned()).collect();
+        others.extend(self.tab_sessions.lock().iter().filter_map(|w| w.upgrade()));
+        others.retain(|s| !s.is_closed());
+        let tunnel = self.tunnel.as_ref().and_then(|t| t.check.as_ref()).map(|check| check());
+        let main = self.main.clone();
+        self.verify = Some(backend.spawn(verify_sessions(main, others, tunnel, timeout)));
     }
 
     fn revive_due(&self) -> bool {
@@ -385,6 +436,54 @@ impl LiveConnection {
             list.retain(|w| w.upgrade().is_some_and(|s| !s.is_closed()));
             list.push(handle.downgrade());
             Ok(handle)
+        }
+    }
+}
+
+/// Check a connection's sessions (the computer slept, or a session of it was lost):
+/// each must answer within `timeout` or is given up as lost (a lost main session
+/// connects again by itself, and tabs open new sessions). A session running a
+/// statement is not interrupted, unless the connection turned out dead (main, or
+/// another session asked in its place, gave no answer): then every session of it is
+/// given up.
+async fn verify_sessions(main: SessionHandle, others: Vec<SessionHandle>, tunnel: Option<futures::future::BoxFuture<'static, DbResult<()>>>, timeout: Duration) {
+    use session::Health;
+    // Through a tunnel, its SSH sessions first: one that no longer answers is replaced,
+    // and the connections it carried end (they read as lost below).
+    if let Some(check) = tunnel {
+        match tokio::time::timeout(timeout, check).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::info!("tunnel check: {e}"),
+            Err(_) => tracing::info!("tunnel check: no answer within {} s", timeout.as_secs()),
+        }
+    }
+    let main_health = main.check(timeout).await;
+    let silent = |h: &Health| matches!(h, Health::Silent);
+    let mut dead = silent(&main_health);
+    if !dead {
+        // Each other session answers for itself. When main could not be asked (in use),
+        // one with a result left open (a data tab between pages) is asked instead: its
+        // result is closed first, as one left unread for long (it reads on by running its
+        // query again). When main answered, such results are left alone: their sessions
+        // went the same way as main.
+        let probe_results = matches!(main_health, Health::Busy);
+        let checks = others.iter().map(|s| async move {
+            if probe_results && !s.is_busy() && s.has_open_cursor() && tokio::time::timeout(timeout, s.close_cursor()).await.is_err() {
+                s.abandon(true);
+                return Health::Silent;
+            }
+            s.check(timeout).await
+        });
+        let results = futures::future::join_all(checks).await;
+        // An idle session that did not answer while main could not be asked: the
+        // connection is dead.
+        dead = matches!(main_health, Health::Busy) && results.iter().any(silent);
+    }
+    if dead {
+        tracing::info!("{}: the server does not answer; connecting again", main.label());
+        main.abandon(true);
+        for s in &others {
+            s.abandon(true);
         }
     }
 }
@@ -676,6 +775,10 @@ pub struct ConnectionManager {
     pub time_zone: TimeZoneChoice,
     /// Ids whose connect finished this frame (for UI reactions like expanding the tree).
     pub just_connected: Vec<String>,
+    /// Clocks at the last poll: a sleep of the computer shows as a gap between them.
+    last_poll: Option<(Instant, SystemTime)>,
+    /// How long a connection being checked may take to answer ([`CHECK_TIMEOUT`]).
+    pub check_timeout: Duration,
     /// The store changed and should be written to disk.
     pub dirty: bool,
 }
@@ -695,6 +798,8 @@ impl ConnectionManager {
             pgpass: None,
             time_zone: TimeZoneChoice::default(),
             just_connected: Vec::new(),
+            last_poll: None,
+            check_timeout: CHECK_TIMEOUT,
             dirty: false,
         }
     }
@@ -779,6 +884,9 @@ impl ConnectionManager {
             if l.main.is_closed() || !l.tunnel_alive() {
                 return ConnStatus::Lost;
             }
+            if l.verify.is_some() {
+                return ConnStatus::Checking;
+            }
             return ConnStatus::Connected;
         }
         if let Some(e) = self.failed.get(id) {
@@ -793,6 +901,22 @@ impl ConnectionManager {
 
     pub fn is_connecting(&self) -> bool {
         !self.connecting.is_empty()
+    }
+
+    /// Changes whenever the connection `id` is opened again (connect, reconnect, a lost
+    /// main session revived); 0 when it is not connected.
+    pub fn epoch(&self, id: &str) -> u64 {
+        self.live.get(id).map_or(0, |l| l.epoch)
+    }
+
+    /// Check every connection now: each session must answer, or it is given up (the
+    /// connection turns red, connects again by itself, and its tabs read on new
+    /// sessions). Done by [`poll`](Self::poll) when the computer slept.
+    pub fn check_all(&mut self, backend: &Backend) {
+        let timeout = self.check_timeout;
+        for live in self.live.values_mut() {
+            live.start_verify(backend, timeout);
+        }
     }
 
     /// Connect with a draft configuration and disconnect again ("Test connection").
@@ -897,6 +1021,14 @@ impl ConnectionManager {
     /// Poll connect jobs and keep-alive. Call once per frame.
     pub fn poll(&mut self, backend: &Backend) {
         self.just_connected.clear();
+        let now = (Instant::now(), SystemTime::now());
+        if let Some(prev) = self.last_poll.replace(now)
+            && slept(prev, now)
+            && !self.live.is_empty()
+        {
+            tracing::info!("the computer slept: checking the connections");
+            self.check_all(backend);
+        }
         self.abandoned.retain_mut(|(job, after)| match job.poll() {
             Some(Ok(c)) => {
                 backend.spawn_detached(close_connected(c, after.take()));
@@ -936,8 +1068,9 @@ impl ConnectionManager {
                                 main,
                                 db_sessions: HashMap::new(),
                                 tab_sessions: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                                health_probe: None,
                                 revive: Revive::default(),
+                                verify: None,
+                                epoch: next_epoch(),
                                 server: c.server,
                                 meta: MetadataCache::default(),
                                 connected_at: Instant::now(),
@@ -961,7 +1094,10 @@ impl ConnectionManager {
             for s in live.db_sessions.values_mut() {
                 s.poll();
             }
-            live.check_health(backend);
+            if live.verify.as_mut().is_some_and(|j| j.poll().is_some()) {
+                live.verify = None;
+            }
+            live.check_health(backend, self.check_timeout);
         }
         let ids: Vec<String> = self.live.iter().filter(|(_, l)| l.needs_new_tunnel()).map(|(id, _)| id.clone()).collect();
         for id in ids {
@@ -999,6 +1135,11 @@ impl ConnectionManager {
     /// Disconnect, closing all sessions in the background.
     pub fn disconnect(&mut self, backend: &Backend, id: &str) {
         if let Some(live) = self.live.remove(id) {
+            // Closed for its tabs at once: they open new sessions (after a reconnect)
+            // instead of waiting on these, which may never answer again.
+            for s in live.sessions() {
+                s.mark_closed_here();
+            }
             backend.spawn_detached(close_live(live));
         }
         // A connect still running: its session and tunnel are closed once it finishes.
@@ -1038,19 +1179,13 @@ impl ConnectionManager {
     }
 }
 
-/// Close a connection's sessions and tunnel, then run its after-disconnect command.
+/// Close a connection's sessions (together: each is bounded, one that does not answer
+/// is given up) and tunnel, then run its after-disconnect command.
 async fn close_live(live: LiveConnection) {
     let after = live.config.init.shell_after_disconnect.clone();
-    live.main.cancel_and_close().await;
-    for s in live.db_sessions.values() {
-        if let Some(s) = s.get() {
-            s.cancel_and_close().await;
-        }
-    }
-    let tab_sessions: Vec<SessionHandle> = std::mem::take(&mut *live.tab_sessions.lock()).iter().filter_map(|w| w.upgrade()).collect();
-    for s in tab_sessions {
-        s.cancel_and_close().await;
-    }
+    let sessions = live.sessions();
+    live.tab_sessions.lock().clear();
+    futures::future::join_all(sessions.iter().map(|s| s.cancel_and_close())).await;
     drop(live.tunnel);
     run_after_disconnect(after).await;
 }
@@ -1131,7 +1266,18 @@ impl NetConnector for TunnelNet {
         }
         let tunnel = Arc::new(ternarygrid_net::open_tunnel(spec).await?);
         let alive = tunnel.clone();
-        Ok(Some(TunnelGuard { local_host: tunnel.local_host(), local_port: tunnel.local_port(), alive: Box::new(move || alive.is_alive()), guard: Box::new(tunnel) }))
+        let checked = tunnel.clone();
+        let check: TunnelCheck = Box::new(move || {
+            let t = checked.clone();
+            Box::pin(async move { t.ensure_connected().await })
+        });
+        Ok(Some(TunnelGuard {
+            local_host: tunnel.local_host(),
+            local_port: tunnel.local_port(),
+            alive: Box::new(move || alive.is_alive()),
+            guard: Box::new(tunnel),
+            check: Some(check),
+        }))
     }
 }
 
@@ -1260,6 +1406,102 @@ mod tests {
         });
         wait_for("the after-disconnect command", || marker.exists());
         assert!(!cm.is_connected(&id));
+    }
+
+    #[test]
+    fn a_sleep_shows_in_the_clocks() {
+        let (t, w) = (Instant::now(), SystemTime::now());
+        let at = |mono: u64, wall: u64| (t + Duration::from_secs(mono), w + Duration::from_secs(wall));
+        assert!(!slept((t, w), at(5, 5)), "polls 5 s apart");
+        assert!(!slept((t, w), at(5, 9)), "a small clock correction");
+        assert!(slept((t, w), at(5, 600)), "slept 10 minutes: the monotonic clock stopped");
+        assert!(slept((t, w), at(70, 70)), "no poll for over a minute (a monotonic clock that counts sleep)");
+        assert!(!slept((t, w), (t + Duration::from_secs(5), w - Duration::from_secs(3600))), "a clock set back");
+    }
+
+    #[cfg(unix)]
+    fn connected(backend: &Backend, dir: &std::path::Path) -> (ConnectionManager, String, String) {
+        let marker = dir.join("after");
+        let (mut cm, id) = manager_with(dir, &marker, None);
+        cm.connect(backend, &id, Credentials::default()).unwrap();
+        wait_for("connect", || {
+            cm.poll(backend);
+            cm.is_connected(&id)
+        });
+        (cm, id, dir.join("rm.db").display().to_string())
+    }
+
+    /// After the computer slept every connection is checked: one that answers stays
+    /// as it was; one that does not turns red and connects again by itself, and the
+    /// other sessions on the same dead path are given up too (their tabs open new ones).
+    #[cfg(unix)]
+    #[test]
+    fn connections_are_checked_after_a_sleep() {
+        let backend = Backend::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut cm, id, file) = connected(&backend, dir.path());
+        let epoch = cm.epoch(&id);
+        assert!(epoch > 0);
+        let main = cm.live(&id).unwrap().main.clone();
+        // The poll notices the sleep in its clocks.
+        cm.last_poll = Some((Instant::now(), SystemTime::now() - Duration::from_secs(600)));
+        cm.poll(&backend);
+        assert_eq!(cm.status(&id), ConnStatus::Checking);
+        wait_for("checked", || {
+            cm.poll(&backend);
+            cm.status(&id) == ConnStatus::Connected
+        });
+        assert!(cm.live(&id).unwrap().main.same(&main) && !main.is_closed(), "a connection that answers is kept");
+        assert_eq!(cm.epoch(&id), epoch);
+
+        // Its sessions went silent (half-open after the sleep).
+        let (silent_main, main_silent) = backend.block_on(session::testing::silenceable(&file, "main"));
+        let (tab, tab_silent) = backend.block_on(session::testing::silenceable(&file, "tab"));
+        cm.live_mut(&id).unwrap().main = silent_main.clone();
+        cm.live(&id).unwrap().tab_sessions.lock().push(tab.downgrade());
+        main_silent.store(true, std::sync::atomic::Ordering::SeqCst);
+        tab_silent.store(true, std::sync::atomic::Ordering::SeqCst);
+        cm.check_timeout = Duration::from_millis(300);
+        cm.check_all(&backend);
+        assert_eq!(cm.status(&id), ConnStatus::Checking, "not green before it answered");
+        wait_for("lost", || {
+            cm.poll(&backend);
+            silent_main.is_lost()
+        });
+        assert!(tab.is_lost(), "the tab's session on the dead path is given up too");
+        wait_for("connected again", || {
+            cm.poll(&backend);
+            cm.status(&id) == ConnStatus::Connected && !cm.live(&id).unwrap().main.same(&silent_main)
+        });
+        assert_ne!(cm.epoch(&id), epoch, "tabs see that the connection is back");
+        let ping = backend.block_on(cm.live(&id).unwrap().main.ping());
+        assert!(ping.is_ok(), "{ping:?}");
+    }
+
+    /// Disconnect (or Reconnect) while a tab's statement waits on a session that went
+    /// silent: the tab sees its session closed at once, the statement ends, and the
+    /// after-disconnect command runs.
+    #[cfg(unix)]
+    #[test]
+    fn disconnecting_does_not_wait_for_a_silent_session() {
+        let backend = Backend::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut cm, id, file) = connected(&backend, dir.path());
+        let (tab, silent) = backend.block_on(session::testing::silenceable(&file, "tab"));
+        cm.live(&id).unwrap().tab_sessions.lock().push(tab.downgrade());
+        silent.store(true, std::sync::atomic::Ordering::SeqCst);
+        let running = {
+            let tab = tab.clone();
+            backend.spawn(async move { tab.execute("SELECT 1", &[], &ternarygrid_core::driver::ExecOptions::default()).await.map(|_| ()) })
+        };
+        wait_for("the statement to wait", || tab.is_busy());
+        cm.disconnect(&backend, &id);
+        assert!(tab.is_closed(), "closed for its tab at once");
+        assert_eq!(cm.status(&id), ConnStatus::Disconnected);
+        let mut running = running;
+        wait_for("the statement to end", || running.is_finished());
+        assert!(running.poll().unwrap().is_err_and(|e| e.is_connection_lost()));
+        wait_for("the after-disconnect command", || dir.path().join("after").exists());
     }
 
     #[test]

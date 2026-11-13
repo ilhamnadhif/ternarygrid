@@ -257,7 +257,7 @@ impl ResultPanel {
     /// Keep the grid model in sync with the fetch job.
     pub(crate) fn poll(&mut self, cx: &mut AppContext) {
         // A "fetch all" ends its operation itself (see `ResultSource::fetch_more`).
-        self.src.poll();
+        self.src.poll_with(Some(cx.backend));
         // A new store (refresh, requery), or other columns (foreign key navigation, ALTER):
         // the model follows; other columns need their editability resolved again.
         if self.columns_seen != self.src.columns_version {

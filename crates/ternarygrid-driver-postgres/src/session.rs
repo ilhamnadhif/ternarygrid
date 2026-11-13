@@ -359,8 +359,12 @@ impl PgSession {
 
     async fn shutdown(&mut self) {
         self.client = None;
-        if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        if let Some(mut task) = self.task.take()
+            && tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err()
+        {
+            // A request still waits on a connection that no longer answers (the task
+            // sends Terminate only once nothing does): dropped, not left running.
+            task.abort();
         }
         self.shared.set_closed(None);
     }
@@ -819,6 +823,19 @@ impl Drop for PgSession {
     fn drop(&mut self) {
         // Dropping the client makes the connection task send Terminate and exit.
         self.client = None;
+        // Unless a request still waits on a connection that no longer answers: the
+        // task is given the time a close has, then dropped.
+        if let Some(task) = self.task.take()
+            && !task.is_finished()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            rt.spawn(async move {
+                let abort = task.abort_handle();
+                if tokio::time::timeout(Duration::from_secs(5), task).await.is_err() {
+                    abort.abort();
+                }
+            });
+        }
     }
 }
 

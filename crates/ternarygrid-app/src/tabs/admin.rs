@@ -23,6 +23,9 @@ use ternarygrid_visual::dashboard::{DashboardLayout, DashboardState, show_dashbo
 pub struct AdminSession {
     session: Loadable<SessionHandle>,
     runtime: Option<tokio::runtime::Handle>,
+    /// The connection's [`epoch`](crate::conn::ConnectionManager::epoch) when the
+    /// session was opened: one that failed opens again by itself once it changed.
+    epoch: u64,
 }
 
 impl AdminSession {
@@ -42,6 +45,16 @@ impl AdminSession {
             }
             self.session = Loadable::NotLoaded;
         }
+        // Connecting (a reconnect): the session opens once it is connected.
+        if cx.conns.live(conn).is_none() && cx.conns.status(conn) == crate::conn::ConnStatus::Connecting {
+            egui::Frame::new().inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| parts::spinner_label(ui, tr("Connecting…")));
+            return None;
+        }
+        // Failed while the connection was lost: it is back, so opening again.
+        let epoch = cx.conns.epoch(conn);
+        if matches!(self.session, Loadable::Failed(_)) && epoch != self.epoch && cx.conns.status(conn) == crate::conn::ConnStatus::Connected {
+            self.session = Loadable::NotLoaded;
+        }
         let Some(live) = cx.conns.live(conn) else {
             kit::empty_state(ui, icon::PLUGS, tr("The connection is closed."), tr("Connect to see the server's state."), |ui| {
                 if kit::primary_icon(ui, icon::PLUGS_CONNECTED, tr("Connect")).clicked() {
@@ -53,6 +66,7 @@ impl AdminSession {
         match &self.session {
             Loadable::NotLoaded => {
                 self.runtime = Some(cx.backend.handle());
+                self.epoch = epoch;
                 let database = database.filter(|_| live.multiple_databases()).map(str::to_string);
                 self.session = Loadable::Loading(live.open_session_job(cx.backend, format!("{} ({label})", live.config.name), database));
             }
@@ -71,6 +85,19 @@ impl AdminSession {
         }
         egui::Frame::new().inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| parts::spinner_label(ui, tr("Opening a session…")));
         None
+    }
+}
+
+impl AdminSession {
+    /// Give the session up (closed in the background) and open a new one on the next
+    /// use: after a cancel that the server may never answer, the next try does not
+    /// wait on the same connection.
+    pub fn reset(&mut self) {
+        if let (Loadable::Loaded(s), Some(rt)) = (&self.session, &self.runtime) {
+            let s = s.clone();
+            rt.spawn(async move { s.close().await });
+        }
+        self.session = Loadable::NotLoaded;
     }
 }
 

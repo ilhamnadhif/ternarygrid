@@ -356,6 +356,10 @@ impl Chain {
         Ok(session)
     }
 
+    /// Replace `session` by a new one on the next use. It is disconnected too: the
+    /// connections forwarded through it end now (their clients read the end) instead of
+    /// waiting on a session that no longer answers until its keepalives give up, or for
+    /// ever without keepalives.
     async fn invalidate(&self, index: usize, session: &Arc<SshSession>) {
         if let Some(HopRuntime::Ssh(hop)) = self.hops.get(index) {
             let mut guard = hop.session.lock().await;
@@ -363,6 +367,10 @@ impl Chain {
                 *guard = None;
             }
         }
+        let old = session.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(PROBE_TIMEOUT, old.disconnect()).await;
+        });
     }
 
     /// Liveness probe timeout of an SSH hop: at most [`PROBE_TIMEOUT`], less
