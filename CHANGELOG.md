@@ -3,6 +3,17 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.8 — 2026-11-13
+
+After the computer sleeps, a connection's dot tells the truth, and an open table never stays on "Reading data…".
+
+### Fixed
+- **A dead connection stayed green after the computer slept.** Nothing checked an idle connection (the keep-alive is off by default), and a connection that died during the sleep often still looks open: what is sent is accepted, and nothing ever comes back. TernaryGrid now notices the sleep and checks every connection. The dot turns amber ("Checking the connection…") for a moment, then green again, or red when the server no longer answers; a red connection then connects again by itself and turns green. The status bar says so too ("Connection lost, reconnecting…"); before, it showed a lost connection in green.
+- **A table stuck on "Reading data…" or "fetching…", even after Reconnect.** A statement waiting on a dead connection held its session, so Disconnect and Reconnect waited for it for ever and the tab kept the dead session; only closing the tab helped. Closing a session now waits a few seconds at most. After Reconnect, or once a connection found dead after a sleep is back, open tables read on by themselves: a first page loads again, and a page being read continues where the rows end, none twice and none missing.
+- **Cancel and Stop always stop.** Cancel on "Reading data…" stops at once, and Retry reads through a new session. Stop in the grid ends a page the server never sends within 5 seconds. A session that no longer answers after a cancel is replaced, unless it holds changes not committed yet (Reconnect asks about those).
+- **SSH tunnels**: an SSH session that stopped answering after a sleep was replaced, but the connections it carried stayed open with nothing behind them. They now end at once, and their sessions open again.
+- **PostgreSQL**: a statement sent on a connection that died fails within a minute instead of after the system's retransmissions (minutes); the `tcp_user_timeout` property sets it in milliseconds, as in libpq, and 0 leaves it to the system. A navigator read waiting on a dead connection ends when the connection is given up, and closing a session no longer leaves its connection running in the background.
+
 ## 0.6.7 — 2026-11-08
 
 A click on a column header selects the whole column, and the status bar counts only the changes that wait for a commit.

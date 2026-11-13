@@ -44,6 +44,9 @@ pub(crate) struct SessionShared {
     /// released (or rolled back to, when the statement failed or was
     /// cancelled) before the next round trip.
     pub stmt_savepoint: AtomicBool,
+    /// The task driving the connection: aborted to drop a connection that no longer
+    /// answers, so that everything waiting on it fails at once.
+    task: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl SessionShared {
@@ -56,7 +59,25 @@ impl SessionShared {
             cursor_open: AtomicBool::new(false),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             stmt_savepoint: AtomicBool::new(false),
+            task: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn set_task(&self, task: tokio::task::AbortHandle) {
+        *self.task.lock() = Some(task);
+    }
+
+    /// Drop the connection now, without a round trip: the socket closes and every
+    /// request waiting for an answer fails with "connection closed". For a
+    /// connection that went silent (half-open after the computer slept), whose
+    /// requests would otherwise wait until the operating system gives up on it.
+    pub(crate) fn abort(&self, reason: &str) {
+        if !self.is_closed() {
+            self.set_closed(Some(reason.to_string()));
+        }
+        if let Some(t) = self.task.lock().take() {
+            t.abort();
+        }
     }
 
     pub(crate) fn push_notice(&self, m: ServerMessage) {
@@ -203,6 +224,11 @@ pub(crate) struct Props {
     pub keepalives_idle: Duration,
     pub keepalives_interval: Duration,
     pub keepalives_count: u32,
+    /// How long data sent may stay unacknowledged before the connection is dropped
+    /// (libpq's `tcp_user_timeout`, in milliseconds; 0 leaves it to the system).
+    /// Keepalives only probe an idle connection: without this, a statement sent into
+    /// a connection that died would wait for the system's retransmissions (minutes).
+    pub tcp_user_timeout: Option<Duration>,
     pub connect_timeout: Option<Duration>,
     pub ssl_mode_override: Option<SslMode>,
 }
@@ -257,6 +283,7 @@ impl Props {
             keepalives_idle: Duration::from_secs(60),
             keepalives_interval: Duration::from_secs(15),
             keepalives_count: 4,
+            tcp_user_timeout: None,
             connect_timeout: None,
             ssl_mode_override: None,
         };
@@ -302,6 +329,10 @@ impl Props {
                     Ok(n) => p.keepalives_count = n.max(1),
                     Err(_) => tracing::warn!(property = "keepalives_count", "ignoring invalid value"),
                 },
+                "tcp_user_timeout" => match v.parse::<u64>() {
+                    Ok(ms) => p.tcp_user_timeout = Some(Duration::from_millis(ms)),
+                    Err(_) => tracing::warn!(property = "tcp_user_timeout", "ignoring invalid value"),
+                },
                 "connect_timeout" | "connecttimeout" | "logintimeout" => {
                     if let Some(d) = parse_secs(&k, v)
                         && !d.is_zero()
@@ -326,6 +357,17 @@ impl Props {
             }
         }
         p
+    }
+
+    /// The `tcp_user_timeout` in effect: the property, else as long as the keepalives
+    /// take to give up on a server that went silent (60 s by default). `None`: the
+    /// system's (minutes).
+    pub(crate) fn user_timeout(&self) -> Option<Duration> {
+        match self.tcp_user_timeout {
+            Some(d) if d.is_zero() => None,
+            Some(d) => Some(d),
+            None => Some(self.keepalives_interval * self.keepalives_count),
+        }
     }
 
     /// Value of the `options` startup parameter.
@@ -368,7 +410,44 @@ async fn open_stream(host: &str, port: u16, props: &Props) -> DbResult<PgStream>
             tracing::debug!("cannot enable TCP keepalive: {e}");
         }
     }
+    if let Some(t) = props.user_timeout()
+        && let Err(e) = set_user_timeout(&tcp, t)
+    {
+        tracing::debug!("cannot set the TCP user timeout: {e}");
+    }
     Ok(PgStream::Tcp(tcp))
+}
+
+/// Drop the connection when data sent stays unacknowledged for `t` (`TCP_USER_TIMEOUT`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_user_timeout(tcp: &TcpStream, t: Duration) -> io::Result<()> {
+    socket2::SockRef::from(tcp).set_tcp_user_timeout(Some(t))
+}
+
+/// Drop the connection when data sent stays unacknowledged for `t`: macOS calls it
+/// `TCP_RXT_CONNDROPTIME` (seconds).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_user_timeout(tcp: &TcpStream, t: Duration) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    /// `<netinet/tcp.h>`: retransmissions stop and the connection drops after this many seconds.
+    const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80;
+    let secs = t.as_secs().clamp(1, i32::MAX as u64) as libc::c_int;
+    // SAFETY: a valid socket descriptor and a pointer to an int of the size given.
+    let r = unsafe {
+        libc::setsockopt(
+            tcp.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_RXT_CONNDROPTIME,
+            (&secs as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+fn set_user_timeout(_tcp: &TcpStream, _t: Duration) -> io::Result<()> {
+    Ok(())
 }
 
 /// A freshly opened connection.
@@ -465,7 +544,16 @@ pub(crate) async fn open(params: &ConnectParams) -> DbResult<Connected> {
             }
         }
     });
-    let cancel = Arc::new(PgCancelHandle { token: client.cancel_token(), host: params.host.clone(), port: params.port, tls: tls.clone(), props: props.clone(), timeout });
+    shared.set_task(task.abort_handle());
+    let cancel = Arc::new(PgCancelHandle {
+        token: client.cancel_token(),
+        host: params.host.clone(),
+        port: params.port,
+        tls: tls.clone(),
+        props: props.clone(),
+        timeout,
+        shared: shared.clone(),
+    });
     Ok(Connected { client, shared, cancel, task, props })
 }
 
@@ -479,6 +567,7 @@ pub(crate) struct PgCancelHandle {
     tls: TlsSetup,
     props: Props,
     timeout: Duration,
+    shared: Arc<SessionShared>,
 }
 
 impl PgCancelHandle {
@@ -504,6 +593,10 @@ impl PgCancelHandle {
 impl CancelHandle for PgCancelHandle {
     async fn cancel(&self) -> DbResult<()> {
         self.send().await
+    }
+
+    fn abort_connection(&self) {
+        self.shared.abort("closed by TernaryGrid: the server did not answer");
     }
 }
 
@@ -536,6 +629,16 @@ mod tests {
         assert!(o.starts_with("-c work_mem=8MB"), "{o}");
         assert!(o.contains("-c search_path=app,\\ public"), "{o}");
         assert!(o.contains("-c statement_timeout=5000"), "{o}");
+    }
+
+    /// Data sent on a connection that died is given up after the keepalives' time
+    /// unless the property (milliseconds, as libpq) says otherwise; 0 is the system's.
+    #[test]
+    fn tcp_user_timeout() {
+        assert_eq!(Props::parse(&params(&[])).user_timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(Props::parse(&params(&[("keepalives_interval", "5"), ("keepalives_count", "3")])).user_timeout(), Some(Duration::from_secs(15)));
+        assert_eq!(Props::parse(&params(&[("tcp_user_timeout", "30000")])).user_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(Props::parse(&params(&[("tcp_user_timeout", "0")])).user_timeout(), None);
     }
 
     #[test]

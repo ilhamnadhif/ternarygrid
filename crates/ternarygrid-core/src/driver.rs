@@ -152,6 +152,12 @@ pub trait QueryCursor: Send {
 #[async_trait]
 pub trait CancelHandle: Send + Sync {
     async fn cancel(&self) -> DbResult<()>;
+
+    /// Drop the session's connection at once, without a round trip (it no longer
+    /// answers): every request still waiting on it fails with a connection error
+    /// instead of waiting until the operating system gives up on the socket.
+    /// Drivers that cannot do so leave it to the caller to stop waiting.
+    fn abort_connection(&self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

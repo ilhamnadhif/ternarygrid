@@ -393,7 +393,7 @@ impl NetConnector for FakeTunnels {
         *self.alive.lock() = alive.clone();
         self.opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let alive = Box::new(move || alive.load(std::sync::atomic::Ordering::SeqCst));
-        Ok(Some(TunnelGuard { local_host: host.to_string(), local_port: port, alive, guard: Box::new(()) }))
+        Ok(Some(TunnelGuard { local_host: host.to_string(), local_port: port, alive, guard: Box::new(()), check: None }))
     }
 }
 

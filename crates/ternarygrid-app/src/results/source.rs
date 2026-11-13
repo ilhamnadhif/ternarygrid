@@ -14,6 +14,10 @@ use ternarygrid_core::driver::{ExecOptions, ResultHeader, ServerMessage};
 use ternarygrid_core::rowstore::{RowStore, SharedRowStore};
 use ternarygrid_core::{ColumnMeta, DbError, DbResult, Dialect, Value};
 
+/// How long a stopped fetch waits for the server's cancel, and a session afterwards
+/// for the server's answer.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+
 /// Outcome of a fetch job.
 pub struct FetchBatch {
     pub added: usize,
@@ -38,6 +42,11 @@ pub struct ResultSource {
     fetch_job: Option<Job<DbResult<FetchBatch>>>,
     /// Operation of the running fetch ("fetch all"); the fetch ends it.
     fetch_op: Option<OpHandle>,
+    /// Rows the running (or last) fetch asked for: fetched again on a new session.
+    fetch_want: usize,
+    /// Stopped while its query ran: the server was asked to cancel it; a fetch that has
+    /// not ended by then is stopped here (a connection that went silent never answers).
+    stop_deadline: Option<Instant>,
     /// Rows of the cursor's result in the store (saved new rows are not), less the
     /// saved deletions: how far a re-executed query skips to continue.
     server_rows: usize,
@@ -72,6 +81,8 @@ impl ResultSource {
             exhausted: token.is_none(),
             fetch_job: None,
             fetch_op: None,
+            fetch_want: 0,
+            stop_deadline: None,
             server_rows: 0,
             fetch_store_len: 0,
             error: None,
@@ -127,6 +138,8 @@ impl ResultSource {
         self.fetch_started = Some(Instant::now());
         self.fetch_store_len = self.store.lock().len();
         self.fetch_op = op.clone();
+        self.fetch_want = n;
+        self.stop_deadline = None;
         let session = self.session.clone();
         let store = self.store.clone();
         let sql = self.sql.clone();
@@ -145,9 +158,27 @@ impl ResultSource {
 
     /// Apply finished fetches.
     pub fn poll(&mut self) {
+        self.poll_with(None);
+    }
+
+    /// [`poll`](Self::poll), able to give up a session whose stopped query never ended.
+    pub fn poll_with(&mut self, backend: Option<&Backend>) {
+        if let Some(t) = self.stop_deadline
+            && Instant::now() >= t
+            && self.fetch_job.as_ref().is_some_and(|j| !j.is_finished())
+        {
+            self.stop_deadline = None;
+            self.cancel_fetch();
+            self.error = Some(DbError::query(ternarygrid_core::tr("The query was stopped: the server did not answer the cancel.")));
+            if let Some(backend) = backend {
+                let s = self.session.clone();
+                backend.spawn_detached(async move { s.settle_after_cancel(STOP_WAIT).await });
+            }
+        }
         if let Some(job) = self.fetch_job.as_mut() {
             if let Some(res) = job.poll() {
                 self.fetch_job = None;
+                self.stop_deadline = None;
                 // The first page of a new run (refresh, server filter): its time is the query's.
                 if self.server_rows == 0
                     && self.fetch_store_len == 0
@@ -209,6 +240,10 @@ impl ResultSource {
     /// running is cancelled on the server, so the session stays usable and the
     /// fetch ends with the server's "cancelled"; reading more pages of an open
     /// cursor is stopped here.
+    ///
+    /// Whatever the server does, the fetch ends: one whose query the server does not
+    /// cancel within [`STOP_WAIT`] is stopped here, and a session that then does not
+    /// answer is given up (the result reads on through a new one).
     pub fn stop(&mut self, backend: &Backend) {
         if self.fetch_job.is_none() {
             return;
@@ -216,10 +251,45 @@ impl ResultSource {
         if self.token.is_none() && self.session.can_cancel() {
             let session = self.session.clone();
             backend.spawn_detached(async move {
-                let _ = session.cancel().await;
+                let _ = tokio::time::timeout(STOP_WAIT, session.cancel()).await;
             });
+            self.stop_deadline = Some(Instant::now() + STOP_WAIT);
+            if let Some(ctx) = backend.context() {
+                ctx.request_repaint_after(STOP_WAIT);
+            }
         } else {
+            // A page takes a moment: one still waited for after seconds came from a
+            // connection that may have gone silent.
+            let slow = self.fetch_started.is_some_and(|t| t.elapsed() >= STOP_WAIT);
             self.cancel_fetch();
+            if slow {
+                let s = self.session.clone();
+                backend.spawn_detached(async move { s.settle_after_cancel(STOP_WAIT).await });
+            }
+        }
+    }
+
+    /// The result's session was replaced (lost, reconnected): read on through `session`.
+    /// A fetch still waiting on the old one, or one that failed with it, runs again from
+    /// the rows already shown (the query is run again and skips them).
+    pub fn rehome(&mut self, backend: &Backend, session: SessionHandle) {
+        if self.session.same(&session) {
+            return;
+        }
+        let refetch = self.fetch_job.is_some() || self.error.as_ref().is_some_and(DbError::is_connection_lost);
+        self.cancel_fetch();
+        self.stop_deadline = None;
+        self.session = session;
+        // Its cursor was on the old session (a token there may name another cursor here).
+        self.token = None;
+        if !self.rerun_safe {
+            // A statement that writes is not run again behind the user's back.
+            self.exhausted = true;
+            return;
+        }
+        if refetch && !self.exhausted {
+            self.error = None;
+            self.fetch_more(backend, self.fetch_want.max(1), None);
         }
     }
 
@@ -433,6 +503,88 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         ops.collect();
+    }
+
+    /// A database file with the numbers 1..=`n` in `t`.
+    fn numbered(backend: &Backend, dir: &std::path::Path, n: usize) -> String {
+        let file = dir.join("n.db").display().to_string();
+        let s = SessionHandle::new(backend.block_on(crate::conn::session::testing::sqlite_on(&file)), "setup", None);
+        backend.block_on(s.execute_update("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])).unwrap();
+        let fill = format!("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {n}) INSERT INTO t SELECT i FROM n");
+        backend.block_on(s.execute_update(&fill, &[])).unwrap();
+        backend.block_on(s.close());
+        file
+    }
+
+    fn settle(src: &mut ResultSource, backend: &Backend, what: &str) {
+        let t0 = Instant::now();
+        while src.is_fetching() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "{what}: the fetch never ended");
+            src.poll_with(Some(backend));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn ids(src: &ResultSource) -> Vec<i64> {
+        src.store.lock().column_values(0).iter().map(|v| v.as_i64().unwrap()).collect()
+    }
+
+    /// Stop on a query whose session went silent (no cancel ever answered): the fetch
+    /// ends anyway, and the session is given up so that the next try opens a new one.
+    #[test]
+    fn stopping_a_query_that_never_answers_ends_it() {
+        let backend = Backend::new().unwrap();
+        let (session, silent) = backend.block_on(crate::conn::session::testing::silenceable(":memory:", "silent"));
+        silent.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut src = ResultSource::new(session.clone(), "SELECT 1".into(), Vec::new(), Vec::new(), None, 1 << 20);
+        src.exhausted = false;
+        src.fetch_more(&backend, 100, None);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(src.is_fetching());
+        let t0 = Instant::now();
+        src.stop(&backend);
+        settle(&mut src, &backend, "stop");
+        assert!(t0.elapsed() < STOP_WAIT * 2, "{:?}", t0.elapsed());
+        assert!(src.error.is_some(), "says it was stopped");
+        let t0 = Instant::now();
+        while !session.is_lost() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the silent session is given up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The result's session was replaced (lost, reconnected): a fetch that waited on the
+    /// old one reads on through the new one, and later pages continue where the rows end.
+    #[test]
+    fn a_result_reads_on_through_a_new_session() {
+        let backend = Backend::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = numbered(&backend, dir.path(), 1000);
+        let (old, silent) = backend.block_on(crate::conn::session::testing::silenceable(&file, "old"));
+        let mut src = ResultSource::new(old.clone(), "SELECT id FROM t ORDER BY id".into(), Vec::new(), Vec::new(), None, 1 << 20);
+        src.exhausted = false;
+        src.fetch_more(&backend, 100, None);
+        settle(&mut src, &backend, "first page");
+        assert_eq!(ids(&src), (1..=100).collect::<Vec<_>>());
+        // The old session went silent while the next page was read (its query runs
+        // again: SQLite closes a cursor left unread at once).
+        silent.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = src.token {
+            backend.block_on(old.close_cursor_token(t));
+        }
+        src.fetch_more(&backend, 100, None);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(src.is_fetching(), "waits on the silent session");
+        old.abandon(true);
+        let new = SessionHandle::new(backend.block_on(crate::conn::session::testing::sqlite_on(&file)), "new", None);
+        src.rehome(&backend, new.clone());
+        assert!(src.session.same(&new));
+        settle(&mut src, &backend, "the page again on the new session");
+        assert!(src.error.is_none(), "{:?}", src.error);
+        assert_eq!(ids(&src), (1..=200).collect::<Vec<_>>(), "no row twice, none missing");
+        src.fetch_more(&backend, 100, None);
+        settle(&mut src, &backend, "the next page");
+        assert_eq!(ids(&src), (1..=300).collect::<Vec<_>>());
     }
 
     #[test]

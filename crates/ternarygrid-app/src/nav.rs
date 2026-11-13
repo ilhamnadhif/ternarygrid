@@ -455,7 +455,7 @@ impl Navigator {
         let node = NavNode::Connection(cfg.id.clone());
         let status = cx.conns.status(&cfg.id);
         let unfolded = self.expanded.contains(&node);
-        let expanded = unfolded && matches!(status, ConnStatus::Connected | ConnStatus::Lost);
+        let expanded = unfolded && matches!(status, ConnStatus::Connected | ConnStatus::Checking | ConnStatus::Lost);
         // Unfolded while connecting or after a failure: the state shows under the row.
         let pending = match &status {
             ConnStatus::Connecting if unfolded => Some(RowKind::Loading),
@@ -466,7 +466,7 @@ impl Navigator {
         let dark = self.dark;
         let color = match &status {
             ConnStatus::Connected => Some(crate::theme::success_color(dark)),
-            ConnStatus::Connecting => Some(crate::theme::warning_color(dark)),
+            ConnStatus::Connecting | ConnStatus::Checking => Some(crate::theme::warning_color(dark)),
             ConnStatus::Failed(_) | ConnStatus::Lost => Some(crate::theme::error_color(dark)),
             ConnStatus::Disconnected => None,
         };
@@ -1546,7 +1546,11 @@ impl Navigator {
         }
         x += 18.0;
         let resp = match &r.node {
-            NavNode::Connection(id) if matches!(cx.conns.status(id), ConnStatus::Lost) => resp.on_hover_text(tr("The connection to the server was lost: unfold it to reconnect")),
+            NavNode::Connection(id) => match cx.conns.status(id) {
+                ConnStatus::Lost => resp.on_hover_text(tr("The connection to the server was lost; it connects again by itself as soon as the server answers")),
+                ConnStatus::Checking => resp.on_hover_text(tr("Checking that the connection still answers (the computer slept)")),
+                _ => resp,
+            },
             _ => resp,
         };
         let icol = if selected {

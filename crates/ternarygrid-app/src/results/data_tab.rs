@@ -25,19 +25,54 @@ pub struct TableDataView {
     started: bool,
     /// When the first query started (a slow one offers Cancel).
     started_at: Option<std::time::Instant>,
+    /// The first query failed because the connection of this session was lost: it runs
+    /// again by itself on the next session (after the connection is back).
+    lost_on: Option<crate::conn::session::SessionHandle>,
+    /// Runs again by itself since data last arrived (a server that drops every session
+    /// does not make the tab retry for ever).
+    auto_retries: u8,
 }
+
+/// Times a first query lost with its connection runs again by itself.
+const AUTO_RETRIES: u8 = 3;
 
 /// A first query running this long offers Cancel (as the grid's fetches).
 const CANCEL_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl TableDataView {
     pub fn new(conn: String, table: ObjectRef, where_clause: Option<String>) -> Self {
-        TableDataView { conn, table, where_clause, order_by: None, session: AdminSession::default(), exec: None, panel: None, error: None, started: false, started_at: None }
+        TableDataView {
+            conn,
+            table,
+            where_clause,
+            order_by: None,
+            session: AdminSession::default(),
+            exec: None,
+            panel: None,
+            error: None,
+            started: false,
+            started_at: None,
+            lost_on: None,
+            auto_retries: 0,
+        }
     }
 
     /// The error that stopped loading the data, if any.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Load the data again after an error (Retry).
+    pub fn retry(&mut self) {
+        self.error = None;
+        self.lost_on = None;
+        self.auto_retries = 0;
+        self.started = false;
+    }
+
+    /// The first page is still being read ("Reading data…").
+    pub fn is_loading(&self) -> bool {
+        self.exec.is_some()
     }
 
     fn start(&mut self, cx: &mut AppContext, session: crate::conn::session::SessionHandle) {
@@ -69,8 +104,14 @@ impl TableDataView {
                     let mut panel = ResultPanel::new(self.conn.clone(), self.table.name.clone(), src, Some(self.table.clone()));
                     panel.set_query(self.where_clause.clone(), self.order_by.clone());
                     self.panel = Some(panel);
+                    self.auto_retries = 0;
                 }
-                ExecEvent::Error { error, .. } => self.error = Some(error.full_text()),
+                ExecEvent::Error { error, .. } => {
+                    if error.is_connection_lost() && self.auto_retries < AUTO_RETRIES {
+                        self.lost_on = Some(exec.session.clone());
+                    }
+                    self.error = Some(error.full_text());
+                }
                 _ => {}
             }
         }
@@ -88,14 +129,29 @@ impl TableDataView {
         // A table of another database of the server needs a session there.
         let database = self.table.database.clone();
         let Some(session) = self.session.get_in(ui, cx, &conn, "data", database.as_deref()) else { return };
-        // The tab's session was lost (server restart, idle timeout) and opened again:
-        // the grid saves and fetches through the new one instead of failing with "closed".
+        // The first query ran on a session that is gone (lost, the connection reconnected):
+        // it runs again on the new one instead of reading "Reading data…" for ever.
+        if let Some(exec) = self.exec.as_ref().filter(|e| !e.session.same(&session) && self.auto_retries < AUTO_RETRIES) {
+            exec.stop_waiting();
+            self.exec = None;
+            self.error = None;
+            self.started = false;
+            self.auto_retries += 1;
+        }
+        // It failed because its connection was lost: again on the new session, by itself.
+        if self.lost_on.as_ref().is_some_and(|s| !s.same(&session)) {
+            self.lost_on = None;
+            self.error = None;
+            self.started = false;
+            self.auto_retries += 1;
+        }
+        // The tab's session was lost (server restart, idle timeout, the computer slept)
+        // and opened again: the grid saves and fetches through the new one, and a fetch
+        // that waited on the old one reads on from where it was.
         if let Some(p) = self.panel.as_mut()
             && !p.src.session.same(&session)
         {
-            p.src.session = session.clone();
-            // Its cursor was on the lost session (a token there may name another cursor here).
-            p.src.token = None;
+            p.src.rehome(cx.backend, session.clone());
         }
         if !self.started {
             self.start(cx, session.clone());
@@ -104,8 +160,7 @@ impl TableDataView {
         if let Some(e) = self.error.clone() {
             crate::widgets::error_box(ui, &e);
             if ui.button((ternarygrid_icons::ic(icon::ARROW_CLOCKWISE), tr("Retry"))).clicked() {
-                self.error = None;
-                self.started = false;
+                self.retry();
             }
             return;
         }
@@ -122,19 +177,35 @@ impl TableDataView {
                 let text_rect = egui::Rect::from_min_size(egui::pos2(left + spin + gap, center.y - text.size().y / 2.0), text.size());
                 ui.put(text_rect, egui::Label::new(egui::RichText::new(tr("Reading data…")).color(weak)).selectable(false));
                 let running = self.started_at.map(|t| t.elapsed()).unwrap_or_default();
-                if let Some(exec) = &self.exec {
+                let mut cancel = false;
+                if self.exec.is_some() {
                     if running >= CANCEL_AFTER {
                         let label = egui::WidgetText::from(tr("Cancel")).into_galley(ui, None, f32::INFINITY, egui::TextStyle::Button);
                         let size = egui::vec2(label.size().x + 2.0 * ui.spacing().button_padding.x + 16.0, ui.spacing().interact_size.y + 2.0);
                         let at = egui::Rect::from_center_size(egui::pos2(center.x, center.y + 30.0), size);
                         if ui.put(at, egui::Button::new(tr("Cancel"))).on_hover_text(tr("Stop the query")).clicked() {
-                            exec.cancel(cx.backend);
+                            cancel = true;
                         }
                     } else {
                         ui.ctx().request_repaint_after(CANCEL_AFTER - running);
                     }
                 }
+                if cancel {
+                    self.cancel_loading(cx.backend);
+                }
             }
+        }
+    }
+
+    /// Cancel the first query ("Reading data…"). It stops at once, whatever the server
+    /// does; the session is given up and Retry opens a new one, so that a connection
+    /// that went silent (the query never answered) is not waited on again. The tab has
+    /// no changes yet to keep in it.
+    pub fn cancel_loading(&mut self, backend: &crate::backend::Backend) {
+        if let Some(exec) = self.exec.take() {
+            exec.cancel(backend);
+            self.session.reset();
+            self.error = Some(tr("The query was cancelled.").to_string());
         }
     }
 }

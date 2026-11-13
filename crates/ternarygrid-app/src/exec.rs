@@ -17,6 +17,9 @@ use ternarygrid_core::{ColumnMeta, DbError};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// How long a cancel waits for the server, and for the session to answer afterwards.
+const CANCEL_WAIT: Duration = Duration::from_secs(5);
+
 /// Client-side command (FR-S8) executed by the engine instead of the server.
 #[derive(Debug, Clone)]
 pub enum ClientAction {
@@ -128,13 +131,22 @@ impl Execution {
         self.job.is_finished() && self.rx.is_empty()
     }
 
-    /// Cancel: stop after the current statement and ask the server to abort it.
+    /// Cancel: stop after the current statement and ask the server to abort it. The
+    /// run stops waiting at once; a session that then does not answer is given up (its
+    /// connection went silent), so that the next run opens a new one instead of waiting
+    /// the same way.
     pub fn cancel(&self, backend: &Backend) {
         self.cancel.cancel();
         let s = self.session.clone();
         backend.spawn_detached(async move {
-            let _ = s.cancel().await;
+            let _ = tokio::time::timeout(CANCEL_WAIT, s.cancel()).await;
+            s.settle_after_cancel(CANCEL_WAIT).await;
         });
+    }
+
+    /// Stop waiting for the run, without asking the server (its session is gone).
+    pub fn stop_waiting(&self) {
+        self.cancel.cancel();
     }
 }
 
@@ -157,7 +169,11 @@ async fn run(
     let exec_opts = ExecOptions { resolve_sources: opts.resolve_sources, timeout: opts.timeout };
     let last_index = plans.len().saturating_sub(1);
     if opts.switch_to_manual {
-        if let Err(e) = session.set_transaction_mode(ternarygrid_core::driver::TransactionMode::Manual).await {
+        let switched = tokio::select! {
+            r = session.set_transaction_mode(ternarygrid_core::driver::TransactionMode::Manual) => r,
+            _ = cancel.cancelled() => Err(DbError::query("cancelled")),
+        };
+        if let Err(e) = switched {
             send(ExecEvent::Message { index: None, severity: "WARNING".into(), text: format!("Cannot switch to manual commit: {e}") });
         } else {
             send(ExecEvent::Message { index: None, severity: "INFO".into(), text: "Smart commit: switched to manual commit mode".into() });
@@ -291,7 +307,14 @@ async fn run(
                             }
                         }
                     }
-                    match session.next_result(token).await {
+                    let next = tokio::select! {
+                        r = session.next_result(token) => r,
+                        _ = cancel.cancelled() => {
+                            ok = false;
+                            break;
+                        }
+                    };
+                    match next {
                         Ok(h) => header = h,
                         Err(crate::conn::session::FetchError::CursorClosed) => break,
                         Err(crate::conn::session::FetchError::Db(e)) => {
@@ -303,7 +326,10 @@ async fn run(
                     }
                 }
                 if !keep_open {
-                    session.close_cursor_token(token).await;
+                    tokio::select! {
+                        () = session.close_cursor_token(token) => {}
+                        _ = cancel.cancelled() => {}
+                    }
                 }
             }
         }

@@ -853,6 +853,16 @@ async fn black_holed_session_is_replaced() {
         b"one"
     );
 
+    // A connection carried by that session, still open (a database session).
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut kept = tokio::net::TcpStream::connect(("127.0.0.1", tunnel.local_port()))
+        .await
+        .unwrap();
+    kept.write_all(b"kept").await.unwrap();
+    let mut buf = [0u8; 4];
+    kept.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"kept");
+
     // The network path of the session dies silently: the next connection
     // times out opening its channel, the probe fails, and a new session is used.
     relay.freeze_existing();
@@ -866,6 +876,11 @@ async fn black_holed_session_is_replaced() {
     .unwrap();
     assert_eq!(back, b"two");
     assert_eq!(tunnel.stats().ssh_reconnects, 1);
+    // The replaced session was disconnected: what it carried ends now, instead of
+    // waiting for ever (no keepalives here) on a session that does not answer.
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(Duration::from_secs(10), kept.read_to_end(&mut rest)).await;
+    assert!(ended.is_ok(), "the connection over the replaced session ended");
 
     // ensure_connected() also detects an unresponsive session.
     relay.freeze_existing();

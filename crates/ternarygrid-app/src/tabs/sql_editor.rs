@@ -2290,12 +2290,9 @@ impl TabView for SqlEditorTab {
                         && p.conn() == conn
                         && p.src.session.database() == s.database()
                     {
-                        p.src.session = s.clone();
-                        p.src.token = None;
-                        // A writing statement is not run again to read on.
-                        if !p.src.rerun_safe {
-                            p.src.exhausted = true;
-                        }
+                        // A fetch still waiting on the old session reads on through the new
+                        // one; a writing statement is not run again to read on.
+                        p.src.rehome(cx.backend, s.clone());
                     }
                 }
             }

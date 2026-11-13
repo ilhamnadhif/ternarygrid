@@ -507,6 +507,19 @@ fn a_dropped_connection_connects_again_by_itself() {
     assert!(backend.block_on(async move { main.ping().await }).is_ok());
 }
 
+/// The status bar tells a lost connection apart from a connected one: red "Connection
+/// lost" instead of the server's version in green.
+#[test]
+fn the_status_bar_tells_a_lost_connection() {
+    let (_dir, mut h, conn) = setup();
+    wait(&mut h, "Tables folder", |h| nav_row(h, "Tables").is_some());
+    assert!(has(&h, "SQLite"), "the server in the status bar: {:?}", labels(&h));
+    assert!(!has(&h, "Connection lost"));
+    let (backend, main) = (h.state().backend.clone(), h.state().conns.live(&conn).unwrap().main.clone());
+    backend.block_on(async move { main.close().await });
+    wait(&mut h, "the status bar to say so", |h| has(h, "Connection lost, reconnecting…"));
+}
+
 /// The text field on the same row as (to the right of) a label.
 fn field_right_of(h: &mut H, label: &str, text: &str) {
     pause(h);

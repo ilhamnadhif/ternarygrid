@@ -63,6 +63,28 @@ struct Shared {
     cursor_watched: AtomicBool,
     /// Rollbacks done: results saved inside the transaction show stale rows after one.
     rollbacks: AtomicU64,
+    /// Cancelled when the session is given up ([`SessionHandle::abandon`]): every
+    /// operation still waiting on it ends with a connection error. A connection that
+    /// went silent (half-open after the computer slept) would keep them waiting until
+    /// the operating system gives up on the socket, or for ever behind a tunnel.
+    kill: tokio_util::sync::CancellationToken,
+}
+
+/// How long a close waits for the session (a statement still running, the server's
+/// goodbye) before the session is given up.
+const CLOSE_WAIT: Duration = Duration::from_secs(5);
+
+/// What [`SessionHandle::check`] found.
+#[derive(Debug)]
+pub enum Health {
+    /// The server answered.
+    Alive,
+    /// The session is in use (a statement runs, a result is open): not asked.
+    Busy,
+    /// The connection is gone: the session was given up (closed, lost).
+    Dead(DbError),
+    /// No answer in time (a connection that went silent): the session was given up as lost.
+    Silent,
 }
 
 /// An open cursor not read for this long is closed: on the server it holds a
@@ -128,6 +150,7 @@ impl SessionHandle {
                 cursor_used: Mutex::new(Instant::now()),
                 cursor_watched: AtomicBool::new(false),
                 rollbacks: AtomicU64::new(0),
+                kill: tokio_util::sync::CancellationToken::new(),
             }),
         }
     }
@@ -142,10 +165,67 @@ impl SessionHandle {
 
     /// Cancel a running statement, then close (Disconnect: a long query does not hold it up).
     pub async fn cancel_and_close(&self) {
+        // Closed (and so not used again) at once, also while the cancel waits.
+        self.mark_closed_here();
         if self.is_busy() {
-            let _ = self.cancel().await;
+            let _ = tokio::time::timeout(CLOSE_WAIT, self.cancel()).await;
         }
         self.close().await;
+    }
+
+    /// Read as closed from now on (TernaryGrid closes it; the close itself follows).
+    pub fn mark_closed_here(&self) {
+        self.inner.closed_here.store(true, Ordering::Relaxed);
+        self.inner.closed.store(true, Ordering::Relaxed);
+    }
+
+    /// Give the session up at once, without waiting for it: it reads as closed, every
+    /// operation waiting on it ends with a connection error, and the driver drops its
+    /// connection where it can. For a session that no longer answers. `lost`: the
+    /// connection failed ([`is_lost`](Self::is_lost)), else TernaryGrid closed it.
+    pub fn abandon(&self, lost: bool) {
+        if !lost {
+            self.inner.closed_here.store(true, Ordering::Relaxed);
+        }
+        self.inner.closed.store(true, Ordering::Relaxed);
+        if !self.inner.kill.is_cancelled() {
+            self.inner.kill.cancel();
+            if let Some(c) = &self.inner.cancel {
+                c.abort_connection();
+            }
+        }
+    }
+
+    /// Given up by [`abandon`](Self::abandon) (or a close that had to).
+    pub fn is_abandoned(&self) -> bool {
+        self.inner.kill.is_cancelled()
+    }
+
+    /// The error of an operation ended because the session was closed or given up.
+    fn closed_error(&self) -> DbError {
+        if self.inner.closed_here.load(Ordering::Relaxed) {
+            DbError::connection("The session was closed")
+        } else {
+            DbError::connection("The connection to the server was lost")
+        }
+    }
+
+    /// `op`, or a connection error as soon as the session is given up.
+    async fn killable<T, E: From<DbError>>(&self, op: impl std::future::Future<Output = Result<T, E>>) -> Result<T, E> {
+        tokio::select! {
+            biased;
+            _ = self.inner.kill.cancelled() => Err(E::from(self.closed_error())),
+            r = op => r,
+        }
+    }
+
+    /// `op`, or nothing once the session is given up.
+    async fn unless_killed(&self, op: impl std::future::Future<Output = ()>) {
+        tokio::select! {
+            biased;
+            _ = self.inner.kill.cancelled() => {}
+            () = op => {}
+        }
     }
 
     pub fn dialect(&self) -> Arc<dyn Dialect> {
@@ -222,10 +302,18 @@ impl SessionHandle {
 
     /// Close the open cursor (if any).
     pub async fn close_cursor(&self) {
-        let taken = self.inner.cursor.lock().await.take();
-        if let Some(mut c) = taken {
-            let _ = c.cursor.close().await;
-        }
+        self.unless_killed(async {
+            let taken = self.inner.cursor.lock().await.take();
+            if let Some(mut c) = taken {
+                let _ = c.cursor.close().await;
+            }
+        })
+        .await
+    }
+
+    /// A cursor is open on the session (a result being read page by page).
+    pub fn has_open_cursor(&self) -> bool {
+        self.inner.cursor.try_lock().map(|c| c.is_some()).unwrap_or(true)
     }
 
     /// Exclusive access to the session, after closing any open cursor.
@@ -248,9 +336,11 @@ impl SessionHandle {
         BusyGuard(self)
     }
 
+    /// A connection error means the session's connection is gone: given up, so that
+    /// nothing else waits on it.
     fn note_error(&self, e: &DbError) {
         if e.is_connection_lost() {
-            self.inner.closed.store(true, Ordering::Relaxed);
+            self.abandon(true);
         }
     }
 
@@ -286,7 +376,7 @@ impl SessionHandle {
     pub async fn execute(&self, sql: &str, params: &[Value], opts: &ExecOptions) -> DbResult<Executed> {
         let started = Instant::now();
         let busy = self.busy();
-        let res = async {
+        let res = self.killable(async {
             let mut guard = self.lock().await;
             let was_in_tx = guard.in_transaction();
             let mut cursor = guard.execute(sql, params, opts).await?;
@@ -311,7 +401,7 @@ impl SessionHandle {
                 self.watch_idle_cursor();
             }
             Ok(Executed { token, header, messages })
-        }
+        })
         .await;
         drop(busy);
         match &res {
@@ -339,33 +429,44 @@ impl SessionHandle {
     /// (another operation needed the session).
     pub async fn fetch(&self, token: u64, max: usize) -> Result<FetchOutcome, FetchError> {
         let busy = self.busy();
-        let mut slot = self.inner.cursor.lock().await;
-        let res = match slot.as_mut() {
-            Some(c) if c.token == token => match c.cursor.fetch(max).await {
-                Ok(rows) => {
-                    *self.inner.cursor_used.lock() = Instant::now();
-                    let messages = c.cursor.take_messages();
-                    Ok(FetchOutcome { exhausted: rows.len() < max, rows, messages })
+        let res = self
+            .killable(async {
+                let mut slot = self.inner.cursor.lock().await;
+                match slot.as_mut() {
+                    Some(c) if c.token == token => match c.cursor.fetch(max).await {
+                        Ok(rows) => {
+                            *self.inner.cursor_used.lock() = Instant::now();
+                            let messages = c.cursor.take_messages();
+                            Ok(FetchOutcome { exhausted: rows.len() < max, rows, messages })
+                        }
+                        Err(e) => Err(FetchError::Db(e)),
+                    },
+                    _ => Err(FetchError::CursorClosed),
                 }
-                Err(e) => {
-                    self.note_error(&e);
-                    Err(FetchError::Db(e))
-                }
-            },
-            _ => Err(FetchError::CursorClosed),
-        };
-        drop(slot);
+            })
+            .await;
         drop(busy);
+        if let Err(FetchError::Db(e)) = &res {
+            self.note_error(e);
+        }
         res
     }
 
     /// Advance the open cursor to its next result (multi-result statements).
     pub async fn next_result(&self, token: u64) -> Result<Option<ResultHeader>, FetchError> {
-        let mut slot = self.inner.cursor.lock().await;
-        match slot.as_mut() {
-            Some(c) if c.token == token => c.cursor.next_result().await.map_err(FetchError::Db),
-            _ => Err(FetchError::CursorClosed),
+        let res = self
+            .killable(async {
+                let mut slot = self.inner.cursor.lock().await;
+                match slot.as_mut() {
+                    Some(c) if c.token == token => c.cursor.next_result().await.map_err(FetchError::Db),
+                    _ => Err(FetchError::CursorClosed),
+                }
+            })
+            .await;
+        if let Err(FetchError::Db(e)) = &res {
+            self.note_error(e);
         }
+        res
     }
 
     /// Close the open cursor once it was not read for [`cursor_idle`]; the result
@@ -411,24 +512,32 @@ impl SessionHandle {
 
     /// Whether the cursor identified by `token` is still open.
     pub async fn cursor_open(&self, token: u64) -> bool {
-        self.inner.cursor.lock().await.as_ref().is_some_and(|c| c.token == token)
+        self.killable(async { Ok::<_, DbError>(self.inner.cursor.lock().await.as_ref().is_some_and(|c| c.token == token)) }).await.unwrap_or(false)
     }
 
     /// Close the cursor only if it is the one identified by `token`.
     pub async fn close_cursor_token(&self, token: u64) {
-        let mut slot = self.inner.cursor.lock().await;
-        if slot.as_ref().is_some_and(|c| c.token == token)
-            && let Some(mut c) = slot.take()
-        {
-            let _ = c.cursor.close().await;
-        }
+        self.unless_killed(async {
+            let mut slot = self.inner.cursor.lock().await;
+            if slot.as_ref().is_some_and(|c| c.token == token)
+                && let Some(mut c) = slot.take()
+            {
+                let _ = c.cursor.close().await;
+            }
+        })
+        .await
     }
 
     /// Run `sql` to completion and return the first row set (metadata-style queries).
     pub async fn query_all(&self, sql: &str, params: &[Value]) -> DbResult<(Vec<ternarygrid_core::ColumnMeta>, Vec<Row>)> {
-        let mut guard = self.lock().await;
-        let r = ternarygrid_core::driver::query_all(guard.as_mut(), sql, params).await;
-        self.refresh_tx(guard.as_ref());
+        let r = self
+            .killable(async {
+                let mut guard = self.lock().await;
+                let r = ternarygrid_core::driver::query_all(guard.as_mut(), sql, params).await;
+                self.refresh_tx(guard.as_ref());
+                r
+            })
+            .await;
         if let Err(e) = &r {
             self.note_error(e);
         }
@@ -438,10 +547,14 @@ impl SessionHandle {
     /// Run `sql` ignoring results; returns affected rows.
     pub async fn execute_update(&self, sql: &str, params: &[Value]) -> DbResult<Option<u64>> {
         let started = Instant::now();
-        let mut guard = self.lock().await;
-        let r = ternarygrid_core::driver::execute_update(guard.as_mut(), sql, params).await;
-        self.refresh_tx(guard.as_ref());
-        drop(guard);
+        let r = self
+            .killable(async {
+                let mut guard = self.lock().await;
+                let r = ternarygrid_core::driver::execute_update(guard.as_mut(), sql, params).await;
+                self.refresh_tx(guard.as_ref());
+                r
+            })
+            .await;
         match &r {
             Ok(n) => self.log_tx(sql, started, *n, true),
             Err(e) => {
@@ -469,6 +582,14 @@ impl SessionHandle {
     /// its key); otherwise the save fails and is undone (0: changed or deleted by someone
     /// else; more: the key does not identify one row).
     pub async fn apply_changes_reading(&self, stmts: &[(String, Vec<Value>)], expect_one: &[bool]) -> DbResult<Applied> {
+        let r = self.killable(self.apply_changes_locked(stmts, expect_one)).await;
+        if let Err(e) = &r {
+            self.note_error(e);
+        }
+        r
+    }
+
+    async fn apply_changes_locked(&self, stmts: &[(String, Vec<Value>)], expect_one: &[bool]) -> DbResult<Applied> {
         let mut guard = self.lock().await;
         // A transaction already open (manual commit, or BEGIN in an auto-commit editor):
         // the statements join it and nothing is committed or rolled back for the user.
@@ -570,29 +691,51 @@ impl SessionHandle {
     }
 
     pub async fn set_transaction_mode(&self, mode: TransactionMode) -> DbResult<()> {
-        let mut guard = self.lock().await;
-        let r = guard.set_transaction_mode(mode).await;
-        self.refresh_tx(guard.as_ref());
+        let r = self
+            .killable(async {
+                let mut guard = self.lock().await;
+                let r = guard.set_transaction_mode(mode).await;
+                self.refresh_tx(guard.as_ref());
+                r
+            })
+            .await;
+        if let Err(e) = &r {
+            self.note_error(e);
+        }
         r
     }
 
     pub async fn commit(&self) -> DbResult<()> {
-        let mut guard = self.lock().await;
-        let r = guard.commit().await;
-        self.refresh_tx(guard.as_ref());
-        if r.is_ok() {
-            self.inner.tx.lock().log.clear();
+        let r = self
+            .killable(async {
+                let mut guard = self.lock().await;
+                let r = guard.commit().await;
+                self.refresh_tx(guard.as_ref());
+                r
+            })
+            .await;
+        match &r {
+            Ok(()) => self.inner.tx.lock().log.clear(),
+            Err(e) => self.note_error(e),
         }
         r
     }
 
     pub async fn rollback(&self) -> DbResult<()> {
-        let mut guard = self.lock().await;
-        let r = guard.rollback().await;
-        self.refresh_tx(guard.as_ref());
-        if r.is_ok() {
-            self.inner.tx.lock().log.clear();
-            self.inner.rollbacks.fetch_add(1, Ordering::Relaxed);
+        let r = self
+            .killable(async {
+                let mut guard = self.lock().await;
+                let r = guard.rollback().await;
+                self.refresh_tx(guard.as_ref());
+                r
+            })
+            .await;
+        match &r {
+            Ok(()) => {
+                self.inner.tx.lock().log.clear();
+                self.inner.rollbacks.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => self.note_error(e),
         }
         r
     }
@@ -616,15 +759,100 @@ impl SessionHandle {
             Ok(r) => r,
             Err(_) => Err(DbError::connection("The server did not answer the ping within 20 s")),
         };
+        drop(guard);
         if let Err(e) = &r {
             self.note_error(e);
         }
         r
     }
 
+    /// Ask the server whether the session still answers, within `timeout` (after the
+    /// computer slept, a connection may look open and never answer again). A session
+    /// that does not answer, or whose connection is gone, is given up as lost. Unlike
+    /// [`ping`](Self::ping), a session running a statement or holding a result open is
+    /// reported busy, not alive. A metadata read or a ping holding it is waited for:
+    /// one that does not end within `timeout` waits on a connection that went silent.
+    pub async fn check(&self, timeout: Duration) -> Health {
+        if self.is_closed() {
+            return Health::Dead(self.closed_error());
+        }
+        if self.is_busy() || self.has_open_cursor() {
+            return Health::Busy;
+        }
+        let deadline = Instant::now() + timeout;
+        let mut guard = match tokio::time::timeout(timeout, self.inner.session.lock()).await {
+            Ok(g) => g,
+            Err(_) if self.is_busy() || self.has_open_cursor() => return Health::Busy,
+            Err(_) => {
+                self.abandon(true);
+                return Health::Silent;
+            }
+        };
+        // A statement started meanwhile left its result open.
+        if self.has_open_cursor() {
+            return Health::Busy;
+        }
+        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_secs(1));
+        let r = tokio::time::timeout(left, guard.ping()).await;
+        drop(guard);
+        match r {
+            Ok(Ok(())) => Health::Alive,
+            Ok(Err(e)) if e.is_connection_lost() => {
+                self.abandon(true);
+                Health::Dead(e)
+            }
+            // Not a connection error: the server answered.
+            Ok(Err(_)) => Health::Alive,
+            Err(_) => {
+                self.abandon(true);
+                Health::Silent
+            }
+        }
+    }
+
+    /// After a statement or a fetch was stopped by the user: the session must answer
+    /// again within `timeout`, else it is given up as lost (its connection went silent,
+    /// so the next run would wait the same way; it opens a new session instead). The
+    /// result left open is closed first (it cannot be asked through). A session that
+    /// holds changes not committed yet is left alone: a reconnect asks about them.
+    pub async fn settle_after_cancel(&self, timeout: Duration) {
+        if self.is_closed() || self.has_uncommitted_writes() {
+            return;
+        }
+        // The stopped operation lets go of the session.
+        let t0 = Instant::now();
+        while self.is_busy() && t0.elapsed() < timeout {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if self.is_busy() {
+            return;
+        }
+        if tokio::time::timeout(timeout, self.close_cursor()).await.is_err() {
+            tracing::info!("{}: no answer after a cancel; the session is given up", self.label());
+            self.abandon(true);
+            return;
+        }
+        if matches!(self.check(timeout).await, Health::Silent) {
+            tracing::info!("{}: no answer after a cancel; the session is given up", self.label());
+        }
+    }
+
+    /// Close the session. It reads as closed at once; a statement still running or a
+    /// server that does not answer holds the close up for [`CLOSE_WAIT`] at most, then
+    /// the session is given up.
     pub async fn close(&self) {
-        self.inner.closed_here.store(true, Ordering::Relaxed);
-        self.close_from_server().await;
+        self.mark_closed_here();
+        if tokio::time::timeout(CLOSE_WAIT, self.close_session()).await.is_err() {
+            self.abandon(false);
+            // Nothing waits on it any more: the driver's own close is quick now.
+            let _ = tokio::time::timeout(CLOSE_WAIT, self.close_session()).await;
+        }
+    }
+
+    async fn close_session(&self) {
+        self.close_cursor().await;
+        let mut guard = self.inner.session.lock().await;
+        let _ = guard.close().await;
     }
 
     /// Tests: the connection ends as when the server or the network dropped it
@@ -711,6 +939,12 @@ pub enum FetchError {
     Db(DbError),
 }
 
+impl From<DbError> for FetchError {
+    fn from(e: DbError) -> Self {
+        FetchError::Db(e)
+    }
+}
+
 impl From<FetchError> for DbError {
     fn from(e: FetchError) -> Self {
         match e {
@@ -732,98 +966,137 @@ impl Drop for BusyGuard<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
 
-    /// A SQLite session that cannot take savepoints (as a failed transaction, or a
-    /// database without them).
-    struct NoSavepoints(Box<dyn ternarygrid_core::Session>);
+    /// A SQLite session that can go silent: from [`Wrapped::silence`] on, statements
+    /// and pings wait for ever, as on a connection that died while the computer slept
+    /// (half-open: what is sent is accepted, nothing ever comes back). It can also
+    /// refuse savepoints (as a failed transaction, or a database without them).
+    pub(crate) struct Wrapped {
+        pub(crate) inner: Box<dyn ternarygrid_core::Session>,
+        pub(crate) no_savepoints: bool,
+        pub(crate) silent: Arc<AtomicBool>,
+    }
+
+    impl Wrapped {
+        fn is_silent(&self) -> bool {
+            self.silent.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A SQLite session on `file` (`:memory:` for its own database).
+    pub(crate) async fn sqlite_on(file: &str) -> Box<dyn ternarygrid_core::Session> {
+        use ternarygrid_core::Driver;
+        let mut cfg = ternarygrid_core::ConnectionConfig::new(DbKind::Sqlite, "test");
+        cfg.file_path = Some(file.into());
+        ternarygrid_driver_sqlite::SqliteDriver::new().connect(&ternarygrid_core::ConnectParams::from_config(&cfg, None)).await.unwrap()
+    }
+
+    /// A session on `file` that goes silent when the flag returned is set.
+    pub(crate) async fn silenceable(file: &str, label: &str) -> (SessionHandle, Arc<AtomicBool>) {
+        let silent = Arc::new(AtomicBool::new(false));
+        let w = Wrapped { inner: sqlite_on(file).await, no_savepoints: false, silent: silent.clone() };
+        (SessionHandle::new(Box::new(w), label, None), silent)
+    }
 
     #[async_trait::async_trait]
-    impl ternarygrid_core::Session for NoSavepoints {
+    impl ternarygrid_core::Session for Wrapped {
         fn kind(&self) -> ternarygrid_core::DbKind {
-            self.0.kind()
+            self.inner.kind()
         }
         fn dialect(&self) -> std::sync::Arc<dyn ternarygrid_core::Dialect> {
-            self.0.dialect()
+            self.inner.dialect()
         }
         fn server_info(&self) -> &ternarygrid_core::driver::ServerInfo {
-            self.0.server_info()
+            self.inner.server_info()
         }
         fn cancel_handle(&self) -> Option<std::sync::Arc<dyn ternarygrid_core::CancelHandle>> {
-            self.0.cancel_handle()
+            self.inner.cancel_handle()
         }
         async fn ping(&mut self) -> DbResult<()> {
-            self.0.ping().await
+            if self.is_silent() {
+                std::future::pending::<()>().await;
+            }
+            self.inner.ping().await
         }
         async fn close(&mut self) -> DbResult<()> {
-            self.0.close().await
+            self.inner.close().await
         }
         fn is_closed(&self) -> bool {
-            self.0.is_closed()
+            self.inner.is_closed()
         }
         async fn execute(&mut self, sql: &str, params: &[Value], opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
-            if sql.starts_with("SAVEPOINT") {
+            if self.no_savepoints && sql.starts_with("SAVEPOINT") {
                 return Err(DbError::query("no savepoints here"));
             }
-            self.0.execute(sql, params, opts).await
+            if self.is_silent() {
+                std::future::pending::<()>().await;
+            }
+            self.inner.execute(sql, params, opts).await
         }
         fn transaction_mode(&self) -> TransactionMode {
-            self.0.transaction_mode()
+            self.inner.transaction_mode()
         }
         async fn set_transaction_mode(&mut self, mode: TransactionMode) -> DbResult<()> {
-            self.0.set_transaction_mode(mode).await
+            self.inner.set_transaction_mode(mode).await
         }
         fn in_transaction(&self) -> bool {
-            self.0.in_transaction()
+            self.inner.in_transaction()
         }
         async fn commit(&mut self) -> DbResult<()> {
-            self.0.commit().await
+            self.inner.commit().await
         }
         async fn rollback(&mut self) -> DbResult<()> {
-            self.0.rollback().await
+            self.inner.rollback().await
         }
         async fn current_database(&mut self) -> DbResult<Option<String>> {
-            self.0.current_database().await
+            self.inner.current_database().await
         }
         async fn current_schema(&mut self) -> DbResult<Option<String>> {
-            self.0.current_schema().await
+            self.inner.current_schema().await
         }
         async fn set_current_schema(&mut self, schema: &str) -> DbResult<()> {
-            self.0.set_current_schema(schema).await
+            self.inner.set_current_schema(schema).await
         }
         async fn list_databases(&mut self) -> DbResult<Vec<ternarygrid_core::meta::DatabaseInfo>> {
-            self.0.list_databases().await
+            self.inner.list_databases().await
         }
         async fn list_schemas(&mut self) -> DbResult<Vec<ternarygrid_core::meta::SchemaInfo>> {
-            self.0.list_schemas().await
+            self.inner.list_schemas().await
         }
         async fn list_objects(&mut self, schema: &ternarygrid_core::SchemaRef, kind: ternarygrid_core::ObjectKind) -> DbResult<Vec<ternarygrid_core::meta::ObjectInfo>> {
-            self.0.list_objects(schema, kind).await
+            self.inner.list_objects(schema, kind).await
         }
         async fn list_children(&mut self, parent: &ternarygrid_core::ObjectRef, kind: ternarygrid_core::ObjectKind) -> DbResult<Vec<ternarygrid_core::meta::ObjectInfo>> {
-            self.0.list_children(parent, kind).await
+            self.inner.list_children(parent, kind).await
         }
         async fn table_definition(&mut self, table: &ternarygrid_core::ObjectRef) -> DbResult<ternarygrid_core::ddl::TableDef> {
-            self.0.table_definition(table).await
+            self.inner.table_definition(table).await
         }
         async fn object_ddl(&mut self, obj: &ternarygrid_core::ObjectRef) -> DbResult<String> {
-            self.0.object_ddl(obj).await
+            self.inner.object_ddl(obj).await
         }
         async fn search_metadata(&mut self, search: &ternarygrid_core::meta::MetadataSearch) -> DbResult<Vec<ternarygrid_core::meta::ObjectInfo>> {
-            self.0.search_metadata(search).await
+            self.inner.search_metadata(search).await
         }
         async fn schema_snapshot(
             &mut self,
             schema: &ternarygrid_core::SchemaRef,
             opts: &ternarygrid_core::ddl::SnapshotOptions,
         ) -> DbResult<ternarygrid_core::ddl::SchemaSnapshot> {
-            self.0.schema_snapshot(schema, opts).await
+            self.inner.schema_snapshot(schema, opts).await
         }
         async fn explain(&mut self, sql: &str, analyze: bool) -> DbResult<ternarygrid_core::plan::QueryPlan> {
-            self.0.explain(sql, analyze).await
+            self.inner.explain(sql, analyze).await
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
 
     async fn sqlite(label: &str) -> Box<dyn ternarygrid_core::Session> {
         use ternarygrid_core::Driver;
@@ -834,7 +1107,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_without_a_savepoint_is_not_started_in_an_open_transaction() {
-        let h = SessionHandle::new(Box::new(NoSavepoints(sqlite("sp").await)), "sp", None);
+        let w = Wrapped { inner: sqlite("sp").await, no_savepoints: true, silent: Arc::new(AtomicBool::new(false)) };
+        let h = SessionHandle::new(Box::new(w), "sp", None);
         h.execute_update("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
         h.set_transaction_mode(TransactionMode::Manual).await.unwrap();
         h.execute_update("INSERT INTO t VALUES (1)", &[]).await.unwrap();
@@ -897,6 +1171,99 @@ mod tests {
         assert!(h.is_busy() && h.busy_for().is_some(), "still busy with the execute");
         drop(execute);
         assert!(!h.is_busy() && h.busy_for().is_none());
+    }
+
+    /// A statement waits for ever (the session went silent) while it is closed, as on
+    /// Disconnect or Reconnect: the session reads as closed at once, the statement ends
+    /// with a connection error, and the close is bounded.
+    #[tokio::test]
+    async fn closing_a_silent_session_ends_its_statement() {
+        let (h, silent) = silenceable(":memory:", "silent").await;
+        silent.store(true, Ordering::SeqCst);
+        let running = {
+            let h = h.clone();
+            tokio::spawn(async move { h.execute("SELECT 1", &[], &ExecOptions::default()).await.map(|_| ()) })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(h.is_busy() && !h.is_closed(), "the statement waits on the session");
+        assert!(matches!(h.check(Duration::from_millis(100)).await, Health::Busy), "a busy session is not asked");
+        let t0 = Instant::now();
+        let closing = {
+            let h = h.clone();
+            tokio::spawn(async move { h.close().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(h.is_closed(), "closed for its users at once");
+        let err = tokio::time::timeout(Duration::from_secs(15), running).await.expect("the statement ends").unwrap().expect_err("an error");
+        assert!(err.is_connection_lost(), "{}", err.full_text());
+        tokio::time::timeout(Duration::from_secs(15), closing).await.expect("the close ends").unwrap();
+        assert!(t0.elapsed() < CLOSE_WAIT * 3, "bounded: {:?}", t0.elapsed());
+        assert!(h.is_closed() && !h.is_lost() && h.is_abandoned(), "closed by TernaryGrid, not lost");
+    }
+
+    /// Given up (the connection was found dead): every operation waiting on it ends,
+    /// and later ones fail at once instead of waiting too.
+    #[tokio::test]
+    async fn an_abandoned_session_ends_every_operation() {
+        let (h, silent) = silenceable(":memory:", "abandoned").await;
+        h.execute_update("CREATE TABLE t (id INTEGER)", &[]).await.unwrap();
+        silent.store(true, Ordering::SeqCst);
+        let running = {
+            let h = h.clone();
+            tokio::spawn(async move { h.query_all("SELECT * FROM t", &[]).await.map(|_| ()) })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.abandon(true);
+        assert!(h.is_closed() && h.is_lost());
+        let err = tokio::time::timeout(Duration::from_secs(2), running).await.expect("ends at once").unwrap().expect_err("an error");
+        assert!(err.is_connection_lost(), "{}", err.full_text());
+        for r in [
+            h.execute_update("SELECT 1", &[]).await.map(|_| ()),
+            h.commit().await,
+            h.rollback().await,
+            h.set_transaction_mode(TransactionMode::Auto).await,
+            h.execute("SELECT 1", &[], &ExecOptions::default()).await.map(|_| ()),
+        ] {
+            assert!(r.is_err_and(|e| e.is_connection_lost()));
+        }
+        assert!(matches!(h.fetch(1, 10).await, Err(FetchError::Db(e)) if e.is_connection_lost()));
+        assert!(!h.cursor_open(1).await);
+    }
+
+    /// A check of a session that does not answer gives it up as lost; one that answers
+    /// stays as it is.
+    #[tokio::test]
+    async fn a_check_finds_a_silent_session() {
+        let (h, silent) = silenceable(":memory:", "check").await;
+        assert!(matches!(h.check(Duration::from_secs(5)).await, Health::Alive));
+        assert!(!h.is_closed());
+        silent.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        assert!(matches!(h.check(Duration::from_millis(200)).await, Health::Silent));
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert!(h.is_closed() && h.is_lost() && h.is_abandoned());
+        assert!(matches!(h.check(Duration::from_millis(200)).await, Health::Dead(_)));
+    }
+
+    /// After a cancel the session must answer again, else it is given up (so that the
+    /// next run does not wait the same way). Changes not committed keep it.
+    #[tokio::test]
+    async fn a_session_silent_after_a_cancel_is_given_up_unless_it_holds_changes() {
+        let (h, silent) = silenceable(":memory:", "settle").await;
+        h.settle_after_cancel(Duration::from_millis(300)).await;
+        assert!(!h.is_closed(), "it answers: kept");
+        silent.store(true, Ordering::SeqCst);
+        h.settle_after_cancel(Duration::from_millis(300)).await;
+        assert!(h.is_lost(), "silent: given up");
+
+        let (h, silent) = silenceable(":memory:", "changes").await;
+        h.execute_update("CREATE TABLE t (id INTEGER)", &[]).await.unwrap();
+        h.set_transaction_mode(TransactionMode::Manual).await.unwrap();
+        h.execute_update("INSERT INTO t VALUES (1)", &[]).await.unwrap();
+        assert!(h.has_uncommitted_writes());
+        silent.store(true, Ordering::SeqCst);
+        h.settle_after_cancel(Duration::from_millis(300)).await;
+        assert!(!h.is_closed(), "uncommitted changes: left to a reconnect, which asks first");
     }
 
     #[test]
