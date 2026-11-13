@@ -176,13 +176,17 @@ impl server::Handler for TestHandler {
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        key: &PublicKey,
+        key: server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
-        self.check_key(user, key)
+        self.check_key(user, key.public_key)
     }
 
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        self.check_key(user, key)
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        self.check_key(user, key.public_key)
     }
 
     async fn auth_keyboard_interactive<'a>(

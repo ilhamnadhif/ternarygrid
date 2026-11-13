@@ -60,7 +60,6 @@ pub fn run(conn: &Connection, sql: &str, params: &[Value]) -> DbResult<Materiali
     if ncols > 0 {
         let cols: Vec<ColumnMeta> = stmt
             .columns()
-            .iter()
             .map(|c| {
                 let decl = c.decl_type().unwrap_or("").to_string();
                 let kind = if decl.is_empty() { DataKind::Other } else { DataKind::guess_from_type_name(&decl) };
