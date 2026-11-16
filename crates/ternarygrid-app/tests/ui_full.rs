@@ -1776,11 +1776,13 @@ fn workspace_from_dbeaver() {
     assert!(h2.state().tip.is_some(), "tip on start");
 }
 
-/// New database… from the navigator on PostgreSQL (TERNARYGRID_TEST_PG): the
-/// dialog, CREATE DATABASE and the new database in the tree.
-#[test]
-fn create_database_from_the_navigator() {
-    let Some(url) = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.trim().is_empty()) else { return };
+/// The application connected to the PostgreSQL server of `TERNARYGRID_TEST_PG` (none
+/// without it), its database row shown: the directory, the harness, the connection's
+/// configuration, its password and its current database.
+type PgHarness = (Dir, H, ternarygrid_core::ConnectionConfig, Option<ternarygrid_core::Secret>, String);
+
+fn pg_harness(settings: impl FnOnce(&mut Settings)) -> Option<PgHarness> {
+    let url = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.trim().is_empty())?;
     let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = Dir(std::env::temp_dir().join(format!("ternarygrid-ui-{}", uuid::Uuid::new_v4().simple())), guard);
     std::fs::create_dir_all(&dir.0).unwrap();
@@ -1802,13 +1804,23 @@ fn create_database_from_the_navigator() {
     let mut conns = ConnectionManager::new(ternarygrid_app::driver_registry(), secrets, Arc::new(DirectNet));
     let id = cfg.id.clone();
     conns.upsert(cfg.clone());
-    let mut settings = Settings::default();
-    settings.updates.check_automatically = Some(false);
-    let mut h = harness_conns(&dir.0, settings, conns);
+    let mut s = Settings::default();
+    s.updates.check_automatically = Some(false);
+    settings(&mut s);
+    let mut h = harness_conns(&dir.0, s, conns);
     frames(&mut h, 3);
     h.state_mut().push_command(AppCommand::Connect(id.clone()));
     wait(&mut h, "connected", |h| h.state().conns.is_connected(&id));
     wait(&mut h, "current database", |h| nav_row(h, &current).is_some());
+    Some((dir, h, cfg, password, current))
+}
+
+/// New database… from the navigator on PostgreSQL (TERNARYGRID_TEST_PG): the
+/// dialog, CREATE DATABASE and the new database in the tree.
+#[test]
+fn create_database_from_the_navigator() {
+    let Some((_dir, mut h, cfg, password, current)) = pg_harness(|_| {}) else { return };
+    let id = cfg.id.clone();
     // A schema belongs to a database: not on the connection, on the database.
     pause(&mut h);
     nav_row(&h, "pg-test").unwrap().click_secondary();
@@ -1865,6 +1877,113 @@ fn create_database_from_the_navigator() {
         ))
         .unwrap();
     backend.block_on(ternarygrid_core::driver::execute_update(s.as_mut(), &format!("DROP DATABASE {name}"), &[])).unwrap();
+}
+
+/// The size the navigator shows for the table or partition `name` of `schema`, from its listing.
+fn listed_size(h: &H, conn: &str, schema: &str, name: &str) -> Option<i64> {
+    let meta = &h.state().conns.live(conn)?.meta;
+    meta.objects
+        .values()
+        .chain(meta.children.values())
+        .filter_map(|l| l.get())
+        .flatten()
+        .find(|o| o.obj.name == name && o.obj.schema.as_deref() == Some(schema))
+        .and_then(|o| o.size_bytes)
+}
+
+/// Truncate… on a partition in the navigator (charges_2026_02 of charges): its size there,
+/// and its table's (the sum of its partitions'), are read again at once — they stayed at the
+/// old gigabytes until a Refresh — and its row stays on screen meanwhile. TRUNCATE in a SQL
+/// editor too.
+#[test]
+fn truncate_updates_the_navigator_sizes() {
+    let Some((_dir, mut h, cfg, _password, _current)) = pg_harness(|s| s.execution.confirm_dangerous_statements = false) else { return };
+    let id = cfg.id.clone();
+    let schema = format!("ternarygrid_sizes_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let session = h.state().conns.live(&id).unwrap().main.clone();
+    let run = |h: &H, sql: &str| {
+        let (s, owned) = (session.clone(), sql.to_string());
+        h.state().backend.block_on(async move { s.execute_update(&owned, &[]).await }).unwrap_or_else(|e| panic!("{sql}: {}", e.full_text()));
+    };
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TABLE {schema}.charges (id int, at date NOT NULL, pad text) PARTITION BY RANGE (at)"),
+        format!("CREATE TABLE {schema}.charges_2026_01 PARTITION OF {schema}.charges FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')"),
+        format!("CREATE TABLE {schema}.charges_2026_02 PARTITION OF {schema}.charges FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')"),
+        format!("INSERT INTO {schema}.charges SELECT g, DATE '2026-01-01' + (g % 59), repeat('x', 200) FROM generate_series(1, 20000) g"),
+        format!("CREATE TABLE {schema}.ledger (id int, pad text)"),
+        format!("INSERT INTO {schema}.ledger SELECT g, repeat('x', 200) FROM generate_series(1, 20000) g"),
+        format!("CREATE TABLE {schema}.journal AS SELECT * FROM {schema}.ledger"),
+    ] {
+        run(&h, &sql);
+    }
+    // Made outside the application: a Refresh shows the schema, then its partitions are unfolded.
+    h.state_mut().push_command(AppCommand::RefreshMetadata { connection: id.clone(), object: None, schema: None });
+    frames(&mut h, 2);
+    {
+        let app = h.state_mut();
+        app.nav.reveal(&id, &ternarygrid_core::ObjectRef::table(Some(schema.clone()), "charges"), &app.conns);
+    }
+    wait(&mut h, "charges", |h| nav_row(h, "charges").is_some() && nav_row(h, "ledger").is_some());
+    let parent = {
+        let meta = &h.state().conns.live(&id).unwrap().meta;
+        meta.objects.values().filter_map(|l| l.get()).flatten().find(|o| o.obj.name == "charges" && o.obj.schema.as_deref() == Some(&schema)).unwrap().obj.clone()
+    };
+    h.state_mut().nav.expand(ternarygrid_app::nav::NavNode::Object { conn: id.clone(), obj: parent.clone() });
+    h.state_mut().nav.expand(ternarygrid_app::nav::NavNode::ChildFolder { conn: id.clone(), parent, kind: ternarygrid_core::ObjectKind::Partition });
+    wait(&mut h, "partitions", |h| nav_row(h, "charges_2026_02").is_some());
+    let part = listed_size(&h, &id, &schema, "charges_2026_02").expect("the partition's size");
+    let table = listed_size(&h, &id, &schema, "charges").expect("the table's size");
+    assert!(part > 1 << 20 && table > part, "partition {part}, table {table}");
+    // Its data open in a tab.
+    let partition = {
+        let meta = &h.state().conns.live(&id).unwrap().meta;
+        meta.children.values().filter_map(|l| l.get()).flatten().find(|o| o.obj.name == "charges_2026_02").unwrap().obj.clone()
+    };
+    h.state_mut().push_command(AppCommand::OpenObject { connection: id.clone(), object: partition, page: ternarygrid_app::command::ObjectPage::Data });
+    wait(&mut h, "the partition's rows", |h| grid_label(h).contains(" rows, 3 columns") && !grid_label(h).contains(" 0 rows"));
+
+    // Right-click the partition: Truncate…, then the window's button.
+    nav_menu(&mut h, "charges_2026_02", &["Truncate…"]);
+    click(&mut h, "Truncate charges_2026_02");
+    wait(&mut h, "the partition's new size in the navigator", |h| {
+        assert!(nav_row(h, "charges_2026_02").is_some(), "the partition's row stays while its size is read");
+        listed_size(h, &id, &schema, "charges_2026_02").is_some_and(|s| s < part / 10)
+    });
+    wait(&mut h, "the table's new size in the navigator", |h| listed_size(h, &id, &schema, "charges").is_some_and(|s| s <= table - part / 2));
+    // The open data tab reads again: the rows are gone.
+    wait(&mut h, "the emptied partition's data tab", |h| grid_label(h).contains("Data grid, 0 rows, 3 columns"));
+    no_errors(&mut h, "truncate");
+
+    // TRUNCATE in a SQL editor.
+    let ledger = listed_size(&h, &id, &schema, "ledger").expect("the table's size");
+    exec_sql(&mut h, &format!("TRUNCATE {schema}.ledger"));
+    wait(&mut h, "the truncated table's new size in the navigator", |h| listed_size(h, &id, &schema, "ledger").is_some_and(|s| s < ledger / 10));
+
+    // In a transaction (manual commit): the new size shows once committed.
+    let journal = listed_size(&h, &id, &schema, "journal").expect("the table's size");
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(id.clone()), schema: None, text: Some(format!("TRUNCATE {schema}.journal")) });
+    frames(&mut h, 3);
+    wait(&mut h, "editor session", |h| focused_editor(h).session_ready());
+    let ctx = h.ctx.clone();
+    h.state_mut().dispatch_action(&ctx, Action::ToggleAutoCommit);
+    frames(&mut h, 5);
+    click_editor(&mut h);
+    h.key_press_modifiers(Modifiers::ALT, Key::X);
+    wait(&mut h, "TRUNCATE in a transaction", |h| {
+        let e = focused_editor(h);
+        !e.is_running() && e.stats_len() > 0 && e.in_transaction()
+    });
+    frames(&mut h, 10);
+    // Not committed: the navigator's session is not left waiting for the TRUNCATE's lock.
+    let s = session.clone();
+    let free = h.state().backend.block_on(async move { tokio::time::timeout(Duration::from_secs(5), s.execute_update("SELECT 1", &[])).await });
+    assert!(free.is_ok(), "the navigator's session waits for the uncommitted TRUNCATE");
+    assert_eq!(listed_size(&h, &id, &schema, "journal"), Some(journal));
+    h.state_mut().dispatch_action(&ctx, Action::Commit);
+    wait(&mut h, "the committed table's new size in the navigator", |h| listed_size(h, &id, &schema, "journal").is_some_and(|s| s < journal / 10));
+    no_errors(&mut h, "commit");
+    run(&h, &format!("DROP SCHEMA {schema} CASCADE"));
 }
 
 /// Booleans in the record view are check boxes: a click toggles, nothing is typed.

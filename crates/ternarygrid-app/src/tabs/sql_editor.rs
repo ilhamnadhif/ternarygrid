@@ -177,6 +177,11 @@ pub struct SqlEditorTab {
     /// Close once the result edits are saved, unless the script changed since (its version then).
     close_after_save: Option<u64>,
     ddl_executed: bool,
+    /// The tables the run's TRUNCATEs empty: the navigator's sizes and row counts change.
+    truncated: Vec<ObjectRef>,
+    /// TRUNCATE ran inside the open transaction (connection, database, tables): other
+    /// sessions, the navigator's, see the new sizes and the empty tables once it is committed.
+    sizes_on_commit: Option<(String, SchemaRef, Vec<ObjectRef>)>,
     last_run: Option<(Instant, Duration)>,
     terminal: bool,
     select_conn_open: bool,
@@ -308,6 +313,8 @@ impl SqlEditorTab {
             close_tx_ok: false,
             close_after_save: None,
             ddl_executed: false,
+            truncated: Vec::new(),
+            sizes_on_commit: None,
             last_run: None,
             terminal: console,
             select_conn_open: false,
@@ -713,13 +720,33 @@ impl SqlEditorTab {
             .iter()
             .map(|p| StatRow { index: p.index, sql: p.original.clone(), range: p.range.clone(), status: None, rows: None, elapsed: None, message: String::new() })
             .collect();
-        self.ddl_executed = prepared.plans.iter().any(|p| {
-            let k = ternarygrid_sql::classify(&p.sql, self.lang.syntax()).kind;
+        let infos: Vec<ternarygrid_sql::StatementInfo> = prepared.plans.iter().map(|p| ternarygrid_sql::classify(&p.sql, self.lang.syntax())).collect();
+        self.ddl_executed = infos.iter().any(|i| {
             matches!(
-                k,
+                i.kind,
                 ternarygrid_sql::StatementKind::Create | ternarygrid_sql::StatementKind::Alter | ternarygrid_sql::StatementKind::Drop | ternarygrid_sql::StatementKind::Rename
             )
         });
+        // TRUNCATE, DROP, ALTER need their tables to themselves: results of other tabs read
+        // page by page let go of theirs, or the statement would wait for them.
+        if infos.iter().any(|i| {
+            matches!(
+                i.kind,
+                ternarygrid_sql::StatementKind::Truncate | ternarygrid_sql::StatementKind::Drop | ternarygrid_sql::StatementKind::Alter | ternarygrid_sql::StatementKind::Rename
+            )
+        }) && let Some(live) = cx.conns.live(&conn)
+        {
+            live.release_idle_cursors(cx.backend, Some(&session));
+        }
+        // TRUNCATE without a name it can read (a client command) still changes the sizes.
+        self.truncated = infos
+            .iter()
+            .filter(|i| i.kind == ternarygrid_sql::StatementKind::Truncate)
+            .map(|i| {
+                let t = i.target.clone().unwrap_or_default();
+                ObjectRef { database: t.catalog, ..ObjectRef::table(t.schema, t.name) }
+            })
+            .collect();
         let smart = cx.settings.execution.smart_commit && prepared.has_writes && session.tx_state().mode == TransactionMode::Auto;
         let opts = ExecOpts {
             fetch_size: cx.settings.results.effective_fetch_size() as usize,
@@ -907,6 +934,23 @@ impl SqlEditorTab {
                         // DDL may touch any schema of the database (CREATE SCHEMA, other.t, ...).
                         let database = self.schema.as_ref().and_then(|s| s.database.clone());
                         cx.push(AppCommand::RefreshMetadata { connection: c.clone(), object: None, schema: Some(SchemaRef { database, schema: None }) });
+                    }
+                    if !self.truncated.is_empty()
+                        && let Some(c) = &self.conn
+                    {
+                        // TRUNCATE other.t may name any schema of the database.
+                        let scope = SchemaRef { database: self.schema.as_ref().and_then(|s| s.database.clone()), schema: None };
+                        let mut emptied = std::mem::take(&mut self.truncated);
+                        emptied.retain(|t| !t.name.is_empty());
+                        // Inside a transaction the other sessions see the old sizes, and on
+                        // PostgreSQL reading them waits for the TRUNCATE's lock: after the commit.
+                        if matches!(&self.session, SessionSlot::Ready(s) if s.tx_state().in_transaction) {
+                            let mut all = self.sizes_on_commit.take().map(|(_, _, e)| e).unwrap_or_default();
+                            all.extend(emptied);
+                            self.sizes_on_commit = Some((c.clone(), scope, all));
+                        } else {
+                            cx.push(AppCommand::RowsChanged { connection: c.clone(), scope, emptied });
+                        }
                     }
                 }
             }
@@ -1202,7 +1246,15 @@ impl SqlEditorTab {
         let commit = *commit;
         self.tx_job = None;
         match r {
-            Ok(()) => self.log("INFO", if commit { tr("Commit") } else { tr("Rollback") }),
+            Ok(()) => {
+                self.log("INFO", if commit { tr("Commit") } else { tr("Rollback") });
+                // The truncated tables' new sizes are visible to the navigator now (none after a rollback).
+                if let Some((connection, scope, emptied)) = self.sizes_on_commit.take()
+                    && commit
+                {
+                    cx.push(AppCommand::RowsChanged { connection, scope, emptied });
+                }
+            }
             Err(e) => {
                 let title = if commit { trf("Commit failed: {}", &[&self.title]) } else { trf("Rollback failed: {}", &[&self.title]) };
                 self.log("ERROR", format!("{title}: {}", e.full_text()));
@@ -2429,6 +2481,10 @@ impl SqlEditorTab {
     }
     pub fn session_ready(&self) -> bool {
         matches!(self.session, SessionSlot::Ready(_))
+    }
+    /// Its session has a transaction open (manual commit, not committed yet).
+    pub fn in_transaction(&self) -> bool {
+        matches!(&self.session, SessionSlot::Ready(s) if s.tx_state().in_transaction)
     }
     pub fn result_count(&self) -> usize {
         self.results.len()

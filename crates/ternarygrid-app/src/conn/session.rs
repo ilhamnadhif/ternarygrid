@@ -39,6 +39,9 @@ impl TxState {
 struct OpenCursor {
     token: u64,
     cursor: Box<dyn QueryCursor>,
+    /// From a statement that only reads (a query): closing it changes nothing on the
+    /// server, its result reads on by running it again.
+    read: bool,
 }
 
 struct Shared {
@@ -390,7 +393,8 @@ impl SessionHandle {
                 // Store the cursor before releasing the session so no other
                 // operation can slip in while the cursor owns the connection.
                 let rows = matches!(header, Some(ResultHeader::Rows(_)));
-                *self.inner.cursor.lock().await = Some(OpenCursor { token, cursor });
+                let read = rows && !ternarygrid_sql::classify(sql, self.inner.dialect.syntax()).is_write;
+                *self.inner.cursor.lock().await = Some(OpenCursor { token, cursor, read });
                 *self.inner.cursor_used.lock() = Instant::now();
                 drop(guard);
                 // Rows left to read hold the cursor open (an INSERT's is gone at once).
@@ -505,6 +509,23 @@ impl SessionHandle {
                 wait = limit.saturating_sub(idle).max(limit.min(Duration::from_secs(10)));
             }
         });
+    }
+
+    /// Close the open cursor of a query unless a fetch reads it right now. On PostgreSQL
+    /// and MySQL an unfinished read holds a lock on its tables: a TRUNCATE, DROP or ALTER
+    /// of one waits for it (until [`cursor_idle`] closed it). Its result reads on by
+    /// running the query again, as after that. A write's cursor (`UPDATE … RETURNING`)
+    /// stays: closing it would cancel the write.
+    pub async fn release_idle_cursor(&self) {
+        let token = match self.inner.cursor.try_lock() {
+            Ok(slot) => slot.as_ref().filter(|c| c.read).map(|c| c.token),
+            Err(_) => None,
+        };
+        if let Some(token) = token
+            && !self.is_busy()
+        {
+            self.close_cursor_token(token).await;
+        }
     }
 
     /// Whether the cursor identified by `token` is still open.
@@ -1261,6 +1282,26 @@ mod tests {
         silent.store(true, Ordering::SeqCst);
         h.settle_after_cancel(Duration::from_millis(300)).await;
         assert!(!h.is_closed(), "uncommitted changes: left to a reconnect, which asks first");
+    }
+
+    /// Before a TRUNCATE elsewhere: a query's open cursor is let go (its result reads on by
+    /// running it again), a write's is not (closing it would cancel the write).
+    #[tokio::test]
+    async fn only_a_querys_idle_cursor_is_released() {
+        let h = SessionHandle::new(sqlite("release").await, "release", None);
+        h.execute_update("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", &[]).await.unwrap();
+        h.execute_update("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) INSERT INTO t SELECT i, 0 FROM n", &[]).await.unwrap();
+        let ex = h.execute("SELECT * FROM t", &[], &ExecOptions::default()).await.unwrap();
+        assert!(h.fetch(ex.token, 10).await.is_ok());
+        assert!(h.cursor_open(ex.token).await);
+        h.release_idle_cursor().await;
+        assert!(!h.cursor_open(ex.token).await, "a query's cursor is released");
+
+        let ex = h.execute("UPDATE t SET v = 1 RETURNING id", &[], &ExecOptions::default()).await.unwrap();
+        assert!(h.cursor_open(ex.token).await);
+        h.release_idle_cursor().await;
+        assert!(h.cursor_open(ex.token).await, "a write's cursor stays");
+        h.close_cursor().await;
     }
 
     #[test]

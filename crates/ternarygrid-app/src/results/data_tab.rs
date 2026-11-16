@@ -31,6 +31,9 @@ pub struct TableDataView {
     /// Runs again by itself since data last arrived (a server that drops every session
     /// does not make the tab retry for ever).
     auto_retries: u8,
+    /// The connection's count of emptied tables when last looked at: the table emptied
+    /// since (TRUNCATE) is read again.
+    emptied_seen: Option<u64>,
 }
 
 /// Times a first query lost with its connection runs again by itself.
@@ -54,6 +57,7 @@ impl TableDataView {
             started_at: None,
             lost_on: None,
             auto_retries: 0,
+            emptied_seen: None,
         }
     }
 
@@ -156,6 +160,7 @@ impl TableDataView {
         if !self.started {
             self.start(cx, session.clone());
         }
+        self.reload_if_emptied(cx);
         self.poll(cx);
         if let Some(e) = self.error.clone() {
             crate::widgets::error_box(ui, &e);
@@ -194,6 +199,34 @@ impl TableDataView {
                     self.cancel_loading(cx.backend);
                 }
             }
+        }
+    }
+
+    /// The table shown was emptied (Truncate… in the navigator, TRUNCATE in an editor): its
+    /// rows are read again, as Refresh does, so the grid does not show rows that are gone.
+    /// A grid holding edits not saved yet keeps them (never thrown away unasked).
+    fn reload_if_emptied(&mut self, cx: &mut AppContext) {
+        let Some(live) = cx.conns.live(&self.conn) else { return };
+        let seq = live.emptied_seq();
+        let emptied = match self.emptied_seen {
+            Some(seen) if seen != seq => {
+                // The table shown now (foreign key navigation may have left the tab's own).
+                let shown = self.panel.as_ref().and_then(|p| p.table.as_ref()).unwrap_or(&self.table);
+                // A lower count: the connection was opened again since, its count started over.
+                live.emptied_since(if seen > seq { 0 } else { seen }, shown)
+            }
+            _ => false,
+        };
+        self.emptied_seen = Some(seq);
+        if !emptied {
+            return;
+        }
+        match self.panel.as_mut() {
+            Some(p) if !p.has_changes() && !p.is_saving() => p.refresh(cx),
+            Some(_) => {}
+            // The first read failed: read again.
+            None if self.exec.is_none() => self.retry(),
+            None => {}
         }
     }
 
