@@ -658,3 +658,24 @@ async fn sessions_locks_metrics() {
     drop(holder);
     db.drop(s.as_mut()).await;
 }
+
+/// PRINT and RAISERROR of severity 10 or less reach the statement's messages (tiberius
+/// drops their tokens; the driver takes them from its log events).
+#[tokio::test]
+async fn print_and_info_messages_arrive() {
+    let Some(mut s) = connect_to(None).await else { return };
+    let sql = "PRINT 'step one'; SELECT 1 AS x; RAISERROR('step two', 0, 1) WITH NOWAIT";
+    let mut cur = s.execute(sql, &[], &ExecOptions::default()).await.unwrap();
+    let mut msgs = Vec::new();
+    for _ in 0..10 {
+        let Some(h) = cur.next_result().await.unwrap() else { break };
+        if matches!(h, ResultHeader::Rows(_)) {
+            while !cur.fetch(100).await.unwrap().is_empty() {}
+        }
+        msgs.extend(cur.take_messages());
+    }
+    msgs.extend(cur.take_messages());
+    let texts: Vec<&str> = msgs.iter().map(|m| m.message.as_str()).collect();
+    assert!(texts.contains(&"step one") && texts.contains(&"step two"), "{msgs:?}");
+    cur.close().await.unwrap();
+}

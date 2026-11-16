@@ -25,6 +25,7 @@ pub mod ddl;
 pub mod dialect;
 pub mod driver;
 pub mod error;
+mod infomsg;
 pub mod keywords;
 pub mod plan;
 pub mod session;

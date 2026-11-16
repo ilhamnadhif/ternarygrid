@@ -3,6 +3,11 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.2 — 2026-11-16
+
+### Fixed
+- **SQL Server: `PRINT`, `RAISERROR` with severity 10 or less and the server's warnings showed nothing.** They appear in the editor's output with the statement, as PostgreSQL's notices do.
+
 ## 0.7.1 — 2026-11-16
 
 The rest of the audit: edits and paging that could reach the wrong rows, time zones and binary keys that changed on the way, and connections that fell back to plain text without a word.
