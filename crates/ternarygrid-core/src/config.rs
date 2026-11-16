@@ -828,6 +828,15 @@ pub enum SecretSlot {
     ProxyPassword,
 }
 
+/// Driver properties that are secrets (an Elasticsearch API key): kept in the secret store,
+/// not in the connections file, and given to the driver only when connecting.
+pub const SECRET_PROPERTIES: &[&str] = &["api_key"];
+
+/// Key under which the secret property `name` of a connection is stored.
+pub fn property_secret_key(connection_id: &str, name: &str) -> String {
+    format!("conn:{connection_id}:prop:{name}")
+}
+
 /// Key under which a connection secret is stored in the secret store.
 pub fn secret_key(connection_id: &str, slot: SecretSlot) -> String {
     let suffix = match slot {

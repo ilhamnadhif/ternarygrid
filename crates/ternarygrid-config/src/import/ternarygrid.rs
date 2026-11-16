@@ -73,6 +73,11 @@ pub fn secret_keys(store: &ConnectionStore, ids: &[String]) -> Vec<String> {
     let mut profiles = BTreeSet::new();
     for c in store.connections.iter().filter(|c| ids.contains(&c.id)) {
         keys.extend(slots.iter().map(|s| secret_key(&c.id, *s)));
+        keys.extend(
+            ternarygrid_core::config::SECRET_PROPERTIES
+                .iter()
+                .map(|n| ternarygrid_core::config::property_secret_key(&c.id, n)),
+        );
         if let Some(p) = &c.network_profile {
             profiles.insert(p.clone());
         }

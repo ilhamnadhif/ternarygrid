@@ -145,6 +145,9 @@ impl PgSession {
             version.split_whitespace().next().unwrap_or("PostgreSQL").to_string()
         };
         self.info = ServerInfo { version_number: ternarygrid_core::driver::parse_version_number(&version), product, version, session_id: pid };
+        if self.flavor != Flavor::Cockroach && (1..10).contains(&self.info.version_number.0) {
+            self.dialect = Arc::new(PgDialect::new().without_scram());
+        }
         let client = self.client()?;
         match client.batch_execute(&SESSION_SETUP.join(";\n")).await {
             Ok(()) => {}

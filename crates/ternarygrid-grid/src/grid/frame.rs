@@ -260,8 +260,20 @@ pub(crate) fn detached_menu(
 pub(super) fn show(model: &mut ResultModel, state: &mut DataGridState, options: &GridOptions, id_salt: Id, ui: &mut Ui) -> GridResponse {
     let id = ui.make_persistent_id(id_salt);
     model.try_sync();
-    if let Some(Err(e)) = model.poll_view_job() {
-        state.show_message(e, true);
+    match model.poll_view_job() {
+        Some(Err(e)) => state.show_message(e, true),
+        // An automatic refresh of the client view reordered the rows: the selection stays on
+        // the record it was on (Delete or Set NULL acted on another one), collapsed to it.
+        Some(Ok(())) => {
+            if let Some((anchor, row)) = state.rt.auto_view_anchor.take() {
+                let col = state.rt.selection.active().col;
+                match model.anchored_row(anchor, row) {
+                    Some(r) => state.rt.selection.select_cell(CellPos::new(r, col)),
+                    None => state.rt.selection.clear(),
+                }
+            }
+        }
+        None => {}
     }
     // The view may have changed under an open cell editor (a sort or filter, a
     // refresh): it edits the same record, at its new display row, or closes.
@@ -288,6 +300,8 @@ pub(super) fn show(model: &mut ResultModel, state: &mut DataGridState, options: 
         let spec = model.client_view_spec();
         if !spec.is_identity() {
             state.rt.auto_view_len = model.stored_row_count();
+            let row = state.rt.selection.active().row;
+            state.rt.auto_view_anchor = model.row_anchor(row).map(|a| (a, row));
             let ctx = ui.ctx().clone();
             model.start_client_view(spec, Box::new(move || ctx.request_repaint()));
         }

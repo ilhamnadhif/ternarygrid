@@ -303,6 +303,13 @@ pub trait Session: Send {
     fn dialect(&self) -> Arc<dyn Dialect>;
     fn server_info(&self) -> &ServerInfo;
 
+    /// What the user should know about how the session was opened: under the SSL mode
+    /// Prefer it may have fallen back to an unencrypted connection (which someone on the
+    /// network path can force by breaking the TLS handshake).
+    fn connect_warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Handle for cancelling the running statement from another task.
     fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>>;
 

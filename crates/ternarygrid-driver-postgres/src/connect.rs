@@ -464,6 +464,20 @@ pub(crate) fn notice_message(n: &tokio_postgres::error::DbError) -> ServerMessag
     ServerMessage { severity: n.severity().to_string(), message: n.message().to_string(), code: Some(n.code().code().to_string()), detail }
 }
 
+/// Certificates libpq accepts and rustls refuses (it fails closed): say what to change.
+fn certificate_hint(e: DbError) -> DbError {
+    let text = e.full_text();
+    if text.contains("NotValidForName") || text.contains("not valid for name") {
+        e.with_hint(
+            "The host name is checked against the certificate's Subject Alternative Names only: a certificate that names the host only in its Common Name is refused (libpq accepts it). Issue the server certificate with a SAN for the host, or use verify-ca.",
+        )
+    } else if text.contains("CaUsedAsEndEntity") {
+        e.with_hint("The server presents a CA certificate as its own (a self-signed CA:TRUE certificate): issue a server certificate signed by that CA, or use require.")
+    } else {
+        e
+    }
+}
+
 /// Open a connection according to `params` and start its driver task.
 pub(crate) async fn open(params: &ConnectParams) -> DbResult<Connected> {
     let props = Props::parse(params);
@@ -511,7 +525,7 @@ pub(crate) async fn open(params: &ConnectParams) -> DbResult<Connected> {
         config.connect_raw(stream, connector).await.map_err(pg)
     };
     let (client, connection) = match tokio::time::timeout(timeout, connect).await {
-        Ok(r) => r?,
+        Ok(r) => r.map_err(certificate_hint)?,
         Err(_) => {
             return Err(DbError::timeout(format!("Timed out after {}s connecting to {host}:{port}", timeout.as_secs())));
         }

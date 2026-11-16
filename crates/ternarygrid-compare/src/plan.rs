@@ -861,6 +861,23 @@ impl<'a> Planner<'a> {
             m.trg_drop = drops;
             m.trg_add = adds;
         }
+        // Constraints added from the source keep its attributes (INITIALLY DEFERRED, NOT VALID …).
+        if ctx.source.kind == ctx.target.kind {
+            let added: Vec<String> = m
+                .pk_add
+                .iter()
+                .chain(&m.uq_add)
+                .filter_map(|k| k.name.clone())
+                .chain(m.ck_add.iter().filter_map(|c| c.name.clone()))
+                .chain(m.fk_add.iter().filter_map(|f| f.name.clone()))
+                .collect();
+            for n in added {
+                match s.constraint_options.get(&n) {
+                    Some(o) => d.constraint_options.insert(n, o.clone()),
+                    None => d.constraint_options.remove(&n),
+                };
+            }
+        }
         m.desired = d;
         m
     }

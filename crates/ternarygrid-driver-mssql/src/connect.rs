@@ -143,13 +143,18 @@ async fn connect_once(params: &ConnectParams, host: &str, port: u16, level: Encr
 /// back to an unencrypted connection when `prefer` meets a server without
 /// TLS support.
 pub async fn open(params: &ConnectParams) -> DbResult<MsClient> {
+    open_reporting(params).await.map(|(c, _)| c)
+}
+
+/// [`open`], and whether `prefer` fell back to an unencrypted connection.
+pub async fn open_reporting(params: &ConnectParams) -> DbResult<(MsClient, bool)> {
     let (level, verify) = encryption_for(params.ssl.mode);
     let mut host = params.host.clone();
     let mut port = params.port;
     let mut level = level;
     for _attempt in 0..3 {
         match connect_once(params, &host, port, level, verify).await {
-            Ok(c) => return Ok(c),
+            Ok(c) => return Ok((c, level == EncryptionLevel::NotSupported && params.ssl.mode == SslMode::Prefer)),
             Err((_, Some((h, p)))) => {
                 tracing::debug!("SQL Server redirected the connection to {h}:{p}");
                 host = h;

@@ -93,6 +93,8 @@ pub struct ClickHouseSession {
     pub(crate) timezone: Option<String>,
     /// Warnings from connecting, delivered with the first executed statement.
     notices: Vec<ServerMessage>,
+    /// Prefer fell back to plain HTTP.
+    plain_fallback: bool,
 }
 
 /// First keyword of a statement (upper case), skipping comments and `(`.
@@ -169,11 +171,14 @@ impl ClickHouseSession {
             let probe = probe(&transport, params)?;
             Ok((transport, probe))
         };
+        let mut plain_fallback = false;
         let (transport, probe) = match attempt(https) {
             Ok(r) => r,
-            // `prefer`: fall back to plain HTTP when the port does not speak TLS.
-            Err(e) if params.ssl.mode == SslMode::Prefer && matches!(e.kind, ErrorKind::Tls | ErrorKind::Connection) => {
+            // `prefer`: fall back to plain HTTP when the port does not speak TLS (not when the
+            // server cannot be reached: the password went out again in clear for nothing).
+            Err(e) if params.ssl.mode == SslMode::Prefer && tls_refused(&e) => {
                 tracing::debug!("ClickHouse HTTPS attempt failed ({e}); retrying with HTTP");
+                plain_fallback = true;
                 attempt(false)?
             }
             Err(e) => return Err(e),
@@ -197,6 +202,10 @@ impl ClickHouseSession {
             timezone = Some(tz.to_string());
         }
         let mut session = Self::assemble(transport, info, Some(probe.database), probe.minimal, timezone);
+        session.plain_fallback = plain_fallback;
+        if probe.dropped.iter().any(|d| d == "output_format_json_quote_denormals") {
+            session.notices.push(ServerMessage::new("INFO", "The server did not accept the connection settings (a readonly = 1 user): NaN and infinite Float values show as NULL"));
+        }
         if let Some(reason) = &probe.rejected {
             let mut dropped = probe.dropped;
             if params.property("time_zone").is_some_and(|z| !z.is_empty()) {
@@ -232,6 +241,7 @@ impl ClickHouseSession {
             minimal,
             timezone,
             notices: Vec::new(),
+            plain_fallback: false,
         }
     }
 
@@ -379,6 +389,14 @@ fn read_only_enforced(value: &str) -> bool {
     value.trim().parse::<u64>().is_ok_and(|v| v > 0)
 }
 
+/// A connect over TLS that failed because the other end does not speak it (or cut the
+/// handshake), not because the server is unreachable.
+fn tls_refused(e: &DbError) -> bool {
+    let text = e.full_text().to_ascii_lowercase();
+    e.kind == ErrorKind::Tls
+        || (e.kind == ErrorKind::Connection && !["refused", "lookup", "resolve", "dns", "unreachable", "no route", "timed out"].iter().any(|w| text.contains(w)))
+}
+
 fn probe(transport: &Transport, params: &ConnectParams) -> DbResult<ProbeResult> {
     let full = default_settings(params);
     // Settings tried in turn while the server rejects them (a `readonly = 1` user may
@@ -467,6 +485,14 @@ impl Session for ClickHouseSession {
 
     fn server_info(&self) -> &ServerInfo {
         &self.info
+    }
+
+    fn connect_warnings(&self) -> Vec<String> {
+        if self.plain_fallback {
+            vec![ternarygrid_core::tr("The connection is not encrypted: the server did not answer over TLS, and the SSL mode Prefer fell back to plain HTTP (the password is sent in clear). Set the SSL mode to Disable for a server without TLS, or Require to refuse such connections.").to_string()]
+        } else {
+            Vec::new()
+        }
     }
 
     fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {

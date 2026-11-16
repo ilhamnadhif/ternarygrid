@@ -504,7 +504,8 @@ pub(crate) fn selection_copy_data_limited(model: &ResultModel, state: &DataGridS
 pub(crate) fn paste_into(model: &mut ResultModel, state: &mut DataGridState, text: &str) -> Result<usize, String> {
     // Text TernaryGrid copied itself: its cells (values with tabs, line breaks and quotes
     // are copied as they are, so the text alone does not tell them) and NULLs.
-    let own = state.rt.last_copy.as_ref().filter(|c| !text.is_empty() && c.text == text);
+    let own = state::LastCopy::of(text);
+    let own = own.as_ref();
     if own.is_some_and(|c| c.gaps) {
         return Err(tr("Cells copied with gaps between them cannot be pasted: copy a block").to_string());
     }

@@ -499,7 +499,22 @@ impl TabView for SessionManagerTab {
             {
                 let sql = row.get(q).map(|v| v.to_text().into_owned()).unwrap_or_default();
                 if !sql.trim().is_empty() {
-                    cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: None, text: Some(sql) });
+                    // In the session's database (its names leave the database out).
+                    let database = list
+                        .data
+                        .columns
+                        .iter()
+                        .position(|c| matches!(c.to_ascii_lowercase().as_str(), "database" | "datname" | "db" | "db_name"))
+                        .and_then(|c| row.get(c))
+                        .filter(|v| !v.is_null())
+                        .map(|v| v.to_text().into_owned())
+                        .filter(|d| !d.is_empty());
+                    // A server of several databases (PostgreSQL, SQL Server) opens the editor on it;
+                    // MySQL's databases are its schemas.
+                    let multiple = cx.conns.live(&self.conn).is_some_and(|l| l.multiple_databases());
+                    let schema =
+                        database.map(|d| if multiple { ternarygrid_core::meta::SchemaRef::new(Some(d), None) } else { ternarygrid_core::meta::SchemaRef::new(None, Some(d)) });
+                    cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema, text: Some(sql) });
                 }
             }
         });

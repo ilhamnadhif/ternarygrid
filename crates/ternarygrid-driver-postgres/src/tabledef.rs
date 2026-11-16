@@ -361,7 +361,8 @@ impl PgSession {
                        JOIN pg_catalog.pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.n ORDER BY k.o), \
                  con.confupdtype::text, con.confdeltype::text, con.condeferrable, \
                  CASE WHEN con.contype = 'c' THEN pg_catalog.pg_get_expr(con.conbin, con.conrelid) END, \
-                 pg_catalog.pg_get_constraintdef(con.oid), con.conislocal \
+                 pg_catalog.pg_get_constraintdef(con.oid), con.conislocal, \
+                 con.confmatchtype::text, con.condeferred, NOT COALESCE(con.convalidated, true), con.connoinherit \
                  FROM pg_catalog.pg_constraint con \
                  LEFT JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid \
                  LEFT JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace \
@@ -379,6 +380,27 @@ impl PgSession {
             let contype = r.s(2)?;
             let cols = r.ss(3)?;
             let t = &mut tables[i];
+            // What the model has no room for (it was lost: a deferred key replayed immediate,
+            // a NOT VALID check replayed validated and failed on the existing rows).
+            let definition = r.os(11)?.unwrap_or_default();
+            let mut o = ConstraintOptions {
+                match_type: match r.os(13)?.as_deref() {
+                    Some("f") => Some("FULL".into()),
+                    Some("p") => Some("PARTIAL".into()),
+                    _ => None,
+                },
+                initially_deferred: r.b(14)?,
+                not_valid: r.b(15)?,
+                no_inherit: r.b(16)?,
+                ..Default::default()
+            };
+            if matches!(contype.as_str(), "p" | "u") {
+                o.deferrable = r.b(9)?;
+                (o.nulls_not_distinct, o.index_parameters) = key_options(&definition);
+            }
+            if contype != "x" && o != ConstraintOptions::default() {
+                t.def.constraint_options.insert(name.clone(), o);
+            }
             match contype.as_str() {
                 "p" => t.def.primary_key = Some(KeyDef { name: Some(name), columns: cols }),
                 "u" => t.def.unique_keys.push(KeyDef { name: Some(name), columns: cols }),
@@ -1233,6 +1255,42 @@ pub(crate) fn options_map(opts: &[String]) -> BTreeMap<String, String> {
             None => (o.clone(), "true".into()),
         })
         .collect()
+}
+
+/// `NULLS NOT DISTINCT`, and what follows the columns (`INCLUDE`, `WITH`, `USING INDEX
+/// TABLESPACE`), of a key's `pg_get_constraintdef`.
+fn key_options(definition: &str) -> (bool, Option<String>) {
+    let nulls_not_distinct = definition.starts_with("UNIQUE NULLS NOT DISTINCT");
+    // The column list: the first parenthesis, to its close (quoted names may hold parentheses).
+    let (mut depth, mut quoted, mut end) = (0i32, false, None);
+    for (i, c) in definition.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else { return (nulls_not_distinct, None) };
+    let mut rest = definition[end..].trim();
+    loop {
+        let before = rest;
+        for tail in ["INITIALLY DEFERRED", "INITIALLY IMMEDIATE", "NOT DEFERRABLE", "DEFERRABLE", "NOT VALID"] {
+            if let Some(r) = rest.strip_suffix(tail) {
+                rest = r.trim_end();
+            }
+        }
+        if rest == before {
+            break;
+        }
+    }
+    (nulls_not_distinct, Some(rest.to_string()).filter(|r| !r.is_empty()))
 }
 
 #[cfg(test)]

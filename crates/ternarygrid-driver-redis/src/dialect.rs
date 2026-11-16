@@ -232,27 +232,101 @@ pub const SYNTAX: SqlSyntax = SqlSyntax {
 
 /// A key or value as a command argument: bare when it is safe, else quoted.
 pub(crate) fn arg(s: &str) -> String {
-    let bare = !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || ":._-{}/@|+=".contains(c));
+    arg_bytes(s.as_bytes())
+}
+
+/// Raw bytes as a command argument: bare when safe, else quoted, with `\xHH` for the bytes
+/// that are no UTF-8 and for control characters (byte by byte: a C1 control such as U+0085
+/// went out as the one byte 0x85, another key).
+pub(crate) fn arg_bytes(b: &[u8]) -> String {
+    let bare = !b.is_empty()
+        && b.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || b":._-{}/@|+=".contains(&c));
     if bare {
-        return s.to_string();
+        return String::from_utf8_lossy(b).into_owned();
     }
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = String::with_capacity(b.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c => out.push(c),
+    for chunk in b.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_control() => {
+                    let mut buf = [0u8; 4];
+                    for byte in c.encode_utf8(&mut buf).bytes() {
+                        out.push_str(&format!("\\x{byte:02x}"));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        for byte in chunk.invalid() {
+            out.push_str(&format!("\\x{byte:02x}"));
         }
     }
     out.push('"');
     out
+}
+
+/// The name a key is shown and addressed by: its text, with `\xHH` for each byte that is
+/// no UTF-8 (a lossy name addressed another key, or none: DEL "removed" nothing). A
+/// backslash before `x` or another backslash is doubled, so every key keeps its own name.
+pub(crate) fn key_name(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len());
+    for chunk in b.utf8_chunks() {
+        let mut chars = chunk.valid().chars().peekable();
+        while let Some(c) = chars.next() {
+            out.push(c);
+            if c == '\\'
+                && matches!(chars.peek(), Some('x' | '\\') | None)
+                && (chars.peek().is_some() || !chunk.invalid().is_empty())
+            {
+                out.push('\\');
+            }
+        }
+        for byte in chunk.invalid() {
+            out.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    out
+}
+
+/// The bytes of a key named by [`key_name`].
+pub(crate) fn key_bytes(name: &str) -> Vec<u8> {
+    let b = name.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            if b.get(i + 1) == Some(&b'\\') {
+                out.push(b'\\');
+                i += 2;
+                continue;
+            }
+            if b.get(i + 1) == Some(&b'x')
+                && let Some(v) = b
+                    .get(i + 2..i + 4)
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(v);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// A key (by its [`key_name`]) as a command argument.
+pub(crate) fn key_arg(name: &str) -> String {
+    arg_bytes(&key_bytes(name))
 }
 
 /// Split a command line into arguments as `redis-cli` does: `"…"` with
@@ -351,7 +425,7 @@ pub(crate) const COUNT_COMMAND: &str = "TERNARYGRID.COUNT";
 /// Rows read for each key type: the navigator keeps the type in the
 /// object's signature.
 pub(crate) fn read_command(key: &str, ty: Option<&str>) -> String {
-    let k = arg(key);
+    let k = key_arg(key);
     match ty.unwrap_or("") {
         "string" => format!("GET {k}"),
         "hash" => format!("HSCAN {k} 0 COUNT 1000"),
@@ -400,7 +474,7 @@ impl Dialect for RedisDialect {
         arg(ident) != ident
     }
     fn qualified(&self, _schema: Option<&str>, name: &str) -> String {
-        arg(name)
+        key_arg(name)
     }
     fn string_literal(&self, s: &str) -> String {
         arg(s)
@@ -474,7 +548,7 @@ impl Dialect for RedisDialect {
         read_command(&table.name, table.signature.as_deref())
     }
     fn truncate_table(&self, table: &ObjectRef) -> String {
-        format!("DEL {}", arg(&table.name))
+        format!("DEL {}", key_arg(&table.name))
     }
 }
 
@@ -488,10 +562,10 @@ impl DdlGenerator for RedisDdl {
         vec![NOT_REDIS.into()]
     }
     fn drop_table(&self, _schema: Option<&str>, name: &str, _cascade: bool) -> String {
-        format!("UNLINK {}", arg(name))
+        format!("UNLINK {}", key_arg(name))
     }
     fn rename_table(&self, _schema: Option<&str>, old_name: &str, new_name: &str) -> String {
-        format!("RENAME {} {}", arg(old_name), arg(new_name))
+        format!("RENAME {} {}", key_arg(old_name), key_arg(new_name))
     }
     fn alter_table(
         &self,
@@ -596,6 +670,42 @@ mod tests {
         assert_eq!(arg("q\"x"), "\"q\\\"x\"");
         let back = split_args(&format!("GET {}", arg("we\"ird key\n"))).unwrap();
         assert_eq!(back[1], b"we\"ird key\n");
+    }
+
+    /// Keys that are no UTF-8 keep their bytes: shown with `\xHH`, addressed by them again
+    /// (a lossy name deleted nothing, or another key); C1 controls go out as UTF-8.
+    #[test]
+    fn keys_keep_their_bytes() {
+        let keys: [&[u8]; 9] = [
+            b"cache:\xff\x01",
+            b"plain",
+            b"back\\slash",
+            b"\\x41",
+            b"a\\\\",
+            b"end\\",
+            b"\\\xff",
+            "caf\u{e9}".as_bytes(),
+            "nel\u{85}".as_bytes(),
+        ];
+        for k in keys {
+            let name = key_name(k);
+            assert_eq!(key_bytes(&name), k, "{name}");
+            let back = split_args(&format!("GET {}", key_arg(&name))).unwrap();
+            assert_eq!(back[1], k, "{name}");
+        }
+        assert_eq!(key_name(b"cache:\xff\x01"), "cache:\\xff\u{1}");
+        assert_eq!(key_name(b"back\\slash"), "back\\slash");
+        assert_ne!(key_name(b"\\xff"), key_name(b"\xff"));
+        // A value of bytes in the recreate script.
+        let blob = [0x82u8, 0xa1, b'"', 0x00, 0xc3];
+        assert_eq!(
+            split_args(&format!("SET k {}", arg_bytes(&blob))).unwrap()[2],
+            blob
+        );
+        assert_eq!(
+            split_args(&format!("SET k {}", arg("\u{85}"))).unwrap()[2],
+            "\u{85}".as_bytes()
+        );
     }
 
     #[test]

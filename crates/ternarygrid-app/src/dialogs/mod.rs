@@ -323,8 +323,13 @@ impl Dialogs {
             }
             if submit.get() {
                 let opt = |s: &str| if s.is_empty() { None } else { Some(Secret::new(s)) };
-                let creds =
-                    Credentials { password: opt(&p.password), ssh_password: opt(&p.ssh_password), ssh_passphrase: opt(&p.ssh_passphrase), proxy_password: opt(&p.proxy_password) };
+                let creds = Credentials {
+                    password: opt(&p.password),
+                    ssh_password: opt(&p.ssh_password),
+                    ssh_passphrase: opt(&p.ssh_passphrase),
+                    proxy_password: opt(&p.proxy_password),
+                    properties: Vec::new(),
+                };
                 if p.save {
                     let pairs = [
                         (SecretSlot::Password, &creds.password),

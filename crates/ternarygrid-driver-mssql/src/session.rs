@@ -58,6 +58,12 @@ pub struct SqlServerSession {
     suppress_refresh: bool,
     /// `SERVERPROPERTY('EngineEdition')` (5 = Azure SQL Database).
     pub(crate) engine_edition: i32,
+    /// The session ran `SET IMPLICIT_TRANSACTIONS` / `SET ANSI_DEFAULTS`: any later statement
+    /// may open a transaction (an UPDATE held its locks unseen, and closing the tab rolled it
+    /// back without asking), so `@@TRANCOUNT` is read after each one.
+    implicit_transactions: bool,
+    /// Prefer fell back to an unencrypted connection.
+    plain_fallback: bool,
 }
 
 struct InitInfo {
@@ -138,7 +144,7 @@ fn refresh_after(mode: TransactionMode, in_transaction: bool, sql: &str) -> bool
 impl SqlServerSession {
     /// Connect and initialise a session.
     pub async fn connect(params: &ConnectParams) -> DbResult<SqlServerSession> {
-        let mut client = connect::open(params).await?;
+        let (mut client, plain_fallback) = connect::open_reporting(params).await?;
         let manual = !params.auto_commit;
         let init = init_client(&mut client, manual).await?;
         let shared = Arc::new(Shared::default());
@@ -158,6 +164,8 @@ impl SqlServerSession {
             reconnect_notice: None,
             suppress_refresh: false,
             engine_edition: init.edition,
+            implicit_transactions: false,
+            plain_fallback,
         })
     }
 
@@ -229,13 +237,16 @@ impl SqlServerSession {
     /// Execute with an explicit mode (internal use).
     pub(crate) async fn exec_with(&mut self, sql: &str, params: &[Value], mode: Option<ExecMode>, opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
         let client = self.acquire().await?;
+        if sqltext::sets_implicit_transactions(sql) {
+            self.implicit_transactions = true;
+        }
         let stmt = Statement {
             sql: sql.to_string(),
             params: params.to_vec(),
             mode: mode.unwrap_or_else(|| exec_mode(sql, params)),
             timeout: opts.timeout,
             resolve_sources: opts.resolve_sources,
-            refresh_state: !self.suppress_refresh && refresh_after(self.mode, self.shared.in_transaction.load(Ordering::SeqCst), sql),
+            refresh_state: !self.suppress_refresh && (self.implicit_transactions || refresh_after(self.mode, self.shared.in_transaction.load(Ordering::SeqCst), sql)),
             refresh_on_error: !self.suppress_refresh,
             tag: sqltext::first_keyword(sql),
             notice: self.reconnect_notice.take(),
@@ -347,6 +358,21 @@ impl Session for SqlServerSession {
 
     fn server_info(&self) -> &ServerInfo {
         &self.info
+    }
+
+    fn connect_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // tiberius adds a CA to the system's roots: it cannot trust that one alone.
+        let ssl = &self.params.ssl;
+        if ssl.only_custom_ca && connect::encryption_for(ssl.mode).1 && ssl.ca_cert.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+            out.push(
+                ternarygrid_core::tr("SQL Server trusts the CA file in addition to the system's root certificates: \"only the custom CA\" cannot be enforced for it.").to_string(),
+            );
+        }
+        if self.plain_fallback {
+            out.push(ternarygrid_core::tr("The connection is not encrypted: TLS could not be used, and the SSL mode Prefer fell back to a plain connection. Set the SSL mode to Require to refuse such connections.").to_string())
+        }
+        out
     }
 
     fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {

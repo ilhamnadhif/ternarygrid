@@ -184,6 +184,45 @@ fn save_and_wait(h: &mut H, view: &mut TableDataView) {
     h.until(view, "save", |v| !v.panel.as_ref().unwrap().has_changes());
 }
 
+/// PostgreSQL: a save closes the result's cursor, and an updated row moves in the table (a
+/// new tuple): reading on by skipping the rows read so far skipped one row and showed the
+/// updated one twice. The rows read are read again after the save.
+#[test]
+fn reading_on_after_a_save_skips_and_repeats_no_row() {
+    let Some(url) = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.trim().is_empty()) else { return };
+    let mut h = H::new(&url);
+    let table = format!("ternarygrid_page_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    h.sql(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, v TEXT)"));
+    h.sql(&format!("INSERT INTO {table} SELECT g, 'x' FROM generate_series(1, 1000) g"));
+    let obj = ObjectRef::table(Some("public".into()), table.clone());
+    let mut view = TableDataView::new(h.id.clone(), obj, None);
+    h.until(&mut view, "first page", |v| v.panel.as_ref().is_some_and(|p| p.model.row_count() >= 200 && p.model.is_editable() && !p.src.is_fetching()));
+    let first = view.panel.as_ref().unwrap().model.row_count();
+    {
+        let p = view.panel.as_mut().unwrap();
+        let row = (0..first).find(|&r| p.model.cell(r, 0) == Some(ternarygrid_core::Value::Int(3))).unwrap();
+        // Longer than the room left in its page: the new version goes to the table's end.
+        p.model.set_cell(row, 1, &"changed ".repeat(300)).unwrap();
+    }
+    save_and_wait(&mut h, &mut view);
+    h.until(&mut view, "settled", |v| v.panel.as_ref().is_some_and(|p| !p.src.is_fetching() && p.model.row_count() >= first));
+    let backend = h.backend.clone();
+    view.panel.as_mut().unwrap().src.fetch_more(&backend, 200, None);
+    h.until(&mut view, "the next page", |v| v.panel.as_ref().is_some_and(|p| !p.src.is_fetching() && p.model.row_count() >= first + 200));
+    let p = view.panel.as_ref().unwrap();
+    let ids: Vec<i64> = (0..p.model.row_count()).filter_map(|r| p.model.cell(r, 0).and_then(|v| v.as_i64())).collect();
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "no row twice");
+    // The rows shown are the table's first ones as it reads now (none skipped at the page's edge).
+    let mut expected: Vec<i64> = h.query(&format!("SELECT id FROM {table} LIMIT {}", ids.len())).iter().map(|r| r[0].parse().unwrap()).collect();
+    expected.sort_unstable();
+    assert_eq!(unique, expected, "rows skipped");
+    drop(view);
+    h.sql(&format!("DROP TABLE {table}"));
+}
+
 #[test]
 fn edit_save_and_cancel() {
     for (name, url) in servers() {

@@ -971,6 +971,37 @@ impl<'a> Lexer<'a> {
             b']' => return (K::RBracket, start + 1, false),
             _ => {}
         }
+        // Oracle alternative quoting `q'[it's]'` (and `nq'…'`): the text runs to the closing
+        // delimiter before a quote, so a `'` inside does not end it.
+        if self.syntax.plsql_blocks {
+            let quote = if (c | 0x20) == b'q' && next == b'\'' {
+                Some(start + 1)
+            } else if (c | 0x20) == b'n' && (next | 0x20) == b'q' && self.byte(start + 2) == b'\'' {
+                Some(start + 2)
+            } else {
+                None
+            };
+            if let Some(q) = quote {
+                let open = self.byte(q + 1);
+                if open > b' ' && open < 0x80 && open != b'\'' {
+                    let close = match open {
+                        b'[' => b']',
+                        b'(' => b')',
+                        b'{' => b'}',
+                        b'<' => b'>',
+                        o => o,
+                    };
+                    let mut i = q + 2;
+                    while i + 1 < self.b.len() {
+                        if self.b[i] == close && self.b[i + 1] == b'\'' {
+                            return (K::String, i + 2, false);
+                        }
+                        i += 1;
+                    }
+                    return (K::String, self.b.len(), true);
+                }
+            }
+        }
         // Prefixed string literals: E'..', N'..', X'..', B'..', U&'..'.
         if next == b'\'' {
             match c | 0x20 {

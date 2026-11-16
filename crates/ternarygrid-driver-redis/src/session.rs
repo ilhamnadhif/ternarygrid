@@ -6,7 +6,9 @@
 //! page while the grid fetches, so a hash of millions of fields neither blocks
 //! the server (as `HGETALL` would) nor fills the memory.
 
-use crate::dialect::{COUNT_COMMAND, RedisDialect, arg, split_args};
+use crate::dialect::{
+    COUNT_COMMAND, RedisDialect, arg, arg_bytes, key_arg, key_bytes, key_name, split_args,
+};
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
 use redis::{
@@ -853,12 +855,7 @@ impl RedisSession {
                 p.cmd("TYPE").arg(k.as_slice());
             }
             let types: Vec<String> = p.query_async(&mut conn).await.map_err(err)?;
-            out.extend(
-                chunk
-                    .iter()
-                    .zip(types)
-                    .map(|(k, t)| (String::from_utf8_lossy(k).into_owned(), t)),
-            );
+            out.extend(chunk.iter().zip(types).map(|(k, t)| (key_name(k), t)));
         }
         Ok(out)
     }
@@ -1127,7 +1124,7 @@ impl RedisSession {
     async fn key_type(&mut self, db: i64, key: &str) -> DbResult<String> {
         let mut conn = self.conn(db).await?;
         redis::cmd("TYPE")
-            .arg(key)
+            .arg(key_bytes(key))
             .query_async(&mut conn)
             .await
             .map_err(err)
@@ -1357,10 +1354,16 @@ impl Session for RedisSession {
         let db = Self::db_of(obj.schema.as_deref()).unwrap_or(self.db);
         let mut conn = self.conn(db).await?;
         let key = obj.name.as_str();
-        let k = arg(key);
+        let k = key_arg(key);
         let ty = self.key_type(db, key).await?;
+        let key = key_bytes(key);
+        let key = key.as_slice();
         let mut out = vec![format!("# {ty} key in db{db}")];
-        let quoted = |v: &Reply| arg(&text_of(v).unwrap_or_default());
+        // Values as their bytes (msgpack, protobuf): a lossy text wrote U+FFFD over them.
+        let quoted = |v: &Reply| match v {
+            Reply::BulkString(b) => arg_bytes(b),
+            other => arg(&text_of(other).unwrap_or_default()),
+        };
         match ty.as_str() {
             "string" => {
                 let v: Reply = redis::cmd("GET")
@@ -1437,6 +1440,8 @@ impl Session for RedisSession {
         let mut conn = self.conn(db).await?;
         let key = obj.name.as_str();
         let ty = self.key_type(db, key).await?;
+        let key = key_bytes(key);
+        let key = key.as_slice();
         let len_cmd = match ty.as_str() {
             "hash" => "HLEN",
             "set" => "SCARD",

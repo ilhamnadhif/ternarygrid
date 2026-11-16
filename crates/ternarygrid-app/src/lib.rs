@@ -134,6 +134,8 @@ pub fn connection_manager(services: &services::Services) -> (conn::ConnectionMan
     let net = Arc::new(conn::TunnelNet { known_hosts: services.paths.known_hosts_file() });
     let mut conns = conn::ConnectionManager::new(driver_registry(), secrets, net);
     conns.store = store;
+    // API keys written in plain text by earlier versions move to the secret store.
+    conns.stash_secret_properties();
     conns.pgpass = Some(Arc::new(|host: &str, port: u16, db: &str, user: &str| ternarygrid_config::import::pgpass::lookup(host, port, db, user)));
     (conns, warnings)
 }

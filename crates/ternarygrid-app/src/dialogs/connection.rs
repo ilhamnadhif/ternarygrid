@@ -222,7 +222,13 @@ impl ConnectionDialog {
 
     fn credentials(&self) -> Credentials {
         let opt = |s: &str| if s.is_empty() { None } else { Some(Secret::new(s)) };
-        Credentials { password: opt(&self.password), ssh_password: opt(&self.ssh_password), ssh_passphrase: opt(&self.ssh_passphrase), proxy_password: opt(&self.proxy_password) }
+        Credentials {
+            password: opt(&self.password),
+            ssh_password: opt(&self.ssh_password),
+            ssh_passphrase: opt(&self.ssh_passphrase),
+            proxy_password: opt(&self.proxy_password),
+            properties: Vec::new(),
+        }
     }
 
     /// What is missing for a test or a save (an empty name is the placeholder's).

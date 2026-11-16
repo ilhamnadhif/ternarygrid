@@ -3,6 +3,46 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.1 — 2026-11-16
+
+The rest of the audit: edits and paging that could reach the wrong rows, time zones and binary keys that changed on the way, and connections that fell back to plain text without a word.
+
+### Fixed — data
+- **Oracle: a TIMESTAMP WITH TIME ZONE edited in the grid moved by the computer's offset** (`08:00 +07:00` was stored as `01:00 +07:00`). Zoned values go to the server with their offset, and TIMESTAMP WITH LOCAL TIME ZONE values show in the session's zone instead of as UTC.
+- **MySQL: Import with "Replace" could overwrite a row of another key.** `ON DUPLICATE KEY UPDATE` follows whichever unique key a row hits; unless the chosen key columns are a unique key of the table, rows are replaced by deleting and inserting them by those columns, in transactions.
+- **Redis: keys that are no UTF-8 were read, renamed and deleted as another key** (Drop "removed" nothing, or a different key). Such bytes show as `\xHH` and are sent as themselves; the recreate script keeps binary values (msgpack, protobuf) byte for byte, and control characters such as U+0085 are sent as UTF-8.
+- **PostgreSQL: reading on after a save could skip a row and show another twice** (an updated row moves in the table). The rows read so far are read again after the save.
+- **The selection stayed on a row position when a sort or filter was applied again to newly fetched rows**, so Delete or Set NULL then hit another record. It follows the record.
+- **Rows fetched while a save ran stayed hidden**, and the next page waits for the save.
+- **When the table's columns changed between two pages** (an ALTER meanwhile), the rows read before showed under the new headers. The result is read again.
+- **Pasting `"Hello"` copied from an editor stored `Hello`.** Quotes are kept unless they wrap a whole field, and NULLs copied from another grid stay NULL.
+- **PostgreSQL DDL lost constraint attributes:** `DEFERRABLE INITIALLY DEFERRED`, `NOT VALID`, `MATCH FULL`, `NO INHERIT`, `NULLS NOT DISTINCT` and a key's `INCLUDE` / `WITH` / tablespace are kept in the DDL tab, the table designer and schema compare, which shows them as differences.
+- PostgreSQL: arrays and ranges of extension types (`ltree[]`) showed as hex after a save; a `COMMIT` that failed as a syntax error no longer marks the transaction closed; changing the password on a server before PostgreSQL 10 (Greenplum 6) no longer makes the SCRAM text the password.
+- MySQL: backslashes in column defaults and comments were doubled on a server with `NO_BACKSLASH_ESCAPES`, also after a `SET sql_mode` in the session.
+- Splitting and classifying SQL: Oracle `q'[…]'` strings, a column named `end` (`e.end`), `ALTER TRIGGER` and `ALTER EVENT SESSION` without a body, `/*! … */` at the end of a statement, T-SQL `IF … DROP` and `BEGIN TRY … TRUNCATE`, Oracle `BEGIN DELETE …`; reads that take a sequence value (`NEXTVAL`, `NEXT VALUE FOR`) or write rows elsewhere (`TABLE … INTO`) count as writes.
+- Export to SQL for the connection's own database uses the server's dialect (its version), as the navigator does.
+
+### Fixed — security
+- **Under the SSL mode Prefer a connection could fall back to an unencrypted one without a word.** MySQL, SQL Server, ClickHouse and Elasticsearch now warn when they connect without TLS; Elasticsearch tries HTTPS first (it always used HTTP), and ClickHouse no longer retries over HTTP when the server cannot be reached at all.
+- **The AI assistant's queries on SQL Server and Oracle ran outside a transaction**, so a function that writes or a `BEGIN TRAN` holding locks got through. Each runs in a transaction of its own, rolled back (read-only on Oracle).
+- With "send sample data" off, the row values in an error (`Key (email)=(…)`) are no longer sent to the AI.
+- Secret connection properties (`api_key`) are kept in the secret store instead of the connection file, also on export and import.
+- SQL Server: `USE otherdb` in an editor that shares the navigator's session is refused: it moved the navigator's DROP and the grid's saves to another database.
+- SQL Server: "only the custom CA" cannot be enforced (the driver adds the CA to the system's roots), and the connection says so.
+- MySQL: `KILL QUERY` checks that its side connection reached the same server (behind a load balancer it could cancel another client's query).
+- Oracle: Terminate refuses the current session.
+
+### Fixed — reliability
+- **Reconnect ran the old connection's after-disconnect command after the new one's before-connect command**, tearing down the VPN or port forward it had just opened. The old close ends first.
+- **SQL Server: after `SET IMPLICIT_TRANSACTIONS ON` (or `ANSI_DEFAULTS ON`) the transaction an UPDATE opened went unseen**, and closing the tab rolled it back without asking.
+- **Oracle auto-commit: `LOCK TABLE` and `SELECT … FOR UPDATE` held their locks until some later DML committed.** They are committed (FOR UPDATE once its rows are read).
+- A write cancelled just as it finished on the server counts as an uncommitted change.
+- A tab session that finished opening during Disconnect no longer lives on, untracked, with the old settings; an SSH or proxy password typed when connecting is kept for reopening the tunnel after a sleep.
+- Oracle: a CA certificate file is used (it was ignored), a client certificate without a wallet is refused with a clear message, certificate errors say what is checked (the chain and host name in every TLS mode, the local address through an SSH tunnel), and Cancel on RAC goes to the session's instance.
+- PostgreSQL: a certificate that names the host only in its Common Name, or a CA certificate used as the server's own, says why it is refused.
+- ClickHouse: an exception written into the result (`Code: 241. DB::Exception …`) is an error instead of a last row; `FORMAT Values` output on one huge line is read in rows of 1 MiB instead of all at once; minimal mode says that NaN and infinite floats show as NULL.
+- Admin → Sessions: double-clicking a session opens an editor on that session's database.
+
 ## 0.7.0 — 2026-11-16
 
 A full audit of TernaryGrid: edits that could change the wrong rows, writes that slipped past read-only connections and the AI assistant, and work that could be lost are fixed.

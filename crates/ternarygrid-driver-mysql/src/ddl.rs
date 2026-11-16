@@ -95,6 +95,16 @@ pub fn string_literal(s: &str) -> String {
     out
 }
 
+/// A string literal for the server's `sql_mode`: with `NO_BACKSLASH_ESCAPES` a backslash is
+/// itself (doubled, `C:\tmp` became `C:\\tmp`).
+pub fn profile_literal(profile: &ServerProfile, s: &str) -> String {
+    if profile.no_backslash_escapes() {
+        ternarygrid_core::dialect::ansi::string_literal(s, false)
+    } else {
+        string_literal(s)
+    }
+}
+
 /// Default expression is a literal that MySQL accepts without parentheses.
 pub fn is_literal_default(d: &str) -> bool {
     let t = d.trim();
@@ -251,7 +261,7 @@ impl MySqlDdl {
         }
         if let Some(cm) = c.comment.as_deref().filter(|x| !x.is_empty()) {
             s.push_str(" COMMENT ");
-            s.push_str(&string_literal(cm));
+            s.push_str(&self.lit(cm));
         }
         s
     }
@@ -300,7 +310,11 @@ impl MySqlDdl {
             })
     }
 
-    fn index_suffix(idx: &IndexDef) -> String {
+    fn lit(&self, s: &str) -> String {
+        profile_literal(&self.profile, s)
+    }
+
+    fn index_suffix(&self, idx: &IndexDef) -> String {
         let mut s = String::new();
         if let Some(m) = idx.method.as_deref()
             && m.eq_ignore_ascii_case("HASH")
@@ -309,7 +323,7 @@ impl MySqlDdl {
         }
         if let Some(c) = idx.comment.as_deref().filter(|c| !c.is_empty()) {
             s.push_str(" COMMENT ");
-            s.push_str(&string_literal(c));
+            s.push_str(&self.lit(c));
         }
         s
     }
@@ -352,7 +366,7 @@ impl MySqlDdl {
             None => format!("UNIQUE KEY ({parts})"),
         };
         if let Some(i) = idx {
-            s.push_str(&Self::index_suffix(i));
+            s.push_str(&self.index_suffix(i));
         }
         s
     }
@@ -363,7 +377,7 @@ impl MySqlDdl {
             Self::index_kind(idx),
             quote(&idx.name),
             self.key_parts(t, &idx.columns),
-            Self::index_suffix(idx)
+            self.index_suffix(idx)
         )
     }
 
@@ -409,14 +423,14 @@ impl MySqlDdl {
                 .filter(|v| !v.is_empty())
             {
                 if QUOTED_OPTIONS.contains(key) {
-                    parts.push(format!("{kw}={}", string_literal(v)));
+                    parts.push(format!("{kw}={}", self.lit(v)));
                 } else if v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     parts.push(format!("{kw}={v}"));
                 }
             }
         }
         if let Some(c) = t.comment.as_deref().filter(|c| !c.is_empty()) {
-            parts.push(format!("COMMENT={}", string_literal(c)));
+            parts.push(format!("COMMENT={}", self.lit(c)));
         }
         parts.join(" ")
     }
@@ -961,7 +975,7 @@ impl DdlGenerator for MySqlDdl {
                     .map(|(_, kw)| *kw)
                     .unwrap_or("");
                 if QUOTED_OPTIONS.contains(key) {
-                    opt_changes.push(format!("{kw}={}", string_literal(v)));
+                    opt_changes.push(format!("{kw}={}", self.lit(v)));
                 } else if v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     opt_changes.push(format!("{kw}={v}"));
                 }
@@ -970,7 +984,7 @@ impl DdlGenerator for MySqlDdl {
         if norm_opt(&rf.comment) != norm_opt(&to.comment) {
             opt_changes.push(format!(
                 "COMMENT={}",
-                string_literal(to.comment.as_deref().unwrap_or(""))
+                self.lit(to.comment.as_deref().unwrap_or(""))
             ));
         }
         if !opt_changes.is_empty() {
@@ -1041,7 +1055,7 @@ impl DdlGenerator for MySqlDdl {
             quote(&index.name),
             self.tname(table),
             self.key_parts(table, &index.columns),
-            Self::index_suffix(index)
+            self.index_suffix(index)
         )
     }
 
@@ -2285,5 +2299,27 @@ mod tests {
         assert_eq!(default_clause("(rand())"), "(rand())");
         assert_eq!(default_clause("uuid()"), "(uuid())");
         assert_eq!(string_literal("a'b\\c"), "'a''b\\\\c'");
+    }
+}
+
+#[cfg(test)]
+mod literal_tests {
+    use super::*;
+    use crate::flavor::Flavor;
+
+    /// Comments and defaults follow NO_BACKSLASH_ESCAPES (a backslash was doubled there).
+    #[test]
+    fn literals_follow_the_sql_mode() {
+        let mut p = ServerProfile::new(Flavor::MySql, (8, 0, 0));
+        assert_eq!(profile_literal(&p, "C:\\tmp"), "'C:\\\\tmp'");
+        p.sql_mode = "NO_BACKSLASH_ESCAPES".into();
+        assert_eq!(profile_literal(&p, "C:\\tmp"), "'C:\\tmp'");
+        let mut t = TableDef::new(None, "t");
+        t.comment = Some("a\\b".into());
+        assert!(
+            MySqlDdl::new(p)
+                .table_options(&t)
+                .contains("COMMENT='a\\b'")
+        );
     }
 }

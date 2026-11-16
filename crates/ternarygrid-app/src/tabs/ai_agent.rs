@@ -419,12 +419,24 @@ impl Agent {
         // PostgreSQL: each query in a read-only transaction of its own, rolled back, so a
         // query cannot make the session writable (`set_config('default_transaction_read_only',
         // 'off', false)` reached through a function) for the ones after it.
-        let read_only_tx = matches!(self.kind, DbKind::Postgres | DbKind::CockroachDb);
-        if read_only_tx && let Err(e) = session.execute_update("START TRANSACTION READ ONLY", &[]).await {
+        // SQL Server and Oracle have no read-only session: a transaction rolled back after
+        // each query undoes what slipped through (a function that writes, `BEGIN TRAN` with
+        // a lock held for the rest of the turn); Oracle's is read-only too.
+        let (begin, end) = match self.kind {
+            DbKind::Postgres | DbKind::CockroachDb => (Some("START TRANSACTION READ ONLY"), "ROLLBACK"),
+            DbKind::SqlServer => (Some("BEGIN TRANSACTION"), "WHILE @@TRANCOUNT > 0 ROLLBACK TRANSACTION"),
+            DbKind::Oracle => (Some("SET TRANSACTION READ ONLY"), "ROLLBACK"),
+            _ => (None, ""),
+        };
+        if let Some(b) = begin
+            && let Err(e) = session.execute_update(b, &[]).await
+        {
             return ToolStep::failed(stmt, e.full_text());
         }
         let r = run(&session, &stmt).await;
-        if read_only_tx && let Err(e) = session.execute_update("ROLLBACK", &[]).await {
+        if begin.is_some()
+            && let Err(e) = session.execute_update(end, &[]).await
+        {
             tracing::warn!("ending the assistant's read-only transaction: {}", e.full_text());
         }
         match r {

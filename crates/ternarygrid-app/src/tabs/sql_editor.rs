@@ -726,6 +726,17 @@ impl SqlEditorTab {
             self.log("INFO", if analyze { tr("Explain analyze…") } else { tr("Explain…") });
             return;
         }
+        // `USE otherdb` on the session this editor shares with the navigator (no separate
+        // connection) moved that session to another database without anyone knowing:
+        // the navigator's DROP / ALTER and the grid's saves then went there.
+        if shared && prepared.plans.iter().any(|p| ternarygrid_sql::classify(&p.sql, self.lang.syntax()).kind == ternarygrid_sql::StatementKind::Use) {
+            let why = tr(
+                "USE would switch the database of the session this editor shares with the navigator: choose the database in the toolbar instead, or turn on a separate connection for each editor in the connection's settings.",
+            );
+            self.log("ERROR", why);
+            cx.toasts.error(tr("USE is not run here"), Some(why.to_string()));
+            return;
+        }
         self.replace_result = !req.new_tab && !cx.settings.results.open_each_query_in_new_tab && prepared.plans.len() == 1;
         self.stats = prepared
             .plans

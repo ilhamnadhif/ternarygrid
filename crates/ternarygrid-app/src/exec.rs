@@ -221,6 +221,11 @@ async fn run(
             None => {
                 ok = false;
                 error_text = Some("cancelled".into());
+                // It may have completed on the server just before the cancel.
+                // (Bounded: a server that ignores the cancel keeps the session.)
+                if plan.is_write {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), session.note_cancelled(&plan.sql)).await;
+                }
             }
             Some(Err(e)) => {
                 ok = false;

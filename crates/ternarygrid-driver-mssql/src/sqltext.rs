@@ -352,8 +352,14 @@ pub fn is_scope_sensitive(sql: &str) -> bool {
 /// driver tracks)?
 pub fn touches_session_state(sql: &str) -> bool {
     tokenize(sql).iter().any(|t| {
-        t.kind == TokKind::Word && ["TRAN", "TRANSACTION", "COMMIT", "ROLLBACK", "USE", "IMPLICIT_TRANSACTIONS", "XACT_ABORT"].iter().any(|w| t.text.eq_ignore_ascii_case(w))
+        t.kind == TokKind::Word
+            && ["TRAN", "TRANSACTION", "COMMIT", "ROLLBACK", "USE", "IMPLICIT_TRANSACTIONS", "ANSI_DEFAULTS", "XACT_ABORT"].iter().any(|w| t.text.eq_ignore_ascii_case(w))
     })
+}
+
+/// Does the SQL set `IMPLICIT_TRANSACTIONS` or `ANSI_DEFAULTS` (which turns it on)?
+pub fn sets_implicit_transactions(sql: &str) -> bool {
+    tokenize(sql).iter().any(|t| t.kind == TokKind::Word && (t.text.eq_ignore_ascii_case("IMPLICIT_TRANSACTIONS") || t.text.eq_ignore_ascii_case("ANSI_DEFAULTS")))
 }
 
 /// Split a script on `GO [count]` separator lines (outside strings and

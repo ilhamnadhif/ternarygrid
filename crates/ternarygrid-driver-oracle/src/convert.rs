@@ -22,11 +22,36 @@ pub(crate) enum Read {
     Bytes,
     Timestamp,
     TimestampUtc,
+    /// TIMESTAMP WITH LOCAL TIME ZONE: the wall clock of the session's zone, at this offset
+    /// (seconds east of UTC; see [`in_session_zone`]).
+    TimestampLocal(i32),
     IntervalDs,
     IntervalYm,
     Json,
     Bool,
     Other,
+}
+
+/// TIMESTAMP WITH LOCAL TIME ZONE columns are read at the session zone's offset `secs`
+/// (they came labelled UTC: shifted by the zone).
+pub(crate) fn in_session_zone(reads: &mut [Read], secs: i32) {
+    for r in reads {
+        if let Read::TimestampLocal(o) = r {
+            *o = secs;
+        }
+    }
+}
+
+/// `+07:00` / `-03:30` (TZ_OFFSET) in seconds east of UTC.
+pub(crate) fn offset_seconds(text: &str) -> Option<i32> {
+    let t = text.trim();
+    let (sign, rest) = match t.as_bytes().first()? {
+        b'-' => (-1, &t[1..]),
+        b'+' => (1, &t[1..]),
+        _ => (1, t),
+    };
+    let (h, m) = rest.split_once(':')?;
+    Some(sign * (h.trim().parse::<i32>().ok()? * 3600 + m.trim().parse::<i32>().ok()? * 60))
 }
 
 /// Column description plus the way its values are read.
@@ -55,9 +80,8 @@ pub(crate) fn column(m: &Metadata) -> (ColumnMeta, Read) {
         | "DB_TYPE_UROWID" => (DataKind::Text, Read::Text),
         "DB_TYPE_RAW" | "DB_TYPE_LONG_RAW" | "DB_TYPE_BLOB" => (DataKind::Binary, Read::Bytes),
         "DB_TYPE_DATE" | "DB_TYPE_TIMESTAMP" => (DataKind::DateTime, Read::Timestamp),
-        "DB_TYPE_TIMESTAMP_TZ" | "DB_TYPE_TIMESTAMP_LTZ" => {
-            (DataKind::DateTimeTz, Read::TimestampUtc)
-        }
+        "DB_TYPE_TIMESTAMP_TZ" => (DataKind::DateTimeTz, Read::TimestampUtc),
+        "DB_TYPE_TIMESTAMP_LTZ" => (DataKind::DateTimeTz, Read::TimestampLocal(0)),
         "DB_TYPE_INTERVAL_DS" => (DataKind::Interval, Read::IntervalDs),
         "DB_TYPE_INTERVAL_YM" => (DataKind::Interval, Read::IntervalYm),
         "DB_TYPE_JSON" => (DataKind::Json, Read::Json),
@@ -143,6 +167,18 @@ fn value(row: &oracledb::Row, i: usize, read: Read) -> DbResult<Value> {
             .and_then(naive)
             .map_or(Value::Null, |t| {
                 Value::DateTimeTz(t.and_utc().fixed_offset())
+            }),
+        Read::TimestampLocal(secs) => row
+            .get::<Option<OracleTimestamp>>(i)
+            .db()?
+            .and_then(naive)
+            .map_or(Value::Null, |t| {
+                let off = chrono::FixedOffset::east_opt(secs)
+                    .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap());
+                match t.and_local_timezone(off).single() {
+                    Some(at) => Value::DateTimeTz(at),
+                    None => Value::DateTime(t),
+                }
             }),
         Read::IntervalDs => row
             .get::<Option<OracleIntervalDS>>(i)
@@ -250,9 +286,17 @@ pub(crate) fn bind(value: &Value) -> Box<dyn ToDbValue + Send + Sync> {
             d.day() as u8,
         )),
         Value::DateTime(t) => Box::new(timestamp(t, false)),
-        Value::DateTimeTz(t) => Box::new(timestamp(&t.naive_utc(), true)),
+        // As text in the session's NLS_TIMESTAMP_TZ_FORMAT: oracledb binds every timestamp as
+        // one without a zone, which Oracle took for the session zone's wall clock (the instant
+        // moved by the zone's offset).
+        Value::DateTimeTz(t) => Box::new(tz_text(t)),
         other => Box::new(other.to_text().into_owned()),
     }
+}
+
+/// A zoned timestamp in the session's `NLS_TIMESTAMP_TZ_FORMAT` (`YYYY-MM-DD HH24:MI:SS.FF TZH:TZM`).
+pub(crate) fn tz_text(t: &chrono::DateTime<chrono::FixedOffset>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S%.9f %:z").to_string()
 }
 
 fn timestamp(t: &NaiveDateTime, utc: bool) -> OracleTimestamp {
@@ -287,5 +331,24 @@ mod tests {
             "-3 00:00:00"
         );
         assert_eq!(interval_ym(&OracleIntervalYM::new(2, 3)), "+2-03");
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::*;
+
+    /// Zoned values go as text in the session's NLS_TIMESTAMP_TZ_FORMAT, the offset kept.
+    #[test]
+    fn zoned_timestamps_keep_their_offset() {
+        let t = chrono::DateTime::parse_from_rfc3339("2024-01-02T08:00:00.5+07:00").unwrap();
+        assert_eq!(tz_text(&t), "2024-01-02 08:00:00.500000000 +07:00");
+        assert_eq!(offset_seconds("+07:00"), Some(7 * 3600));
+        assert_eq!(offset_seconds("-03:30"), Some(-(3 * 3600 + 30 * 60)));
+        assert_eq!(offset_seconds("+00:00"), Some(0));
+        assert_eq!(offset_seconds("Europe/Paris"), None);
+        let mut reads = vec![Read::TimestampUtc, Read::TimestampLocal(0)];
+        in_session_zone(&mut reads, 3600);
+        assert_eq!(reads, vec![Read::TimestampUtc, Read::TimestampLocal(3600)]);
     }
 }

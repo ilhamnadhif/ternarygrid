@@ -125,8 +125,6 @@ pub(crate) struct Runtime {
     pub fetch_requested_at: Option<usize>,
     /// Store that count belongs to (a refresh brings a new store, with the same count again).
     pub fetch_store: usize,
-    /// The last plain copy: pasted back, its cells are the copied ones.
-    pub last_copy: Option<LastCopy>,
     /// Scroll the active cell into view on the next frame.
     pub scroll_to_active: bool,
     pub copy_dialog: bool,
@@ -136,6 +134,9 @@ pub(crate) struct Runtime {
     pub dropdown: Option<Dropdown>,
     /// Store length when a stale client view was last refreshed automatically.
     pub auto_view_len: usize,
+    /// The active cell's record when such a refresh started (its display row then): the
+    /// selection follows it, it was a display position and pointed at another record.
+    pub auto_view_anchor: Option<(RowAnchor, usize)>,
     /// Store that length belongs to (a refresh brings a new store).
     pub view_store: usize,
     /// What the column widths were last fitted for (a hash of the names, key /
@@ -181,6 +182,22 @@ pub(crate) struct LastCopy {
     pub nulls: Vec<Vec<bool>>,
     /// Cells between the copied ones were left out (a ⌘-click selection).
     pub gaps: bool,
+}
+
+/// The last plain copy of any grid of the app (pasted into another grid, its NULLs stay
+/// NULL too; one per grid lost them there).
+static LAST_COPY: std::sync::Mutex<Option<LastCopy>> = std::sync::Mutex::new(None);
+
+impl LastCopy {
+    /// Remember (or, with `None`, forget) what the last copy put on the clipboard.
+    pub(crate) fn remember(copy: Option<LastCopy>) {
+        *LAST_COPY.lock().unwrap_or_else(|e| e.into_inner()) = copy;
+    }
+
+    /// The last copy, when `text` is what it put on the clipboard.
+    pub(crate) fn of(text: &str) -> Option<LastCopy> {
+        LAST_COPY.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|c| !text.is_empty() && c.text == text).cloned()
+    }
 }
 
 /// The painted body of the last frame. When the fetch task holds the row

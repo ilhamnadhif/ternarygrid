@@ -208,6 +208,23 @@ impl<'a> BatchWriter<'a> {
         }
     }
 
+    /// Replace rows by key with DELETE + INSERT (in transactions) instead of the dialect's
+    /// upsert: MySQL's `ON DUPLICATE KEY UPDATE` resolves on whatever unique key a row hits
+    /// first, not the chosen key columns, so a row of another key was overwritten.
+    pub(crate) fn without_upsert(&mut self, why: &str) {
+        if self.upsert_sql.take().is_none() || self.target.key_index.is_empty() {
+            return;
+        }
+        self.warnings.push(why.to_string());
+        if self.scope == TransactionScope::None {
+            if self.savepoints.is_some() {
+                self.scope = TransactionScope::PerBatch;
+            } else {
+                self.refused = Some(format!("{} cannot replace rows by these key columns safely: they are no unique key of the table", self.dialect.kind().display_name()));
+            }
+        }
+    }
+
     /// Switch the session into the transaction mode of the scope.
     pub(crate) async fn begin(&mut self) -> DbResult<()> {
         if let Some(why) = &self.refused {

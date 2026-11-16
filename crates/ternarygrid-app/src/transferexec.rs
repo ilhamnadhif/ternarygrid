@@ -46,6 +46,9 @@ pub struct AppSessionFactory {
     config: ConnectionConfig,
     /// An already open session handed out by the first [`SessionFactory::open`].
     first: Mutex<Option<Box<dyn Session>>>,
+    /// The connected server's dialect (MySQL's `sql_mode`: NO_BACKSLASH_ESCAPES), not the
+    /// driver's default: an SQL export doubled backslashes on such a server.
+    server_dialect: Option<Arc<dyn Dialect>>,
 }
 
 impl AppSessionFactory {
@@ -57,16 +60,19 @@ impl AppSessionFactory {
         if let Some(db) = database.map(str::trim).filter(|d| !d.is_empty()) {
             params.database = Some(db.to_string());
         }
-        AppSessionFactory { driver, params, config, first: Mutex::new(None) }
+        AppSessionFactory { driver, params, config, first: Mutex::new(None), server_dialect: None }
     }
 
     /// Sessions of a connected connection (used by the transfer tabs).
     pub fn from_live(live: &LiveConnection, database: Option<&str>) -> Self {
-        Self::new(live.driver.clone(), live.params().clone(), live.config.clone(), database)
+        let mut f = Self::new(live.driver.clone(), live.params().clone(), live.config.clone(), database);
+        f.server_dialect = Some(live.dialect.clone());
+        f
     }
 
     /// Hand out `session` first, before opening new ones.
-    pub fn with_session(self, session: Box<dyn Session>) -> Self {
+    pub fn with_session(mut self, session: Box<dyn Session>) -> Self {
+        self.server_dialect = Some(session.dialect());
         *self.first.lock() = Some(session);
         self
     }
@@ -99,7 +105,7 @@ impl SessionFactory for AppSessionFactory {
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
-        self.driver.dialect()
+        self.server_dialect.clone().unwrap_or_else(|| self.driver.dialect())
     }
 }
 
@@ -215,8 +221,9 @@ pub async fn export(exec: &AppTaskExecutor, ctx: &RunContext, connection_id: &st
         return Err(DbError::config(tr("The export task has no objects to export")));
     }
     let database = export_database(&job);
-    let sql_dialect = extras.sql_dialect.map(|k| exec.registry.dialect(k));
     let c = exec.connection(connection_id).await?;
+    // The same product: the connected server's dialect (its sql_mode) is the factory's.
+    let sql_dialect = extras.sql_dialect.filter(|k| *k != c.config.kind).map(|k| exec.registry.dialect(k));
     let same_db = database.is_none() || database == c.params.database;
     let factory = AppSessionFactory::new(c.driver.clone(), c.params.clone(), c.config.clone(), database.as_deref());
     // The rest of `c` (the tunnel) lives until the end of this function.
