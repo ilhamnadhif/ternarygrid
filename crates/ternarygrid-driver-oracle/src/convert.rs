@@ -112,7 +112,14 @@ fn value(row: &oracledb::Row, i: usize, read: Read) -> DbResult<Value> {
         Read::Float => row
             .get::<Option<f32>>(i)
             .db()?
-            .map_or(Value::Null, |f| Value::Float(f as f64)),
+            // The shortest decimal of the BINARY_FLOAT (0.1, not 0.10000000149011612).
+            .map_or(Value::Null, |f| {
+                Value::Float(if f.is_finite() {
+                    f.to_string().parse().unwrap_or(f as f64)
+                } else {
+                    f as f64
+                })
+            }),
         Read::Double => row
             .get::<Option<f64>>(i)
             .db()?

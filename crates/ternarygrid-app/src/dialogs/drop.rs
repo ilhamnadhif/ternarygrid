@@ -20,6 +20,8 @@ pub struct DropDialog {
     objects: Vec<ObjectRef>,
     cascade: bool,
     job: Option<Job<DbResult<usize>>>,
+    /// Objects dropped so far by the running job (one statement each, in order).
+    dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     error: Option<String>,
 }
 
@@ -69,7 +71,7 @@ pub fn drop_sql(d: &dyn Dialect, o: &ObjectRef, cascade: bool) -> String {
 
 impl DropDialog {
     pub fn new(conn: String, objects: Vec<ObjectRef>) -> Self {
-        DropDialog { conn, objects, cascade: false, job: None, error: None }
+        DropDialog { conn, objects, cascade: false, job: None, dropped: Default::default(), error: None }
     }
 
     /// Draw; returns false when closed.
@@ -94,7 +96,23 @@ impl DropDialog {
                     }
                     return false;
                 }
-                Err(e) => self.error = Some(e.full_text()),
+                Err(e) => {
+                    // The objects before the failing one are gone: out of the list (Drop again
+                    // runs the rest, not their "does not exist") and out of the navigator.
+                    let done = self.dropped.load(std::sync::atomic::Ordering::Relaxed).min(self.objects.len());
+                    if done > 0 {
+                        let gone: Vec<ObjectRef> = self.objects.drain(..done).collect();
+                        let mut schemas: Vec<_> = gone.iter().map(|o| o.schema_ref()).collect();
+                        schemas.sort();
+                        schemas.dedup();
+                        for s in schemas {
+                            cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: None, schema: Some(s) });
+                        }
+                        self.error = Some(format!("{}\n{}", trn(done, "1 object was dropped before the error.", "{} objects were dropped before the error."), e.full_text()));
+                    } else {
+                        self.error = Some(e.full_text());
+                    }
+                }
             }
         }
         let backend = cx.backend;
@@ -175,6 +193,8 @@ impl DropDialog {
             if let Some(live) = cx.conns.live(&self.conn) {
                 live.release_idle_cursors(cx.backend, None);
             }
+            self.dropped.store(0, std::sync::atomic::Ordering::Relaxed);
+            let dropped = self.dropped.clone();
             self.job = Some(backend.spawn(async move {
                 // The sessions are shared: other uncommitted work would be committed with the drop.
                 if work.iter().map(|(_, s)| s).chain(&own).any(|s| s.has_uncommitted_writes()) {
@@ -189,6 +209,10 @@ impl DropDialog {
                 for (sql, s) in &work {
                     s.execute_update(sql, &[]).await.map_err(|e| e.with_context(sql.clone()))?;
                     n += 1;
+                    // Counted once it is committed (auto-commit), which is when it is gone.
+                    if !s.tx_state().in_transaction {
+                        dropped.store(n, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 // In manual commit mode the drop would stay in an open transaction (holding its locks).
                 let mut done: Vec<&SessionHandle> = Vec::new();

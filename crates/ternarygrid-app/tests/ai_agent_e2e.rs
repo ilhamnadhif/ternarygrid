@@ -40,3 +40,30 @@ async fn the_assistants_session_only_reads() {
         assert!(err.full_text().to_lowercase().contains("read"), "[{var}] {}", err.full_text());
     }
 }
+
+/// PostgreSQL: each query runs in a read-only transaction of its own. A query that
+/// lifted the session's read-only default (`set_config(…, false)`, reachable through
+/// functions that run strings) left the queries after it free to write.
+#[tokio::test]
+async fn each_query_is_read_only_even_when_the_session_default_is_lifted() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let Some(url) = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.trim().is_empty()) else { return };
+    let kind = ternarygrid_config::parse_connection_url(&url).unwrap().0.kind;
+    let syntax = ternarygrid_app::driver_registry().dialect(kind).syntax().clone();
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let (table, func) = (format!("ai_probe_{tag}"), format!("ai_write_{tag}"));
+    let admin = open(url.clone()).await.unwrap();
+    admin.execute_update(&format!("CREATE TABLE {table} (id int)"), &[]).await.unwrap();
+    admin.execute_update(&format!("CREATE FUNCTION {func}() RETURNS int LANGUAGE sql VOLATILE AS $$ INSERT INTO {table} VALUES (1) RETURNING 1 $$"), &[]).await.unwrap();
+    let mut agent = Agent::new(kind, syntax, None, Box::pin(open(url.clone())));
+    let session = agent.session().await.unwrap();
+    // As a function running a string could: the session's default no longer read-only.
+    session.execute_update("SELECT set_config('default_transaction_read_only', 'off', false)", &[]).await.unwrap();
+    let step = agent.answer(&call(&format!("SELECT {func}()"))).await;
+    assert!(!step.ok, "the write ran: {}", step.summary);
+    assert!(!session.tx_state().in_transaction, "the read-only transaction ended");
+    let (_, rows) = admin.query_all(&format!("SELECT count(*) FROM {table}"), &[]).await.unwrap();
+    assert_eq!(rows[0][0].as_i64(), Some(0));
+    assert!(agent.answer(&call("SELECT 1")).await.ok);
+    admin.execute_update(&format!("DROP FUNCTION {func}(); DROP TABLE {table}"), &[]).await.unwrap();
+}

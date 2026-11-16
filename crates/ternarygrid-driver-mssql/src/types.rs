@@ -199,7 +199,8 @@ fn convert_raw(data: ColumnData<'static>, ct: ColumnType) -> Value {
         ColumnData::I16(v) => v.map(|x| Value::Int(i64::from(x))).unwrap_or(Value::Null),
         ColumnData::I32(v) => v.map(|x| Value::Int(i64::from(x))).unwrap_or(Value::Null),
         ColumnData::I64(v) => v.map(Value::Int).unwrap_or(Value::Null),
-        ColumnData::F32(v) => v.map(|x| Value::Float(f64::from(x))).unwrap_or(Value::Null),
+        // The shortest decimal of the `real` (0.1, not 0.10000000149011612).
+        ColumnData::F32(v) => v.map(|x| Value::Float(if x.is_finite() { x.to_string().parse().unwrap_or(f64::from(x)) } else { f64::from(x) })).unwrap_or(Value::Null),
         ColumnData::F64(v) => match v {
             None => Value::Null,
             // tiberius 0.13 decodes money as `scaled_i64 as f64 / 1e4` and does not expose the

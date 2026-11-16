@@ -761,7 +761,17 @@ impl BackupTab {
             return;
         }
         self.form_error = None;
-        let spec = match self.spec(cx) {
+        // A backup is written beside its file and moved over it when done (see `backup_staging`).
+        let staged = if self.restore { None } else { crate::tools::backup_staging(&self.backup.to_options()) };
+        let spec = match &staged {
+            Some((options, _)) => cx
+                .conns
+                .live(&self.conn)
+                .ok_or_else(|| DbError::connection(tr("Connect first: the tools use the connection's settings")))
+                .and_then(|live| live.driver.backup_command(live.params(), options)),
+            None => self.spec(cx),
+        };
+        let spec = match spec {
             Ok(s) => s,
             Err(e) => {
                 self.form_error = Some(e.message);
@@ -786,7 +796,7 @@ impl BackupTab {
         let progress = op.progress.clone();
         let cancel = op.cancel.clone();
         let job = cx.backend.spawn(async move {
-            crate::tools::run_command(spec, cancel, move |line| {
+            let ran = crate::tools::run_command(spec, cancel, move |line| {
                 progress.set_message(line.chars().take(120).collect::<String>());
                 let mut l = sink.lock();
                 if l.len() < MAX_LOG_LINES {
@@ -797,7 +807,11 @@ impl BackupTab {
                 drop(l);
                 repaint.request();
             })
-            .await
+            .await;
+            match &staged {
+                Some((s, out)) => crate::tools::finish_backup(&s.output, out, ran.is_ok()).and(ran),
+                None => ran,
+            }
         });
         let output = (!self.restore).then(|| PathBuf::from(self.backup.output.trim()));
         self.run = Some(ToolRun { op, log, job: Some(job), started: Instant::now(), ended: None, outcome: None, output });

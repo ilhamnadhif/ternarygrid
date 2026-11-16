@@ -527,6 +527,18 @@ async fn manual_transactions() {
         assert!(s.in_transaction());
         s.rollback().await.unwrap();
         assert!(!s.in_transaction());
+        // a commit of a transaction an unwrapped statement aborted (the server would answer
+        // COMMIT with ROLLBACK, no error) fails instead of looking done, and stays open
+        exec(&mut s, &format!("BEGIN; INSERT INTO {schema}.tx VALUES (8)")).await;
+        execute_update(&mut *s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", &[]).await.unwrap_err();
+        let e = s.commit().await.unwrap_err();
+        assert_eq!(e.code.as_deref(), Some("25P02"), "{}", e.full_text());
+        assert!(s.in_transaction());
+        let e = execute_update(&mut *s, "COMMIT", &[]).await.unwrap_err();
+        assert_eq!(e.code.as_deref(), Some("25P02"), "{}", e.full_text());
+        s.rollback().await.unwrap();
+        assert!(!s.in_transaction());
+        assert_eq!(scalar(&mut other, &format!("SELECT count(*) FROM {schema}.tx WHERE id = 8")).await, count(0));
         exec(&mut s, &format!("BEGIN; INSERT INTO {schema}.tx VALUES (7); COMMIT")).await;
         assert!(!s.in_transaction());
         exec(&mut s, "BEGIN; SELECT 1").await;
@@ -777,6 +789,15 @@ async fn resolve_sources_of_result_columns() {
         let Some(ResultHeader::Rows(cols)) = cur.next_result().await.unwrap() else { panic!() };
         assert_eq!(cols[0].source.as_ref().unwrap().column, "full_name");
         cur.close().await.unwrap();
+        // ... also by DDL of another session: the table renamed and a new one of its name made
+        // elsewhere, the old table's rows name the old table (edits went to the new one).
+        let mut other = connect(&params).await;
+        exec(&mut other, &format!("ALTER TABLE {schema}.src RENAME TO src_archive; CREATE TABLE {schema}.src (id int, full_name text)")).await;
+        let mut cur = s.execute(&format!("SELECT id, full_name FROM {schema}.src_archive"), &[], &opts).await.unwrap();
+        let Some(ResultHeader::Rows(cols)) = cur.next_result().await.unwrap() else { panic!() };
+        assert_eq!(cols[0].source.as_ref().unwrap().table, "src_archive");
+        cur.close().await.unwrap();
+        other.close().await.ok();
         s.close().await.ok();
     })
     .await;

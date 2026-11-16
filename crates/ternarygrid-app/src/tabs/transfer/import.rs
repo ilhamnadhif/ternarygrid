@@ -101,6 +101,8 @@ enum MappingKey {
 pub struct ImportTab {
     /// Finished successfully: the pop-up closes.
     done: bool,
+    /// "Delete them first" asks before Run (as mock data and migration do).
+    confirm_clear: bool,
     uid: u64,
     conn: String,
     page: usize,
@@ -152,6 +154,7 @@ impl ImportTab {
         let schema = schema.or_else(|| table.as_ref().map(ObjectRef::schema_ref)).filter(|s| s.schema.is_some() || s.database.is_some());
         ImportTab {
             done: false,
+            confirm_clear: false,
             uid: next_uid(),
             conn,
             page: PAGE_FILE,
@@ -276,7 +279,14 @@ impl ImportTab {
 
     /// The job as it would run now.
     pub fn job(&self) -> Option<ImportJob> {
-        Some(ImportJob { source: self.source_config(), mapping: self.mapping()?, infer: self.infer_options(), sample_rows: self.sample_rows })
+        let mut source = self.source_config();
+        let mut mapping = self.mapping()?;
+        // CSV: "NULL as" is read by the reader, which knows whether a field was quoted: a real
+        // text `NULL` an export quoted stays text (converting every `NULL` text made it NULL).
+        if let ImportSourceConfig::Csv { options, .. } = &mut source {
+            options.null_values = std::mem::take(&mut mapping.convert.null_values);
+        }
+        Some(ImportJob { source, mapping, infer: self.infer_options(), sample_rows: self.sample_rows })
     }
 
     pub fn page(&self) -> usize {
@@ -350,6 +360,40 @@ impl ImportTab {
 
     pub fn saved_task_id(&self) -> Option<&str> {
         self.saver.saved.as_deref()
+    }
+
+    /// "Delete them first": every row of the table goes before the file's are written.
+    fn confirm_clear_ui(&mut self, ctx: &egui::Context, cx: &mut AppContext) {
+        if !self.confirm_clear {
+            return;
+        }
+        let (mut run, mut cancel) = (false, false);
+        let table = self.target_ref().map(|t| t.display_path()).unwrap_or_default();
+        let text = trf("All rows of {} are deleted before the rows of the file are imported.", &[&table]);
+        let (resp, _) =
+            parts::Dialog::new(tr("Delete the existing rows?")).icon(icon::ERASER).tone(Tone::Error).width(480.0).body_padding(egui::Margin::symmetric(20, 18)).show_modal(
+                ctx,
+                egui::Id::new(("imp_confirm_clear", self.uid)),
+                |ui| {
+                    ui.add(egui::Label::new(RichText::new(&text).size(13.5)).wrap());
+                },
+                |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if kit::button_ex(ui, kit::Kind::DangerFilled, Some(icon::ERASER), tr("Delete and import"), false).clicked() {
+                            run = true;
+                        }
+                        if kit::button_ex(ui, kit::Kind::Ghost, None, tr("Cancel"), false).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
+        if run {
+            self.start(cx);
+        }
+        if run || cancel || resp.close {
+            self.confirm_clear = false;
+        }
     }
 
     // --------------------------------------------------------------- helpers
@@ -1380,6 +1424,7 @@ impl ImportTab {
             Some(Clicked::Back) => self.page -= 1,
             Some(Clicked::Next) => self.page += 1,
             // Run again into a table the last run created: `created` keeps it from being created twice.
+            Some(Clicked::Run) if self.options.mode == ImportMode::TruncateFirst && self.target == ImportTarget::Existing => self.confirm_clear = true,
             Some(Clicked::Run) => self.start(cx),
             Some(Clicked::Save) => {
                 let target = self.target_ref().map(|t| t.name).unwrap_or_default();
@@ -1656,6 +1701,7 @@ impl TabView for ImportTab {
         if let Some((name, folder)) = self.saver.ui(ui.ctx(), egui::Id::new(("imp_save", uid))) {
             self.save_task(cx, &name, folder);
         }
+        self.confirm_clear_ui(ui.ctx(), cx);
         if self.preview_job.is_some() || self.sheets_job.is_some() || self.saver.is_saving() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }

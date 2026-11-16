@@ -1986,6 +1986,76 @@ fn truncate_updates_the_navigator_sizes() {
     run(&h, &format!("DROP SCHEMA {schema} CASCADE"));
 }
 
+/// A query that reads a table twice (a self-join) is read-only even when no column shows
+/// twice: the row key (`e.id`) is not the row of `m.name`, and saving renamed the employee
+/// instead of the manager. A query of the table once stays editable.
+#[test]
+fn a_self_join_result_is_read_only() {
+    let (_dir, mut h, _conn) = setup();
+    exec_sql(&mut h, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER); INSERT INTO emp VALUES (1, 'Boss', NULL), (2, 'Ann', 1);");
+    let state = |h: &mut H| {
+        let p = focused_editor(h).result_panel(0).map(|p| (p.model.row_count(), p.model.is_editable(), p.model.read_only_reason().cloned()));
+        p.unwrap_or((0, false, None))
+    };
+    exec_sql(&mut h, "SELECT id, name FROM emp");
+    wait(&mut h, "editable rows of one table", |h| matches!(state(h), (2, true, _)));
+    exec_sql(&mut h, "SELECT e.id, m.name AS manager FROM emp e JOIN emp m ON m.id = e.manager_id");
+    wait(&mut h, "the self-join read-only", |h| matches!(state(h), (1, false, Some(ternarygrid_grid::ReadOnlyReason::MultipleTables))));
+    frames(&mut h, 20);
+    assert!(!focused_editor(&mut h).result_panel(0).unwrap().model.is_editable());
+    no_errors(&mut h, "self-join");
+}
+
+/// The "Confirm execution" question takes the keyboard (Enter typed under it replaced the
+/// selection), and what runs is what was confirmed: text changed under it is asked about again.
+#[test]
+fn typing_under_the_confirm_question_runs_nothing_unconfirmed() {
+    let (dir, mut h, conn) = setup();
+    exec_sql(&mut h, "CREATE TABLE junk (id INTEGER); INSERT INTO junk VALUES (1), (2); CREATE TABLE keep (id INTEGER); INSERT INTO keep VALUES (1);");
+    let db = sample_db(&h, &conn);
+    h.state_mut().push_command(AppCommand::NewSqlEditor { connection: Some(conn.clone()), schema: None, text: Some("DELETE FROM junk".into()) });
+    frames(&mut h, 3);
+    wait(&mut h, "editor session", |h| focused_editor(h).session_ready());
+    click_editor(&mut h);
+    h.key_press_modifiers(Modifiers::ALT, Key::X);
+    wait(&mut h, "the question", |h| has(h, "Confirm execution"));
+    h.key_press(Key::Enter);
+    frames(&mut h, 3);
+    assert_eq!(focused_editor(&mut h).text(), "DELETE FROM junk", "Enter went to the question, not the text");
+    // The text changes anyway (as typing under the question did): Execute asks again.
+    let ctx = h.ctx.clone();
+    focused_editor(&mut h).set_text(&ctx, "DELETE FROM keep");
+    frames(&mut h, 2);
+    click(&mut h, "Execute");
+    frames(&mut h, 10);
+    assert!(has(&h, "Confirm execution"), "asked again about the new text");
+    assert_eq!(query_one(&db, "SELECT COUNT(*) FROM keep"), "1", "nothing ran unconfirmed");
+    assert_eq!(query_one(&db, "SELECT COUNT(*) FROM junk"), "2");
+    click(&mut h, "Execute");
+    wait(&mut h, "the confirmed statement", |_| query_one(&db, "SELECT COUNT(*) FROM keep") == "0");
+    assert_eq!(query_one(&db, "SELECT COUNT(*) FROM junk"), "2");
+    drop(dir);
+}
+
+/// A script opened from outside the project's Scripts folder is saved where it is (the
+/// project refused its path, and the automatic save then showed an error every frame).
+#[test]
+fn a_script_from_elsewhere_saves_in_place() {
+    let (dir, mut h, _conn) = setup();
+    let file = dir.0.join("Downloads").join("report.sql");
+    std::fs::write(&file, "SELECT 1;\n").unwrap();
+    h.state_mut().open_path(&file, false);
+    frames(&mut h, 3);
+    let ctx = h.ctx.clone();
+    focused_editor(&mut h).set_text(&ctx, "SELECT 2;\n");
+    frames(&mut h, 2);
+    pause(&mut h);
+    h.key_press_modifiers(CMD, Key::S);
+    frames(&mut h, 3);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "SELECT 2;\n");
+    no_errors(&mut h, "save outside the project");
+}
+
 /// Booleans in the record view are check boxes: a click toggles, nothing is typed.
 #[test]
 fn boolean_check_boxes_in_the_record_view() {

@@ -60,6 +60,39 @@ const DENIED: &[&str] = &[
     "pg_try_advisory_*",
     "lo_import",
     "lo_export",
+    "lo_unlink",
+    "lo_create",
+    "lo_creat",
+    "lo_from_bytea",
+    "lo_put",
+    "lo_truncate*",
+    // Run the text of a string as SQL: the name of a function in it may be built
+    // from pieces (`'pg_terminate' || '_backend(1)'`), so they are refused whole.
+    "query_to_xml*",
+    "query_to_xmlschema",
+    "cursor_to_xml*",
+    "ts_stat",
+    // Not stopped by a read-only transaction.
+    "pg_drop_replication_slot",
+    "pg_create_physical_replication_slot",
+    "pg_create_logical_replication_slot",
+    "pg_copy_*_replication_slot",
+    "pg_replication_slot_advance",
+    "pg_replication_origin_*",
+    "pg_logical_emit_message",
+    "pg_promote",
+    "pg_stat_reset*",
+    "pg_create_restore_point",
+    "pg_backup_start",
+    "pg_backup_stop",
+    "pg_start_backup",
+    "pg_stop_backup",
+    "pg_wal_replay_*",
+    "pg_log_backend_memory_contexts",
+    "pg_file_*",
+    "pg_logdir_ls",
+    "pg_import_system_collations",
+    "pg_notify",
     "dblink",
     "dblink_*",
     "set_config",
@@ -259,6 +292,10 @@ pub fn check(sql: &str, syntax: &SqlSyntax, kind: DbKind) -> Result<String, Stri
     if !reads || info.is_write || analyze {
         return Err(trf("Only queries can run here ({} is not one); show the statement to the user instead", &[&info.kind.label()]));
     }
+    // A different escape character for `U&` names would hide what they spell.
+    if lower.contains("uescape") {
+        return Err(tr("UESCAPE cannot be used here").to_string());
+    }
     let lists: &[&[&str]] = if kind == DbKind::ClickHouse { &[DENIED, DENIED_CLICKHOUSE] } else { &[DENIED] };
     let mut uses = Uses::default();
     scan(&stmt, syntax, lists, 0, &mut uses);
@@ -379,7 +416,18 @@ impl Agent {
             Ok(s) => s,
             Err(e) => return ToolStep::failed(stmt, e.full_text()),
         };
-        match run(&session, &stmt).await {
+        // PostgreSQL: each query in a read-only transaction of its own, rolled back, so a
+        // query cannot make the session writable (`set_config('default_transaction_read_only',
+        // 'off', false)` reached through a function) for the ones after it.
+        let read_only_tx = matches!(self.kind, DbKind::Postgres | DbKind::CockroachDb);
+        if read_only_tx && let Err(e) = session.execute_update("START TRANSACTION READ ONLY", &[]).await {
+            return ToolStep::failed(stmt, e.full_text());
+        }
+        let r = run(&session, &stmt).await;
+        if read_only_tx && let Err(e) = session.execute_update("ROLLBACK", &[]).await {
+            tracing::warn!("ending the assistant's read-only transaction: {}", e.full_text());
+        }
+        match r {
             Ok((cols, rows, more)) => ToolStep::rows(stmt, cols, rows, more),
             Err(e) => ToolStep::failed(stmt, e.full_text()),
         }
@@ -547,6 +595,16 @@ mod tests {
             "SELECT query_to_xml('select pg_sleep(100)', true, false, '')",
             "SELECT * INTO copy FROM charges",
             "SELECT a FROM t INTO OUTFILE '/tmp/x'",
+            // Unicode-escaped names, functions that run a string built from pieces, and
+            // functions a read-only transaction does not stop.
+            "SELECT U&\"pg_terminate_backend\"(pid) FROM pg_stat_activity",
+            "SELECT U&\"set\\005Fconfig\"('default_transaction_read_only', 'off', false)",
+            "SELECT u&\"\\0070g_sleep\"(5)",
+            "SELECT U&\"x!0070g_sleep\" UESCAPE '!' (5)",
+            "SELECT query_to_xml('select pg_terminate' || '_backend(1)', true, false, '')",
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots",
+            "SELECT pg_stat_reset()",
+            "SELECT lo_unlink(16400)",
         ] {
             assert!(check(refused).is_err(), "{refused}");
         }

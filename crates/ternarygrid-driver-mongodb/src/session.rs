@@ -93,8 +93,28 @@ pub(crate) fn uri(params: &ConnectParams) -> String {
     ) || srv && params.ssl.mode != SslMode::Disable;
     if tls {
         q.push(("tls".into(), "true".into()));
-        if params.ssl.mode != SslMode::VerifyFull && !srv {
-            q.push(("tlsAllowInvalidCertificates".into(), "true".into()));
+        match params.ssl.mode {
+            SslMode::VerifyFull => {}
+            // verify-ca: the chain is checked, the host name not (it turned all checks off).
+            SslMode::VerifyCa => q.push(("tlsAllowInvalidHostnames".into(), "true".into())),
+            _ if !srv => q.push(("tlsAllowInvalidCertificates".into(), "true".into())),
+            _ => {}
+        }
+        // The connection's CA and client certificate (files): they were never used.
+        let file = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.contains("-----BEGIN"))
+                .map(str::to_string)
+        };
+        if let Some(ca) = file(&params.ssl.ca_cert) {
+            q.push(("tlsCAFile".into(), ca));
+        }
+        // MongoDB takes the certificate and its key in one PEM file.
+        if let Some(cert) = file(&params.ssl.client_cert)
+            && file(&params.ssl.client_key).is_none_or(|k| k == cert)
+        {
+            q.push(("tlsCertificateKeyFile".into(), cert));
         }
     }
     if !srv
@@ -535,6 +555,9 @@ impl MongoSession {
         let first = &calls[0];
         let rest = &calls[1..];
         let Some(coll_name) = coll else {
+            // Database methods take no chained calls: `db.runCommand({insert…}).count()`
+            // (the grid's row count of its result) would run the command again.
+            no_chained_calls(&calls)?;
             // Database methods.
             let reply = match first.name.as_str() {
                 "runCommand" => database
@@ -1473,10 +1496,43 @@ fn plan_node(d: &Document) -> PlanNode {
     n
 }
 
+/// A database method (`db.runCommand(…)`) runs alone: a call chained after it is
+/// refused before anything runs.
+fn no_chained_calls(calls: &[crate::shell::Call]) -> DbResult<()> {
+    match calls {
+        [first, next, ..] => Err(DbError::unsupported(format!(
+            "db.{}() cannot be followed by .{}()",
+            first.name, next.name
+        ))),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ternarygrid_core::config::ConnectionConfig;
+
+    /// The grid's row count appends `.count()`: on a database command it would run the
+    /// command (an insert) a second time.
+    #[test]
+    fn a_database_command_takes_no_chained_call() {
+        let crate::shell::Command::Chain {
+            collection, calls, ..
+        } = crate::shell::parse("db.runCommand({insert: 'events', documents: [{n: 1}]}).count()")
+            .unwrap()
+        else {
+            panic!("a chain")
+        };
+        assert!(collection.is_none());
+        assert!(no_chained_calls(&calls).is_err());
+        let crate::shell::Command::Chain { calls, .. } =
+            crate::shell::parse("db.runCommand({ping: 1})").unwrap()
+        else {
+            panic!("a chain")
+        };
+        assert!(no_chained_calls(&calls).is_ok());
+    }
 
     #[test]
     fn connection_strings() {
@@ -1494,6 +1550,17 @@ mod tests {
             u.contains("directConnection=true") && u.contains("authSource=admin"),
             "{u}"
         );
+        // verify-ca checks the chain (not the host name); the CA file is used.
+        cfg.ssl.mode = SslMode::VerifyCa;
+        cfg.ssl.ca_cert = Some("/etc/ca.pem".into());
+        let u = uri(&ConnectParams::from_config(&cfg, None));
+        assert!(
+            u.contains("tlsAllowInvalidHostnames=true")
+                && !u.contains("tlsAllowInvalidCertificates")
+                && u.contains("tlsCAFile=%2Fetc%2Fca.pem"),
+            "{u}"
+        );
+        cfg.ssl.ca_cert = None;
         cfg.properties.insert("srv".into(), "true".into());
         cfg.ssl.mode = SslMode::Prefer;
         let u = uri(&ConnectParams::from_config(&cfg, None));

@@ -293,15 +293,28 @@ impl SqlServerSession {
     async fn explain_impl(&mut self, sql: &str, analyze: bool) -> DbResult<QueryPlan> {
         let (on, off) = if analyze { ("SET STATISTICS XML ON", "SET STATISTICS XML OFF") } else { ("SET SHOWPLAN_XML ON", "SET SHOWPLAN_XML OFF") };
         self.suppress_refresh = true;
-        let on_res = self.batch(on).await;
+        // STATISTICS XML runs the statement: its changes are rolled back (in a transaction
+        // of its own, or to a savepoint of the one open), as EXPLAIN ANALYZE elsewhere.
+        let in_tx = analyze && self.scalar("SELECT @@TRANCOUNT", &[]).await.ok().and_then(|v| v.as_i64()).unwrap_or(0) > 0;
+        let (begin, undo) = if in_tx {
+            ("SAVE TRANSACTION ternarygrid_explain", "IF XACT_STATE() = 1 ROLLBACK TRANSACTION ternarygrid_explain")
+        } else {
+            ("BEGIN TRANSACTION", "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+        };
+        let mut on_res = self.batch(on).await;
+        if analyze && on_res.is_ok() {
+            on_res = self.batch(begin).await;
+        }
         let res = match on_res {
             Ok(()) => self.results(sql, &[]).await,
             Err(e) => Err(e),
         };
+        let undo_res = if analyze { self.batch(undo).await } else { Ok(()) };
         self.suppress_refresh = false;
         // the OFF batch refreshes the transaction state (STATISTICS XML executes the statement)
         let off_res = self.batch(off).await;
         let results = res?;
+        undo_res?;
         off_res?;
         let mut docs = Vec::new();
         for (cols, rows) in results {

@@ -440,6 +440,7 @@ pub(crate) fn run(
         show_system_objects: cfg.show_system_objects,
         foreign_keys,
         legacy_alter_table,
+        rebuild_armed: std::cell::Cell::new(false),
     };
     worker.sync_state();
     if ready
@@ -508,6 +509,9 @@ pub(crate) struct Worker {
     pub foreign_keys: bool,
     /// `PRAGMA legacy_alter_table` as configured for the connection.
     pub legacy_alter_table: bool,
+    /// A table rebuild of the table designer started (its marked pragmas ran) and
+    /// was not committed: a rollback switches the pragmas back.
+    pub rebuild_armed: std::cell::Cell<bool>,
 }
 
 impl Worker {
@@ -593,11 +597,14 @@ impl Worker {
     /// After a rollback: switch `foreign_keys` and `legacy_alter_table` back to the
     /// connection's configuration. A table rebuild turns them off / on outside its
     /// transaction, so a rebuild that failed and was rolled back would leave the
-    /// session without foreign key enforcement. No effect inside a transaction.
+    /// session without foreign key enforcement. Only after a rebuild (its pragmas
+    /// carry [`REBUILD_MARK`](crate::ddl::REBUILD_MARK)): pragmas the user set stay as
+    /// set, whatever is rolled back. No effect inside a transaction.
     pub fn restore_pragmas(&self) {
-        if !self.conn.is_autocommit() {
+        if !self.rebuild_armed.get() || !self.conn.is_autocommit() {
             return;
         }
+        self.rebuild_armed.set(false);
         for (name, configured) in [
             ("foreign_keys", self.foreign_keys),
             ("legacy_alter_table", self.legacy_alter_table),
@@ -867,6 +874,10 @@ impl Worker {
         let single = statements.len() == 1;
         let mut param_pos = 0usize;
         let mut header_reply = reply;
+        // A pragma of a table rebuild (the mark is a comment, outside the statement's span).
+        if sql.contains(crate::ddl::REBUILD_MARK) {
+            self.rebuild_armed.set(true);
+        }
         for span in &statements {
             let kind = lexer::classify(span.text);
             let fail = |w: &Worker, e: DbError, reply: Reply<Option<ResultHeader>>| {
@@ -966,8 +977,11 @@ impl Worker {
                 match result {
                     Ok(_) => {
                         let header = self.update_header(&kind);
-                        if kind == StatementKind::Rollback {
-                            self.restore_pragmas();
+                        match kind {
+                            StatementKind::Rollback => self.restore_pragmas(),
+                            // The rebuild is done: its own last pragma switches them back.
+                            StatementKind::Commit => self.rebuild_armed.set(false),
+                            _ => {}
                         }
                         self.sync_state();
                         self.end_command();

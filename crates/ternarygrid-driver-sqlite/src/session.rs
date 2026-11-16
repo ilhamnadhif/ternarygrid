@@ -214,7 +214,9 @@ impl Session for SqliteSession {
             if w.conn.is_autocommit() {
                 Ok(())
             } else {
-                w.exec_batch("COMMIT")
+                w.exec_batch("COMMIT")?;
+                w.rebuild_armed.set(false);
+                Ok(())
             }
         })
         .await

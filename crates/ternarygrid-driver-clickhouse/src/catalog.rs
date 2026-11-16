@@ -511,6 +511,8 @@ fn table_from_row(db: &str, r: &Row) -> TableDef {
     if !cols.is_empty() {
         t.primary_key = Some(KeyDef { name: None, columns: cols });
     }
+    // A MergeTree key sorts; rows may share it (DELETE … WHERE key = … removed all of them).
+    t.primary_key_not_unique = true;
     t.row_estimate = int(r.get(7));
     t.size_bytes = int(r.get(8));
     t.comment = opt(r.get(9));
@@ -1046,6 +1048,7 @@ mod tests {
         assert_eq!(t.options.get("order_by").map(String::as_str), Some("a, b"));
         assert_eq!(t.options.get("primary_key").map(String::as_str), Some("a"));
         assert_eq!(t.primary_key.as_ref().unwrap().columns, vec!["a"]);
+        assert!(t.primary_key_not_unique && t.row_key().is_none(), "the sorting key identifies no row");
         assert_eq!(t.checks.len(), 1);
         assert_eq!(t.row_estimate, Some(5));
         let c = column_from_row(&vec![

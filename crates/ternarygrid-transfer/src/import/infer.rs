@@ -119,8 +119,10 @@ pub(crate) fn classify_text(raw: &str, opts: &InferOptions) -> Guess {
     };
     let unsigned = normalized.strip_prefix(['-', '+']).unwrap_or(&normalized);
     let leading_zero = unsigned.len() > 1 && unsigned.starts_with('0') && !unsigned.starts_with("0.");
+    // `+14155552671` is a phone number: a number would lose its `+`.
+    let plus = normalized.starts_with('+');
     if !unsigned.is_empty() && unsigned.chars().all(|c| c.is_ascii_digit()) {
-        if leading_zero {
+        if leading_zero || plus {
             return Guess::Text; // codes like 007 must keep their zeros
         }
         return if normalized.parse::<i64>().is_ok() { Guess::Int { digits: count_digits(unsigned) } } else { Guess::Decimal { int_digits: count_digits(unsigned), scale: 0 } };
@@ -258,7 +260,9 @@ pub fn generic_type_name(col: &InferredColumn) -> String {
             }
         }
         DataKind::Decimal => match (col.precision, col.scale) {
-            (Some(p), Some(s)) if p <= 38 => format!("NUMERIC({},{s})", (p + 4).min(38)),
+            // The scale gets room too: a later row with more fraction digits (0.125 after
+            // 12.50) was rounded by the database without an error.
+            (Some(p), Some(s)) if p <= 30 => format!("NUMERIC({},{})", (p + 8).min(38), (s + 4).min(30)),
             _ => "NUMERIC".into(),
         },
         DataKind::Float => "DOUBLE PRECISION".into(),
@@ -297,6 +301,8 @@ mod tests {
         assert_eq!((d.kind, d.precision, d.scale), (DataKind::Decimal, Some(5), Some(2)));
         assert_eq!(infer(&["1e5", "2"]).kind, DataKind::Float);
         assert_eq!(infer(&["007", "1"]).kind, DataKind::Text);
+        // Phone numbers keep their `+`.
+        assert_eq!(infer(&["+14155552671", "+442071838750"]).kind, DataKind::Text);
         assert_eq!(infer(&["0", "1"]).kind, DataKind::Int);
         assert_eq!(infer(&["0.5"]).kind, DataKind::Decimal);
         assert_eq!(infer(&["123456789012345678901234567890"]).kind, DataKind::Decimal);

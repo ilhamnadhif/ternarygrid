@@ -192,6 +192,11 @@ fn fetch_latest(url: Option<String>) -> Result<CheckResult, String> {
     if url == "off" {
         return Ok(CheckResult::UpToDate);
     }
+    // Releases come over HTTPS only (a release build): a plain http:// address from the
+    // environment would let anyone on the way offer an update.
+    if !cfg!(debug_assertions) && !url.starts_with("https://") {
+        return Err(format!("updates are only checked over HTTPS, not {url}"));
+    }
     let crypto = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let tls = ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::Rustls).root_certs(ureq::tls::RootCerts::WebPki).unversioned_rustls_crypto_provider(crypto).build();
     let agent: ureq::Agent = ureq::Agent::config_builder()

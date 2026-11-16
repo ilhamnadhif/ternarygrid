@@ -705,21 +705,14 @@ pub async fn run_mock(config: &MockConfig, session: &mut dyn Session, progress: 
         None => StdRng::from_rng(&mut rand::rng()),
     };
 
-    // Truncate first (before sequences look at MAX()).
-    if config.mode == MockMode::TruncateFirst {
-        let truncate = dialect.truncate_table(&table_ref);
-        if let Err(e) = cancellable(ternarygrid_core::driver::execute_update(session, &truncate, &[]), cancel, handle.clone()).await {
-            if e.kind == ErrorKind::Cancelled {
-                return Err(e);
-            }
-            let delete = format!("DELETE FROM {}", dialect.qualified_ref(&table_ref));
-            cancellable(ternarygrid_core::driver::execute_update(session, &delete, &[]), cancel, handle.clone()).await?;
-        }
-    }
+    // "Delete them first" runs with the first batch (below), in its transaction: a check
+    // that stops the run (no rows to reference, a value that does not fit) left the table
+    // emptied. The table is empty then: counts and MAX() below are not asked (they start over).
+    let truncate_first = config.mode == MockMode::TruncateFirst;
 
     // Unique texts continue after the rows already in the table.
     let mut unique_offset = 0u64;
-    if active.iter().any(|(g, _)| g.unique) {
+    if !truncate_first && active.iter().any(|(g, _)| g.unique) {
         let sql = format!("SELECT COUNT(*) FROM {}", dialect.qualified_ref(&table_ref));
         let n = cancellable(query_scalar(session, &sql, &[]), cancel, handle.clone()).await?;
         unique_offset = n.as_i64().and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
@@ -730,7 +723,7 @@ pub async fn run_mock(config: &MockConfig, session: &mut dyn Session, progress: 
     for (i, (g, col)) in active.iter().enumerate() {
         if let GeneratorKind::Sequence { start, step, after_max } = &g.generator {
             sequences[i] = *start;
-            if *after_max {
+            if *after_max && !truncate_first {
                 let sql = format!("SELECT MAX({}) FROM {}", dialect.quote_ident(&col.name), dialect.qualified_ref(&table_ref));
                 let max = cancellable(query_scalar(session, &sql, &[]), cancel, handle.clone()).await?;
                 if let Some(m) = max.as_i64() {
@@ -761,7 +754,9 @@ pub async fn run_mock(config: &MockConfig, session: &mut dyn Session, progress: 
         };
         let list = cols.iter().map(|c| dialect.quote_ident(c)).collect::<Vec<_>>().join(", ");
         let sql = dialect.limit_query(&format!("SELECT DISTINCT {list} FROM {}", dialect.qualified_ref(table)), 10_000, 0);
-        let (_, rows) = cancellable(query_all(session, &sql, &[]), cancel, handle.clone()).await?;
+        // The table itself, emptied first: none of its rows are left to reference.
+        let own = truncate_first && table.name.eq_ignore_ascii_case(&table_ref.name) && table.schema == table_ref.schema;
+        let rows = if own { Vec::new() } else { cancellable(query_all(session, &sql, &[]), cancel, handle.clone()).await?.1 };
         let rows: Vec<Row> = rows.into_iter().filter(|r| r.iter().all(|v| !v.is_null())).collect();
         if rows.is_empty() {
             let required =
@@ -789,6 +784,9 @@ pub async fn run_mock(config: &MockConfig, session: &mut dyn Session, progress: 
     let mut writer = BatchWriter::new(session, target, TransactionScope::PerBatch, config.on_error, batch_size, item.clone());
     writer.begin().await?;
     let outcome = async {
+        if truncate_first {
+            writer.clear_table(&table_ref).await?;
+        }
         let mut produced = 0u64;
         while produced < config.rows {
             if cancel.is_cancelled() {

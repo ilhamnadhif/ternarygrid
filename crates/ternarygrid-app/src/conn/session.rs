@@ -548,6 +548,8 @@ impl SessionHandle {
 
     /// Run `sql` to completion and return the first row set (metadata-style queries).
     pub async fn query_all(&self, sql: &str, params: &[Value]) -> DbResult<(Vec<ternarygrid_core::ColumnMeta>, Vec<Row>)> {
+        // In use (see `check`): a slow statement is not taken for a connection that went silent.
+        let _busy = self.busy();
         let r = self
             .killable(async {
                 let mut guard = self.lock().await;
@@ -564,6 +566,8 @@ impl SessionHandle {
 
     /// Run `sql` ignoring results; returns affected rows.
     pub async fn execute_update(&self, sql: &str, params: &[Value]) -> DbResult<Option<u64>> {
+        // In use: an ALTER waiting for a lock, a long DROP, is not taken for a silent connection.
+        let _busy = self.busy();
         let started = Instant::now();
         let r = self
             .killable(async {
@@ -600,6 +604,7 @@ impl SessionHandle {
     /// its key); otherwise the save fails and is undone (0: changed or deleted by someone
     /// else; more: the key does not identify one row).
     pub async fn apply_changes_reading(&self, stmts: &[(String, Vec<Value>)], expect_one: &[bool]) -> DbResult<Applied> {
+        let _busy = self.busy();
         let r = self.killable(self.apply_changes_locked(stmts, expect_one)).await;
         if let Err(e) = &r {
             self.note_error(e);
@@ -709,6 +714,7 @@ impl SessionHandle {
     }
 
     pub async fn set_transaction_mode(&self, mode: TransactionMode) -> DbResult<()> {
+        let _busy = self.busy();
         let r = self
             .killable(async {
                 let mut guard = self.lock().await;
@@ -724,6 +730,8 @@ impl SessionHandle {
     }
 
     pub async fn commit(&self) -> DbResult<()> {
+        // A COMMIT taking long (deferred constraints, a slow disk) is not cut off as silent.
+        let _busy = self.busy();
         let r = self
             .killable(async {
                 let mut guard = self.lock().await;
@@ -740,6 +748,7 @@ impl SessionHandle {
     }
 
     pub async fn rollback(&self) -> DbResult<()> {
+        let _busy = self.busy();
         let r = self
             .killable(async {
                 let mut guard = self.lock().await;
@@ -1282,6 +1291,22 @@ mod tests {
         silent.store(true, Ordering::SeqCst);
         h.settle_after_cancel(Duration::from_millis(300)).await;
         assert!(!h.is_closed(), "uncommitted changes: left to a reconnect, which asks first");
+    }
+
+    /// A statement that holds the session for long (an ALTER waiting for a lock, a big
+    /// COMMIT) is in use, not silent: the check used to give the session up, and with it
+    /// every session of the connection (uncommitted changes rolled back).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_statement_is_not_taken_for_a_silent_session() {
+        let h = SessionHandle::new(sqlite("slow").await, "slow", None);
+        let h2 = h.clone();
+        let slow =
+            tokio::spawn(async move { h2.execute_update("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000000) SELECT count(*) FROM n", &[]).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(h.check(Duration::from_millis(200)).await, Health::Busy));
+        assert!(!h.is_closed(), "not given up");
+        slow.await.unwrap().unwrap();
+        assert!(matches!(h.check(Duration::from_secs(5)).await, Health::Alive));
     }
 
     /// Before a TRUNCATE elsewhere: a query's open cursor is let go (its result reads on by

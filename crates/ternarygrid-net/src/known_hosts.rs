@@ -30,6 +30,14 @@ pub enum HostKeyStatus {
     },
     /// Nothing is recorded for this host.
     Unknown,
+    /// Nothing found, but a known_hosts file could not be read: a key pinned there would
+    /// not be seen, so the host cannot be taken for new.
+    Unreadable {
+        /// The file that could not be read.
+        file: PathBuf,
+        /// Why.
+        error: String,
+    },
     /// Keys of other types are recorded for this host, but not this one.
     OtherTypesKnown {
         /// Key types recorded for the host (e.g. `ssh-rsa`).
@@ -123,8 +131,16 @@ impl KnownHosts {
         let mut other: Option<(PathBuf, usize)> = None;
         let mut other_types: Vec<String> = Vec::new();
         let mut known: Option<(PathBuf, usize)> = None;
+        let mut unreadable: Option<(PathBuf, String)> = None;
         for file in self.files() {
-            for e in read_entries(file) {
+            let entries = match try_read_entries(file) {
+                Ok(e) => e,
+                Err(e) => {
+                    unreadable.get_or_insert((file.clone(), e));
+                    Vec::new()
+                }
+            };
+            for e in entries {
                 if !host_matches(&name, &e.patterns) {
                     continue;
                 }
@@ -165,6 +181,9 @@ impl KnownHosts {
                 file,
                 line,
             };
+        }
+        if let Some((file, error)) = unreadable {
+            return HostKeyStatus::Unreadable { file, error };
         }
         HostKeyStatus::Unknown
     }
@@ -336,19 +355,23 @@ pub fn lookup_name(host: &str, port: u16) -> String {
 }
 
 fn read_entries(path: &Path) -> Vec<Entry> {
+    try_read_entries(path).unwrap_or_else(|e| {
+        tracing::debug!("cannot read known_hosts file {}: {e}", path.display());
+        Vec::new()
+    })
+}
+
+/// The entries of `path` (none when it does not exist); an error when it cannot be read.
+fn try_read_entries(path: &Path) -> Result<Vec<Entry>, String> {
     // Lossy: a comment in another encoding must not hide every entry.
     match std::fs::read(path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes)
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes)
             .lines()
             .enumerate()
             .filter_map(|(i, l)| parse_line(l, i + 1))
-            .collect(),
-        Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!("cannot read known_hosts file {}: {e}", path.display());
-            }
-            Vec::new()
-        }
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -693,6 +716,25 @@ mod tests {
         // Learning never touches read-only files.
         kh.learn("new-host", 22, &k1).unwrap();
         assert!(!std::fs::read_to_string(&ro).unwrap().contains("new-host"));
+    }
+
+    /// A known_hosts file that cannot be read (a directory here; EACCES alike) hides the key
+    /// pinned in it: the host is not taken for new (any key was accepted and learnt).
+    #[test]
+    fn an_unreadable_file_is_no_unknown_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("system_known_hosts");
+        std::fs::create_dir(&unreadable).unwrap();
+        let kh = KnownHosts::with_files(dir.path().join("own"), vec![unreadable]);
+        assert!(matches!(
+            kh.check("db", 22, &key()),
+            HostKeyStatus::Unreadable { .. }
+        ));
+        let missing = KnownHosts::with_files(dir.path().join("own"), vec![dir.path().join("none")]);
+        assert!(
+            matches!(missing.check("db", 22, &key()), HostKeyStatus::Unknown),
+            "a missing file is no error"
+        );
     }
 
     #[test]

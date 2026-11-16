@@ -88,6 +88,9 @@ pub struct TernaryGridApp {
     pub dialogs: Dialogs,
     started: Instant,
     first_frame: bool,
+    /// When the open editors were last remembered, and what was remembered (see
+    /// [`TernaryGridApp::autosave_session`]).
+    session_saved: (Instant, String),
     /// Exit after the first frame (startup benchmark).
     pub exit_after_first_frame: bool,
     active_tab: Option<u64>,
@@ -178,6 +181,7 @@ impl TernaryGridApp {
             dialogs: Dialogs::default(),
             started: Instant::now(),
             first_frame: true,
+            session_saved: (Instant::now(), String::new()),
             exit_after_first_frame: false,
             active_tab: None,
             revealed_tab: None,
@@ -1210,7 +1214,10 @@ impl TernaryGridApp {
                     let console = t.kind == ternarygrid_config::project::TabKind::SqlConsole;
                     self.script_counter += 1;
                     let title = t.title.clone().unwrap_or_else(|| format!("Script-{}", self.script_counter));
-                    self.open_tab(Box::new(crate::tabs::sql_editor::SqlEditorTab::new(conn, schema, t.content.clone().unwrap_or_default(), None, console, title)));
+                    let mut tab = crate::tabs::sql_editor::SqlEditorTab::new(conn, schema, t.content.clone().unwrap_or_default(), None, console, title);
+                    // Its text is in no file: closing it asks (it was discarded as unchanged).
+                    tab.mark_unsaved();
+                    self.open_tab(Box::new(tab));
                 }
                 ternarygrid_config::project::TabKind::ObjectEditor | ternarygrid_config::project::TabKind::DataEditor => {
                     let (Some(conn), Some(obj)) = (t.connection_id.clone().filter(|c| self.conns.config(c).is_some()), t.object.clone()) else { continue };
@@ -1236,6 +1243,38 @@ impl TernaryGridApp {
                 _ => {}
             }
         }
+    }
+
+    /// Remember the open editors every 30 seconds when they changed, not only at quit: a
+    /// crash or a forced quit lost every untitled script.
+    fn autosave_session(&mut self) {
+        if self.session_saved.0.elapsed() < std::time::Duration::from_secs(30) || !self.settings.general.restore_session {
+            return;
+        }
+        self.session_saved.0 = Instant::now();
+        let state = self.session_state();
+        let text = serde_json::to_string(&state).unwrap_or_default();
+        if text == self.session_saved.1 {
+            return;
+        }
+        if let Some(projects) = self.services.projects.as_ref()
+            && let Err(e) = projects.save_session(&state)
+        {
+            tracing::warn!("cannot save the session: {e}");
+        }
+        self.session_saved.1 = text;
+    }
+
+    fn session_state(&self) -> ternarygrid_config::SessionState {
+        let mut state = ternarygrid_config::SessionState::default();
+        for (_, t) in self.dock.iter_all_tabs() {
+            if let Some(v) = t.view.session_state()
+                && let Ok(tab) = serde_json::from_value::<ternarygrid_config::SessionTab>(v)
+            {
+                state.tabs.push(tab);
+            }
+        }
+        state
     }
 
     /// Remember the open editors for the next start.
@@ -1731,6 +1770,7 @@ impl eframe::App for TernaryGridApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         crate::theme::sync_fonts(&ctx);
+        self.autosave_session();
         if self.first_frame {
             self.first_frame = false;
             crate::bench::report_first_frame(self.started);

@@ -29,9 +29,9 @@ pub enum ImportMode {
     /// Insert the rows.
     #[default]
     Append,
-    /// Delete all rows first, then insert. Only with [`TransactionScope::Whole`]
-    /// is the deletion undone when the import fails; otherwise it is committed
-    /// before the rows are written.
+    /// Delete all rows first, then insert. In a transaction (whole import or per
+    /// batch) the deletion is committed with the first batch, so an import that
+    /// fails before leaves the table as it was; without one it is committed at once.
     TruncateFirst,
     /// Insert or replace rows by key ([`ImportMapping::key_columns`]) via
     /// [`Dialect::upsert`]; dialects without upsert get `DELETE` + `INSERT`,

@@ -903,7 +903,21 @@ fn next_batch_statement(
     is_write: bool,
 ) -> Option<usize> {
     use StatementKind as K;
+    // CREATE TABLE / INDEX hold no statements (a routine's, a view's, a trigger's body is
+    // not cut): `CREATE INDEX ix ON t(a)\nDELETE FROM orders` hid the DELETE's danger.
+    let word = |k: usize| sig.get(k).map(|t| t.text(src)).unwrap_or("");
+    let creates_storage = kind == K::Create
+        && (from + 1..(from + 5).min(sig.len()))
+            .take_while(|&k| {
+                ["UNIQUE", "CLUSTERED", "NONCLUSTERED", "TABLE", "INDEX"]
+                    .iter()
+                    .any(|w| word(k).eq_ignore_ascii_case(w))
+            })
+            .any(|k| {
+                word(k).eq_ignore_ascii_case("TABLE") || word(k).eq_ignore_ascii_case("INDEX")
+            });
     let cut = !is_write
+        || creates_storage
         || matches!(
             kind,
             K::Insert | K::Update | K::Delete | K::Drop | K::Truncate | K::Call
@@ -930,7 +944,13 @@ fn next_batch_statement(
                         .get(k + 1)
                         .is_some_and(|n| n.text(src).eq_ignore_ascii_case("TRIGGER"));
                 // After UPDATE / DELETE a SELECT is the next statement (`INSERT … SELECT` fills the insert).
-                let read = is("SELECT") && matches!(kind, K::Update | K::Delete);
+                // After a statement that does not write and is no query (SET, DECLARE, PRINT,
+                // USE, BEGIN TRAN) a SELECT or WITH starts one too: `SET NOCOUNT ON\nSELECT *
+                // INTO copy FROM orders` was taken for a read on a read-only connection.
+                let read = (is("SELECT") && matches!(kind, K::Update | K::Delete))
+                    || ((is("SELECT") || is("WITH"))
+                        && !is_write
+                        && !matches!(kind, K::Select | K::Insert));
                 if write || trigger || read {
                     return Some(k);
                 }
@@ -1263,6 +1283,17 @@ impl<'a> Sig<'a> {
                 if drop.is_some() {
                     i.danger = Some(Danger::AlterDrop);
                 }
+                // `ALTER TABLE t TRUNCATE PARTITION …` (MySQL, Oracle), `DISCARD TABLESPACE`:
+                // the rows go like with TRUNCATE.
+                if self
+                    .find_top(p + 1, |j| {
+                        (self.w(j, "TRUNCATE") && self.any(j + 1, &["PARTITION", "SUBPARTITION"]))
+                            || (self.w(j, "DISCARD") && self.w(j + 1, "TABLESPACE"))
+                    })
+                    .is_some()
+                {
+                    i.danger = Some(Danger::Truncate);
+                }
                 i
             }
             "DROP" => {
@@ -1337,6 +1368,18 @@ impl<'a> Sig<'a> {
                 i
             }
             "SHOW" => info(K::Show, first).rows(),
+            // MySQL: DESC / DESCRIBE are EXPLAIN too (`DESC ANALYZE DELETE …` runs the DELETE).
+            "DESCRIBE" | "DESC"
+                if self.any(
+                    p + 1,
+                    &[
+                        "ANALYZE", "FORMAT", "SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE",
+                        "WITH", "TABLE", "FOR",
+                    ],
+                ) =>
+            {
+                self.explain(p, first, depth)
+            }
             "DESCRIBE" | "DESC" => {
                 let mut i = info(K::Describe, first).rows();
                 i.target = self.name_at(p + 1);
@@ -1514,6 +1557,13 @@ impl<'a> Sig<'a> {
     fn set(&self, p: usize, first: String) -> StatementInfo {
         use StatementKind as K;
         let n = p + 1;
+        // MariaDB / Percona `SET STATEMENT var = value[, …] FOR <statement>`: the statement.
+        if self.w(n, "STATEMENT")
+            && let Some(f) = self.find_top(n + 1, |j| self.w(j, "FOR"))
+            && f + 1 < self.t.len()
+        {
+            return self.classify(f + 1, 1);
+        }
         let tx = self.w(n, "TRANSACTION")
             || (self.any(n, &["SESSION", "LOCAL", "GLOBAL"])
                 && (self.w(n + 1, "TRANSACTION") || self.w(n + 1, "CHARACTERISTICS")));
@@ -1721,6 +1771,30 @@ mod tests {
         classify(sql, &mysql())
     }
 
+    /// MySQL / MariaDB statements that hid a write or a danger behind another keyword.
+    #[test]
+    fn hidden_writes_and_dangers_of_mysql() {
+        let d = cm("DESC ANALYZE DELETE t FROM t JOIN u ON t.id = u.id");
+        assert!(d.is_write, "DESC is EXPLAIN: ANALYZE runs the DELETE");
+        assert!(!cm("DESC orders").is_write);
+        assert_eq!(cm("DESC orders").kind, K::Describe);
+        let s = cm("SET STATEMENT max_statement_time=60 FOR DELETE FROM orders");
+        assert!(
+            s.is_write && s.danger == Some(Danger::DeleteWithoutWhere),
+            "{s:?}"
+        );
+        assert!(!cm("SET STATEMENT max_statement_time=60 FOR SELECT 1").is_write);
+        assert_eq!(
+            cm("ALTER TABLE orders TRUNCATE PARTITION p2023").danger,
+            Some(Danger::Truncate)
+        );
+        assert_eq!(
+            cm("ALTER TABLE orders DISCARD TABLESPACE").danger,
+            Some(Danger::Truncate)
+        );
+        assert_eq!(cm("ALTER TABLE orders ADD COLUMN x INT").danger, None);
+    }
+
     #[test]
     fn later_tsql_statements_and_read_write() {
         let t = |sql: &str| classify(sql, &tsql());
@@ -1733,6 +1807,33 @@ mod tests {
             assert!(t(sql).is_write, "{sql}");
         }
         assert!(!t("SELECT a FROM t WHERE b IN (SELECT b FROM u)").is_write);
+        // A SELECT … INTO after a statement that does not write is found (read-only).
+        for sql in [
+            "SET NOCOUNT ON\nSELECT * INTO dbo.orders_copy FROM dbo.orders",
+            "DECLARE @n INT\nSELECT * INTO dbo.c FROM dbo.orders",
+            "PRINT 'x'\nSELECT a INTO #t FROM dbo.orders",
+            "USE shop\nSELECT a INTO dbo.c FROM dbo.orders",
+            "SET NOCOUNT ON\nWITH c AS (SELECT 1 AS a) SELECT a INTO dbo.c FROM c",
+        ] {
+            assert!(t(sql).is_write, "{sql}");
+        }
+        for sql in [
+            "SET NOCOUNT ON\nSELECT * FROM dbo.orders WITH (NOLOCK)",
+            "SELECT a FROM t UNION SELECT b FROM u",
+            "DECLARE @x INT = (SELECT 1)\nSELECT @x",
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+        ] {
+            assert!(!t(sql).is_write, "{sql}");
+        }
+        // CREATE TABLE / INDEX do not hide what follows them.
+        assert_eq!(
+            t("CREATE INDEX ix ON dbo.t(a)\nDELETE FROM dbo.orders").danger,
+            Some(Danger::DeleteWithoutWhere)
+        );
+        assert_eq!(
+            t("CREATE TABLE dbo.t (a INT)\nTRUNCATE TABLE dbo.orders").danger,
+            Some(Danger::Truncate)
+        );
         assert!(!t("SELECT * FROM a INNER MERGE JOIN b ON a.id = b.id").is_write);
         // Each statement of a run is checked on its own.
         assert_eq!(

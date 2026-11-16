@@ -188,6 +188,13 @@ pub fn delimiter_command_arg<'a>(token: &Token, src: &'a str) -> Option<&'a str>
 /// quotes unescaped (`"a""b"` → `a"b`, `[a]]b]` → `a]b`). Unquoted text is
 /// returned unchanged.
 pub fn unquote_ident(text: &str) -> Cow<'_, str> {
+    // PostgreSQL `U&"…"`: unicode escapes (`\0070` is `p`); the name is what they spell,
+    // or `U&"pg_terminate_backend"` passes for another name than it is.
+    if let Some(inner) = text.strip_prefix("U&").or_else(|| text.strip_prefix("u&"))
+        && inner.starts_with('"')
+    {
+        return Cow::Owned(unicode_escapes(&unquote_ident(inner)));
+    }
     let mut chars = text.chars();
     let Some(open) = chars.next() else {
         return Cow::Borrowed(text);
@@ -206,6 +213,38 @@ pub fn unquote_ident(text: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(inner)
     }
+}
+
+/// The text of a `U&` literal with its escapes (`\XXXX`, `\+XXXXXX`, `\\`) decoded,
+/// with the default escape character (a `UESCAPE` clause changes it; such text is
+/// kept as written).
+fn unicode_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let (digits, skip) = match after.strip_prefix('+') {
+            Some(six) => (six.get(..6), 7),
+            None => (after.get(..4), 4),
+        };
+        if let Some(next) = after.strip_prefix('\\') {
+            out.push('\\');
+            rest = next;
+        } else if let Some(c) = digits
+            .filter(|d| d.chars().all(|c| c.is_ascii_hexdigit()))
+            .and_then(|d| u32::from_str_radix(d, 16).ok())
+            .and_then(char::from_u32)
+        {
+            out.push(c);
+            rest = &after[skip..];
+        } else {
+            out.push('\\');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Multi-character operators recognised by maximal munch (3, then 2 chars).
@@ -630,7 +669,9 @@ impl<'a> Lexer<'a> {
         while matches!(self.byte(i), b' ' | b'\t') {
             i += 1;
         }
-        if self.byte(i).is_ascii_digit() {
+        // `GO 5` repeats the batch; a `/` line is only the terminator: `/ 100` at the
+        // start of a line divides (Oracle), it does not end the statement before it.
+        if sep[0].is_ascii_alphabetic() && self.byte(i).is_ascii_digit() {
             while self.byte(i).is_ascii_digit() {
                 i += 1;
             }
@@ -1080,6 +1121,19 @@ pub(crate) fn is_word(t: &Token, src: &str, word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `U&"…"` names are what their escapes spell (the assistant's denied functions).
+    #[test]
+    fn unicode_escaped_identifiers() {
+        assert_eq!(
+            unquote_ident(r#"U&"pg_terminate_backend""#),
+            "pg_terminate_backend"
+        );
+        assert_eq!(unquote_ident(r#"u&"\0070g_sleep""#), "pg_sleep");
+        assert_eq!(unquote_ident(r#"U&"set\+00005Fconfig""#), "set_config");
+        assert_eq!(unquote_ident(r#"U&"a\\b""#), "a\\b");
+        assert_eq!(unquote_ident(r#""plain""#), "plain");
+    }
     use crate::testutil::*;
     use TokenKind as K;
 

@@ -222,6 +222,19 @@ pub(crate) fn table_combo_ex(
     changed
 }
 
+/// `keys` identify one row of `def`: they hold its primary key, a unique key or a unique
+/// index of plain columns (case of names ignored).
+fn keys_identify_rows(def: &TableDef, keys: &[String]) -> bool {
+    let has = |cols: &[String]| !cols.is_empty() && cols.iter().all(|c| keys.iter().any(|k| k.eq_ignore_ascii_case(c)));
+    def.row_key().is_some_and(|k| has(&k.columns))
+        || def.unique_keys.iter().any(|k| has(&k.columns))
+        || def
+            .indexes
+            .iter()
+            .filter(|i| i.unique && i.predicate.is_none() && i.columns.iter().all(|c| !c.is_expression))
+            .any(|i| has(&i.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()))
+}
+
 /// Definition of `table` from the metadata cache (requested when missing);
 /// `Err` with the error text when it cannot be read.
 pub(crate) fn cached_table_def(cx: &mut AppContext, conn: &str, table: &ObjectRef) -> Result<Option<Arc<TableDef>>, String> {
@@ -1051,6 +1064,12 @@ impl DataCompareTab {
         };
         let target_conn = cx.conns.config(&o.target_conn).map(|c| c.name.clone()).unwrap_or_default();
         let production = cx.conns.type_of(&o.target_conn).is_production();
+        // Keys that are no primary or unique key of the target: a statement of the script
+        // (`DELETE … WHERE email = 'A@x.com'`) may change every row sharing them.
+        let (keys, target_table) = (self.keys.clone(), self.target.table.clone());
+        let o_target_conn = o.target_conn.clone();
+        let not_unique = target_table.and_then(|t| cached_table_def(cx, &o_target_conn, &t).ok().flatten()).is_some_and(|def| !keys_identify_rows(&def, &keys));
+        let Some(o) = &self.result else { return };
         let (n, name) = (o.diff.sync_statements.len(), o.target_name.clone());
         let statements = ternarygrid_core::trn(n, tr("1 statement"), tr("{} statements"));
         let question = trf("Run {} on {} (\"{}\") in one transaction?", &[&statements, &name, &target_conn]);
@@ -1071,6 +1090,14 @@ impl DataCompareTab {
                     ui.label(RichText::new(tr("Rows of the target will be inserted, updated and deleted to match the source.")).color(p.text_muted));
                     if production {
                         look::note(ui, ternarygrid_ui::parts::Tone::Warning, None, &warning);
+                    }
+                    if not_unique {
+                        look::note(
+                            ui,
+                            ternarygrid_ui::parts::Tone::Error,
+                            None,
+                            &trf("The keys ({}) are no primary or unique key of the target: a statement may update or delete every row that shares them.", &[&keys.join(", ")]),
+                        );
                     }
                 },
                 |ui| {
@@ -1314,5 +1341,23 @@ impl DataCompareTab {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ternarygrid_core::ddl::{IndexColumn, IndexDef, KeyDef};
+
+    /// The sync script's keys identify rows only when they hold a primary or unique key.
+    #[test]
+    fn keys_that_identify_rows() {
+        let mut def = TableDef::new(None, "users");
+        def.primary_key = Some(KeyDef { name: None, columns: vec!["id".into()] });
+        assert!(keys_identify_rows(&def, &["id".into()]));
+        assert!(keys_identify_rows(&def, &["ID".into(), "email".into()]));
+        assert!(!keys_identify_rows(&def, &["email".into()]));
+        def.indexes.push(IndexDef { name: "u_email".into(), columns: vec![IndexColumn::column("email")], unique: true, ..Default::default() });
+        assert!(keys_identify_rows(&def, &["email".into()]));
     }
 }

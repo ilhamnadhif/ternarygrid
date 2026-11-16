@@ -155,6 +155,10 @@ pub(crate) fn tool_env(params: &ConnectParams) -> Vec<(String, Secret)> {
     }
     // The `sslmode` connection property overrides the TLS setting, as for the session.
     let mode = ["sslmode", "ssl_mode"].iter().find_map(|k| params.property(k)).and_then(SslMode::parse).unwrap_or(params.ssl.mode);
+    // verify-ca without a CA is verify-full against the system roots (as the session):
+    // libpq 16+ refuses `sslrootcert=system` with verify-ca.
+    let has_ca = params.ssl.ca_cert.as_deref().and_then(file_path_of).is_some();
+    let mode = if mode == SslMode::VerifyCa && !has_ca { SslMode::VerifyFull } else { mode };
     env.push(("PGSSLMODE".to_string(), Secret::new(mode.label())));
     if mode != SslMode::Disable {
         if let Some(ca) = params.ssl.ca_cert.as_deref().and_then(file_path_of) {

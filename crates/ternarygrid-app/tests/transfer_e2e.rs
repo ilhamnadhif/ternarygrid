@@ -370,7 +370,9 @@ fn export_to_csv_and_json_and_import_back() {
         let imported = h.text_rows(&format!("SELECT id, name, created, note FROM {copy} ORDER BY id"));
         assert_eq!(imported, original, "{name}: values survive the CSV round trip");
         let sums = h.text_rows(&format!("SELECT SUM(amount) FROM {t} UNION ALL SELECT SUM(amount) FROM {copy}"));
-        assert_eq!(sums[0], sums[1], "{name}: amounts");
+        // The same amounts; the new column has room for more fraction digits (328.250000).
+        let value = |r: &Vec<String>| r[0].parse::<f64>().unwrap_or(f64::NAN);
+        assert_eq!(value(&sums[0]), value(&sums[1]), "{name}: amounts {sums:?}");
 
         // ---- Import the JSON file into the existing table (append).
         let mut imp2 = ImportTab::new(h.id.clone(), Some(h.table(&copy)), None);

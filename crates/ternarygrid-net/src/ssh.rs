@@ -150,6 +150,11 @@ pub(crate) fn verify_host_key(
             "If the server's keys changed, remove the old entries for this host from {} and connect again.",
             file.display()
         ))),
+        HostKeyStatus::Unreadable { file, error } => Err(DbError::ssh(format!(
+            "The SSH host {addr} cannot be verified: {} cannot be read ({error})",
+            file.display()
+        ))
+        .with_hint("A key pinned in that file would not be seen. Make the file readable, then connect again.")),
         HostKeyStatus::Unknown => match policy {
             HostKeyPolicy::Strict => Err(DbError::ssh(format!(
                 "The SSH host {addr} is not known (presented {} key {fp}) and the host key policy is Strict",
@@ -158,11 +163,20 @@ pub(crate) fn verify_host_key(
             .with_hint(format!(
                 "Verify the fingerprint with the server administrator, then add the host to {own} or use the \"accept new\" policy."
             ))),
-            _ => {
+            // Accept new: only once the key is recorded. A known_hosts file that cannot be
+            // read hides the key pinned there (the host looks new), and one that cannot be
+            // written would accept any key again next time: refused either way.
+            HostKeyPolicy::AcceptNew => match known_hosts.learn(host, port, key) {
+                Ok(()) => {
+                    tracing::info!("trusting new SSH host {addr} ({} {fp}); recorded in {own}", alg.as_str());
+                    Ok(())
+                }
+                Err(e) => Err(DbError::ssh(format!("The SSH host {addr} is not known and its key ({} {fp}) cannot be recorded: {e}", alg.as_str()))
+                    .with_hint(format!("Make {own} readable and writable, or choose the \"accept all\" host key policy for this tunnel."))),
+            },
+            HostKeyPolicy::AcceptAll => {
                 if let Err(e) = known_hosts.learn(host, port, key) {
                     tracing::warn!("could not record the host key of {addr}: {e}");
-                } else {
-                    tracing::info!("trusting new SSH host {addr} ({} {fp}); recorded in {own}", alg.as_str());
                 }
                 Ok(())
             }

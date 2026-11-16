@@ -3,6 +3,53 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.0 — 2026-11-16
+
+A full audit of TernaryGrid: edits that could change the wrong rows, writes that slipped past read-only connections and the AI assistant, and work that could be lost are fixed.
+
+### Fixed — data
+- **A self-join could edit the wrong row.** In `SELECT e.id, m.name AS manager FROM employees e JOIN employees m …`, changing `manager` renamed the employee instead of the manager. A query that reads a table twice is now read-only (the table's data tab edits it).
+- **ClickHouse: deleting one row deleted every row sharing its sorting key** (a whole day for `ORDER BY event_date`). Its key does not identify rows: results, generated SQL and data compare no longer use it as one (define a virtual key to edit).
+- **Edits made while a save was running were marked saved without being written** (a row deleted then vanished from the grid but stayed in the database). The rows are locked while saving.
+- **Foreign key navigation on Oracle and ClickHouse kept the previous table's columns**, and edits went to that table.
+- **PostgreSQL: a table renamed by someone else kept its old name** in the results of a long-open editor, so edits went to the new table of that name.
+- **A row whose key the database makes (a UUID default) could not be changed after saving it:** the update matched nothing and still said "Saved". It now asks for a refresh.
+- **`WITH d AS (DELETE … RETURNING *) SELECT * FROM d` was undone** when it returned more than one page: closing its result cancelled the statement. Writes that return rows are read to the end.
+- **PostgreSQL: Commit of a transaction an earlier error had aborted reported success** while the server rolled everything back. It now says so and keeps the transaction open for a Rollback.
+- **SQL Server: Explain Analyze committed the statement it explained** (a DELETE ran). It is rolled back, as on PostgreSQL and MySQL.
+- **MongoDB: "Calculate total row count" ran a `db.runCommand(…)` again**, inserting twice.
+- **SQLite: a Rollback switched `PRAGMA foreign_keys` back on**, so a manual table rebuild's `DROP TABLE` ran `ON DELETE CASCADE`. Only the table designer's own rebuilds are undone that way now.
+- **Import with "Delete them first" emptied the table even when the import then failed.** The rows go with the first batch's transaction, and Run asks first. Mock data alike.
+- **The table designer cut text silently** when a PostgreSQL column was made shorter (`varchar(100)` → `varchar(10)`): the server now refuses values that do not fit, and every column type change is flagged in the confirmation.
+- **Truncate… on a MySQL partition emptied a table of the partition's name.**
+- **Oracle: a line starting with `/ 100` ended the statement**, so `UPDATE … SET amount = amount / 100 WHERE …` ran without its WHERE.
+- **Schema compare "Apply to target" on PostgreSQL** runs in one transaction: a failing statement no longer leaves the target half migrated.
+- Import: a decimal column made from the file gets room for more fraction digits (later rows were rounded), phone numbers keep their `+`, codes keep leading zeros (or fail visibly), a quoted `NULL` text stays text, and a CSV value ending in part of a multi-character delimiter is quoted.
+- A backup is written beside its file and moved into place when done: a failed or cancelled run no longer replaces the last good backup with a cut one.
+- Migration refuses a target that is its source table also when only the letter case differs, or when another saved connection points at the same database.
+- Data compare warns when its keys are no primary or unique key of the target.
+
+### Fixed — security
+- **The AI assistant could be steered past its read-only guard on PostgreSQL** (a `U&"…"`-escaped function name, or SQL built inside a string), for example to end sessions or lift the read-only mode. Each of its queries now runs in a read-only transaction, escaped names are decoded, and functions that run strings or touch replication are refused.
+- **SQL Server read-only connections ran `SELECT … INTO`** after a first line that does not write (`SET NOCOUNT ON`), and scheduled SQL tasks ignored the read-only flag.
+- **An imported connections file could run a program or SQL at the first connect** (a password command, init SQL): like shell commands, they are removed unless kept on purpose, and SSH tunnels that accepted any host key accept new keys only.
+- PostgreSQL `verify-ca` accepted any certificate a public CA issued; it now trusts only the CA given (without one it checks like `verify-full`). Redis and MongoDB `verify-ca` checked nothing; they now verify, and use the CA and client certificate configured.
+- An unreadable `known_hosts` file no longer lets an SSH host's key through as new.
+- Updates require the published checksum and are only checked over HTTPS.
+- A task file's id could add a crontab entry; the diagnostics bundle printed password commands; an imported vault could freeze the app with huge key-derivation settings; the assistant's approval card cut long statements off.
+- Read-only OpenSearch connections refused `POST /_plugins/_sql` deletes but not the same by `GET`.
+
+### Fixed — reliability
+- **Typing under "Confirm execution" changed what ran** (Enter replaced the selection). The question takes the keyboard, and changed text is asked about again.
+- **A slow statement (an ALTER waiting for a lock, a big COMMIT) made the connection check give up every session**, rolling back editors' uncommitted changes.
+- **Typing right after ⌘S was not counted as a change**: closing the tab lost it without asking. Untitled scripts are remembered every 30 seconds, not only at quit, and come back marked unsaved.
+- Scripts opened from outside the project could not be saved (and the automatic save then showed an error on every frame).
+- Editors sharing one session ran in the schema another editor chose; a run right after a session opened could miss the editor's schema; switching the schema while a script ran moved its remaining statements.
+- "Open in SQL editor" from Truncate / Maintenance opens on the object's database.
+- Find next (⌘G / F3) moves to the next match; a partly failed multi-object drop refreshes the navigator; an object whose database cannot be reached shows why (with Retry) instead of loading for ever; editors' sessions are kept alive like the navigator's; quitting closes every connection at once.
+- The SQL editor's T-SQL, MySQL and Oracle parsing: `DESC ANALYZE`, `SET STATEMENT … FOR`, `ALTER TABLE … TRUNCATE PARTITION`, `CREATE INDEX` followed by a `DELETE` and clauses after a blank line (`PARTITION BY`, `OUTPUT`, `FOR UPDATE`) are classified and split correctly.
+- Smaller: Oracle tracks the transaction after a failed DDL, `LOCK TABLE` and `WITH … FOR UPDATE`; `real` / `BINARY_FLOAT` show their shortest decimal; migration maps `Decimal64(S)` and Oracle `NUMBER` with odd scales without overflow or rounding; Cassandra refuses booleans and numbers it cannot bind; Redis key scans keep bounded memory; bulk grid changes over their limit say so.
+
 ## 0.6.9 — 2026-11-16
 
 After Truncate…, the navigator shows the table's new size at once, and the truncate no longer waits for the table's open data tab.

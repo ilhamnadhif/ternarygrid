@@ -42,6 +42,9 @@ impl FieldStyle {
         text.starts_with(char::is_whitespace)
             || text.ends_with(char::is_whitespace)
             || text.contains(self.delimiter.as_str())
+            // A multi-character delimiter: a value ending in its start (`a|` before `||`)
+            // runs into the delimiter after it (`a|||b` reads back as `a` and `|b`).
+            || (self.delimiter.chars().count() > 1 && (1..self.delimiter.len()).filter(|&i| self.delimiter.is_char_boundary(i)).any(|i| text.ends_with(&self.delimiter[..i])))
             || text.contains(self.quote)
             || text.contains(['\n', '\r'])
             || (self.escape == EscapeStyle::Backslash && text.contains('\\'))
@@ -175,4 +178,22 @@ impl RowSink for CsvSink {
 /// Type shown in headers: the database type, or the logical kind when unknown.
 pub(crate) fn type_label(c: &ColumnMeta) -> String {
     if c.type_name.is_empty() { format!("{:?}", c.kind).to_lowercase() } else { c.type_name.clone() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A value ending in the start of a multi-character delimiter is quoted: `a|` before
+    /// `||` wrote `a|||b`, read back as `a` and `|b`.
+    #[test]
+    fn a_value_ending_in_the_delimiters_start_is_quoted() {
+        let style = FieldStyle { delimiter: "||".into(), quote: '"', mode: QuoteMode::Needed, escape: EscapeStyle::Doubled, null_string: String::new() };
+        assert!(style.needs_quotes("a|"));
+        assert!(style.needs_quotes("a||b"));
+        assert!(!style.needs_quotes("a|b"));
+        assert!(!style.needs_quotes("plain"));
+        let comma = FieldStyle { delimiter: ",".into(), ..style };
+        assert!(!comma.needs_quotes("a|"));
+    }
 }

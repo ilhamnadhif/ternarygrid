@@ -52,6 +52,9 @@ pub struct CsvReadOptions {
     pub trim: bool,
     /// Unquoted fields equal to this text are NULL.
     pub null_string: String,
+    /// Unquoted fields equal to one of these texts are NULL too; quoted they stay text
+    /// (an export writes a real text `NULL` quoted to tell it from NULL).
+    pub null_values: Vec<String>,
     /// Lines starting with this character are ignored. Must be ASCII.
     pub comment_char: Option<char>,
     /// Records read ahead to determine the number of columns.
@@ -69,6 +72,7 @@ impl Default for CsvReadOptions {
             skip_rows: 0,
             trim: false,
             null_string: String::new(),
+            null_values: Vec::new(),
             comment_char: None,
             sample_rows: 100,
         }
@@ -381,6 +385,7 @@ pub struct CsvSource {
     columns: Vec<ColumnMeta>,
     pending: VecDeque<Row>,
     null_string: String,
+    null_values: Vec<String>,
     records: u64,
     ragged: u64,
     first_data_line: u64,
@@ -454,6 +459,7 @@ impl CsvSource {
             columns: metas,
             pending: VecDeque::new(),
             null_string: options.null_string.clone(),
+            null_values: options.null_values.clone(),
             records: 0,
             ragged: 0,
             first_data_line: if header.is_some() { header_line } else { 1 },
@@ -470,8 +476,11 @@ impl CsvSource {
         if fields.len() != width {
             self.ragged += 1;
         }
-        let mut row: Row =
-            fields.into_iter().take(width).map(|f| if !f.quoted && f.text == self.null_string { Value::Null } else { Value::Text(f.text.into_boxed_str()) }).collect();
+        let mut row: Row = fields
+            .into_iter()
+            .take(width)
+            .map(|f| if !f.quoted && (f.text == self.null_string || self.null_values.contains(&f.text)) { Value::Null } else { Value::Text(f.text.into_boxed_str()) })
+            .collect();
         row.resize(width, Value::Null);
         row
     }

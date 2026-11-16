@@ -522,11 +522,15 @@ impl RedisCursor {
                     (None, Reply::Array(a)) => a.iter().map(|x| vec![value(x)]).collect(),
                     (None, _) => Vec::new(),
                 };
-                // Keys (fields, members) once each.
-                self.rows.extend(
-                    rows.into_iter()
-                        .filter(|r| r.first().is_none_or(|k| seen.insert(fingerprint(k)))),
-                );
+                // Keys (fields, members) once each. Up to a bound: over tens of millions of
+                // keys the set alone took gigabytes (past it, a rare repeat may show).
+                const MAX_SEEN: usize = 2_000_000;
+                self.rows.extend(rows.into_iter().filter(|r| {
+                    r.first().is_none_or(|k| {
+                        let f = fingerprint(k);
+                        (seen.len() >= MAX_SEEN && !seen.contains(&f)) || seen.insert(f)
+                    })
+                }));
                 *finished = cursor == "0";
                 args[*at] = cursor.into_bytes();
                 Ok(true)
@@ -675,6 +679,8 @@ fn forwarded_tls(params: &ConnectParams, tls: bool) -> Option<ForwarderResolver>
 
 pub struct RedisSession {
     base: ConnectionInfo,
+    /// A custom CA and / or client certificate (mTLS).
+    tls_certs: Option<redis::TlsCertificates>,
     settings: RedisConnectionInfo,
     config: AsyncConnectionConfig,
     conns: HashMap<i64, MultiplexedConnection>,
@@ -706,7 +712,9 @@ impl RedisSession {
             ConnectionAddr::TcpTls {
                 host: params.tls_host().to_string(),
                 port: params.port,
-                insecure: params.ssl.mode != SslMode::VerifyFull,
+                // verify-ca checks too: `insecure` accepted any certificate there (and the
+                // host name is checked as well, which rustls cannot leave out).
+                insecure: !matches!(params.ssl.mode, SslMode::VerifyCa | SslMode::VerifyFull),
                 tls_params: None,
             }
         } else {
@@ -742,8 +750,15 @@ impl RedisSession {
         if let Some(resolver) = forwarded {
             config = config.set_dns_resolver(resolver);
         }
+        // The CA and client certificate of the connection (they were never sent).
+        let tls_certs = if tls {
+            tls_certificates(&params.ssl)?
+        } else {
+            None
+        };
         let mut s = RedisSession {
             base,
+            tls_certs,
             settings,
             config,
             conns: HashMap::new(),
@@ -786,7 +801,11 @@ impl RedisSession {
             .base
             .clone()
             .set_redis_settings(self.settings.clone().set_db(db));
-        let client = redis::Client::open(info).map_err(err)?;
+        let client = match &self.tls_certs {
+            Some(certs) => redis::Client::build_with_tls(info, certs.clone()),
+            None => redis::Client::open(info),
+        }
+        .map_err(err)?;
         let c = client
             .get_multiplexed_async_connection_with_config(&self.config)
             .await
@@ -1589,6 +1608,59 @@ impl Session for RedisSession {
         }
         Ok(out)
     }
+}
+
+/// PEM given inline (`-----BEGIN …`) or as a file path.
+fn read_pem(source: &str, what: &str) -> DbResult<Vec<u8>> {
+    if source.contains("-----BEGIN") {
+        return Ok(source.as_bytes().to_vec());
+    }
+    let path = source.trim();
+    let path = match path.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(rest),
+        None => std::path::PathBuf::from(path),
+    };
+    std::fs::read(&path).map_err(|e| {
+        DbError::config(format!(
+            "Cannot read the {what} file '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+/// The connection's CA certificate and client certificate for redis' TLS.
+fn tls_certificates(
+    ssl: &ternarygrid_core::config::SslConfig,
+) -> DbResult<Option<redis::TlsCertificates>> {
+    let some = |v: &Option<String>| {
+        v.as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    let root_cert = some(&ssl.ca_cert)
+        .map(|c| read_pem(&c, "CA certificate"))
+        .transpose()?;
+    let client_tls = match (some(&ssl.client_cert), some(&ssl.client_key)) {
+        (Some(c), Some(k)) => Some(redis::ClientTlsConfig {
+            client_cert: read_pem(&c, "client certificate")?,
+            client_key: read_pem(&k, "client key")?,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(DbError::config(
+                "A client certificate needs its key, and a key its certificate",
+            ));
+        }
+    };
+    Ok(
+        (root_cert.is_some() || client_tls.is_some()).then_some(redis::TlsCertificates {
+            client_tls,
+            root_cert,
+        }),
+    )
 }
 
 #[cfg(test)]

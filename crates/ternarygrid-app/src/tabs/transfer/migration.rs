@@ -300,14 +300,30 @@ impl MigrationTab {
                 return Some(trf("Several tables are migrated to {}; give them different target names.", &[&name]));
             }
         }
-        if *target == self.conn {
-            // Same connection: the target must not be the source table itself.
+        // The same database, also through another saved connection to it: the target must not
+        // be the source table itself (DROP AND CREATE dropped it before a row was read).
+        // Names compare without case (`Users` is `users` on most servers).
+        let same_database = *target == self.conn
+            || match (cx.conns.config(target), cx.conns.config(&self.conn)) {
+                (Some(a), Some(b)) => {
+                    a.kind == b.kind
+                        && if a.kind.is_file_based() {
+                            let canon = |p: &Option<String>| p.as_deref().and_then(|p| std::fs::canonicalize(p).ok());
+                            canon(&a.file_path).is_some() && canon(&a.file_path) == canon(&b.file_path)
+                        } else {
+                            a.host.trim().eq_ignore_ascii_case(b.host.trim()) && a.effective_port() == b.effective_port() && a.database == b.database
+                        }
+                }
+                _ => false,
+            };
+        if same_database {
             let default = current_schema(cx, &self.conn).and_then(|s| s.schema);
             let target_schema = self.target_schema.as_ref().and_then(|s| s.schema.clone()).or(default.clone());
+            let lower = |s: &Option<String>| s.as_ref().map(|s| s.to_lowercase());
             for t in self.tables.iter().filter(|t| t.enabled) {
                 let source_schema = t.source.schema.clone().or(default.clone());
                 let name = if t.target_name.trim().is_empty() { apply_case(self.options.name_case, &t.source.name) } else { t.target_name.trim().to_string() };
-                if source_schema == target_schema && name == t.source.name {
+                if lower(&source_schema) == lower(&target_schema) && name.eq_ignore_ascii_case(&t.source.name) {
                     return Some(trf("The target of {} is the table itself; choose another schema or name.", &[&t.source.display_path()]));
                 }
             }
