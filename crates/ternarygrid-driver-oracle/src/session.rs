@@ -652,9 +652,20 @@ impl Session for OracleSession {
         let opts = opts.clone();
         let auto = self.mode == TransactionMode::Auto;
         let text = sql.clone();
-        let outcome = self
+        let outcome = match self
             .blocking(move |c| run(c, &text, &params, &opts, auto))
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                // Oracle commits the open transaction before a DDL statement runs, also when
+                // the statement then fails (ORA-00955): nothing is left to roll back.
+                if ends_tx {
+                    self.in_tx = false;
+                }
+                return Err(e);
+            }
+        };
         let cancel = self.cancel.clone();
         match outcome {
             Outcome::Rows {
@@ -662,7 +673,11 @@ impl Session for OracleSession {
                 reads,
                 cursor,
             } => {
-                if first == "SELECT" && sql.to_ascii_uppercase().contains("FOR UPDATE") && !auto {
+                // Locks held until the end of the transaction (`… FOR UPDATE`, also after WITH).
+                if matches!(first, "SELECT" | "WITH")
+                    && sql.to_ascii_uppercase().contains("FOR UPDATE")
+                    && !auto
+                {
                     self.in_tx = true;
                 }
                 Ok(Box::new(OracleCursor {
@@ -684,7 +699,8 @@ impl Session for OracleSession {
             } => {
                 if ends_tx {
                     self.in_tx = false;
-                } else if !auto && (dml || plsql) {
+                } else if !auto && (dml || plsql || first == "LOCK") {
+                    // LOCK TABLE holds its lock until the end of the transaction.
                     self.in_tx = true;
                 }
                 let rows_affected = if dml { Some(rows) } else { None };

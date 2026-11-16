@@ -1,8 +1,9 @@
 //! Running vendor command line tools (pg_dump, mysqldump, sqlcmd ...) for
 //! backup, restore and "execute in native client" (FR-A2).
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use ternarygrid_core::admin::CommandSpec;
+use ternarygrid_core::admin::{BackupFormat, BackupOptions, CommandSpec};
 use ternarygrid_core::{DbError, DbResult};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -94,4 +95,49 @@ pub async fn run_command(spec: CommandSpec, cancel: CancellationToken, mut on_li
     };
     let status = status.map_err(DbError::from)?;
     if status.success() { Ok(()) } else { Err(DbError::io(format!("{} exited with {status}", spec.program)).with_detail(last_lines.join("\n"))) }
+}
+
+/// A backup goes to a file next to its own (`<file>.partial`), moved over it once the tool
+/// succeeded: written in place, a failed or cancelled run (a dropped connection, Stop) left
+/// a cut file where the last good backup was. `None` for a directory backup (pg_dump -Fd).
+pub fn backup_staging(options: &BackupOptions) -> Option<(BackupOptions, PathBuf)> {
+    if options.format == BackupFormat::Directory {
+        return None;
+    }
+    let name = options.output.file_name()?.to_string_lossy().into_owned();
+    let mut staged = options.clone();
+    staged.output = options.output.with_file_name(format!("{name}.partial"));
+    Some((staged, options.output.clone()))
+}
+
+/// End a staged backup: moved into place when it succeeded, removed otherwise.
+pub fn finish_backup(staged: &Path, output: &Path, succeeded: bool) -> DbResult<()> {
+    if succeeded {
+        std::fs::rename(staged, output).map_err(|e| DbError::io(format!("Cannot move the backup to {}: {e}", output.display())))
+    } else {
+        let _ = std::fs::remove_file(staged);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_backup_replaces_its_file_only_when_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("nightly.sql");
+        std::fs::write(&out, "last good backup").unwrap();
+        let (staged, target) = backup_staging(&BackupOptions { output: out.clone(), ..Default::default() }).unwrap();
+        assert_eq!(staged.output, dir.path().join("nightly.sql.partial"));
+        std::fs::write(&staged.output, "cut").unwrap();
+        finish_backup(&staged.output, &target, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "last good backup");
+        assert!(!staged.output.exists());
+        std::fs::write(&staged.output, "new backup").unwrap();
+        finish_backup(&staged.output, &target, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "new backup");
+        assert!(backup_staging(&BackupOptions { output: out, format: BackupFormat::Directory, ..Default::default() }).is_none());
+    }
 }

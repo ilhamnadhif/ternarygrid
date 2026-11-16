@@ -122,6 +122,12 @@ fn convert_text(s: &str, kind: DataKind, opts: &ConvertOptions) -> Result<Value,
     match kind {
         DataKind::Int | DataKind::Float | DataKind::Decimal => {
             let normalized = normalize_number(t, opts);
+            // A code typed as a number (a ZIP code `02134`, `+44…` after the sampled rows)
+            // would lose its zeros or its sign: the row fails instead of changing silently.
+            let digits = normalized.strip_prefix('-').unwrap_or(&normalized);
+            if normalized.starts_with('+') || (digits.len() > 1 && digits.starts_with('0') && !digits.starts_with("0.")) {
+                return Err(format!("'{t}' keeps its leading zeros or sign only as text"));
+            }
             Value::parse_as(&normalized, kind)
         }
         DataKind::Date => {
@@ -526,6 +532,11 @@ mod tests {
         assert_eq!(c(Value::text(""), DataKind::Text).unwrap(), Value::text(""));
         assert_eq!(c(Value::text(" a "), DataKind::Text).unwrap(), Value::text(" a "));
         assert!(c(Value::text("x"), DataKind::Int).is_err());
+        // A code after the sampled rows (ZIP 02134, +44…) fails instead of losing zeros or sign.
+        assert!(c(Value::text("02134"), DataKind::Int).is_err());
+        assert!(c(Value::text("+4420"), DataKind::Int).is_err());
+        assert_eq!(c(Value::text("-12"), DataKind::Int).unwrap(), Value::Int(-12));
+        assert_eq!(c(Value::text("0.5"), DataKind::Decimal).unwrap().to_text(), "0.5");
         assert_eq!(c(Value::text("0xff"), DataKind::Binary).unwrap(), Value::bytes(vec![255u8]));
         assert_eq!(c(Value::text("AAEC/w=="), DataKind::Binary).unwrap(), Value::bytes(vec![0x00u8, 0x01, 0x02, 0xff]));
         // Ambiguous input is read as hex.

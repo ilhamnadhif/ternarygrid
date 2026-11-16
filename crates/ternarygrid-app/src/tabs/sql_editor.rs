@@ -118,6 +118,8 @@ struct ParamPrompt {
 struct Confirm {
     request: Request,
     reasons: Vec<String>,
+    /// The editor text's version the reasons were found in.
+    version: u64,
 }
 
 enum SessionSlot {
@@ -177,6 +179,8 @@ pub struct SqlEditorTab {
     /// Close once the result edits are saved, unless the script changed since (its version then).
     close_after_save: Option<u64>,
     ddl_executed: bool,
+    /// The text's version an automatic save failed for (not tried again until it changes).
+    autosave_failed: Option<u64>,
     /// The tables the run's TRUNCATEs empty: the navigator's sizes and row counts change.
     truncated: Vec<ObjectRef>,
     /// TRUNCATE ran inside the open transaction (connection, database, tables): other
@@ -313,6 +317,7 @@ impl SqlEditorTab {
             close_tx_ok: false,
             close_after_save: None,
             ddl_executed: false,
+            autosave_failed: None,
             truncated: Vec::new(),
             sizes_on_commit: None,
             last_run: None,
@@ -657,6 +662,13 @@ impl SqlEditorTab {
             cx.toasts.info(tr("Opening a session… run the statement again in a moment."));
             return;
         };
+        // A session of its own gets the editor's schema and commit mode in the frames after it
+        // opened: run before, the statements went to the default schema (or in auto-commit).
+        let shared = cx.conns.config(&conn).is_some_and(|c| !c.init.separate_editor_connection);
+        if self.preparing_session(shared) {
+            cx.toasts.info(tr("Preparing the session… run the statement again in a moment."));
+            return;
+        }
         let text = req.sql.clone().unwrap_or_else(|| self.editor.text().to_string());
         let prepared = {
             let cfg = self.prep_config(cx);
@@ -700,7 +712,7 @@ impl SqlEditorTab {
                 }
             }
             if !reasons.is_empty() {
-                self.confirm = Some(Confirm { request: req, reasons });
+                self.confirm = Some(Confirm { request: req, reasons, version: self.editor.version() });
                 return;
             }
         }
@@ -758,6 +770,9 @@ impl SqlEditorTab {
             },
             store_budget: cx.settings.results.store_budget_bytes(),
             switch_to_manual: smart,
+            // A session shared with other editors (and the navigator) has the schema the last
+            // of them chose: this editor's is set again in its run.
+            schema: if shared { self.schema.as_ref().and_then(|s| s.schema.clone()) } else { None },
         };
         let name = cfg.as_ref().map(|c| c.name.clone());
         let history =
@@ -951,6 +966,13 @@ impl SqlEditorTab {
                         } else {
                             cx.push(AppCommand::RowsChanged { connection: c.clone(), scope, emptied });
                         }
+                    }
+                    // A COMMIT (or ROLLBACK) typed in the script ended the transaction a TRUNCATE
+                    // ran in: the sizes waiting for the Commit button are read now.
+                    if !matches!(&self.session, SessionSlot::Ready(s) if s.tx_state().in_transaction)
+                        && let Some((connection, scope, emptied)) = self.sizes_on_commit.take()
+                    {
+                        cx.push(AppCommand::RowsChanged { connection, scope, emptied });
                     }
                 }
             }
@@ -1159,6 +1181,27 @@ impl SqlEditorTab {
             },
         };
         let text = self.editor.text_with_original_line_endings().into_owned();
+        // A script opened from elsewhere (File › Open, a file dropped on the window) is saved
+        // where it is: the project only takes paths in its Scripts folder, so it could never
+        // be saved.
+        let scripts = project.scripts_dir();
+        let in_project = |p: &std::path::Path| -> bool {
+            let root = scripts.canonicalize().unwrap_or_else(|_| scripts.clone());
+            let canon = p.canonicalize().ok().or_else(|| Some(p.parent()?.canonicalize().ok()?.join(p.file_name()?)));
+            canon.is_some_and(|c| c.starts_with(&root))
+        };
+        if self.path.is_some() && !in_project(&path) {
+            return match write_in_place(&path, &text) {
+                Ok(()) => {
+                    self.editor.mark_saved();
+                    true
+                }
+                Err(e) => {
+                    cx.toasts.error(tr("Cannot save the script"), Some(format!("{}: {e}", path.display())));
+                    false
+                }
+            };
+        }
         match project.save_script(&path, &text) {
             Ok(p) => {
                 let meta = ternarygrid_config::ScriptMeta {
@@ -1398,7 +1441,14 @@ impl SqlEditorTab {
                     self.select_schema_open = false;
                     let db_changed = s.database.is_some() && s.database != self.schema.as_ref().and_then(|x| x.database.clone());
                     // Another database closes the session: not over a transaction or pending edits.
-                    let blocked = if db_changed { self.session_switch_blocked(cx) } else { None };
+                    // Nor while a script runs: the statements after the switch ran in the new schema.
+                    let blocked = if self.exec.is_some() {
+                        Some(tr("A script is running in this editor: stop it or wait until it ends."))
+                    } else if db_changed {
+                        self.session_switch_blocked(cx)
+                    } else {
+                        None
+                    };
                     if let Some(why) = blocked {
                         cx.toasts.warning(tr("The database was not changed"), Some(why.to_string()));
                     } else {
@@ -1952,8 +2002,11 @@ impl SqlEditorTab {
                 },
             );
             if run {
-                let mut req = self.confirm.take().expect("present").request;
-                req.confirmed = true;
+                let c = self.confirm.take().expect("present");
+                let mut req = c.request;
+                // The text changed under the question (typed into while it showed): what runs
+                // now is not what was confirmed; it is prepared and asked about again.
+                req.confirmed = c.version == self.editor.version();
                 self.run(cx, req);
             } else if close || modal.close {
                 self.confirm = None;
@@ -2208,7 +2261,9 @@ impl TabView for SqlEditorTab {
             }
             A::Find => self.editor.open_find(false),
             A::Replace => self.editor.open_find(true),
-            A::FindNext | A::FindPrevious => self.editor.open_find(false),
+            // The app's keymap takes ⌘G / F3: the next match, not the find bar opened again.
+            A::FindNext => self.editor.find_next(&self.lang, true),
+            A::FindPrevious => self.editor.find_next(&self.lang, false),
             A::GoToLine => self.editor.open_goto_line(),
             A::Autocomplete => self.editor.trigger_completion(),
             A::ToggleComment | A::ToggleBlockComment | A::UpperCase | A::LowerCase => {
@@ -2374,7 +2429,9 @@ impl TabView for SqlEditorTab {
                 }
             });
         }
-        if (self.auto_run || self.run_on_open) && self.session_ready() && self.exec.is_none() {
+        let shared = self.conn.as_ref().and_then(|c| cx.conns.config(c)).is_some_and(|c| !c.init.separate_editor_connection);
+        // A run on opening waits until the session has the editor's schema and mode.
+        if (self.auto_run || self.run_on_open) && self.session_ready() && self.exec.is_none() && !self.preparing_session(shared) {
             let confirmed = self.auto_run;
             self.auto_run = false;
             self.run_on_open = false;
@@ -2432,6 +2489,11 @@ impl TabView for SqlEditorTab {
                         ui.label(RichText::new(status).size(11.5).color(pal.text_faint));
                     });
                 });
+                // A question over the editor (confirm, parameters, unsaved changes) takes the
+                // keyboard: typing went into the text under it (Enter replaced the selection).
+                if self.confirm.is_some() || self.params.is_some() || self.close_prompt || self.close_tx_prompt {
+                    ui.memory_mut(|m| m.surrender_focus(editor_id));
+                }
                 SqlEditor::new(&mut self.editor, &self.lang, &opts, &theme).show(ui)
             })
             .inner;
@@ -2449,8 +2511,15 @@ impl TabView for SqlEditorTab {
         }
         // Auto-save.
         let interval = cx.settings.editor.auto_save_interval_secs;
-        if interval > 0 && self.path.is_some() && self.editor.is_modified() && self.changed_at.is_some_and(|t| t.elapsed() > Duration::from_secs(interval as u64)) {
-            self.save(cx);
+        if interval > 0
+            && self.path.is_some()
+            && self.editor.is_modified()
+            && self.autosave_failed != Some(self.editor.version())
+            && self.changed_at.is_some_and(|t| t.elapsed() > Duration::from_secs(interval as u64))
+            && !self.save(cx)
+        {
+            // Once per text: retried on every repaint, a failure showed an error each frame.
+            self.autosave_failed = Some(self.editor.version());
         }
         self.dialogs(ui, cx);
     }
@@ -2482,12 +2551,34 @@ impl SqlEditorTab {
     pub fn session_ready(&self) -> bool {
         matches!(self.session, SessionSlot::Ready(_))
     }
+    /// The text is in no file (an untitled script restored from the last session): closing
+    /// the tab asks before the text is lost.
+    pub fn mark_unsaved(&mut self) {
+        if !self.console && self.path.is_none() && !self.editor.text().trim().is_empty() {
+            self.editor.mark_unsaved();
+        }
+    }
+
+    /// The session's schema or commit mode is still being set (see `run`): a session shared
+    /// with other editors gets the schema in the run itself.
+    fn preparing_session(&self, shared: bool) -> bool {
+        let schema_pending = self.pending_schema && self.schema.as_ref().is_some_and(|s| s.schema.is_some());
+        (!shared && schema_pending) || self.restore_mode.is_some() || self.schema_job.is_some()
+    }
+
     /// Its session has a transaction open (manual commit, not committed yet).
     pub fn in_transaction(&self) -> bool {
         matches!(&self.session, SessionSlot::Ready(s) if s.tx_state().in_transaction)
     }
     pub fn result_count(&self) -> usize {
         self.results.len()
+    }
+    /// The grid of result `i` (`None` for plans and errors).
+    pub fn result_panel(&self, i: usize) -> Option<&ResultPanel> {
+        match self.results.get(i)? {
+            ResultItem::Rows(p) => Some(p),
+            _ => None,
+        }
     }
     /// Rows fetched so far by result `i` (`None` for plans and errors).
     pub fn result_rows(&self, i: usize) -> Option<usize> {
@@ -2723,4 +2814,18 @@ fn connection_chip(ui: &mut Ui, kind: Option<ternarygrid_core::DbKind>, marker: 
         painter.galley(egui::pos2(x + w + gap, cy - caret.size().y / 2.0), caret, p.text_faint);
     }
     resp
+}
+
+/// Write `text` to `path` outside the project (a script opened from elsewhere): through a
+/// file next to it renamed over it, so a failure leaves the old text, with its permissions.
+fn write_in_place(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let tmp = dir.join(format!(".{}.ternarygrid-save", path.file_name().map(|f| f.to_string_lossy()).unwrap_or_default()));
+    std::fs::write(&tmp, text)?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }

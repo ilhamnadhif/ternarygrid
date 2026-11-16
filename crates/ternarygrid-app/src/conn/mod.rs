@@ -496,6 +496,11 @@ impl LiveConnection {
             init_session(s.as_mut(), &cfg, &params).await?;
             answered.store(true, std::sync::atomic::Ordering::Relaxed);
             let handle = SessionHandle::new(s, label, database);
+            // Kept alive like the main session: an idle editor holding a manual-commit
+            // transaction was dropped by a firewall or the server's idle timeout.
+            if cfg.init.keep_alive_secs > 0 {
+                tokio::spawn(keep_alive_loop(handle.downgrade(), cfg.init.keep_alive_secs, tokio_util::sync::CancellationToken::new()));
+            }
             // Weak: a session its tab dropped (closed while opening) closes instead of staying open.
             let mut list = tab_sessions.lock();
             list.retain(|w| w.upgrade().is_some_and(|s| !s.is_closed()));
@@ -547,9 +552,16 @@ async fn verify_sessions(main: SessionHandle, others: Vec<SessionHandle>, tunnel
     if dead {
         tracing::info!("{}: the server does not answer; connecting again", main.label());
         main.abandon(true);
-        for s in &others {
+        // A session holding changes not committed yet is given up only when it does not
+        // answer itself: giving it up rolls them back (main may only have been slow).
+        let spare = others.iter().map(|s| async move {
+            if s.has_uncommitted_writes() && !s.is_closed() && matches!(s.check(timeout).await, Health::Alive | Health::Busy) {
+                tracing::info!("{}: keeps its uncommitted changes, it answers", s.label());
+                return;
+            }
             s.abandon(true);
-        }
+        });
+        futures::future::join_all(spare).await;
     }
 }
 
@@ -1236,12 +1248,9 @@ impl ConnectionManager {
             return;
         }
         backend.block_on(async move {
-            let _ = tokio::time::timeout(timeout, async move {
-                for live in lives {
-                    close_live(live).await;
-                }
-            })
-            .await;
+            // Together: one connection whose session does not answer used the whole time,
+            // and the ones after it never ran their after-disconnect commands.
+            let _ = tokio::time::timeout(timeout, futures::future::join_all(lives.into_iter().map(close_live))).await;
         });
     }
 }

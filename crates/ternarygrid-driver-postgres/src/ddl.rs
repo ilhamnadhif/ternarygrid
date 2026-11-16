@@ -526,7 +526,9 @@ impl DdlGenerator for PgDdl {
                 if let Some(coll) = tc.collation.as_deref().filter(|c| !c.is_empty() && *c != "default") {
                     s.push_str(&format!(" COLLATE {}", collation_sql(coll)));
                 }
-                if fc.data_type != tc.data_type {
+                // Between character types the assignment cast applies (no USING): a value too
+                // long for the new length fails the change, where `USING c::varchar(10)` cut it.
+                if fc.data_type != tc.data_type && !(is_character_type(&fc.data_type) && is_character_type(&tc.data_type)) {
                     s.push_str(&format!(" USING {col}::{}", tc.data_type));
                 }
                 out.push(s);
@@ -1133,6 +1135,10 @@ pub(crate) fn map_type(source: DbKind, data_type: &str, kind: DataKind) -> Strin
                         (Some(p), None | Some(0)) if p <= 9 => "integer".into(),
                         (Some(p), None | Some(0)) if p <= 18 => "bigint".into(),
                         (Some(p), Some(sc)) if sc > 0 && sc <= p => format!("numeric({p},{sc})"),
+                        // NUMBER(2,4) holds 0.0012: four fraction digits (numeric(2) rounded it to 0).
+                        (Some(_), Some(sc)) if sc > 0 && sc <= 1000 => format!("numeric({sc},{sc})"),
+                        // NUMBER(5,-2) holds up to 9,999,900: p - s integer digits.
+                        (Some(p), Some(sc)) if sc < 0 && p - sc <= 1000 => format!("numeric({})", p - sc),
                         (Some(p), _) if p <= 1000 => format!("numeric({p})"),
                         _ => "numeric".into(),
                     }
@@ -1215,7 +1221,21 @@ fn map_clickhouse(raw: &str, kind: DataKind) -> String {
         "int128" | "int256" | "uint128" | "uint256" => "numeric".into(),
         "float32" => "real".into(),
         "float64" => "double precision".into(),
-        "decimal" | "decimal32" | "decimal64" | "decimal128" | "decimal256" => with_args("numeric", &args),
+        "decimal" => with_args("numeric", &args),
+        // `Decimal64(S)` takes the scale only: its precision is the size's (12345.6789 in
+        // Decimal64(4) overflowed numeric(4)).
+        "decimal32" | "decimal64" | "decimal128" | "decimal256" => {
+            let precision = match base.as_str() {
+                "decimal32" => 9,
+                "decimal64" => 18,
+                "decimal128" => 38,
+                _ => 76,
+            };
+            match args.as_deref().and_then(|a| a.trim().parse::<u32>().ok()) {
+                Some(scale) => format!("numeric({precision},{scale})"),
+                None => format!("numeric({precision})"),
+            }
+        }
         "bool" | "boolean" => "boolean".into(),
         "string" | "fixedstring" | "enum8" | "enum16" | "enum" => "text".into(),
         "uuid" => "uuid".into(),
@@ -1242,6 +1262,15 @@ fn map_clickhouse(raw: &str, kind: DataKind) -> String {
         "json" | "object" | "map" | "tuple" | "nested" | "variant" | "dynamic" => "jsonb".into(),
         _ => default_type_for(kind).to_string(),
     }
+}
+
+/// `varchar(n)`, `character varying`, `char(n)`, `bpchar`, `text`: one family whose
+/// assignment casts check the length.
+fn is_character_type(t: &str) -> bool {
+    let t = t.trim().to_ascii_lowercase();
+    ["varchar", "character varying", "character", "char", "bpchar", "text"]
+        .iter()
+        .any(|p| t == *p || t.starts_with(&format!("{p}(")) || (t.starts_with(p) && t[p.len()..].starts_with(' ')))
 }
 
 #[cfg(test)]
@@ -1418,6 +1447,21 @@ mod tests {
         assert!(s.iter().any(|x| x == "COMMENT ON TABLE app.orders IS 'All orders'"));
     }
 
+    /// Narrowing a text column: no `USING col::varchar(n)` (that cut the values); the
+    /// assignment cast makes a value too long fail the change. Other types keep USING.
+    #[test]
+    fn narrowing_a_text_column_fails_instead_of_cutting() {
+        let ddl = PgDdl::new();
+        let mut from = TableDef::new(Some("app".into()), "t");
+        from.columns = vec![ColumnDef::new("c", "character varying(100)"), ColumnDef::new("n", "text")];
+        let mut to = from.clone();
+        to.columns[0].data_type = "varchar(10)".into();
+        to.columns[1].data_type = "integer".into();
+        let s = ddl.alter_table(&from, &to, &[]);
+        assert!(s.contains(&"ALTER TABLE app.t ALTER COLUMN c TYPE varchar(10)".to_string()), "{s:#?}");
+        assert!(s.contains(&"ALTER TABLE app.t ALTER COLUMN n TYPE integer USING n::integer".to_string()), "{s:#?}");
+    }
+
     #[test]
     fn alter_identity() {
         let ddl = PgDdl::new();
@@ -1515,6 +1559,12 @@ mod tests {
     fn type_mapping() {
         let m = |k: DbKind, t: &str| map_type(k, t, DataKind::guess_from_type_name(t));
         assert_eq!(m(DbKind::MySql, "tinyint(1)"), "boolean");
+        // Sizes and scales that fit every value of the source.
+        assert_eq!(m(DbKind::ClickHouse, "Decimal64(4)"), "numeric(18,4)");
+        assert_eq!(m(DbKind::ClickHouse, "Decimal(10, 2)"), "numeric(10, 2)");
+        assert_eq!(m(DbKind::Oracle, "NUMBER(5,-2)"), "numeric(7)");
+        assert_eq!(m(DbKind::Oracle, "NUMBER(2,4)"), "numeric(4,4)");
+        assert_eq!(m(DbKind::Oracle, "NUMBER(10,2)"), "numeric(10,2)");
         assert_eq!(m(DbKind::MySql, "int unsigned"), "bigint");
         assert_eq!(m(DbKind::MySql, "int(11) unsigned"), "bigint");
         assert_eq!(m(DbKind::MySql, "bigint unsigned"), "numeric(20)");

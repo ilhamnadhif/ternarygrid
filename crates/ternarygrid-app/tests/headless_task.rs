@@ -73,3 +73,25 @@ fn run_task_headless() {
     assert_eq!(log.runs().unwrap().len(), 2);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A task script on a read-only connection with a statement that writes is refused before
+/// anything runs: SQL Server and Oracle sessions do not stop writes themselves, so the
+/// connection's flag was the only guard, and tasks did not look at it.
+#[test]
+fn a_read_only_connection_refuses_a_writing_task_script() {
+    use ternarygrid_core::Driver;
+    let backend = Backend::new().unwrap();
+    backend.block_on(async {
+        let mut cfg = ternarygrid_core::config::ConnectionConfig::new(ternarygrid_core::DbKind::Sqlite, "ro");
+        cfg.file_path = Some(":memory:".into());
+        let mut s = ternarygrid_driver_sqlite::SqliteDriver::new().connect(&ternarygrid_core::ConnectParams::from_config(&cfg, None)).await.unwrap();
+        ternarygrid_core::driver::execute_update(s.as_mut(), "CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1)", &[]).await.unwrap();
+        let ctx = ternarygrid_tasks::RunContext::new("run", "task", ternarygrid_tasks::Trigger::Manual, tokio_util::sync::CancellationToken::new(), std::sync::Arc::new(|_| {}));
+        let e = ternarygrid_app::taskexec::run_script(&ctx, s.as_mut(), "SELECT count(*) FROM t;\nDELETE FROM t", None, None, true, true, Some("production")).await.unwrap_err();
+        assert!(e.message.contains("read-only") && e.message.contains("statement 2"), "{}", e.full_text());
+        let (_, rows) = ternarygrid_core::driver::query_all(s.as_mut(), "SELECT count(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rows[0][0].as_i64(), Some(1), "nothing ran");
+        // Reads run.
+        ternarygrid_app::taskexec::run_script(&ctx, s.as_mut(), "SELECT count(*) FROM t", None, None, true, true, Some("production")).await.unwrap();
+    });
+}

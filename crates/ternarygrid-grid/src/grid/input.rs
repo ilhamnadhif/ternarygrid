@@ -770,12 +770,8 @@ impl GridFrame<'_> {
         if !copied || !self.options.allow_editing || !self.model.is_editable() {
             return;
         }
-        let edits: Vec<_> = self
-            .selected_cells(100_000)
-            .into_iter()
-            .filter(|&(r, c)| self.model.can_edit_cell(r, c).is_ok())
-            .map(|(r, c)| (r, c, crate::model::CellValue::Value(Value::Null)))
-            .collect();
+        let Some(cells) = self.cells_to_change() else { return };
+        let edits: Vec<_> = cells.into_iter().filter(|&(r, c)| self.model.can_edit_cell(r, c).is_ok()).map(|(r, c)| (r, c, crate::model::CellValue::Value(Value::Null))).collect();
         if let Err(e) = self.model.set_cells(edits) {
             self.notify(e, true);
         }
@@ -884,9 +880,23 @@ impl GridFrame<'_> {
         }
     }
 
+    /// At most this many cells are changed at once (Set NULL / DEFAULT …).
+    const MAX_CELL_EDITS: usize = 100_000;
+
+    /// The selected cells for one change, or `None` (with a message) when there are more
+    /// than [`Self::MAX_CELL_EDITS`]: changing only the first ones went unnoticed.
+    fn cells_to_change(&mut self) -> Option<Vec<(usize, usize)>> {
+        let cells = self.selected_cells(Self::MAX_CELL_EDITS + 1);
+        if cells.len() > Self::MAX_CELL_EDITS {
+            self.notify(ternarygrid_core::trf("Select at most {} cells to change at once", &[&Self::MAX_CELL_EDITS]), true);
+            return None;
+        }
+        Some(cells)
+    }
+
     /// Set selected cells to NULL.
     pub fn set_selected_null(&mut self) {
-        let cells = self.selected_cells(100_000);
+        let Some(cells) = self.cells_to_change() else { return };
         let edits = cells.into_iter().map(|(r, c)| (r, c, crate::model::CellValue::Value(Value::Null))).collect();
         if let Err(e) = self.model.set_cells(edits) {
             self.notify(e, true);
@@ -895,7 +905,7 @@ impl GridFrame<'_> {
 
     /// Set selected cells to DEFAULT.
     pub fn set_selected_default(&mut self) {
-        let cells = self.selected_cells(100_000);
+        let Some(cells) = self.cells_to_change() else { return };
         let edits = cells.into_iter().map(|(r, c)| (r, c, crate::model::CellValue::Default)).collect();
         if let Err(e) = self.model.set_cells(edits) {
             self.notify(e, true);
@@ -922,8 +932,14 @@ impl GridFrame<'_> {
 
     /// Mark selected rows deleted.
     pub fn delete_selected(&mut self) {
-        let rows = self.state.rt.selection.rows(self.geo.nrows, 1_000_000);
+        const MAX_ROWS: usize = 1_000_000;
+        let rows = self.state.rt.selection.rows(self.geo.nrows, MAX_ROWS + 1);
         if rows.is_empty() {
+            return;
+        }
+        // Marking only the first million of a larger selection went unnoticed.
+        if rows.len() > MAX_ROWS {
+            self.notify(ternarygrid_core::trf("Select at most {} rows to delete at once", &[&MAX_ROWS]), true);
             return;
         }
         match self.model.delete_rows(&rows) {
@@ -987,7 +1003,7 @@ impl GridFrame<'_> {
     /// Copy into the selected cells the value of the same column in the row
     /// above (`above`) or below.
     pub fn copy_from_adjacent(&mut self, above: bool) {
-        let cells = self.selected_cells(100_000);
+        let Some(cells) = self.cells_to_change() else { return };
         let mut edits = Vec::with_capacity(cells.len());
         for (r, c) in cells {
             let src = if above { r.checked_sub(1) } else { Some(r + 1).filter(|&x| x < self.geo.nrows) };
@@ -1005,7 +1021,7 @@ impl GridFrame<'_> {
 
     /// Put a new random UUID into each selected cell.
     pub fn generate_uuid(&mut self) {
-        let cells = self.selected_cells(100_000);
+        let Some(cells) = self.cells_to_change() else { return };
         let edits = cells.into_iter().map(|(r, c)| (r, c, crate::model::CellValue::Value(Value::text(uuid::Uuid::new_v4().to_string())))).collect();
         if let Err(e) = self.model.set_cells(edits) {
             self.notify(e, true);

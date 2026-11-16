@@ -103,6 +103,77 @@ fn errors(events: &[ExecEvent]) -> Vec<String> {
         .collect()
 }
 
+/// A write that returns rows (a data-modifying CTE) is read to its end: closing its
+/// cursor after the first page (the script's next statement) cancelled it on the
+/// server, and the DELETE was undone while the editor showed it as done.
+#[test]
+fn a_write_returning_rows_is_not_cancelled_by_the_next_statement() {
+    for (name, url) in servers().into_iter().filter(|(n, _)| *n == "postgres") {
+        let backend = Backend::new().unwrap();
+        let (cm, id) = connect(&backend, &url);
+        let table = format!("ternarygrid_cte_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let create = format!("CREATE TABLE {table} AS SELECT g AS id FROM generate_series(1, 1000) g");
+        let delete = format!("WITH d AS (DELETE FROM {table} WHERE id <= 600 RETURNING *) SELECT * FROM d");
+        let count = format!("SELECT count(*) FROM {table}");
+        let events = run_script(&backend, &cm, &id, &[&create, &delete, &count]);
+        assert!(errors(&events).is_empty(), "{name}: {:?}", errors(&events));
+        let deleted = events.iter().find_map(|e| match e {
+            ExecEvent::Rows { index: 1, store, exhausted, .. } => Some((store.lock().len(), *exhausted)),
+            _ => None,
+        });
+        assert_eq!(deleted, Some((600, true)), "{name}: every deleted row read");
+        let left = events.iter().find_map(|e| match e {
+            ExecEvent::Rows { index: 2, store, .. } => store.lock().cell(0, 0).and_then(|v| v.as_i64()),
+            _ => None,
+        });
+        assert_eq!(left, Some(400), "{name}: the DELETE was kept");
+        run_script(&backend, &cm, &id, &[&format!("DROP TABLE {table}")]);
+    }
+}
+
+/// A run on a session other editors share sets its editor's schema first: the session had
+/// the schema the last editor chose, and `DELETE FROM orders` ran in that one.
+#[test]
+fn a_run_sets_its_schema_on_a_shared_session() {
+    for (name, url) in servers().into_iter().filter(|(n, _)| *n == "postgres") {
+        let backend = Backend::new().unwrap();
+        let (cm, id) = connect(&backend, &url);
+        let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let (a, b) = (format!("ex_a_{tag}"), format!("ex_b_{tag}"));
+        run_script(
+            &backend,
+            &cm,
+            &id,
+            &[
+                &format!("CREATE SCHEMA {a}"),
+                &format!("CREATE SCHEMA {b}"),
+                &format!("CREATE TABLE {a}.t AS SELECT 'a' AS v"),
+                &format!("CREATE TABLE {b}.t AS SELECT 'b' AS v"),
+                &format!("SET search_path = {a}"),
+            ],
+        );
+        let session = cm.live(&id).unwrap().main.clone();
+        let plan = StmtPlan { index: 0, sql: "SELECT v FROM t".into(), original: "SELECT v FROM t".into(), range: 0..15, is_write: false, client: None };
+        let mut exec = Execution::start(&backend, session, vec![plan], ExecOpts { schema: Some(b.clone()), ..Default::default() }, None);
+        let mut events = Vec::new();
+        wait_until(
+            || {
+                events.extend(exec.poll());
+                exec.is_finished()
+            },
+            "execution",
+        );
+        events.extend(exec.poll());
+        assert!(errors(&events).is_empty(), "{name}: {:?}", errors(&events));
+        let v = events.iter().find_map(|e| match e {
+            ExecEvent::Rows { store, .. } => store.lock().cell(0, 0).map(|v| v.to_text().into_owned()),
+            _ => None,
+        });
+        assert_eq!(v.as_deref(), Some("b"), "{name}: ran in the editor's schema");
+        run_script(&backend, &cm, &id, &[&format!("DROP SCHEMA {a} CASCADE"), &format!("DROP SCHEMA {b} CASCADE")]);
+    }
+}
+
 #[test]
 fn execute_fetch_count_and_metadata() {
     for (name, url) in servers() {

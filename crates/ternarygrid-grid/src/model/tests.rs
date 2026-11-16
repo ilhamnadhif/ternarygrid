@@ -236,6 +236,17 @@ fn null_safe_keys_and_key_updates() {
     assert_eq!(stmts[1], ("UPDATE app.people SET code = $1 WHERE code = $2".to_string(), vec![Value::text("b"), Value::text("a")]));
 }
 
+/// A row whose NOT NULL key holds NULL (saved here, the key made by the database and not
+/// read back): changing it is refused, `WHERE id IS NULL` changed nothing as "Saved".
+#[test]
+fn a_key_the_database_made_and_was_not_read_back() {
+    let mut m = model(2);
+    m.store().lock().set_cell(0, 0, Value::Null);
+    m.set_cell(0, 2, "5").unwrap();
+    let e = m.checked_change_set().unwrap_err();
+    assert!(e.contains("refresh"), "{e}");
+}
+
 #[test]
 fn no_update_or_delete_without_a_key_that_identifies_the_row() {
     let d = PgLike(GenericDialect::new());
@@ -293,6 +304,32 @@ fn no_update_or_delete_without_a_key_that_identifies_the_row() {
     assert_eq!(stmts[0].0, "DELETE FROM app.people WHERE 1 = 0");
     assert_eq!(stmts[1].0, "UPDATE app.people SET name = $1 WHERE 1 = 0");
     assert!(cs.preview_sql(&d).contains("WHERE 1 = 0"));
+}
+
+/// While the changes are saved nothing changes the rows: a row deleted then vanished
+/// from the grid but stayed in the database, Undo or Discard dropped what was committed.
+#[test]
+fn no_edits_while_saving() {
+    let mut m = model(3);
+    m.set_cell(0, 2, "99").unwrap();
+    m.set_saving(true);
+    assert!(m.set_cell(1, 2, "5").is_err());
+    assert!(m.set_null(1, 2).is_err());
+    assert!(m.delete_rows(&[2]).is_err());
+    assert!(m.add_row(None).is_err());
+    assert!(m.duplicate_rows(&[0]).is_err());
+    assert!(m.paste_block(1, &[vec!["7".into()]], &[2], None).is_err());
+    assert!(m.can_edit_cell(1, 2).is_err());
+    assert!(!m.can_undo() && !m.undo());
+    m.discard_changes();
+    assert_eq!(m.pending_counts(), PendingCounts { updated: 1, inserted: 0, deleted: 0 });
+    // The save applies exactly what was pending when it started.
+    m.apply_saved();
+    m.set_saving(false);
+    assert!(!m.has_changes());
+    assert_eq!(m.cell(0, 2), Some(Value::Int(99)));
+    assert_eq!(m.row_count(), 3);
+    m.set_cell(1, 2, "5").unwrap();
 }
 
 #[test]

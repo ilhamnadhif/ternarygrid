@@ -414,7 +414,22 @@ impl Dialect for MySqlDialect {
     }
 
     fn truncate_sql(&self, tables: &[ObjectRef], options: &BTreeMap<String, bool>) -> Vec<String> {
-        let mut out: Vec<String> = tables.iter().map(|t| self.truncate_table(t)).collect();
+        let mut out: Vec<String> = tables
+            .iter()
+            .map(|t| match (t.kind, &t.table) {
+                // A partition is no table: `TRUNCATE TABLE p2023` emptied a table of that name.
+                (ObjectKind::Partition, Some(parent)) => {
+                    let parent = ObjectRef::table(t.schema.clone(), parent.clone())
+                        .with_database(t.database.clone());
+                    format!(
+                        "ALTER TABLE {} TRUNCATE PARTITION {}",
+                        self.qualified_ref(&parent),
+                        self.quote_ident(&t.name)
+                    )
+                }
+                _ => self.truncate_table(t),
+            })
+            .collect();
         if !out.is_empty() && options.get("no_fk_checks").copied().unwrap_or(false) {
             out.insert(0, "SET FOREIGN_KEY_CHECKS = 0".to_string());
             out.push("SET FOREIGN_KEY_CHECKS = 1".to_string());
@@ -555,6 +570,19 @@ mod tests {
 
     fn my80() -> MySqlDialect {
         MySqlDialect::for_server(ServerProfile::new(Flavor::MySql, (8, 0, 36)))
+    }
+
+    /// Truncate… on a partition of the navigator empties the partition, not a table that
+    /// happens to have its name.
+    #[test]
+    fn truncate_a_partition() {
+        let d = my80();
+        let orders = ObjectRef::table(Some("shop".into()), "orders");
+        let p = ObjectRef::child(ObjectKind::Partition, &orders, "p2023");
+        assert_eq!(
+            d.truncate_sql(&[p], &BTreeMap::new()),
+            ["ALTER TABLE shop.orders TRUNCATE PARTITION p2023"]
+        );
     }
 
     #[test]

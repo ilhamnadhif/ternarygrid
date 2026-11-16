@@ -370,7 +370,13 @@ fn to_cql(v: &Value, t: &ColumnType<'_>) -> DbResult<Option<CqlValue>> {
             Value::Int(i) => Ok(*i),
             Value::UInt(u) => i64::try_from(*u).map_err(|_| bad()),
             Value::Bool(b) => Ok(*b as i64),
-            Value::Float(f) if f.fract() == 0.0 => Ok(*f as i64),
+            // `as i64` saturates: 1e20 became i64::MAX.
+            Value::Float(f)
+                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f < i64::MAX as f64 =>
+            {
+                Ok(*f as i64)
+            }
+            Value::Float(_) => Err(bad()),
             _ => text().trim().parse().map_err(|_| bad()),
         }
     };
@@ -384,12 +390,14 @@ fn to_cql(v: &Value, t: &ColumnType<'_>) -> DbResult<Option<CqlValue>> {
     Ok(Some(match n {
         NativeType::Ascii => CqlValue::Ascii(text()),
         NativeType::Text => CqlValue::Text(text()),
+        // Text that is no boolean is refused: `on`, `Y` or a typo was bound as false.
         NativeType::Boolean => CqlValue::Boolean(match v {
             Value::Bool(b) => *b,
-            _ => matches!(
-                text().trim().to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes" | "t"
-            ),
+            _ => match text().trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" | "t" | "on" => true,
+                "false" | "0" | "no" | "n" | "f" | "off" => false,
+                _ => return Err(bad()),
+            },
         }),
         NativeType::Blob => CqlValue::Blob(match v {
             Value::Bytes(b) => b.to_vec(),

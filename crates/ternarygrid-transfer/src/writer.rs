@@ -283,14 +283,38 @@ impl<'a> BatchWriter<'a> {
         Ok(rows.first().and_then(|r| r.first()).and_then(|v| v.as_i64()))
     }
 
-    /// Remove all rows of `table`: `TRUNCATE` (falling back to `DELETE`), or
-    /// `DELETE` inside the transaction for [`TransactionScope::Whole`].
+    /// Remove all rows of `table`: `TRUNCATE` (falling back to `DELETE`) without a
+    /// transaction. In a transaction (whole import or per batch) the rows go with the
+    /// first batch's commit: an import that fails before (a row that does not convert,
+    /// a failed insert) leaves the table as it was. `TRUNCATE` there only where it is
+    /// transactional (PostgreSQL, SQL Server), else `DELETE`.
     pub(crate) async fn clear_table(&mut self, table: &ObjectRef) -> DbResult<()> {
         let delete = format!("DELETE FROM {}", self.dialect.qualified_ref(table));
-        if self.scope == TransactionScope::Whole {
+        let truncate = self.dialect.truncate_table(table);
+        if self.scope != TransactionScope::None {
+            if matches!(self.dialect.kind(), DbKind::Postgres | DbKind::SqlServer) {
+                // A failed TRUNCATE (a foreign key refers to the table) aborts the transaction:
+                // to a savepoint first, then DELETE.
+                if let Some(sp) = savepoint_sql(self.dialect.kind()) {
+                    let name = "ternarygrid_clear";
+                    self.execute(&format!("{} {name}", sp.create)).await?;
+                    match self.exec(&truncate, &[]).await {
+                        Ok(_) => {
+                            if let Some(release) = sp.release {
+                                self.execute(&format!("{release} {name}")).await?;
+                            }
+                            return Ok(());
+                        }
+                        Err(e) if is_fatal(&e) => return Err(e),
+                        Err(e) => {
+                            tracing::debug!("TRUNCATE failed ({e}), using DELETE");
+                            self.execute(&format!("{} {name}", sp.rollback)).await?;
+                        }
+                    }
+                }
+            }
             return self.execute(&delete).await;
         }
-        let truncate = self.dialect.truncate_table(table);
         match self.exec(&truncate, &[]).await {
             Ok(_) => {}
             Err(e) if is_fatal(&e) => return Err(e),
@@ -301,9 +325,6 @@ impl<'a> BatchWriter<'a> {
                 }
                 self.execute(&delete).await?;
             }
-        }
-        if self.scope == TransactionScope::PerBatch {
-            self.session.commit().await?;
         }
         Ok(())
     }

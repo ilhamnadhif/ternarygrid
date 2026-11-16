@@ -66,11 +66,14 @@ pub struct ResultSource {
     /// The statement may run again to read past a closed cursor (a query, not
     /// `UPDATE … RETURNING` or `CALL`: those would change the data again).
     pub rerun_safe: bool,
+    /// The statement [`ResultSource::columns`] (and their tables) came from.
+    columns_from: String,
 }
 
 impl ResultSource {
     /// Wrap a freshly executed cursor whose first header was `Rows(columns)`.
     pub fn new(session: SessionHandle, sql: String, params: Vec<Value>, columns: Vec<ColumnMeta>, token: Option<u64>, budget: usize) -> Self {
+        let sql_for_columns = sql.clone();
         ResultSource {
             session,
             sql,
@@ -95,6 +98,7 @@ impl ResultSource {
             columns_version: 0,
             budget,
             rerun_safe: true,
+            columns_from: sql_for_columns,
         }
     }
 
@@ -192,8 +196,11 @@ impl ResultSource {
                     Ok(b) => {
                         let mut columns = b.columns;
                         // The same columns without their tables (a driver that did not look them
-                        // up again) keep the known ones: the result stays editable.
+                        // up again) keep the known ones: the result stays editable. Only for the
+                        // same statement: another table with columns of the same names (foreign
+                        // key navigation on Oracle) kept the table before, and edits went there.
                         if let Some(cols) = columns.as_mut()
+                            && self.columns_from == self.sql
                             && cols.len() == self.columns.len()
                             && cols.iter().all(|c| c.source.is_none())
                             && cols.iter().zip(&self.columns).all(|(a, b)| a.name == b.name && a.type_name == b.type_name)
@@ -202,11 +209,12 @@ impl ResultSource {
                                 c.source = old.source.clone();
                             }
                         }
-                        if let Some(cols) = columns
-                            && cols.iter().map(|c| (&c.name, &c.type_name, &c.source)).ne(self.columns.iter().map(|c| (&c.name, &c.type_name, &c.source)))
-                        {
-                            self.columns = cols;
-                            self.columns_version += 1;
+                        if let Some(cols) = columns {
+                            if cols.iter().map(|c| (&c.name, &c.type_name, &c.source)).ne(self.columns.iter().map(|c| (&c.name, &c.type_name, &c.source))) {
+                                self.columns = cols;
+                                self.columns_version += 1;
+                            }
+                            self.columns_from = self.sql.clone();
                         }
                         self.exhausted = b.exhausted;
                         self.token = b.token;

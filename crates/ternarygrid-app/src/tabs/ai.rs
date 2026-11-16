@@ -1543,6 +1543,18 @@ impl AiAssistantTab {
                 },
             );
             parts::hline(ui);
+            // A statement to allow is shown whole, wrapped: cut at the edge, the end of a long
+            // line (`… WHERE id = 42<spaces> OR 1=1`) was out of sight when the user allowed it.
+            if !runnable && sql {
+                egui::Frame::new().inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                    let lang = self.lang.as_ref().map(|(_, l)| l);
+                    let mut job = highlight_job(code, lang, &theme, FontId::monospace(12.5));
+                    job.wrap.max_width = ui.available_width();
+                    job.wrap.break_anywhere = true;
+                    ui.add(egui::Label::new(job).selectable(true));
+                });
+                return;
+            }
             // Long lines scroll sideways without a bar (as designed, the code is cut at the edge).
             egui::Frame::new().inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
                 egui::ScrollArea::horizontal()

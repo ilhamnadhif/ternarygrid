@@ -77,9 +77,15 @@ pub(crate) async fn apply_script(s: SessionHandle, target_schema: Option<String>
         }
         None => None,
     };
-    let mut n = 0;
+    // PostgreSQL changes its schema in transactions: the whole migration is one, so a
+    // statement that fails (a NOT NULL on a column with NULLs) undoes the ones before it
+    // instead of leaving the target half migrated.
     let mut result = Ok(());
-    for sql in &stmts {
+    if matches!(s.kind(), ternarygrid_core::DbKind::Postgres) && !s.tx_state().in_transaction {
+        result = s.execute_update("BEGIN", &[]).await.map(|_| ());
+    }
+    let mut n = 0;
+    for sql in stmts.iter().filter(|_| result.is_ok()) {
         if let Err(e) = s.execute_update(sql, &[]).await {
             result = Err(e.with_context(sql.chars().take(200).collect::<String>()));
             break;
@@ -698,6 +704,26 @@ mod tests {
     async fn tables(s: &SessionHandle) -> Vec<String> {
         let (_, rows) = s.query_all("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name", &[]).await.unwrap();
         rows.iter().map(|r| r[0].to_string()).collect()
+    }
+
+    /// PostgreSQL (TERNARYGRID_TEST_PG): in auto-commit the migration is one transaction,
+    /// so a failing statement leaves nothing of the ones before it.
+    #[tokio::test]
+    async fn a_failing_migration_leaves_postgresql_as_it_was() {
+        let Some(url) = std::env::var("TERNARYGRID_TEST_PG").ok().filter(|u| !u.trim().is_empty()) else { return };
+        let (cfg, password) = ternarygrid_config::parse_connection_url(&url).unwrap();
+        let driver = crate::driver_registry().get(ternarygrid_core::DbKind::Postgres).unwrap();
+        let s = driver.connect(&ternarygrid_core::ConnectParams::from_config(&cfg, password)).await.unwrap();
+        let s = SessionHandle::new(s, "compare", None);
+        let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let (t, x) = (format!("cmp_t_{tag}"), format!("cmp_x_{tag}"));
+        s.execute_update(&format!("CREATE TABLE {t} (a int); INSERT INTO {t} VALUES (NULL)"), &[]).await.unwrap();
+        let e = apply_script(s.clone(), None, vec![format!("CREATE TABLE {x} (id int)"), format!("ALTER TABLE {t} ALTER COLUMN a SET NOT NULL")]).await.unwrap_err();
+        assert!(e.full_text().contains("SET NOT NULL"), "{}", e.full_text());
+        assert!(!s.tx_state().in_transaction);
+        let (_, rows) = s.query_all(&format!("SELECT to_regclass('{x}') IS NULL"), &[]).await.unwrap();
+        assert_eq!(rows[0][0], ternarygrid_core::Value::Bool(true), "the CREATE TABLE before was undone");
+        s.execute_update(&format!("DROP TABLE {t}"), &[]).await.unwrap();
     }
 
     #[tokio::test]

@@ -364,10 +364,11 @@ const NONCE_LEN: usize = 24;
 /// Upper bounds accepted when reading a vault, protecting against files
 /// that would make us allocate absurd amounts of memory (the parameters are
 /// used before the AEAD check can tell a forged header). TernaryGrid only
-/// writes [`KdfParams::default`] (64 MiB, 3 iterations, 1 lane).
-const MAX_M_COST_KIB: u32 = 1024 * 1024;
-const MAX_T_COST: u32 = 16;
-const MAX_P_COST: u32 = 64;
+/// writes [`KdfParams::default`] (64 MiB, 3 iterations, 1 lane); an imported file
+/// asking for much more would freeze the application for minutes on any password.
+const MAX_M_COST_KIB: u32 = 256 * 1024;
+const MAX_T_COST: u32 = 10;
+const MAX_P_COST: u32 = 16;
 
 /// Argon2id cost parameters, stored in the vault header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1323,9 +1324,11 @@ mod tests {
             KdfParams::default().validate().is_ok(),
             "what TernaryGrid writes"
         );
-        assert!(KdfParams::new(1024 * 1024, 3, 1).validate().is_ok());
-        assert!(KdfParams::new(1024 * 1024 + 1, 3, 1).validate().is_err());
-        assert!(KdfParams::new(64 * 1024, 17, 1).validate().is_err());
+        assert!(KdfParams::new(256 * 1024, 3, 1).validate().is_ok());
+        // An imported file asking for more froze the application on any password.
+        assert!(KdfParams::new(256 * 1024 + 1, 3, 1).validate().is_err());
+        assert!(KdfParams::new(64 * 1024, 11, 1).validate().is_err());
+        assert!(KdfParams::new(64 * 1024, 3, 17).validate().is_err());
         // A writable vault.bin claiming 2 GiB is refused before any allocation.
         let (_d, v) = vault();
         v.create_with_params(&Secret::new("m"), TEST_PARAMS)

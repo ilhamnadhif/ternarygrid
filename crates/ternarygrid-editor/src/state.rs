@@ -305,6 +305,11 @@ impl EditorState {
         self.undo.mark_saved();
     }
 
+    /// Mark the current text as saved nowhere (restored from a session): closing asks.
+    pub fn mark_unsaved(&mut self) {
+        self.undo.mark_unsaved();
+    }
+
     /// Number of lines (at least 1).
     pub fn line_count(&self) -> usize {
         self.index.line_count()
@@ -569,6 +574,16 @@ impl EditorState {
         self.find.replace_open = replace;
         self.find.focus_query = true;
         self.find.dirty = true;
+    }
+
+    /// Select the next (or previous) match of the find query, wrapping around (Find next
+    /// / previous); with no query yet, the find bar opens.
+    pub fn find_next(&mut self, lang: &dyn crate::EditorLanguage, forward: bool) {
+        if self.find.query.is_empty() {
+            self.open_find(false);
+        } else {
+            crate::find_bar::find_step(self, lang, forward);
+        }
     }
 
     /// Close the find bar.
@@ -978,6 +993,23 @@ mod tests {
 
     fn ctx() -> Context {
         Context::default()
+    }
+
+    /// Find next / previous move through the matches (⌘G re-selected the same one).
+    #[test]
+    fn find_next_moves_to_the_next_match() {
+        let lang = crate::BasicSqlLanguage::default();
+        let mut s = EditorState::new(1, "SELECT a, b, a FROM a".into());
+        s.find.query = "a".into();
+        s.find.options.whole_word = true;
+        s.find_next(&lang, true);
+        assert_eq!(s.sel.range(), 7..8);
+        s.find_next(&lang, true);
+        assert_eq!(s.sel.range(), 13..14);
+        s.find_next(&lang, true);
+        assert_eq!(s.sel.range(), 20..21);
+        s.find_next(&lang, false);
+        assert_eq!(s.sel.range(), 13..14);
     }
 
     #[test]

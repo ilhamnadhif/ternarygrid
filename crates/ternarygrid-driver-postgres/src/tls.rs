@@ -111,6 +111,15 @@ fn root_store(ssl: &SslConfig) -> DbResult<Arc<RootCertStore>> {
     Ok(Arc::new(store))
 }
 
+/// The CA certificate of `ssl` alone (verify-ca).
+fn custom_roots(ssl: &SslConfig) -> DbResult<Arc<RootCertStore>> {
+    let mut store = RootCertStore::empty();
+    for c in load_certs(ssl.ca_cert.as_deref().unwrap_or_default(), "CA certificate")? {
+        store.add(c).map_err(|e| DbError::config(format!("The CA certificate cannot be used as trust anchor: {e}")))?;
+    }
+    Ok(Arc::new(store))
+}
+
 /// Accepts any certificate (prefer / require) but still checks handshake signatures.
 #[derive(Debug)]
 struct NoVerifier {
@@ -199,9 +208,20 @@ pub(crate) fn build(ssl: &SslConfig, server_name: &str) -> DbResult<TlsSetup> {
     };
     let with_verifier = match ssl.mode {
         SslMode::Disable | SslMode::Prefer | SslMode::Require => builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerifier { algs })),
-        SslMode::VerifyCa => {
-            let roots = root_store(ssl)?;
+        // verify-ca checks the chain only, so it trusts only the CA the user gave (as libpq,
+        // which refuses the system roots there): with the public roots any certificate a
+        // public CA issued for any domain passed. Without a CA it is verify-full against
+        // the public roots (the host name checked).
+        SslMode::VerifyCa if ssl.ca_cert.as_deref().is_some_and(|s| !s.trim().is_empty()) => {
+            let roots = custom_roots(ssl)?;
             builder.dangerous().with_custom_certificate_verifier(Arc::new(ChainVerifier { roots, algs }))
+        }
+        SslMode::VerifyCa => {
+            // (`root_store` refuses "only the custom CA" without one.)
+            let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(root_store(ssl)?, prov.clone())
+                .build()
+                .map_err(|e| DbError::tls(format!("Cannot create the certificate verifier: {e}")))?;
+            builder.with_webpki_verifier(verifier)
         }
         SslMode::VerifyFull => {
             let roots = root_store(ssl)?;
@@ -259,5 +279,8 @@ mod tests {
         let ssl = SslConfig { mode: SslMode::Require, ca_cert: Some("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".into()), ..Default::default() };
         // not used in require mode: no error
         assert!(build(&ssl, "h").is_ok());
+        // verify-ca trusts only the CA given: an unusable one is an error, not the public roots.
+        let ssl = SslConfig { mode: SslMode::VerifyCa, ca_cert: Some("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".into()), ..Default::default() };
+        assert!(build(&ssl, "h").is_err());
     }
 }

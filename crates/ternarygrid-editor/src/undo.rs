@@ -133,9 +133,17 @@ impl UndoStack {
         self.undo.back().map_or(self.base_id, |g| g.id)
     }
 
-    /// Mark the current state as saved.
+    /// Mark the current state as saved. The open step is closed: typing on at once
+    /// starts a new one, or it would merge into the saved step and the text would
+    /// not count as modified (closing the tab would lose it without asking).
     pub fn mark_saved(&mut self) {
+        self.close_group();
         self.saved = Some(self.top_id());
+    }
+
+    /// Mark the current state as not saved anywhere (text restored from a session).
+    pub fn mark_unsaved(&mut self) {
+        self.saved = None;
     }
 
     /// `true` if the text differs from the last saved state (undoing back to
@@ -515,6 +523,44 @@ mod tests {
         let r = u.redo().expect("redo");
         apply(&mut text, &r);
         assert_eq!(text, "-- a\n-- b\n-- c");
+    }
+
+    /// Typing on right after a save (same word, within the merge window) is a
+    /// change: it does not merge into the saved step.
+    #[test]
+    fn typing_right_after_a_save_is_modified() {
+        let mut u = UndoStack::new(100);
+        u.record(
+            EditKind::Typing,
+            vec![rec(0, "", "1")],
+            Selection::caret(0),
+            Selection::caret(1),
+            0.0,
+        );
+        u.mark_saved();
+        assert!(!u.is_modified());
+        u.record(
+            EditKind::Typing,
+            vec![rec(1, "", "0")],
+            Selection::caret(1),
+            Selection::caret(2),
+            0.2,
+        );
+        assert!(u.is_modified());
+        // Undoing the new typing goes back to the saved text.
+        u.undo();
+        assert!(!u.is_modified());
+    }
+
+    /// Text restored from a session is in no file: modified until saved.
+    #[test]
+    fn restored_text_is_unsaved() {
+        let mut u = UndoStack::new(100);
+        assert!(!u.is_modified());
+        u.mark_unsaved();
+        assert!(u.is_modified());
+        u.mark_saved();
+        assert!(!u.is_modified());
     }
 
     #[test]

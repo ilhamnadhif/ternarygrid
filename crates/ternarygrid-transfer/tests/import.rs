@@ -39,6 +39,14 @@ async fn csv_encodings_and_bom() {
     assert!(s.take_warnings().iter().any(|w| w.contains("invalid")));
 }
 
+/// "NULL as" texts are NULL only unquoted: an export quotes a real text `NULL`.
+#[tokio::test]
+async fn csv_null_texts_respect_quotes() {
+    let opts = CsvReadOptions { null_values: vec!["NULL".into(), "\\N".into()], ..Default::default() };
+    let mut s = csv(b"v\nNULL\n\"NULL\"\n\\N\nx\n", opts);
+    assert_eq!(drain(&mut s).await, vec![vec![Value::Null], vec![Value::text("NULL")], vec![Value::Null], vec![Value::text("x")]]);
+}
+
 #[tokio::test]
 async fn csv_ragged_rows_and_header_modes() {
     let data = b"a,b\n1\n2,3,4\n";
@@ -103,7 +111,8 @@ async fn import_creates_table_from_inferred_types() {
     assert_eq!(kinds, vec![DataKind::Int, DataKind::Text, DataKind::Decimal, DataKind::Date, DataKind::Bool]);
     let dialect = sqlite_dialect();
     let mapping = ImportMapping::from_inferred(ObjectRef::table(None, "people"), &inferred, dialect.as_ref());
-    assert_eq!(mapping.columns[2].target_type, "NUMERIC(8,2)");
+    // Room for longer values and more fraction digits than the sample showed.
+    assert_eq!(mapping.columns[2].target_type, "NUMERIC(12,6)");
     assert_eq!(mapping.columns[1].target_type, "VARCHAR(10)");
     let progress = Progress::new();
     let summary = run_import(&mut src, &mut session, &mapping, &progress, &CancellationToken::new()).await.unwrap();
@@ -111,7 +120,7 @@ async fn import_creates_table_from_inferred_types() {
     assert_eq!((summary.rows_read, summary.rows_written, summary.rows_failed), (3, 3, 0));
     assert_eq!(progress.rows(), 3);
     let types: Vec<String> = select(&session.conn, "SELECT type FROM pragma_table_info('people')").into_iter().map(|r| r[0].to_text().into_owned()).collect();
-    assert_eq!(types, vec!["INTEGER", "VARCHAR(10)", "NUMERIC(8,2)", "DATE", "BOOLEAN"]);
+    assert_eq!(types, vec!["INTEGER", "VARCHAR(10)", "NUMERIC(12,6)", "DATE", "BOOLEAN"]);
     let rows = select(&session.conn, "SELECT id, name, joined, active FROM people ORDER BY id");
     assert_eq!(rows[0], vec![Value::Int(1), Value::text("Ann"), Value::text("2024-01-31"), Value::Int(1)]);
     assert_eq!(select(&session.conn, "SELECT price FROM people WHERE id = 3"), vec![vec![Value::Null]]);
@@ -202,6 +211,19 @@ async fn import_abort_and_transactions() {
     let err = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
     assert!(err.message.contains("Row 3, column age"), "{}", err.full_text());
     // The truncate was rolled back too.
+    assert_eq!(select(&session.conn, "SELECT name FROM customers"), vec![vec![Value::text("old")]]);
+    assert!(!session.in_transaction_now());
+
+    // Per batch (the default): the deletion goes with the first batch, so a row that does
+    // not convert before it leaves the table as it was (it was committed at once, emptying it).
+    let mut session = SqliteSession::memory(sqlite_dialect());
+    customers(&session);
+    let mut m = customer_mapping(ImportMode::TruncateFirst);
+    assert_eq!(m.transaction, TransactionScope::PerBatch);
+    m.batch_size = 10;
+    let mut src = csv(CUSTOMERS, CsvReadOptions::default());
+    let err = run_import(&mut src, &mut session, &m, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(err.message.contains("Row 3, column age"), "{}", err.full_text());
     assert_eq!(select(&session.conn, "SELECT name FROM customers"), vec![vec![Value::text("old")]]);
     assert!(!session.in_transaction_now());
 
@@ -471,7 +493,7 @@ async fn xml_and_json_import_into_sqlite() {
             vec![Value::Int(2), Value::text("Bob & Co"), Value::Null, Value::text("2024-01-03 11:30:00")],
         ]
     );
-    assert_eq!(m.columns[2].target_type, "NUMERIC(7,2)");
+    assert_eq!(m.columns[2].target_type, "NUMERIC(11,6)");
 
     let lines = "{\"id\": 1, \"tags\": [\"a\", \"b\"], \"price\": 12345678901234567890.25}\n{\"id\": 2, \"tags\": null, \"price\": 1}\n";
     let mut src = JsonSource::from_reader(Cursor::new(lines.as_bytes().to_vec()), JsonReadOptions::default()).unwrap();

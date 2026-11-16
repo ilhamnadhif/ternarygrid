@@ -651,7 +651,22 @@ const READ_ENDPOINTS: &[&str] = &[
 /// (the path's first `_` segment, so `/i/_doc/_search` indexes a document).
 fn rest_reads(method: &str, path: &str, body: Option<&str>) -> bool {
     match method {
-        "GET" | "HEAD" => true,
+        "HEAD" => true,
+        // A GET reads, except the SQL API's (OpenSearch takes `GET /_plugins/_sql` with a
+        // body or `?sql=`, and its SQL may DELETE).
+        "GET" if !is_sql_endpoint(path) => true,
+        "GET" => {
+            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let in_query = query.split('&').find_map(|kv| {
+                kv.split_once('=')
+                    .filter(|(k, _)| *k == "sql" || *k == "query")
+                    .map(|(_, v)| percent_decode(&v.replace('+', " ")))
+            });
+            let in_body = body
+                .and_then(|b| serde_json::from_str::<J>(b).ok())
+                .and_then(|b| b.get("query").and_then(J::as_str).map(str::to_string));
+            in_query.into_iter().chain(in_body).all(|q| sql_reads(&q))
+        }
         "POST" => {
             let path = percent_decode(path.split(['?', '#']).next().unwrap_or(""));
             let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -675,6 +690,14 @@ fn rest_reads(method: &str, path: &str, body: Option<&str>) -> bool {
         }
         _ => false,
     }
+}
+
+/// The path is the SQL API (`/_sql`, `/_plugins/_sql`, `/_opendistro/_sql`).
+fn is_sql_endpoint(path: &str) -> bool {
+    let path = percent_decode(path.split(['?', '#']).next().unwrap_or(""));
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .any(|s| s == "_sql")
 }
 
 struct SearchCursor {
@@ -1622,6 +1645,8 @@ mod tests {
             ("POST", "/logs/_async_search", Some("{}")),
             ("POST", "/logs/_pit?keep_alive=1m", None),
             ("POST", "/%5Fsearch", None),
+            ("GET", "/_plugins/_sql?sql=SELECT+1", None),
+            ("GET", "/logs/_search", None),
         ] {
             assert!(rest_reads(m, p, b), "{m} {p}");
         }
@@ -1648,6 +1673,13 @@ mod tests {
             ),
             ("POST", "/_tasks/n:1/_cancel", None),
             ("PATCH", "/logs", None),
+            // OpenSearch's SQL API by GET: a body or `?sql=` that deletes.
+            (
+                "GET",
+                "/_plugins/_sql",
+                Some("{\"query\": \"DELETE FROM logs\"}"),
+            ),
+            ("GET", "/_opendistro/_sql?sql=DELETE+FROM+logs", None),
         ] {
             assert!(!rest_reads(m, p, b), "{m} {p}");
         }

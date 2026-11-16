@@ -836,6 +836,20 @@ impl TableDesignerTab {
         s
     }
 
+    /// Existing columns whose type changes: their values are converted, and those that do
+    /// not fit the new type (longer text, more digits, a time of day) may be cut or rounded.
+    fn retyped_columns(&self) -> Vec<String> {
+        if self.original.is_none() {
+            return Vec::new();
+        }
+        self.model
+            .columns
+            .iter()
+            .filter(|c| c.orig_name.is_some() && c.orig_type.as_ref().is_some_and(|(t, l, _)| *t != c.type_text || *l != c.length))
+            .map(|c| c.name.trim().to_string())
+            .collect()
+    }
+
     /// Problems that prevent executing the design.
     fn issues(&self) -> Vec<String> {
         self.page_issues().into_iter().map(|(_, s)| s).collect()
@@ -1957,14 +1971,15 @@ impl TableDesignerTab {
             // Named after what it does; red only where data can be lost (a column or table
             // dropped, a table rebuilt) or the connection is a production one.
             let drops = drops_data(&stmts);
+            let retyped = self.retyped_columns();
             let production = cx.conns.type_of(&self.conn).confirm_execute;
-            let danger = drops || production;
+            let danger = drops || !retyped.is_empty() || production;
             let (title, action) = if create { (trf("Create table {}", &[&name]), tr("Create table")) } else { (trf("Apply changes to {}", &[&name]), tr("Apply changes")) };
             let (mut run, mut cancel) = (false, false);
             let lang = self.lang.as_ref();
             let transactional = transactional_ddl(self.kind);
             let uid = self.uid;
-            let header_icon = if drops {
+            let header_icon = if drops || !retyped.is_empty() {
                 icon::WARNING
             } else if create {
                 icon::PLUS
@@ -1972,7 +1987,7 @@ impl TableDesignerTab {
                 icon::CHECK
             };
             let mut dialog = parts::Dialog::new(&title).icon(header_icon).width(640.0);
-            if drops {
+            if drops || !retyped.is_empty() {
                 dialog = dialog.tone(parts::Tone::Error);
             } else if production {
                 dialog = dialog.tone(parts::Tone::Warning);
@@ -1986,7 +2001,20 @@ impl TableDesignerTab {
                     ui.label(RichText::new(trf("Run {} on \"{}\"?", &[&what, &conn])).size(13.5));
                     if drops {
                         parts::callout(ui, parts::Tone::Error, None, tr("These statements drop columns or rebuild the table: data they remove cannot be recovered."), |_| {});
-                    } else if production {
+                    }
+                    if !retyped.is_empty() {
+                        parts::callout(
+                            ui,
+                            parts::Tone::Error,
+                            None,
+                            &trf(
+                                "The type of {} changes: its values are converted, and values that do not fit the new type (longer text, more digits, a time of day) may be cut or rounded.",
+                                &[&retyped.join(", ")],
+                            ),
+                            |_| {},
+                        );
+                    }
+                    if !drops && retyped.is_empty() && production {
                         parts::callout(ui, parts::Tone::Warning, None, &trf("\"{}\" is a production connection.", &[&conn]), |_| {});
                     }
                     if !transactional {
@@ -2482,8 +2510,23 @@ impl TabView for TableDesignerTab {
             return;
         }
         let Some(session) = self.session(cx) else {
-            egui::Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| parts::spinner_label(ui, tr("Opening a session…")));
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            // The session of the table's database could not be opened: why, with Retry.
+            match cx.conns.live(&self.conn).and_then(|l| l.session_error(self.schema.database.as_deref())) {
+                Some(e) => {
+                    egui::Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| {
+                        crate::widgets::error_box(ui, &e);
+                        if kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked()
+                            && let Some(live) = cx.conns.live_mut(&self.conn)
+                        {
+                            live.retry_failed_sessions();
+                        }
+                    });
+                }
+                None => {
+                    egui::Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| parts::spinner_label(ui, tr("Opening a session…")));
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                }
+            }
             return;
         };
         if self.dialect.is_none() {

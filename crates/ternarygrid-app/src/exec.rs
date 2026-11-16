@@ -55,6 +55,9 @@ pub struct ExecOpts {
     pub store_budget: usize,
     /// Smart commit: switch the session to manual commit before running.
     pub switch_to_manual: bool,
+    /// Make this schema current first, in the same run: a session other editors share
+    /// keeps the schema the last of them chose.
+    pub schema: Option<String>,
 }
 
 impl Default for ExecOpts {
@@ -66,6 +69,7 @@ impl Default for ExecOpts {
             timeout: None,
             store_budget: ternarygrid_core::rowstore::DEFAULT_STORE_BUDGET,
             switch_to_manual: false,
+            schema: None,
         }
     }
 }
@@ -179,8 +183,20 @@ async fn run(
             send(ExecEvent::Message { index: None, severity: "INFO".into(), text: "Smart commit: switched to manual commit mode".into() });
         }
     }
+    // The editor's schema, set where the statements run (nothing runs in another one).
+    let mut schema_failed = false;
+    if let Some(schema) = &opts.schema {
+        let set = tokio::select! {
+            r = async { session.lock().await.set_current_schema(schema).await } => r,
+            _ = cancel.cancelled() => Err(DbError::query("cancelled")),
+        };
+        if let Err(e) = set {
+            schema_failed = true;
+            send(ExecEvent::Message { index: None, severity: "ERROR".into(), text: format!("Cannot make {schema} the current schema; nothing was run: {e}") });
+        }
+    }
     for (pos, plan) in plans.into_iter().enumerate() {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || schema_failed {
             break;
         }
         let index = plan.index;
@@ -359,5 +375,8 @@ fn returns_one_result(session: &SessionHandle, sql: &str) -> bool {
         return true;
     }
     let info = ternarygrid_sql::classify_command(sql, language).unwrap_or_else(|| ternarygrid_sql::classify(sql, session.dialect().syntax()));
-    matches!(info.kind, K::Select | K::Show | K::Explain | K::Describe | K::Pragma)
+    // A write that returns rows (`WITH d AS (DELETE … RETURNING *) SELECT * FROM d`) is read
+    // to its end: closing its cursor half way (the next statement, the next run) cancels
+    // the statement on the server, and the write is undone after it was shown as done.
+    matches!(info.kind, K::Select | K::Show | K::Explain | K::Describe | K::Pragma) && !info.is_write
 }

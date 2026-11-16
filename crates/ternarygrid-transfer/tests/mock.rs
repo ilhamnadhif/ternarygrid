@@ -142,6 +142,24 @@ async fn explicit_generators_null_ratio_and_errors() {
     let err = run_mock(&fk, &mut session, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
     assert!(err.message.contains("has no rows"), "{}", err.message);
 
+    // "Delete them first" with a run that stops (a self-referencing NOT NULL key: no rows are
+    // left to reference): the table keeps its rows (it was emptied before the check).
+    session.exec_batch("CREATE TABLE emp (id INTEGER PRIMARY KEY, boss INTEGER NOT NULL); INSERT INTO emp VALUES (1, 1), (2, 1)");
+    let emp = session.table_definition(&ObjectRef::table(None, "emp")).await.unwrap();
+    let selfref = MockConfig {
+        table: emp,
+        rows: 2,
+        mode: MockMode::TruncateFirst,
+        generators: vec![
+            ColumnGenerator::new("id", GeneratorKind::Sequence { start: 10, step: 1, after_max: false }),
+            ColumnGenerator::new("boss", GeneratorKind::ForeignKey { table: ObjectRef::table(None, "emp"), column: "id".into(), group: None }),
+        ],
+        ..Default::default()
+    };
+    let err = run_mock(&selfref, &mut session, &Progress::new(), &CancellationToken::new()).await.unwrap_err();
+    assert!(err.message.contains("has no rows"), "{}", err.message);
+    assert_eq!(select(&session.conn, "SELECT count(*) FROM emp"), vec![vec![Value::Int(2)]], "the rows are kept");
+
     // Cancellation stops between batches.
     let cancel = CancellationToken::new();
     cancel.cancel();

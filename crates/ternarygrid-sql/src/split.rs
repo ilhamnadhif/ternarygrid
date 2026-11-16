@@ -399,6 +399,21 @@ const CONTINUE_BEFORE: &[&str] = &[
     "BETWEEN",
     "QUALIFY",
     "VALUES",
+    // Clauses after a blank line that belong to the statement before: cut off, the table
+    // was created unpartitioned (`PARTITION BY`), a DELETE ran without its WHERE (`OUTPUT`).
+    "PARTITION",
+    "ENGINE",
+    "INHERITS",
+    "TABLESPACE",
+    "FOR",
+    "OUTPUT",
+    "COLLATE",
+    "CHARSET",
+    "CHARACTER",
+    "AUTO_INCREMENT",
+    "ROW_FORMAT",
+    "OPTIONS",
+    "SERVER",
 ];
 
 fn word_in(t: &Token, src: &str, list: &[&str]) -> bool {
@@ -997,6 +1012,22 @@ mod tests {
         assert_eq!(got[3], "db.users.countDocuments({})");
     }
 
+    /// Clauses after a blank line that belong to the statement before (Smart mode).
+    #[test]
+    fn blank_lines_before_continuation_clauses() {
+        let t = texts(
+            "CREATE TABLE m (d date)\n\nPARTITION BY RANGE (d);",
+            &SqlSyntax::ansi(),
+        );
+        assert_eq!(t.len(), 1, "{t:#?}");
+        let t = texts("DELETE FROM t\n\nOUTPUT deleted.* WHERE id = 1", &tsql());
+        assert_eq!(t.len(), 1, "{t:#?}");
+        let t = texts("SELECT * FROM t\n\nFOR UPDATE", &SqlSyntax::ansi());
+        assert_eq!(t.len(), 1, "{t:#?}");
+        let t = texts("SELECT 1\n\nSELECT 2", &SqlSyntax::ansi());
+        assert_eq!(t.len(), 2, "{t:#?}");
+    }
+
     #[test]
     fn plsql_blocks_and_slash_lines() {
         let mut syn = SqlSyntax::ansi();
@@ -1029,6 +1060,14 @@ mod tests {
             got[4]
         );
         assert!(got[5].starts_with("SELECT 2 FROM dual / 2"), "{}", got[5]);
+        // A line starting with a division is no `/` terminator (`GO 5` only for GO): the
+        // UPDATE ran without its WHERE.
+        let got = texts(
+            "UPDATE prices SET amount = amount\n  / 100\nWHERE currency = 'JPY';\nSELECT 1 FROM dual;",
+            &syn,
+        );
+        assert_eq!(got.len(), 2, "{got:#?}");
+        assert!(got[0].ends_with("WHERE currency = 'JPY'"), "{}", got[0]);
         // T-SQL keeps DECLARE @x as a statement of its own.
         let tsql = texts("DECLARE @x int;\nSELECT @x;", &tsql());
         assert_eq!(tsql.len(), 2, "{tsql:#?}");

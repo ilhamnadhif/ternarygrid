@@ -320,6 +320,7 @@ impl ResultPanel {
             && let Some(r) = j.poll()
         {
             self.save_job = None;
+            self.model.set_saving(false);
             match r {
                 Ok((n, committed, inserted, updated)) => {
                     self.src.rows_deleted(self.model.deleted_below(self.src.server_rows()));
@@ -452,11 +453,12 @@ impl ResultPanel {
             find(obj)?.row_key_columns()
         };
         let mut e = determine_editability(self.model.columns(), key_lookup, read_only);
-        // A column of the table twice is fine (`SELECT name, * FROM t`) unless the query
-        // reads the table twice (`t a JOIN t b`): then a column cannot tell its row.
+        // A query that reads the table twice (`employees e JOIN employees m`): the server
+        // tells a column's table, not which of the two rows it comes from, so the key
+        // (`e.id`) may not be the row of an edited column (`m.name`), even when no column
+        // shows twice. Read-only (the data tab of the table edits it).
         if let Ok(t) = &e
             && self.table.is_none()
-            && ternarygrid_grid::model::has_duplicate_sources(self.model.columns(), &t.table.name)
         {
             let reads = ternarygrid_sql::analyze(&self.src.sql, live.dialect.syntax())
                 .tables
@@ -921,6 +923,8 @@ impl ResultPanel {
         let table = cs.table.clone();
         let s = self.src.session.clone();
         let expect_one: Vec<bool> = (0..stmts.len()).map(|i| i < cs.deletes.len() + cs.updates.len()).collect();
+        // Edits wait until the save is done (keys, undo, Discard included).
+        self.model.set_saving(true);
         self.save_job = Some(cx.backend.spawn(async move {
             let applied = s.apply_changes_reading(&stmts, &expect_one).await?;
             let mut inserted: HashMap<u64, Vec<(usize, Value)>> = HashMap::new();

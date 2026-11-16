@@ -255,6 +255,8 @@ pub struct ResultModel {
     undo: Vec<Undo>,
     virtual_columns: Vec<VirtualColumn>,
     editability: Result<EditTarget, ReadOnlyReason>,
+    /// The changes are being saved ([`ResultModel::set_saving`]).
+    saving: bool,
     dictionaries: HashMap<usize, Dictionary>,
     enum_values: HashMap<usize, Vec<String>>,
     foreign_keys: Vec<ForeignKeyLink>,
@@ -294,6 +296,7 @@ impl ResultModel {
             undo: Vec::new(),
             virtual_columns: Vec::new(),
             editability: Err(ReadOnlyReason::NoSourceTable),
+            saving: false,
             dictionaries: HashMap::new(),
             enum_values: HashMap::new(),
             foreign_keys: Vec::new(),
@@ -1001,13 +1004,34 @@ impl ResultModel {
         self.editability.as_ref().map_err(ReadOnlyReason::message)
     }
 
+    /// The changes are being saved: the rows are not changed meanwhile. An edit made then
+    /// was marked saved with the others without being written (a row deleted during
+    /// the save vanished from the grid, but not from the database).
+    pub fn set_saving(&mut self, saving: bool) {
+        self.saving = saving;
+        self.generation += 1;
+    }
+
+    /// See [`ResultModel::set_saving`].
+    pub fn is_saving(&self) -> bool {
+        self.saving
+    }
+
+    /// The edit target, unless the result is read-only or its changes are being saved.
+    fn edit_target(&self) -> Result<&EditTarget, String> {
+        if self.saving {
+            return Err(tr("Wait until the changes are saved").to_string());
+        }
+        self.target()
+    }
+
     /// Check whether a cell can be edited; returns the reason when not.
     pub fn can_edit_cell(&self, row: usize, col: usize) -> Result<(), String> {
         self.check_cell(row, col).map(|_| ())
     }
 
     fn check_cell(&self, row: usize, col: usize) -> Result<RowSource, String> {
-        let target = self.target()?;
+        let target = self.edit_target()?;
         if self.is_virtual_column(col) {
             return Err(tr("Virtual columns are computed and cannot be edited").to_string());
         }
@@ -1197,7 +1221,7 @@ impl ResultModel {
     /// Insert a new row after display row `after` (`None` appends at the end).
     /// Returns the display index of the new row.
     pub fn add_row(&mut self, after: Option<usize>) -> Result<usize, String> {
-        self.target()?;
+        self.edit_target()?;
         let (row, undo) = self.insert_row_inner(after, vec![CellValue::Default; self.columns.len()]);
         self.push_undo(Undo::Insert(vec![undo]));
         self.generation += 1;
@@ -1209,7 +1233,7 @@ impl ResultModel {
         if row > 0 {
             return self.add_row(Some(row - 1));
         }
-        self.target()?;
+        self.edit_target()?;
         let id = self.next_insert_id;
         self.next_insert_id += 1;
         // Before the first row: anchored at the top, not after the current first row.
@@ -1246,7 +1270,7 @@ impl ResultModel {
     /// Insert copies of `rows` (display indices) after the last of them.
     /// Auto-increment columns are left at their default. Returns the new display rows.
     pub fn duplicate_rows(&mut self, rows: &[usize]) -> Result<Vec<usize>, String> {
-        self.target()?;
+        self.edit_target()?;
         let mut sorted: Vec<usize> = rows.iter().copied().filter(|&r| r < self.row_count()).collect();
         sorted.sort_unstable();
         sorted.dedup();
@@ -1296,7 +1320,7 @@ impl ResultModel {
     /// Mark rows for deletion (new rows are removed immediately).
     /// Returns the number of affected rows.
     pub fn delete_rows(&mut self, rows: &[usize]) -> Result<usize, String> {
-        self.target()?;
+        self.edit_target()?;
         let mut stored = Vec::new();
         let mut inserted_idx = Vec::new();
         for &r in rows {
@@ -1335,7 +1359,7 @@ impl ResultModel {
     /// the end. All-or-nothing; one undo step. Returns the number of cells set.
     /// `nulls` marks the cells that are NULL (text TernaryGrid copied itself), else parsed.
     pub fn paste_block(&mut self, row: usize, block: &[Vec<String>], columns: &[usize], nulls: Option<&[Vec<bool>]>) -> Result<usize, String> {
-        self.target()?;
+        self.edit_target()?;
         if block.is_empty() {
             return Ok(0);
         }
@@ -1399,6 +1423,9 @@ impl ResultModel {
 
     /// Undo the last edit step. Returns false when there is nothing to undo.
     pub fn undo(&mut self) -> bool {
+        if self.saving {
+            return false;
+        }
         let Some(u) = self.undo.pop() else { return false };
         self.apply_undo(u);
         self.generation += 1;
@@ -1407,7 +1434,7 @@ impl ResultModel {
 
     /// True when [`ResultModel::undo`] would do something.
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        !self.saving && !self.undo.is_empty()
     }
 
     fn apply_undo(&mut self, u: Undo) {
@@ -1474,8 +1501,12 @@ impl ResultModel {
         PendingCounts { updated: self.updates.keys().filter(|s| !self.deleted.contains(s)).count(), inserted: self.inserted.len(), deleted: self.deleted.len() }
     }
 
-    /// Drop all pending changes.
+    /// Drop all pending changes (not while they are being saved: the grid would show
+    /// stale values for what the database committed).
     pub fn discard_changes(&mut self) {
+        if self.saving {
+            return;
+        }
         self.updates.clear();
         self.deleted.clear();
         self.inserted.clear();
@@ -1523,6 +1554,16 @@ impl ResultModel {
                     .map(|&k| {
                         let (name, type_name) = col_info(k).ok_or_else(unreadable)?;
                         let value = row.get(k).cloned().ok_or_else(unreadable)?;
+                        // A NULL in a key column that allows none: a row saved here whose key
+                        // the database made (a UUID default) and that was not read back. Its
+                        // `WHERE id IS NULL` would change nothing while the save said done.
+                        // (A unique key that allows NULL keeps its NULL-safe `IS NULL`.)
+                        if value.is_null() && self.columns.get(k).and_then(|m| m.nullable) == Some(false) {
+                            return Err(trf(
+                                "Row {} has no value in its key column '{}' yet (the database made it when the row was saved); refresh the result to change it",
+                                &[&(s as usize + 1), &name],
+                            ));
+                        }
                         Ok(KeyValue { column: k, name, type_name, value })
                     })
                     .collect()

@@ -227,6 +227,10 @@ pub struct TableDef {
     pub referenced_by: Vec<ForeignKeyDef>,
     pub row_estimate: Option<i64>,
     pub size_bytes: Option<i64>,
+    /// The primary key does not identify rows (ClickHouse: the sorting key, rows may
+    /// share it): it is not used as a row key (editing, sync scripts, generated
+    /// UPDATE/DELETE), so a change of one row cannot hit others.
+    pub primary_key_not_unique: bool,
 }
 
 impl TableDef {
@@ -243,6 +247,7 @@ impl TableDef {
     pub fn row_key(&self) -> Option<&KeyDef> {
         if let Some(pk) = &self.primary_key
             && !pk.columns.is_empty()
+            && !self.primary_key_not_unique
         {
             return Some(pk);
         }
@@ -510,5 +515,17 @@ mod tests {
         t.unique_keys = vec![KeyDef { name: None, columns: vec!["code".into()] }];
         t.primary_key = Some(KeyDef { name: None, columns: vec!["id".into()] });
         assert_eq!(t.row_key_columns(), Some(vec!["id".to_string()]), "the primary key wins");
+    }
+
+    /// A key that does not identify rows (ClickHouse's sorting key) is no row key:
+    /// `DELETE … WHERE event_date = ?` removed every row of that day.
+    #[test]
+    fn a_key_that_is_not_unique_identifies_no_row() {
+        let mut t = TableDef { name: "events".into(), columns: vec![col("event_date", false)], ..Default::default() };
+        t.primary_key = Some(KeyDef { name: None, columns: vec!["event_date".into()] });
+        assert!(t.row_key().is_some());
+        t.primary_key_not_unique = true;
+        assert_eq!(t.row_key(), None);
+        assert_eq!(t.row_key_columns(), None);
     }
 }

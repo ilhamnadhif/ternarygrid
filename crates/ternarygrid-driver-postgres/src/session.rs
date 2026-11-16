@@ -318,6 +318,18 @@ impl PgSession {
         self.client()?.batch_execute(sql).await.map_err(pg)
     }
 
+    /// A transaction that a failed statement aborted takes COMMIT as a ROLLBACK, without
+    /// an error: the commit would look done while every change was undone. Asked first
+    /// (any statement fails with 25P02 there); the transaction stays open for a Rollback.
+    async fn refuse_aborted_commit(&self) -> DbResult<()> {
+        match self.batch("SELECT 1").await {
+            Err(e) if e.code.as_deref() == Some("25P02") => {
+                Err(DbError::query("The transaction failed earlier, so committing it would undo every change in it: roll it back, then run the changes again.").with_code("25P02"))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Catalog query helper.
     pub(crate) async fn q(&self, sql: &str, params: &[P<'_>]) -> DbResult<Vec<tokio_postgres::Row>> {
         catalog::query(self.client()?, sql, params).await
@@ -405,8 +417,11 @@ impl PgSession {
         Ok(plans)
     }
 
-    /// Batch-resolve base table / column of result columns (cached per session).
+    /// Batch-resolve base table / column of result columns, for each query anew: kept for
+    /// the session, a table renamed by another session (`orders` → `orders_archive`, a new
+    /// `orders`) still resolved to its old name, and the grid's edits went to the new table.
     async fn resolve_sources(&mut self, columns: &[ColInfo], plans: &mut [ColumnPlan]) -> DbResult<()> {
+        self.source_cache.clear();
         let keys: Vec<(u32, i16)> = columns
             .iter()
             .filter_map(|c| match (c.table_oid, c.column_id) {
@@ -524,6 +539,10 @@ impl PgSession {
         }
         if script.is_empty() {
             return Ok(Box::new(PgCursor::new(Body::Empty, self.shared.clone(), guard, self.cancel.clone(), None, self.rt.clone())));
+        }
+        // COMMIT typed in the editor: not silently a rollback either.
+        if self.shared.in_tx() && script.statements.len() == 1 && matches!(script.statements[0].tx, TxEffect::Commit { .. }) {
+            self.refuse_aborted_commit().await?;
         }
         self.restore_search_path().await?;
         self.implicit_begin(&script).await?;
@@ -649,6 +668,7 @@ impl Session for PgSession {
     async fn set_transaction_mode(&mut self, mode: TransactionMode) -> DbResult<()> {
         if mode == TransactionMode::Auto && self.shared.in_tx() {
             let _g = self.acquire().await?;
+            self.refuse_aborted_commit().await?;
             let r = self.batch("COMMIT").await;
             // A failed COMMIT ends the transaction too.
             self.shared.set_in_tx(false);
@@ -667,6 +687,7 @@ impl Session for PgSession {
         if !self.shared.in_tx() {
             return Ok(());
         }
+        self.refuse_aborted_commit().await?;
         let r = self.batch("COMMIT").await;
         // COMMIT ends the transaction even when it fails (e.g. deferred constraints).
         self.shared.set_in_tx(false);

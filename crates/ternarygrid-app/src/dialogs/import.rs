@@ -121,12 +121,7 @@ impl ImportDialog {
         let Some(mut result) = self.result.take() else { return false };
         let mut keep = self.selected.iter();
         result.connections.retain(|_| *keep.next().unwrap_or(&false));
-        if !self.keep_shell_commands {
-            for c in &mut result.connections {
-                c.init.shell_before_connect = None;
-                c.init.shell_after_disconnect = None;
-            }
-        }
+        result.neutralize(self.keep_shell_commands);
         if !self.folder_prefix.trim().is_empty() {
             result.prefix_folders(self.folder_prefix.trim());
         }
@@ -362,11 +357,11 @@ impl ImportDialog {
                     }
                 }
                 _ => {
-                    if c.init.shell_before_connect.is_some() || c.init.shell_after_disconnect.is_some() {
+                    if ternarygrid_config::import::runs_on_connect(c) {
                         ui.spacing_mut().item_spacing.x = 5.0;
                         ui.label(RichText::new(icon::TERMINAL_WINDOW).font(style::icon_font(14.0)).color(p.warn));
-                        ui.label(RichText::new(tr("Runs a shell command")).size(12.0).color(p.text_muted))
-                            .on_hover_text(tr("It runs a shell command when connecting or disconnecting: kept only with the option below."));
+                        ui.label(RichText::new(tr("Runs commands")).size(12.0).color(p.text_muted))
+                            .on_hover_text(tr("It runs a shell command, a password command or SQL when connecting or disconnecting: kept only with the option below."));
                     }
                 }
             }
@@ -386,7 +381,7 @@ impl ImportDialog {
                 ternarygrid_ui::kit::radio_value(ui, &mut self.policy, DuplicatePolicy::KeepBoth, tr("Keep both"));
             });
             super::form_row(ui, tr("Put into folder"), |ui| add_field(ui, text_field(&mut self.folder_prefix, f32::INFINITY).hint_text(hint(ui, tr("their own folders")))));
-            super::form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.keep_shell_commands, tr("Keep shell commands that run on connect / disconnect")));
+            super::form_row(ui, "", |ui| ternarygrid_ui::kit::checkbox(ui, &mut self.keep_shell_commands, tr("Keep the commands and SQL that run on connect / disconnect")));
         });
     }
 }

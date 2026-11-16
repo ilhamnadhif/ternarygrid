@@ -82,6 +82,11 @@ use options::*;
 /// Prefix of the temporary table used by table rebuilds.
 const REBUILD_PREFIX: &str = "_ternarygrid_new_";
 
+/// Marks the pragmas of a table rebuild: when the rebuild fails and is rolled back,
+/// the session switches `foreign_keys` and `legacy_alter_table` back to the
+/// connection's configuration. Pragmas the user writes are left as written.
+pub(crate) const REBUILD_MARK: &str = "/* ternarygrid: table rebuild */";
+
 /// Savepoint wrapping a multi-statement native `ALTER`.
 const NATIVE_SAVEPOINT: &str = "ternarygrid_alter";
 
@@ -1231,7 +1236,7 @@ impl<'a> Plan<'a> {
         let (mid, post_renames) = self.rebuild_definition();
         let tmp_t = qualified(s, &mid.name);
         let mut out = vec![
-            "PRAGMA foreign_keys = OFF".to_string(),
+            format!("{REBUILD_MARK} PRAGMA foreign_keys = OFF"),
             "BEGIN".to_string(),
             create_table_sql(&mid, true),
         ];
@@ -1278,12 +1283,12 @@ impl<'a> Plan<'a> {
         out.push(format!("DROP TABLE {old_t}"));
         // Legacy mode: the rename must neither validate nor rewrite views and
         // triggers, which still refer to the dropped table at this point.
-        out.push("PRAGMA legacy_alter_table = ON".to_string());
+        out.push(format!("{REBUILD_MARK} PRAGMA legacy_alter_table = ON"));
         out.push(format!(
             "ALTER TABLE {tmp_t} RENAME TO {}",
             quote_ident(&self.from.name)
         ));
-        out.push("PRAGMA legacy_alter_table = OFF".to_string());
+        out.push(format!("{REBUILD_MARK} PRAGMA legacy_alter_table = OFF"));
 
         // unchanged indexes and triggers, in their old form
         let dropped: Vec<String> = self.dropped.iter().map(|c| c.name.clone()).collect();
@@ -1911,7 +1916,11 @@ mod tests {
         to.checks.clear();
         to.indexes.clear();
         let sql = SqliteDdl::new().alter_table(&from, &to, &[]);
-        assert_eq!(sql[0], "PRAGMA foreign_keys = OFF", "{sql:?}");
+        assert_eq!(
+            sql[0],
+            format!("{REBUILD_MARK} PRAGMA foreign_keys = OFF"),
+            "{sql:?}"
+        );
         assert!(!sql.iter().any(|s| s.contains("ix_age")), "{sql:?}");
         // dropping an indexed column natively
         let mut from2 = users();
@@ -1951,7 +1960,7 @@ mod tests {
         let mut to = from.clone();
         to.columns[2].data_type = "BIGINT".into();
         let sql = SqliteDdl::new().alter_table(&from, &to, &[]);
-        assert_eq!(sql[0], "PRAGMA foreign_keys = OFF");
+        assert_eq!(sql[0], format!("{REBUILD_MARK} PRAGMA foreign_keys = OFF"));
         assert_eq!(sql[1], "BEGIN");
         assert!(
             sql[2].starts_with("CREATE TABLE main._ternarygrid_new_users ("),
@@ -1995,7 +2004,7 @@ mod tests {
 
         // without enforcement on the connection: no check, and it stays off
         let sql = SqliteDdl::with_foreign_keys(false).alter_table(&from, &to, &[]);
-        assert_eq!(sql[0], "PRAGMA foreign_keys = OFF");
+        assert_eq!(sql[0], format!("{REBUILD_MARK} PRAGMA foreign_keys = OFF"));
         assert!(
             !sql.iter().any(|s| s.contains("foreign_key_check")),
             "{sql:?}"

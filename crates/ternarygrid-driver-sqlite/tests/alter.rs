@@ -36,7 +36,9 @@ async fn apply(s: &mut SqliteSession, stmts: &[String]) -> Vec<Vec<Value>> {
 }
 
 fn is_rebuild(stmts: &[String]) -> bool {
-    stmts.iter().any(|s| s == "PRAGMA foreign_keys = OFF")
+    stmts
+        .iter()
+        .any(|s| s.ends_with("PRAGMA foreign_keys = OFF"))
 }
 
 /// name, type, nullable, default, auto increment, generated, collation
@@ -576,12 +578,19 @@ async fn foreign_key_checks_and_failed_rebuilds() {
     // a rollback after a failure inside the legacy rename window as well
     exec(
         &mut s,
-        "PRAGMA foreign_keys = OFF; BEGIN; PRAGMA legacy_alter_table = ON",
+        "/* ternarygrid: table rebuild */ PRAGMA foreign_keys = OFF; BEGIN; /* ternarygrid: table rebuild */ PRAGMA legacy_alter_table = ON",
     )
     .await;
     s.rollback().await.unwrap();
     assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 1);
     assert_eq!(int(&mut s, "PRAGMA legacy_alter_table").await, 0);
+    // The user's own pragmas stay as written, whatever is rolled back: switched back on,
+    // a later DROP TABLE of the user's manual rebuild would run ON DELETE CASCADE.
+    exec(&mut s, "PRAGMA foreign_keys = OFF; BEGIN").await;
+    exec(&mut s, "ROLLBACK").await;
+    assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 0);
+    s.rollback().await.unwrap();
+    assert_eq!(int(&mut s, "PRAGMA foreign_keys").await, 0);
 }
 
 /// Execute statements one by one until one fails; returns its error.

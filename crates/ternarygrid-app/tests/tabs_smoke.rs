@@ -390,6 +390,21 @@ fn an_emptied_tables_data_tab_reads_again() {
     h.frames(&mut other, 20);
     assert_eq!(rows(&other), Some(2));
 
+    // A tab holding an edit not saved yet keeps it; it reads the emptied table once the
+    // edit is discarded (the signal was used up and it never read again).
+    other.data.as_mut().unwrap().panel.as_mut().unwrap().model.set_cell(0, 1, "Changed").unwrap();
+    let s = h.cm.live(&h.id).unwrap().main.clone();
+    h.backend.block_on(async move { s.execute_update("DELETE FROM customer", &[]).await }).unwrap();
+    h.cm.live_mut(&h.id).unwrap().note_emptied(std::slice::from_ref(&customer));
+    h.frames(&mut other, 20);
+    assert_eq!(rows(&other), Some(2), "the edit is kept");
+    other.data.as_mut().unwrap().panel.as_mut().unwrap().model.discard_changes();
+    let t0 = Instant::now();
+    while rows(&other) != Some(0) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "read again after the discard: {:?}", rows(&other));
+        h.frames(&mut other, 1);
+    }
+
     // Names compare as the server folds unquoted ones; one written without a schema
     // (TRUNCATE orders in an editor) is the table in any schema.
     let live = h.cm.live_mut(&h.id).unwrap();

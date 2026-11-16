@@ -54,7 +54,14 @@ pub fn describe_connections(conns: &[ConnectionConfig]) -> serde_json::Value {
                 "connection": i + 1,
                 "kind": c.kind.display_name(),
                 "type": c.connection_type,
-                "auth": format!("{:?}", c.auth),
+                // The kind only: a password command holds the password (`echo s3cret`).
+                "auth": match &c.auth {
+                    ternarygrid_core::config::AuthMethod::Password => "password",
+                    ternarygrid_core::config::AuthMethod::Prompt => "prompt",
+                    ternarygrid_core::config::AuthMethod::Pgpass => "pgpass",
+                    ternarygrid_core::config::AuthMethod::Command { .. } => "command",
+                    ternarygrid_core::config::AuthMethod::None => "none",
+                },
                 "saved_password": c.save_password,
                 "read_only": c.read_only,
                 "auto_commit": c.auto_commit,

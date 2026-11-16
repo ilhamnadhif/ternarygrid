@@ -91,7 +91,8 @@ impl AppTaskExecutor {
                 }
             }
         }
-        let r = run_script(ctx, c.session.as_mut(), &text, database, schema, stop_on_error, commit_at_end).await;
+        let read_only = c.config.read_only.then_some(c.config.name.as_str());
+        let r = run_script(ctx, c.session.as_mut(), &text, database, schema, stop_on_error, commit_at_end, read_only).await;
         let _ = c.session.close().await;
         r
     }
@@ -112,18 +113,23 @@ impl AppTaskExecutor {
             let _ = c.session.close().await;
             return Err(DbError::read_only(format!("The connection \"{}\" is read-only", c.config.name)));
         }
+        let staged = backup.and_then(crate::tools::backup_staging);
         let spec = match (backup, restore) {
-            (Some(b), _) => c.driver.backup_command(&c.params, b)?,
+            (Some(b), _) => c.driver.backup_command(&c.params, staged.as_ref().map(|(s, _)| s).unwrap_or(b))?,
             (_, Some(r)) => c.driver.restore_command(&c.params, r)?,
             _ => return Err(DbError::internal("nothing to run")),
         };
         ctx.info(spec.display());
         let mut lines = 0u64;
-        crate::tools::run_command(spec, ctx.cancel.clone(), |l| {
+        let ran = crate::tools::run_command(spec, ctx.cancel.clone(), |l| {
             lines += 1;
             ctx.info(l);
         })
-        .await?;
+        .await;
+        if let Some((s, out)) = &staged {
+            crate::tools::finish_backup(&s.output, out, ran.is_ok())?;
+        }
+        ran?;
         let mut out = RunOutcome::default();
         if let Some(b) = backup {
             out.output_files.push(b.output.clone());
@@ -185,7 +191,10 @@ impl AppTaskExecutor {
     }
 }
 
-/// Run a script statement by statement on a headless session.
+/// Run a script statement by statement on a headless session. `read_only`: the name of
+/// a read-only connection; a script with a statement that writes is refused before any
+/// runs (SQL Server and Oracle sessions do not stop writes themselves).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_script(
     ctx: &RunContext,
     s: &mut dyn Session,
@@ -194,6 +203,7 @@ pub async fn run_script(
     schema: Option<&str>,
     stop_on_error: bool,
     commit_at_end: bool,
+    read_only: Option<&str>,
 ) -> DbResult<RunOutcome> {
     if let Some(db) = database.filter(|d| !d.is_empty()) {
         s.set_current_database(db).await?;
@@ -203,6 +213,11 @@ pub async fn run_script(
     }
     let syntax = s.dialect().syntax().clone();
     let spans = ternarygrid_sql::split_statements(text, &syntax, &ternarygrid_sql::SplitOptions::default());
+    if let Some(name) = read_only
+        && let Some((i, _)) = spans.iter().enumerate().find(|(_, span)| !span.is_client_command && ternarygrid_sql::classify(span.text(text), &syntax).is_write)
+    {
+        return Err(DbError::read_only(format!("The connection \"{name}\" is read-only; statement {} changes data or schema", i + 1)));
+    }
     let total = spans.len() as u64;
     let mut rows = 0u64;
     let mut failed = 0usize;

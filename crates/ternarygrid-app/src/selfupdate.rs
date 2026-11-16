@@ -166,11 +166,14 @@ fn download_into(version: &str, asset: &Asset, dir: &Path, stage: &Arc<Mutex<Sta
     if size != asset.size {
         return Err(format!("download incomplete ({size} of {} bytes)", asset.size));
     }
-    if let Some(expected) = &asset.sha256 {
-        let actual = sha256_file(&archive).map_err(|e| e.to_string())?;
-        if &actual != expected {
-            return Err("the download does not match its published checksum".into());
-        }
+    // The published checksum is required: without it any archive of the right size was
+    // unpacked and installed.
+    let Some(expected) = &asset.sha256 else {
+        return Err("the release publishes no checksum for its archive; download it from the release page".into());
+    };
+    let actual = sha256_file(&archive).map_err(|e| e.to_string())?;
+    if &actual != expected {
+        return Err("the download does not match its published checksum".into());
     }
     let unpacked = dir.join("app");
     let ok = Command::new("/usr/bin/ditto").args(["-x", "-k"]).arg(&archive).arg(&unpacked).status().map_err(|e| e.to_string())?.success();
@@ -566,6 +569,9 @@ mod tests {
         let bad = Asset { sha256: Some("00".repeat(32)), ..asset.clone() };
         assert_eq!(download("9.9.9", &bad, &stage, &go).unwrap_err(), "the download does not match its published checksum");
         assert_eq!(download("9.9.8", &asset, &stage, &go).unwrap_err(), "the downloaded version does not match the release");
+        // No published checksum: refused.
+        let unchecked = Asset { sha256: None, ..asset.clone() };
+        assert!(download("9.9.9", &unchecked, &stage, &go).unwrap_err().contains("no checksum"));
         // Cancelled: stopped, nothing left.
         assert_eq!(download("9.9.9", &asset, &stage, &AtomicBool::new(true)).unwrap_err(), CANCELLED);
     }

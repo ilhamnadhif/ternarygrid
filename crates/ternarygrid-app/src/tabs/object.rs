@@ -742,6 +742,18 @@ impl TabView for ObjectEditorTab {
             });
             return;
         }
+        // The session of the object's database could not be opened: why, with Retry
+        // (the pages waited on it with "Loading…" for ever).
+        if let Some(e) = cx.conns.live(&self.conn).and_then(|l| l.session_error(self.obj.database.as_deref())) {
+            ui.add_space(14.0);
+            crate::widgets::error_box(ui, &e);
+            if ternarygrid_ui::kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked()
+                && let Some(live) = cx.conns.live_mut(&self.conn)
+            {
+                live.retry_failed_sessions();
+            }
+            return;
+        }
         let seen = cx.conns.live(&self.conn).map(|l| l.meta.invalidations);
         if self.invalidations.is_some() && self.invalidations != seen {
             self.refresh();
