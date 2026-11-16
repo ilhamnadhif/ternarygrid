@@ -59,6 +59,16 @@ pub struct Credentials {
     pub ssh_password: Option<Secret>,
     pub ssh_passphrase: Option<Secret>,
     pub proxy_password: Option<Secret>,
+    /// Secret driver properties ([`SECRET_PROPERTIES`](ternarygrid_core::config::SECRET_PROPERTIES)).
+    pub properties: Vec<(String, Secret)>,
+}
+
+/// The secret properties of connection `id` kept in `secrets`.
+fn secret_properties(secrets: &dyn SecretSource, id: &str) -> Vec<(String, Secret)> {
+    ternarygrid_core::config::SECRET_PROPERTIES
+        .iter()
+        .filter_map(|n| secrets.get(&ternarygrid_core::config::property_secret_key(id, n)).ok().flatten().map(|v| (n.to_string(), v)))
+        .collect()
 }
 
 /// Something the user must enter before a connection can be opened.
@@ -139,6 +149,9 @@ pub struct LiveConnection {
     /// data views read the rows again.
     emptied: Vec<(ObjectRef, u64)>,
     emptied_seq: u64,
+    /// Set when the connection is closed (Disconnect, Reconnect): a tab session still
+    /// opening then closes instead of living on with the old settings, untracked.
+    closed: Arc<std::sync::atomic::AtomicBool>,
     /// Stops the keep-alive task when the connection is dropped.
     _keepalive: KeepAlive,
 }
@@ -491,9 +504,14 @@ impl LiveConnection {
         let cfg = self.config.clone();
         let tab_sessions = self.tab_sessions.clone();
         let answered = self.revive.answered.clone();
+        let closed = self.closed.clone();
         async move {
             let mut s = driver.connect(&params).await?;
             init_session(s.as_mut(), &cfg, &params).await?;
+            if closed.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = s.close().await;
+                return Err(DbError::connection(ternarygrid_core::tr("The connection was closed while the session opened")));
+            }
             answered.store(true, std::sync::atomic::Ordering::Relaxed);
             let handle = SessionHandle::new(s, label, database);
             // Kept alive like the main session: an idle editor holding a manual-commit
@@ -761,6 +779,10 @@ async fn connect_task(
         AuthMethod::None => None,
     };
     let mut params = ConnectParams::from_config(&cfg, password);
+    // Secret properties from the secret store, in memory only.
+    for (name, value) in &creds.properties {
+        params.properties.entry(name.clone()).or_insert_with(|| value.expose().to_string());
+    }
     params.auto_commit = cfg.auto_commit.unwrap_or(conn_type.auto_commit);
     if let Some(tz) = &time_zone {
         apply_time_zone(&mut params, tz);
@@ -821,6 +843,7 @@ pub async fn connect_saved(
         ssh_password: get(SecretSlot::SshPassword, net_cfg.ssh.is_some()),
         ssh_passphrase: get(SecretSlot::SshPassphrase, net_cfg.ssh.is_some()),
         proxy_password: get(SecretSlot::ProxyPassword, net_cfg.proxy.is_some()),
+        properties: secret_properties(secrets, &cfg.id),
     };
     let mut eff = cfg.clone();
     eff.ssh = net_cfg.ssh;
@@ -841,7 +864,16 @@ pub struct ConnectionManager {
     connecting: HashMap<String, Job<DbResult<Connected>>>,
     /// Connects given up while running (disconnected, removed): what they open is
     /// closed when they finish, with the after-disconnect command.
-    abandoned: Vec<(Job<DbResult<Connected>>, Option<String>)>,
+    abandoned: Vec<(String, Job<DbResult<Connected>>, Option<String>)>,
+    /// Closes still running, per connection (sessions, tunnel, the after-disconnect
+    /// command): a new connect of it waits for its own to end (`true` once done).
+    closing: HashMap<String, tokio::sync::watch::Receiver<bool>>,
+    /// Credentials the user typed for a connection (SSH password, passphrase, proxy
+    /// password), kept in memory while it is open: a tunnel opened again after a sleep
+    /// needs them too (only the database password was kept).
+    prompted: HashMap<String, Credentials>,
+    /// What a connect warned about (an unencrypted fallback), by connection, to show once.
+    pub connect_warnings: Vec<(String, String)>,
     failed: HashMap<String, String>,
     /// Connect errors already reported (their connection stays red until it connects).
     failed_shown: HashSet<String>,
@@ -868,6 +900,9 @@ impl ConnectionManager {
             live: HashMap::new(),
             connecting: HashMap::new(),
             abandoned: Vec::new(),
+            closing: HashMap::new(),
+            prompted: HashMap::new(),
+            connect_warnings: Vec::new(),
             failed: HashMap::new(),
             failed_shown: HashSet::new(),
             secrets,
@@ -916,6 +951,30 @@ impl ConnectionManager {
         self.config(conn_id).map(|c| self.store.color(c))
     }
 
+    /// Move the secret properties of every connection (an API key) from the connections
+    /// file into the secret store (it was written there in plain text). A store that is
+    /// locked keeps them where they are until a later save.
+    pub fn stash_secret_properties(&mut self) {
+        let mut moved = Vec::new();
+        for c in &self.store.connections {
+            for name in ternarygrid_core::config::SECRET_PROPERTIES {
+                if let Some(v) = c.properties.get(*name).filter(|v| !v.is_empty()) {
+                    match self.secrets.set(&ternarygrid_core::config::property_secret_key(&c.id, name), &Secret::new(v.clone())) {
+                        Ok(()) => moved.push((c.id.clone(), name.to_string())),
+                        Err(e) => tracing::warn!("cannot store a secret property in the secret store: {e}"),
+                    }
+                }
+            }
+        }
+        for (id, name) in moved {
+            if let Some(mut c) = self.store.get(&id).cloned() {
+                c.properties.remove(&name);
+                let _ = self.store.update(c);
+                self.dirty = true;
+            }
+        }
+    }
+
     pub fn upsert(&mut self, cfg: ConnectionConfig) {
         // A live connection shows the new name, colour, type and navigator settings
         // at once (its sessions keep what they were opened with until a reconnect).
@@ -929,6 +988,7 @@ impl ConnectionManager {
             tracing::warn!("cannot store connection: {e}");
         }
         self.dirty = true;
+        self.stash_secret_properties();
     }
 
     pub fn remove(&mut self, backend: &Backend, id: &str) {
@@ -1074,6 +1134,7 @@ impl ConnectionManager {
             ssh_password: prompted.ssh_password.clone().or_else(|| get(SecretSlot::SshPassword, net.ssh.is_some())),
             ssh_passphrase: prompted.ssh_passphrase.clone().or_else(|| get(SecretSlot::SshPassphrase, net.ssh.is_some())),
             proxy_password: prompted.proxy_password.clone().or_else(|| get(SecretSlot::ProxyPassword, net.proxy.is_some())),
+            properties: secret_properties(self.secrets.as_ref(), &cfg.id),
         }
     }
 
@@ -1086,13 +1147,35 @@ impl ConnectionManager {
         let driver = self.registry.get(cfg.kind).ok_or_else(|| DbError::unsupported(format!("No driver for {}", cfg.kind)))?;
         let conn_type = self.connection_type(&cfg.connection_type);
         let creds = self.credentials(id, &prompted);
+        self.prompted.insert(id.to_string(), prompted);
         let net = self.net.clone();
         let pgpass = self.pgpass.clone();
         self.failed.remove(id);
         self.failed_shown.remove(id);
         let time_zone = session_time_zone(self.time_zone);
-        self.connecting.insert(id.to_string(), backend.spawn(connect_task(driver, cfg, conn_type, creds, net, pgpass, time_zone)));
+        // Reconnect: the old connection's close (its after-disconnect command) runs first, or
+        // it would undo what this one's before-connect command just set up (a VPN, a forward).
+        let closing = self.closing.remove(id).filter(|rx| !*rx.borrow());
+        self.connecting.insert(
+            id.to_string(),
+            backend.spawn(async move {
+                if let Some(mut rx) = closing {
+                    let _ = tokio::time::timeout(Duration::from_secs(90), rx.wait_for(|done| *done)).await;
+                }
+                connect_task(driver, cfg, conn_type, creds, net, pgpass, time_zone).await
+            }),
+        );
         Ok(())
+    }
+
+    /// Close `live` in the background, noted as closing until done (see `closing`).
+    fn close_in_background(&mut self, backend: &Backend, id: &str, close: impl std::future::Future<Output = ()> + Send + 'static) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        self.closing.insert(id.to_string(), rx);
+        backend.spawn_detached(async move {
+            close.await;
+            let _ = tx.send(true);
+        });
     }
 
     /// Poll connect jobs and keep-alive. Call once per frame.
@@ -1106,14 +1189,19 @@ impl ConnectionManager {
             tracing::info!("the computer slept: checking the connections");
             self.check_all(backend);
         }
-        self.abandoned.retain_mut(|(job, after)| match job.poll() {
+        self.closing.retain(|_, rx| !*rx.borrow());
+        let mut finished = Vec::new();
+        self.abandoned.retain_mut(|(id, job, after)| match job.poll() {
             Some(Ok(c)) => {
-                backend.spawn_detached(close_connected(c, after.take()));
+                finished.push((id.clone(), close_connected(c, after.take())));
                 false
             }
             Some(Err(_)) => false,
             None => true,
         });
+        for (id, close) in finished {
+            self.close_in_background(backend, &id, close);
+        }
         let ids: Vec<String> = self.connecting.keys().cloned().collect();
         for id in ids {
             let done = self.connecting.get_mut(&id).and_then(|j| j.poll());
@@ -1126,6 +1214,10 @@ impl ConnectionManager {
                         // The session's dialect: it knows the server (MySQL / MariaDB version,
                         // CockroachDB) and the connection's settings (SQLite foreign keys).
                         let dialect = c.session.dialect();
+                        for w in c.session.connect_warnings() {
+                            tracing::warn!("{}: {w}", cfg.name);
+                            self.connect_warnings.push((id.clone(), w));
+                        }
                         let catalog_folders = Arc::new(dialect.catalog_folders());
                         let conn_type = self.connection_type(&cfg.connection_type);
                         let main = SessionHandle::new(c.session, format!("{} (main)", cfg.name), c.database.clone());
@@ -1156,6 +1248,7 @@ impl ConnectionManager {
                                 catalog_folders,
                                 emptied: Vec::new(),
                                 emptied_seq: 0,
+                                closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                                 _keepalive: keepalive,
                             },
                         );
@@ -1183,8 +1276,9 @@ impl ConnectionManager {
             let Some(cfg) = self.config(&id).map(|c| self.effective_config(c)) else { continue };
             let Some(driver) = self.registry.get(cfg.kind) else { continue };
             let conn_type = self.connection_type(&cfg.connection_type);
-            // The database password the connection was opened with (it may have been prompted).
-            let prompted = Credentials { password: self.live[&id].params.password.clone(), ..Default::default() };
+            // What was typed when it was opened, and the database password it was opened with.
+            let mut prompted = self.prompted.get(&id).cloned().unwrap_or_default();
+            prompted.password = self.live[&id].params.password.clone().or(prompted.password);
             let creds = self.credentials(&id, &prompted);
             let job = backend.spawn(connect_task(driver, cfg, conn_type, creds, self.net.clone(), self.pgpass.clone(), session_time_zone(self.time_zone)));
             if let Some(live) = self.live.get_mut(&id) {
@@ -1213,18 +1307,20 @@ impl ConnectionManager {
 
     /// Disconnect, closing all sessions in the background.
     pub fn disconnect(&mut self, backend: &Backend, id: &str) {
+        self.prompted.remove(id);
         if let Some(live) = self.live.remove(id) {
             // Closed for its tabs at once: they open new sessions (after a reconnect)
             // instead of waiting on these, which may never answer again.
             for s in live.sessions() {
                 s.mark_closed_here();
             }
-            backend.spawn_detached(close_live(live));
+            live.closed.store(true, std::sync::atomic::Ordering::Release);
+            self.close_in_background(backend, id, close_live(live));
         }
         // A connect still running: its session and tunnel are closed once it finishes.
         if let Some(job) = self.connecting.remove(id) {
             let after = self.config(id).and_then(|c| c.init.shell_after_disconnect.clone());
-            self.abandoned.push((job, after));
+            self.abandoned.push((id.to_string(), job, after));
         }
     }
 
@@ -1258,6 +1354,7 @@ impl ConnectionManager {
 /// Close a connection's sessions (together: each is bounded, one that does not answer
 /// is given up) and tunnel, then run its after-disconnect command.
 async fn close_live(live: LiveConnection) {
+    live.closed.store(true, std::sync::atomic::Ordering::Release);
     let after = live.config.init.shell_after_disconnect.clone();
     let sessions = live.sessions();
     live.tab_sessions.lock().clear();
@@ -1374,6 +1471,25 @@ impl NetConnector for DirectNet {
 mod tests {
     use super::*;
 
+    /// A secret property (an Elasticsearch API key) is kept in the secret store, not in the
+    /// connections file, and comes back with the credentials when connecting.
+    #[test]
+    fn secret_properties_live_in_the_secret_store() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let mut cm = ConnectionManager::new(crate::driver_registry(), secrets.clone(), Arc::new(DirectNet));
+        let mut cfg = ternarygrid_core::config::ConnectionConfig::new(DbKind::Elasticsearch, "es");
+        cfg.properties.insert("api_key".into(), "s3cret".into());
+        cfg.properties.insert("https".into(), "true".into());
+        let id = cfg.id.clone();
+        cm.upsert(cfg);
+        let stored = cm.config(&id).unwrap().clone();
+        assert!(!stored.properties.contains_key("api_key"), "not in the connections file");
+        assert_eq!(stored.properties.get("https").map(String::as_str), Some("true"));
+        assert_eq!(secrets.get(&ternarygrid_core::config::property_secret_key(&id, "api_key")).unwrap().map(|s| s.expose().to_string()).as_deref(), Some("s3cret"));
+        let creds = cm.credentials_for(&stored, &Credentials::default());
+        assert_eq!(creds.properties.iter().map(|(k, v)| (k.as_str(), v.expose())).collect::<Vec<_>>(), vec![("api_key", "s3cret")]);
+    }
+
     #[test]
     fn session_time_zones() {
         assert_eq!(format_offset(25_200), "+07:00");
@@ -1482,6 +1598,35 @@ mod tests {
         });
         wait_for("the after-disconnect command", || marker.exists());
         assert!(!cm.is_connected(&id));
+    }
+
+    /// Reconnect: the old connection's after-disconnect command ends before the new one's
+    /// before-connect command starts (it tore down the VPN the new one had just opened).
+    #[cfg(unix)]
+    #[test]
+    fn a_reconnect_waits_for_the_old_close() {
+        let backend = Backend::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let mut cfg = ConnectionConfig::new(DbKind::Sqlite, "hooks");
+        cfg.file_path = Some(dir.path().join("h.db").display().to_string());
+        cfg.init.shell_before_connect = Some(format!("echo up >> '{}'", log.display()));
+        cfg.init.shell_after_disconnect = Some(format!("sleep 0.3; echo down >> '{}'", log.display()));
+        let mut cm = ConnectionManager::new(crate::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
+        let id = cfg.id.clone();
+        cm.upsert(cfg);
+        cm.connect(&backend, &id, Credentials::default()).unwrap();
+        wait_for("connect", || {
+            cm.poll(&backend);
+            cm.is_connected(&id)
+        });
+        cm.disconnect(&backend, &id);
+        cm.connect(&backend, &id, Credentials::default()).unwrap();
+        wait_for("reconnect", || {
+            cm.poll(&backend);
+            cm.is_connected(&id)
+        });
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "up\ndown\nup\n");
     }
 
     #[test]

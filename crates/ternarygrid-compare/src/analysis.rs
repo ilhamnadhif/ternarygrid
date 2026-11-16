@@ -570,6 +570,14 @@ impl<'a> Analysis<'a> {
         let name_change = |a: Option<&str>, b: Option<&str>| -> Option<PropertyChange> {
             if names && a.is_some() && b.is_some() && !ctx.same_opt(a, b) { Some(PropertyChange::new("name", a.map(str::to_string), b.map(str::to_string))) } else { None }
         };
+        // Attributes beyond the model (PostgreSQL: INITIALLY DEFERRED, NOT VALID, MATCH FULL …),
+        // between databases of one kind (another kind has no such words).
+        let same_kind = ctx.source.kind.is_some() && ctx.source.kind == ctx.target.kind;
+        let options_change = |a: Option<&str>, b: Option<&str>| -> Option<PropertyChange> {
+            let get = |d: &TableDef, n: Option<&str>| n.and_then(|n| d.constraint_options.get(n)).map(|o| o.summary()).unwrap_or_default();
+            let (x, y) = (get(s, a), get(t, b));
+            (same_kind && x != y).then(|| PropertyChange::new("options", Some(x), Some(y)))
+        };
         let columns = if o.columns { columns } else { SubMatch::default() };
 
         let primary_key = if o.primary_keys {
@@ -587,6 +595,7 @@ impl<'a> Analysis<'a> {
                         ch.push(PropertyChange::new("columns", Some(list(&a.columns)), Some(list(&b.columns))));
                     }
                     ch.extend(name_change(a.name.as_deref(), b.name.as_deref()));
+                    ch.extend(options_change(a.name.as_deref(), b.name.as_deref()));
                     ch
                 },
             )
@@ -608,6 +617,7 @@ impl<'a> Analysis<'a> {
                         ch.push(PropertyChange::new("columns", Some(list(&a.columns)), Some(list(&b.columns))));
                     }
                     ch.extend(name_change(a.name.as_deref(), b.name.as_deref()));
+                    ch.extend(options_change(a.name.as_deref(), b.name.as_deref()));
                     ch
                 },
             )
@@ -630,6 +640,7 @@ impl<'a> Analysis<'a> {
                         ch.push(PropertyChange::new("expression", Some(a.expression.clone()), Some(b.expression.clone())));
                     }
                     ch.extend(name_change(a.name.as_deref(), b.name.as_deref()));
+                    ch.extend(options_change(a.name.as_deref(), b.name.as_deref()));
                     ch
                 },
             )
@@ -674,6 +685,7 @@ impl<'a> Analysis<'a> {
                         ch.push(PropertyChange::new("deferrable", Some(yes_no(a.deferrable)), Some(yes_no(b.deferrable))));
                     }
                     ch.extend(name_change(a.name.as_deref(), b.name.as_deref()));
+                    ch.extend(options_change(a.name.as_deref(), b.name.as_deref()));
                     ch
                 },
             );

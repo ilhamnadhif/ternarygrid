@@ -441,25 +441,51 @@ fn render_xml(data: &CopyData, opts: &CopyOptions, fmt: &FormatOptions) -> Strin
 /// Parse clipboard text (TSV as produced by spreadsheets and TernaryGrid) into
 /// rows of fields. Quoted fields may contain tabs, quotes (`""`) and line
 /// breaks. A trailing line break is ignored.
+///
+/// A quote opens a quoted field only when the field ends right after its closing quote
+/// (`"a" b` is the text `"a" b`), and one line without tabs is one value as it is:
+/// `"Hello"` copied from an editor pastes with its quotes (spreadsheets quote only cells
+/// with line breaks).
 pub fn parse_clipboard_table(text: &str) -> Vec<Vec<String>> {
     let text = text.replace("\r\n", "\n");
     let text = text.strip_suffix('\n').unwrap_or(&text);
     if text.is_empty() {
         return Vec::new();
     }
+    if !text.contains('\t') && !text.contains('\n') {
+        return vec![vec![text.to_string()]];
+    }
     let delimiter = if text.contains('\t') { '\t' } else { '\u{0}' };
+    let chars: Vec<char> = text.chars().collect();
+    // The closing quote of a quoted field opened at `open`, when the field ends there.
+    let closing = |open: usize| {
+        let mut j = open + 1;
+        while j < chars.len() {
+            if chars[j] == '"' {
+                if chars.get(j + 1) == Some(&'"') {
+                    j += 2;
+                    continue;
+                }
+                return matches!(chars.get(j + 1), None | Some('\n')) || chars.get(j + 1) == Some(&delimiter);
+            }
+            j += 1;
+        }
+        false
+    };
     let mut rows = Vec::new();
     let mut row: Vec<String> = Vec::new();
     let mut field = String::new();
-    let mut chars = text.chars().peekable();
     let mut at_field_start = true;
     let mut in_quotes = false;
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
         if in_quotes {
             if c == '"' {
-                if chars.peek() == Some(&'"') {
+                if chars.get(i) == Some(&'"') {
                     field.push('"');
-                    chars.next();
+                    i += 1;
                 } else {
                     in_quotes = false;
                 }
@@ -469,7 +495,7 @@ pub fn parse_clipboard_table(text: &str) -> Vec<Vec<String>> {
             continue;
         }
         match c {
-            '"' if at_field_start => {
+            '"' if at_field_start && closing(i - 1) => {
                 in_quotes = true;
                 at_field_start = false;
             }
@@ -574,6 +600,11 @@ mod tests {
         assert_eq!(parse_clipboard_table("a\r\nb"), vec![vec!["a"], vec!["b"]]);
         assert_eq!(parse_clipboard_table("\"x\ty\"\t\"multi\nline\"\t\"q\"\"q\"\nz\t\t"), vec![vec!["x\ty", "multi\nline", "q\"q"], vec!["z", "", ""]]);
         assert_eq!(parse_clipboard_table("single value"), vec![vec!["single value"]]);
+        // Quotes that do not wrap a whole field are text.
+        assert_eq!(parse_clipboard_table("\"Hello\""), vec![vec!["\"Hello\""]]);
+        assert_eq!(parse_clipboard_table("\"a\" b\t2"), vec![vec!["\"a\" b", "2"]]);
+        assert_eq!(parse_clipboard_table("\"a\"\"b\"\t2\nx\ty"), vec![vec!["a\"b", "2"], vec!["x", "y"]]);
+        assert_eq!(parse_clipboard_table("\"multi\nline\""), vec![vec!["multi\nline"]]);
         assert!(parse_clipboard_table("").is_empty());
         // JSON as copied (no quotes around it) reads back as it is.
         assert_eq!(parse_clipboard_table("{\"a\":\"x\"}\t2"), vec![vec!["{\"a\":\"x\"}", "2"]]);

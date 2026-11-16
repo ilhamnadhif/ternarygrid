@@ -886,6 +886,11 @@ impl AiAssistantTab {
         };
         let action = self.action;
         let mut input = ActionInput { text: self.input.clone(), error: self.error_input.clone(), ..Default::default() };
+        // Without data rows for the provider, an error's details stay too: they often hold
+        // row values (`Key (email)=(ann@x.com) already exists`, "Failing row contains …").
+        if !cx.settings.ai.send_sample_data {
+            input.error = without_row_values(&input.error);
+        }
         let live = self.conn.as_ref().and_then(|c| cx.conns.live(c));
         // Plans and definitions come from the assistant's database, whichever the connection's is.
         let database = self.scope.as_ref().and_then(|s| s.database.clone());
@@ -2475,5 +2480,43 @@ mod look_tests {
         assert_eq!(grouped(318), "318");
         assert_eq!(grouped(2104), "2,104");
         assert_eq!(grouped(1_234_567u64), "1,234,567");
+    }
+}
+
+/// An error message without the parts that quote rows: its Detail line and values in
+/// `(…)=(…)` (the key the server names stays: `Key (email)=(…)`).
+fn without_row_values(error: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in error.lines() {
+        let l = line.trim_start();
+        if l.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("detail:")) || l.starts_with("Failing row contains") {
+            out.push("Detail: (row values left out)".to_string());
+            continue;
+        }
+        let mut s = String::new();
+        let mut rest = line;
+        while let Some(i) = rest.find(")=(") {
+            s.push_str(&rest[..i + 3]);
+            let after = &rest[i + 3..];
+            let close = after.find(')').unwrap_or(after.len());
+            s.push('…');
+            rest = &after[close..];
+        }
+        s.push_str(rest);
+        out.push(s);
+    }
+    out.join("\n")
+}
+
+#[cfg(test)]
+mod row_value_tests {
+    use super::*;
+
+    #[test]
+    fn errors_lose_their_row_values() {
+        let e = "[23505] duplicate key value violates unique constraint \"u\"\nDetail: Key (email)=(ann@x.com) already exists.\nHint: h";
+        let s = without_row_values(e);
+        assert!(!s.contains("ann@x.com") && s.contains("duplicate key") && s.contains("Hint: h"), "{s}");
+        assert_eq!(without_row_values("Key (id)=(5) is still referenced"), "Key (id)=(…) is still referenced");
     }
 }

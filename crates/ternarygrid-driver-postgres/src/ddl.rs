@@ -115,20 +115,56 @@ pub(crate) fn column_definition(c: &ColumnDef) -> String {
     s
 }
 
-fn key_clause(kind: &str, k: &KeyDef) -> String {
-    match &k.name {
-        Some(n) => format!("CONSTRAINT {} {kind} ({})", quote_ident(n), ident_list(&k.columns)),
-        None => format!("{kind} ({})", ident_list(&k.columns)),
+/// The options of the constraint named `name` of `t` (none for an unnamed one).
+fn options<'a>(t: &'a TableDef, name: Option<&str>) -> Option<&'a ConstraintOptions> {
+    name.and_then(|n| t.constraint_options.get(n))
+}
+
+/// `DEFERRABLE` / `INITIALLY DEFERRED`, and `NOT VALID` when `altering` (a new table has
+/// no rows to leave unchecked).
+fn constraint_attributes(s: &mut String, deferrable: bool, o: Option<&ConstraintOptions>, altering: bool) {
+    if deferrable {
+        s.push_str(" DEFERRABLE");
+        if o.is_some_and(|o| o.initially_deferred) {
+            s.push_str(" INITIALLY DEFERRED");
+        }
+    }
+    if altering && o.is_some_and(|o| o.not_valid) {
+        s.push_str(" NOT VALID");
     }
 }
 
-fn check_clause(c: &CheckDef) -> String {
+fn key_clause(kind: &str, k: &KeyDef, t: &TableDef) -> String {
+    let o = options(t, k.name.as_deref());
+    let mut s = match &k.name {
+        Some(n) => format!("CONSTRAINT {} {kind}", quote_ident(n)),
+        None => kind.to_string(),
+    };
+    if kind == "UNIQUE" && o.is_some_and(|o| o.nulls_not_distinct) {
+        s.push_str(" NULLS NOT DISTINCT");
+    }
+    s.push_str(&format!(" ({})", ident_list(&k.columns)));
+    if let Some(p) = o.and_then(|o| o.index_parameters.as_deref()) {
+        s.push(' ');
+        s.push_str(p);
+    }
+    constraint_attributes(&mut s, o.is_some_and(|o| o.deferrable), o, false);
+    s
+}
+
+fn check_clause(c: &CheckDef, t: &TableDef, altering: bool) -> String {
+    let o = options(t, c.name.as_deref());
     let expr = c.expression.trim();
     let wrapped = if is_wrapped(expr) { expr.to_string() } else { format!("({expr})") };
-    match &c.name {
+    let mut s = match &c.name {
         Some(n) => format!("CONSTRAINT {} CHECK {wrapped}", quote_ident(n)),
         None => format!("CHECK {wrapped}"),
+    };
+    if o.is_some_and(|o| o.no_inherit) {
+        s.push_str(" NO INHERIT");
     }
+    constraint_attributes(&mut s, false, o, altering);
+    s
 }
 
 /// The expression is entirely enclosed in one pair of parentheses.
@@ -153,21 +189,23 @@ fn is_wrapped(expr: &str) -> bool {
     true
 }
 
-fn fk_clause(fk: &ForeignKeyDef) -> String {
+fn fk_clause(fk: &ForeignKeyDef, t: &TableDef, altering: bool) -> String {
+    let o = options(t, fk.name.as_deref());
     let mut s = String::new();
     if let Some(n) = &fk.name {
         s.push_str(&format!("CONSTRAINT {} ", quote_ident(n)));
     }
     s.push_str(&format!("FOREIGN KEY ({}) REFERENCES {} ({})", ident_list(&fk.columns), qualified(fk.ref_schema.as_deref(), &fk.ref_table), ident_list(&fk.ref_columns)));
+    if let Some(m) = o.and_then(|o| o.match_type.as_deref()) {
+        s.push_str(&format!(" MATCH {m}"));
+    }
     if fk.on_update != FkAction::NoAction {
         s.push_str(&format!(" ON UPDATE {}", fk.on_update.sql()));
     }
     if fk.on_delete != FkAction::NoAction {
         s.push_str(&format!(" ON DELETE {}", fk.on_delete.sql()));
     }
-    if fk.deferrable {
-        s.push_str(" DEFERRABLE");
-    }
+    constraint_attributes(&mut s, fk.deferrable, o, altering);
     s
 }
 
@@ -320,17 +358,17 @@ impl PgDdl {
         let mut s = format!("{head} {} PARTITION OF {parent}", tname(t));
         let mut body = Vec::new();
         if let Some(pk) = t.primary_key.as_ref().filter(|k| !k.columns.is_empty()) {
-            body.push(key_clause("PRIMARY KEY", pk));
+            body.push(key_clause("PRIMARY KEY", pk, t));
         }
         for u in &t.unique_keys {
-            body.push(key_clause("UNIQUE", u));
+            body.push(key_clause("UNIQUE", u, t));
         }
         for c in &t.checks {
-            body.push(check_clause(c));
+            body.push(check_clause(c, t, false));
         }
         if include_fks {
             for fk in &t.foreign_keys {
-                body.push(fk_clause(fk));
+                body.push(fk_clause(fk, t, false));
             }
         }
         if !body.is_empty() {
@@ -370,17 +408,17 @@ impl DdlGenerator for PgDdl {
             };
             let mut body: Vec<String> = t.columns.iter().map(column_definition).collect();
             if let Some(pk) = t.primary_key.as_ref().filter(|k| !k.columns.is_empty()) {
-                body.push(key_clause("PRIMARY KEY", pk));
+                body.push(key_clause("PRIMARY KEY", pk, t));
             }
             for u in &t.unique_keys {
-                body.push(key_clause("UNIQUE", u));
+                body.push(key_clause("UNIQUE", u, t));
             }
             for c in &t.checks {
-                body.push(check_clause(c));
+                body.push(check_clause(c, t, false));
             }
             if include_foreign_keys {
                 for fk in &t.foreign_keys {
-                    body.push(fk_clause(fk));
+                    body.push(fk_clause(fk, t, false));
                 }
             }
             let mut s = if body.is_empty() { format!("{head} {name} ()") } else { format!("{head} {name} (\n    {}\n)", body.join(",\n    ")) };
@@ -698,7 +736,7 @@ impl DdlGenerator for PgDdl {
     }
 
     fn add_primary_key(&self, table: &TableDef, key: &KeyDef) -> String {
-        format!("ALTER TABLE {} ADD {}", tname(table), key_clause("PRIMARY KEY", key))
+        format!("ALTER TABLE {} ADD {}", tname(table), key_clause("PRIMARY KEY", key, table))
     }
 
     fn drop_primary_key(&self, table: &TableDef, key: &KeyDef) -> String {
@@ -707,7 +745,7 @@ impl DdlGenerator for PgDdl {
     }
 
     fn add_unique_key(&self, table: &TableDef, key: &KeyDef) -> String {
-        format!("ALTER TABLE {} ADD {}", tname(table), key_clause("UNIQUE", key))
+        format!("ALTER TABLE {} ADD {}", tname(table), key_clause("UNIQUE", key, table))
     }
 
     fn drop_unique_key(&self, table: &TableDef, key: &KeyDef) -> String {
@@ -716,7 +754,7 @@ impl DdlGenerator for PgDdl {
     }
 
     fn add_check(&self, table: &TableDef, check: &CheckDef) -> String {
-        format!("ALTER TABLE {} ADD {}", tname(table), check_clause(check))
+        format!("ALTER TABLE {} ADD {}", tname(table), check_clause(check, table, true))
     }
 
     fn drop_check(&self, table: &TableDef, check: &CheckDef) -> String {
@@ -725,7 +763,7 @@ impl DdlGenerator for PgDdl {
     }
 
     fn add_foreign_key(&self, table: &TableDef, fk: &ForeignKeyDef) -> String {
-        format!("ALTER TABLE {} ADD {}", tname(table), fk_clause(fk))
+        format!("ALTER TABLE {} ADD {}", tname(table), fk_clause(fk, table, true))
     }
 
     fn drop_foreign_key(&self, table: &TableDef, fk: &ForeignKeyDef) -> String {

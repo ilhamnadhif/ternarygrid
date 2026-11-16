@@ -131,6 +131,8 @@ impl ImportDialog {
             cx.toasts.error(tr("Cannot store the imported passwords"), Some(e.to_string()));
         }
         cx.conns.dirty = true;
+        // An API key the file had in its properties goes to the secret store.
+        cx.conns.stash_secret_properties();
         let detail = if warnings.is_empty() { None } else { Some(warnings.join("\n")) };
         let mut parts = vec![trn(summary.added, "Imported 1 connection", "Imported {} connections")];
         if summary.replaced > 0 {

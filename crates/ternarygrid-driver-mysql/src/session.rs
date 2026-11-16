@@ -84,6 +84,11 @@ pub struct MySqlSession {
     /// Lets `close()` interrupt the worker of an open cursor.
     abort: Option<watch::Sender<bool>>,
     tls: bool,
+    /// Prefer fell back to a plain connection.
+    plain_fallback: bool,
+    /// The last statement may have changed `sql_mode` (`SET sql_mode = …`): it is read again
+    /// before the next one, so literals follow `NO_BACKSLASH_ESCAPES` as it is now.
+    sql_mode_changed: bool,
     connect_timeout: Duration,
 }
 
@@ -126,13 +131,19 @@ impl MySqlSession {
             Some(r) => (
                 convert::read::text_or_empty(r, 0),
                 convert::read::int(r, 1)
-                    .map(|v| v as u32)
-                    .unwrap_or(conn.id()),
+                    .map(|v| v as u64)
+                    .unwrap_or(conn.id() as u64),
                 convert::read::text_or_empty(r, 2),
                 convert::read::int(r, 3).unwrap_or(0) as u32,
                 convert::read::text_or_empty(r, 4),
             ),
-            None => (String::new(), conn.id(), String::new(), 0, String::new()),
+            None => (
+                String::new(),
+                conn.id() as u64,
+                String::new(),
+                0,
+                String::new(),
+            ),
         };
         let flavor = if version.is_empty() {
             configured
@@ -173,7 +184,12 @@ impl MySqlSession {
         let side_opts: mysql_async::Opts = mysql_async::OptsBuilder::from_opts(opened.opts.clone())
             .db_name(None::<String>)
             .into();
-        let killer = Killer::new(side_opts, conn_id, params.connect_timeout);
+        let server: Option<String> = conn
+            .query_first(connect::SERVER_IDENTITY)
+            .await
+            .ok()
+            .flatten();
+        let killer = Killer::new(side_opts, conn_id, server, params.connect_timeout);
         let cancel = Arc::new(MySqlCancelHandle {
             killer: killer.clone(),
         });
@@ -200,6 +216,9 @@ impl MySqlSession {
             settings,
             abort: None,
             tls: opened.tls,
+            sql_mode_changed: false,
+            plain_fallback: !opened.tls
+                && params.ssl.mode == ternarygrid_core::config::SslMode::Prefer,
             connect_timeout: params.connect_timeout,
         })
     }
@@ -226,7 +245,7 @@ impl MySqlSession {
 
     /// Server id of this session's connection (`CONNECTION_ID()`).
     pub(crate) fn connection_id(&self) -> u64 {
-        self.killer.connection_id() as u64
+        self.killer.connection_id()
     }
 
     fn apply_return(&mut self, r: ConnReturn) {
@@ -417,6 +436,14 @@ impl Session for MySqlSession {
         &self.info
     }
 
+    fn connect_warnings(&self) -> Vec<String> {
+        if self.plain_fallback {
+            vec![ternarygrid_core::tr("The connection is not encrypted: TLS could not be used, and the SSL mode Prefer fell back to a plain connection. Set the SSL mode to Require to refuse such connections.").to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {
         Some(self.cancel.clone())
     }
@@ -464,6 +491,16 @@ impl Session for MySqlSession {
         opts: &ExecOptions,
     ) -> DbResult<Box<dyn QueryCursor>> {
         self.wait_idle().await?;
+        if std::mem::take(&mut self.sql_mode_changed)
+            && let Ok(rows) = self.rows("SELECT @@SESSION.sql_mode", Vec::new()).await
+            && let Some(mode) = rows.first().and_then(|r| crate::convert::read::text(r, 0))
+        {
+            self.profile.sql_mode = mode.to_ascii_uppercase();
+            self.dialect = Arc::new(MySqlDialect::for_server(self.profile.clone()));
+        }
+        if sql.to_ascii_lowercase().contains("sql_mode") {
+            self.sql_mode_changed = true;
+        }
         let cs: Charset = self.settings.wire_charset;
         let encoded = convert::encode_text(&cs, sql)?;
         let params = if params.is_empty() {

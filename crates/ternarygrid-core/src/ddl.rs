@@ -231,6 +231,58 @@ pub struct TableDef {
     /// share it): it is not used as a row key (editing, sync scripts, generated
     /// UPDATE/DELETE), so a change of one row cannot hit others.
     pub primary_key_not_unique: bool,
+    /// Attributes of the named constraints beyond the model's (PostgreSQL: `INITIALLY
+    /// DEFERRED`, `NOT VALID`, `MATCH FULL` …), by constraint name. The DDL replays them.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub constraint_options: BTreeMap<String, ConstraintOptions>,
+}
+
+/// What a constraint has beyond its [`KeyDef`], [`CheckDef`] or [`ForeignKeyDef`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ConstraintOptions {
+    /// `FULL` or `PARTIAL` (`MATCH …` of a foreign key; `SIMPLE`, the default, is `None`).
+    pub match_type: Option<String>,
+    /// `DEFERRABLE` of a primary or unique key (a foreign key's is [`ForeignKeyDef::deferrable`]).
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+    /// The existing rows were not checked (`NOT VALID`).
+    pub not_valid: bool,
+    /// `NO INHERIT` of a check.
+    pub no_inherit: bool,
+    /// `NULLS NOT DISTINCT` of a unique key.
+    pub nulls_not_distinct: bool,
+    /// What follows a key's columns: `INCLUDE (…)`, `WITH (…)`, `USING INDEX TABLESPACE …`.
+    pub index_parameters: Option<String>,
+}
+
+impl ConstraintOptions {
+    /// The attributes as words, for comparing and showing (`MATCH FULL, INITIALLY DEFERRED`).
+    pub fn summary(&self) -> String {
+        let mut v: Vec<String> = Vec::new();
+        if let Some(m) = &self.match_type {
+            v.push(format!("MATCH {m}"));
+        }
+        if self.nulls_not_distinct {
+            v.push("NULLS NOT DISTINCT".into());
+        }
+        if let Some(p) = &self.index_parameters {
+            v.push(p.clone());
+        }
+        if self.deferrable {
+            v.push("DEFERRABLE".into());
+        }
+        if self.initially_deferred {
+            v.push("INITIALLY DEFERRED".into());
+        }
+        if self.no_inherit {
+            v.push("NO INHERIT".into());
+        }
+        if self.not_valid {
+            v.push("NOT VALID".into());
+        }
+        v.join(", ")
+    }
 }
 
 impl TableDef {

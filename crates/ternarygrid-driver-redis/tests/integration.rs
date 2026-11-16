@@ -326,3 +326,47 @@ async fn read_only_connections_refuse_writes() {
     );
     run(rw.as_mut(), "FLUSHDB").await;
 }
+
+/// Keys and values that are no UTF-8 keep their bytes: read, recreated and deleted as
+/// themselves (a lossy name deleted nothing; the recreate script wrote U+FFFD).
+#[tokio::test]
+async fn binary_keys_and_values_keep_their_bytes() {
+    let Some(mut p) = params() else { return };
+    p.database = Some("10".into());
+    let mut s = RedisDriver::new().connect(&p).await.expect("connect");
+    let s = s.as_mut();
+    run(s, "DEL \"bin:\\xff\\x01\" blob").await;
+    run(s, "SET \"bin:\\xff\\x01\" v").await;
+    run(s, "HSET blob f \"\\x82\\xa1\\x00\"").await;
+    let keys = s
+        .list_objects(&SchemaRef::schema("db10"), ObjectKind::Table)
+        .await
+        .unwrap();
+    let bin = keys
+        .iter()
+        .find(|k| k.obj.name.starts_with("bin:"))
+        .expect("the binary key");
+    assert_eq!(bin.obj.name, "bin:\\xff\u{1}");
+    let d = s.dialect();
+    let (_, r) = rows(s, &d.select_table(&bin.obj, None, None, None, None), 10).await;
+    assert_eq!(r, vec![vec![Value::Text("v".into())]]);
+    let blob = keys.iter().find(|k| k.obj.name == "blob").unwrap();
+    let before = s.object_ddl(&blob.obj).await.unwrap();
+    assert!(
+        before.contains("HSET blob f \"\\x82\\xa1\\x00\""),
+        "{before}"
+    );
+    run(s, "DEL blob").await;
+    for line in before.lines().filter(|l| !l.starts_with('#')) {
+        run(s, line).await;
+    }
+    assert_eq!(s.object_ddl(&blob.obj).await.unwrap(), before);
+    run(s, &d.ddl().drop_table(None, &bin.obj.name, false)).await;
+    assert_eq!(
+        query_scalar(s, "EXISTS \"bin:\\xff\\x01\"", &[])
+            .await
+            .unwrap(),
+        Value::Int(0)
+    );
+    run(s, "DEL blob").await;
+}

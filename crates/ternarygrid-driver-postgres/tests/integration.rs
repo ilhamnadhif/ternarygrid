@@ -1215,6 +1215,53 @@ fn normalize(def: &TableDef, from: &str, to: &str) -> TableDef {
     d
 }
 
+/// Constraint attributes the model had no room for (a deferred key replayed immediate, a
+/// NOT VALID check replayed validated) are read and written back.
+#[tokio::test]
+async fn constraint_attributes_survive_the_ddl() {
+    let Some(url) = url() else { return };
+    let params = params_from_url(&url);
+    with_schema(&params, |params, s1| async move {
+        let s2 = format!("{s1}_copy");
+        let mut s = connect(&params).await;
+        let nnd = if major(s.as_ref()) >= 15 { " NULLS NOT DISTINCT" } else { "" };
+        exec(&mut s, &format!("CREATE TABLE {s1}.p (id int PRIMARY KEY, code int, tag int, CONSTRAINT p_tag_key UNIQUE (tag) DEFERRABLE, CONSTRAINT p_code_key UNIQUE{nnd} (code) INCLUDE (id) DEFERRABLE INITIALLY DEFERRED)")).await;
+        exec(&mut s, &format!("CREATE TABLE {s1}.c (id int, pid int, a int, b int, CONSTRAINT c_b_check CHECK (b >= 0) NO INHERIT)")).await;
+        exec(&mut s, &format!("INSERT INTO {s1}.c VALUES (1, NULL, -1, 0)")).await;
+        exec(&mut s, &format!("ALTER TABLE {s1}.c ADD CONSTRAINT c_pid_fkey FOREIGN KEY (pid) REFERENCES {s1}.p (id) MATCH FULL DEFERRABLE INITIALLY DEFERRED")).await;
+        exec(&mut s, &format!("ALTER TABLE {s1}.c ADD CONSTRAINT c_a_check CHECK (a > 0) NOT VALID")).await;
+        let ddl = PgDdl::new();
+        let p = s.table_definition(&ObjectRef::table(Some(s1.clone()), "p")).await.unwrap();
+        let c = s.table_definition(&ObjectRef::table(Some(s1.clone()), "c")).await.unwrap();
+        let text = ddl.create_table(&p, true).join(";\n");
+        assert!(text.contains(&format!("UNIQUE{nnd} (code) INCLUDE (id) DEFERRABLE INITIALLY DEFERRED")), "{text}");
+        assert!(text.contains("UNIQUE (tag) DEFERRABLE\n"), "{text}");
+        let fk = ddl.add_foreign_key(&c, &c.foreign_keys[0]);
+        assert!(fk.contains("MATCH FULL") && fk.contains("DEFERRABLE INITIALLY DEFERRED"), "{fk}");
+        let check = c.checks.iter().find(|k| k.name.as_deref() == Some("c_a_check")).unwrap();
+        assert!(ddl.add_check(&c, check).ends_with("NOT VALID"), "{}", ddl.add_check(&c, check));
+        assert!(ddl.create_table(&c, false).join(";").contains("NO INHERIT"));
+        // Replayed into another schema with the row the NOT VALID check leaves alone.
+        exec(&mut s, &format!("CREATE SCHEMA {s2}")).await;
+        let (tp, mut tc) = (normalize(&p, &s1, &s2), normalize(&c, &s1, &s2));
+        let not_valid: Vec<_> = tc.checks.iter().filter(|k| k.name.as_deref() == Some("c_a_check")).cloned().collect();
+        tc.checks.retain(|k| k.name.as_deref() != Some("c_a_check"));
+        for stmt in ddl.create_table(&tp, false).into_iter().chain(ddl.create_table(&tc, false)) {
+            exec(&mut s, &stmt).await;
+        }
+        exec(&mut s, &format!("INSERT INTO {s2}.c VALUES (1, NULL, -1, 0)")).await;
+        exec(&mut s, &ddl.add_check(&tc, &not_valid[0])).await;
+        exec(&mut s, &ddl.add_foreign_key(&tc, &tc.foreign_keys[0])).await;
+        for (name, a) in [("p", &p), ("c", &c)] {
+            let b = s.table_definition(&ObjectRef::table(Some(s2.clone()), name)).await.unwrap();
+            assert_eq!(a.constraint_options, b.constraint_options, "constraint options of {name}");
+        }
+        exec(&mut s, &format!("DROP SCHEMA {s2} CASCADE")).await;
+        s.close().await.ok();
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn ddl_round_trip_into_second_schema() {
     let Some(url) = url() else { return };

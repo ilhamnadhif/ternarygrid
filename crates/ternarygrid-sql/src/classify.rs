@@ -835,12 +835,11 @@ fn classify_sig(src: &str, sig: &[Token], syntax: &SqlSyntax) -> StatementInfo {
         return classify_run(src, sig, syntax);
     };
     let mut info = classify_run(src, &sig[first.clone()], syntax);
-    // Procedure bodies and blocks hold statements of their own: their dangers are not the statement's.
-    let holds_body = info.is_write
-        && matches!(
-            info.kind,
-            StatementKind::Create | StatementKind::Alter | StatementKind::Other
-        );
+    // Procedure bodies hold statements of their own: their dangers are not the statement's
+    // (they run when it is called). An anonymous block (`BEGIN DELETE FROM t; END;`) runs
+    // its statements now: their dangers are asked about.
+    let holds_body =
+        info.is_write && matches!(info.kind, StatementKind::Create | StatementKind::Alter);
     for r in &pieces[1..] {
         let piece = classify_run(src, &sig[r.clone()], syntax);
         info.is_write |= piece.is_write;
@@ -906,6 +905,12 @@ fn next_batch_statement(
     // CREATE TABLE / INDEX hold no statements (a routine's, a view's, a trigger's body is
     // not cut): `CREATE INDEX ix ON t(a)\nDELETE FROM orders` hid the DELETE's danger.
     let word = |k: usize| sig.get(k).map(|t| t.text(src)).unwrap_or("");
+    // Control flow runs the statements it holds now: `IF … DROP TABLE t`, `BEGIN TRY
+    // TRUNCATE TABLE t END TRY …`, `BEGIN DELETE FROM t; END;` are looked into.
+    let control = ["IF", "WHILE", "BEGIN", "ELSE", "DECLARE"]
+        .iter()
+        .any(|w| word(from).eq_ignore_ascii_case(w))
+        && kind != K::Transaction(TxCommand::Begin);
     let creates_storage = kind == K::Create
         && (from + 1..(from + 5).min(sig.len()))
             .take_while(|&k| {
@@ -918,6 +923,7 @@ fn next_batch_statement(
             });
     let cut = !is_write
         || creates_storage
+        || control
         || matches!(
             kind,
             K::Insert | K::Update | K::Delete | K::Drop | K::Truncate | K::Call
@@ -1224,6 +1230,11 @@ impl<'a> Sig<'a> {
             "TABLE" => {
                 let mut i = info(K::Select, first).rows();
                 i.target = self.name_at(p + 1);
+                // MySQL `TABLE t INTO OUTFILE '/x'` writes a file on the server.
+                if self.find_top(p + 1, |j| self.w(j, "INTO")).is_some() {
+                    i.is_write = true;
+                    i.returns_rows = false;
+                }
                 i
             }
             "INSERT" | "REPLACE" | "UPSERT" => {
@@ -1489,7 +1500,7 @@ impl<'a> Sig<'a> {
                 && (self.any(j + 1, &["UPDATE", "SHARE"]) || (self.any(j + 1, &["NO", "KEY"]))))
                 || (self.w(j, "LOCK") && self.w(j + 1, "IN"))
         });
-        if locking.is_some() || self.lifts_read_only(p + 1) {
+        if locking.is_some() || self.lifts_read_only(p + 1) || self.advances_sequence(p + 1) {
             i.is_write = true;
         }
         if i.target.is_none() {
@@ -1593,6 +1604,17 @@ impl<'a> Sig<'a> {
         let mut i = StatementInfo::new(K::Set, first);
         i.is_write = global || read_only_setting;
         i
+    }
+
+    /// A sequence taken from (`NEXT VALUE FOR s` in T-SQL, `s.NEXTVAL` in Oracle): the
+    /// servers do not stop it on read-only connections, and it cannot be undone.
+    fn advances_sequence(&self, from: usize) -> bool {
+        (from..self.t.len()).any(|k| {
+            (self.w(k, "NEXT") && self.w(k + 1, "VALUE") && self.w(k + 2, "FOR"))
+                || (self.text(k).eq_ignore_ascii_case("NEXTVAL")
+                    && k > 0
+                    && self.kind(k - 1) == Some(TokenKind::Dot))
+        })
     }
 
     /// `READ WRITE` from token `from` on.
@@ -1771,6 +1793,16 @@ mod tests {
         classify(sql, &mysql())
     }
 
+    /// Reads with lasting effects count as writes (read-only connections refuse them).
+    #[test]
+    fn reads_that_take_sequences_or_write_files() {
+        assert!(classify("SELECT NEXT VALUE FOR dbo.seq", &tsql()).is_write);
+        assert!(c("SELECT s.NEXTVAL FROM dual").is_write);
+        assert!(!c("SELECT nextval_note FROM t").is_write);
+        assert!(cm("TABLE users INTO OUTFILE '/tmp/x'").is_write);
+        assert!(!cm("TABLE users").is_write);
+    }
+
     /// MySQL / MariaDB statements that hid a write or a danger behind another keyword.
     #[test]
     fn hidden_writes_and_dangers_of_mysql() {
@@ -1825,6 +1857,28 @@ mod tests {
         ] {
             assert!(!t(sql).is_write, "{sql}");
         }
+        // Statements inside control flow and anonymous blocks keep their dangers.
+        assert_eq!(
+            t("IF OBJECT_ID('dbo.t') IS NOT NULL DROP TABLE dbo.t").danger,
+            Some(Danger::Drop)
+        );
+        assert_eq!(
+            t("BEGIN TRY TRUNCATE TABLE dbo.t END TRY BEGIN CATCH END CATCH").danger,
+            Some(Danger::Truncate)
+        );
+        assert_eq!(
+            t("CREATE PROCEDURE p AS DELETE FROM dbo.t").danger,
+            None,
+            "a body runs when called"
+        );
+        let mut ora = SqlSyntax::ansi();
+        ora.compound_blocks = true;
+        ora.plsql_blocks = true;
+        ora.batch_separator = Some("/");
+        assert_eq!(
+            classify("BEGIN DELETE FROM orders; COMMIT; END;", &ora).danger,
+            Some(Danger::DeleteWithoutWhere)
+        );
         // CREATE TABLE / INDEX do not hide what follows them.
         assert_eq!(
             t("CREATE INDEX ix ON dbo.t(a)\nDELETE FROM dbo.orders").danger,

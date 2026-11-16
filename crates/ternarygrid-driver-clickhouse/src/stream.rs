@@ -197,6 +197,37 @@ impl<R: Read> LineReader<R> {
         Ok(Some(&self.buf))
     }
 
+    /// Next line of at most `max` bytes, and whether it ended there (`false`: a piece of a
+    /// longer line, the rest follows). `FORMAT Values` writes a whole result on one line:
+    /// read whole, it was held in memory at once.
+    pub fn next_piece(&mut self, max: usize) -> std::io::Result<Option<(&[u8], bool)>> {
+        self.buf.clear();
+        loop {
+            let available = self.inner.fill_buf()?;
+            if available.is_empty() {
+                break;
+            }
+            let take = available.len().min(max.saturating_sub(self.buf.len()).max(1));
+            if let Some(i) = available[..take].iter().position(|&b| b == b'\n') {
+                self.buf.extend_from_slice(&available[..i]);
+                self.inner.consume(i + 1);
+                return Ok(Some((&self.buf, true)));
+            }
+            self.buf.extend_from_slice(&available[..take]);
+            self.inner.consume(take);
+            if self.buf.len() >= max {
+                // Ending right there (the line break or the body's end next) it is whole.
+                let next = self.inner.fill_buf()?;
+                let whole = next.first().is_none_or(|&b| b == b'\n');
+                if !next.is_empty() && whole {
+                    self.inner.consume(1);
+                }
+                return Ok(Some((&self.buf, whole)));
+            }
+        }
+        if self.buf.is_empty() { Ok(None) } else { Ok(Some((&self.buf, true))) }
+    }
+
     /// True when the next read would have to wait for the network.
     pub fn buffer_is_empty(&self) -> bool {
         self.inner.buffer().is_empty()
@@ -207,6 +238,22 @@ impl<R: Read> LineReader<R> {
 mod tests {
     use super::*;
     use ternarygrid_core::ErrorKind;
+
+    /// A line longer than the cap comes in pieces; short lines whole.
+    #[test]
+    fn long_lines_come_in_pieces() {
+        let body = b"abcdefghij\nxy\n\nlast";
+        let mut r = LineReader::with_capacity(3, &body[..]);
+        let mut got = Vec::new();
+        while let Some((l, whole)) = r.next_piece(4).unwrap() {
+            got.push((String::from_utf8(l.to_vec()).unwrap(), whole));
+        }
+        let want = [("abcd", false), ("efgh", false), ("ij", true), ("xy", true), ("", true), ("last", true)];
+        let mut r = LineReader::with_capacity(3, &b"abcd\nef"[..]);
+        assert_eq!(r.next_piece(4).unwrap(), Some((&b"abcd"[..], true)));
+        assert_eq!(r.next_piece(4).unwrap(), Some((&b"ef"[..], true)));
+        assert_eq!(got, want.map(|(a, b)| (a.to_string(), b)));
+    }
 
     fn feed_all(p: &mut BodyParser, body: &[u8]) -> (Vec<Vec<Json>>, Option<DbError>) {
         let mut rows = Vec::new();

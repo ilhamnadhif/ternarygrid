@@ -343,7 +343,12 @@ impl ExportTab {
         let database = export_database(&job);
         let Some(live) = cx.conns.live(&self.conn) else { return };
         let factory: Arc<dyn SessionFactory> = Arc::new(AppSessionFactory::from_live(live, database.as_deref()));
-        let sql_dialect = if job.format == ExportFormat::Sql { self.sql_dialect.map(|k| cx.conns.registry.dialect(k)) } else { None };
+        // The same product as the connection: the server's own dialect, through the factory.
+        let sql_dialect = if job.format == ExportFormat::Sql {
+            self.sql_dialect.filter(|k| Some(*k) != cx.conns.config(&self.conn).map(|c| c.kind)).map(|k| cx.conns.registry.dialect(k))
+        } else {
+            None
+        };
         self.error = None;
         self.result = None;
         self.log.clear();
@@ -431,7 +436,11 @@ impl ExportTab {
             options.sql.source_kind = Some(kind);
         }
         let format = self.settings.format;
-        let dialect = cx.conns.registry.dialect(self.sql_dialect.unwrap_or(kind));
+        // The connected server's dialect for its own product (its sql_mode), else the target's.
+        let dialect = match (self.sql_dialect, cx.conns.live(&self.conn)) {
+            (k, Some(live)) if k.is_none_or(|k| k == kind) => live.dialect.clone(),
+            (k, _) => cx.conns.registry.dialect(k.unwrap_or(kind)),
+        };
         let item = self.fetched_item();
         let file = expand_file_name(&self.settings.file_name_pattern, &item, &self.settings.source, 1, format, chrono::Local::now().naive_local());
         let path = self.settings.output_folder.join(file);

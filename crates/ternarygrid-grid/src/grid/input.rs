@@ -746,7 +746,7 @@ impl GridFrame<'_> {
         match super::copy_text_and_nulls(self.model, self.state, self.options, opts) {
             Ok((text, cells, texts, nulls, gaps)) => {
                 let plain = opts.format == CopyFormat::Tsv && !opts.include_header && !opts.include_row_numbers;
-                self.state.rt.last_copy = plain.then(|| super::state::LastCopy { text: text.clone(), cells: texts, nulls, gaps });
+                super::state::LastCopy::remember(plain.then(|| super::state::LastCopy { text: text.clone(), cells: texts, nulls, gaps }));
                 self.ctx.copy_text(text);
                 self.actions.push(GridAction::Copied { cells, format: opts.format });
                 let msg = if opts.format == CopyFormat::Tsv && !opts.include_header {

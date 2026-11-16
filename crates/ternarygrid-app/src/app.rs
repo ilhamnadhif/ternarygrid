@@ -1821,6 +1821,10 @@ impl eframe::App for TernaryGridApp {
                 self.nav.expand(crate::nav::NavNode::Connection(id.clone()));
             }
         }
+        for (id, warning) in std::mem::take(&mut self.conns.connect_warnings) {
+            let name = self.conns.config(&id).map(|c| c.name.clone()).unwrap_or_default();
+            self.toasts.warning(ternarygrid_core::trf("Connected to {}, with a warning", &[&name]), Some(warning));
+        }
         for (id, err) in self.conns.errors() {
             let name = self.conns.config(&id).map(|c| c.name.clone()).unwrap_or_default();
             self.toasts.error(ternarygrid_core::trf("Cannot connect to {}", &[&name]), Some(err));

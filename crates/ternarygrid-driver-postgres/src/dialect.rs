@@ -47,6 +47,9 @@ pub fn syntax() -> &'static SqlSyntax {
 pub struct PgDialect {
     kind: DbKind,
     ddl: PgDdl,
+    /// The server predates SCRAM (PostgreSQL 9.x, Greenplum 6): a SCRAM verifier sent as the
+    /// password would become the password itself.
+    no_scram: bool,
 }
 
 impl Default for PgDialect {
@@ -58,12 +61,18 @@ impl Default for PgDialect {
 impl PgDialect {
     /// Dialect for PostgreSQL.
     pub fn new() -> Self {
-        PgDialect { kind: DbKind::Postgres, ddl: PgDdl::new() }
+        PgDialect { kind: DbKind::Postgres, ddl: PgDdl::new(), no_scram: false }
     }
 
     /// Dialect for CockroachDB (PostgreSQL syntax, fewer maintenance operations).
     pub fn cockroach() -> Self {
-        PgDialect { kind: DbKind::CockroachDb, ddl: PgDdl::new() }
+        PgDialect { kind: DbKind::CockroachDb, ddl: PgDdl::new(), no_scram: false }
+    }
+
+    /// Dialect for a server without SCRAM (before PostgreSQL 10).
+    pub fn without_scram(mut self) -> Self {
+        self.no_scram = true;
+        self
     }
 
     /// The DDL generator.
@@ -315,7 +324,9 @@ impl Dialect for PgDialect {
     fn returning_column(&self, column: &str, type_name: &str) -> String {
         let q = self.quote_ident(column);
         match crate::types::kind_from_type_name(type_name) {
-            DataKind::DateTimeTz | DataKind::Decimal | DataKind::Other => format!("{q}::text AS {q}"),
+            // Arrays and ranges too: binary elements of extension types (ltree[]) came back
+            // as hex (`{"\\x…"}`), the text form is what the grid shows when it reads them.
+            DataKind::DateTimeTz | DataKind::Decimal | DataKind::Other | DataKind::Array | DataKind::Range => format!("{q}::text AS {q}"),
             _ => q,
         }
     }
@@ -557,6 +568,10 @@ impl Dialect for PgDialect {
         if self.kind == DbKind::CockroachDb {
             return Some(format!("ALTER USER {role} WITH PASSWORD {}", string_literal(new_password)));
         }
+        // Before SCRAM the server hashes it (md5) itself: the verifier text would be the password.
+        if self.no_scram {
+            return Some(format!("ALTER ROLE {role} ENCRYPTED PASSWORD {}", string_literal(new_password)));
+        }
         // Send a SCRAM-SHA-256 verifier instead of the clear text password so the
         // password never appears in server logs or pg_stat_activity.
         let verifier = postgres_protocol::password::scram_sha_256(new_password.as_bytes());
@@ -591,6 +606,10 @@ mod tests {
         assert_eq!(d.returning_column("id", "int4"), "id");
         assert_eq!(d.returning_column("at", "timestamptz"), "at::text AS at");
         assert_eq!(d.returning_column("doc", "tsvector"), "doc::text AS doc");
+        assert_eq!(d.returning_column("tags", "ltree[]"), "tags::text AS tags");
+        assert_eq!(PgDialect::new().without_scram().change_password_sql(None, "p'w").unwrap(), "ALTER ROLE CURRENT_USER ENCRYPTED PASSWORD 'p''w'");
+        assert!(PgDialect::new().change_password_sql(None, "pw").unwrap().contains("SCRAM-SHA-256$"));
+        assert_eq!(d.returning_column("span", "tstzrange"), "span::text AS span");
         match d.returned_value("timestamptz", Value::text("2026-10-21 05:12:31.9+07")) {
             Value::DateTimeTz(t) => assert_eq!(t.offset().local_minus_utc(), 7 * 3600),
             v => panic!("{v:?}"),

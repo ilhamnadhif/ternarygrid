@@ -164,8 +164,16 @@ fn apply_success(shared: &SessionShared, info: Option<&StmtInfo>) {
 
 /// Apply the transaction effect of a statement that failed. A failed
 /// statement inside a transaction leaves it open (aborted); a failed
-/// COMMIT / ROLLBACK / PREPARE TRANSACTION ends it.
-fn apply_failure(shared: &SessionShared, info: Option<&StmtInfo>) {
+/// COMMIT / ROLLBACK / PREPARE TRANSACTION ends it, unless it never ran: a syntax
+/// error (SQLSTATE class 42, `COMMIT foo`) leaves the transaction open, aborted.
+fn apply_failure(shared: &SessionShared, info: Option<&StmtInfo>, e: &tokio_postgres::Error) {
+    apply_failure_code(shared, info, e.code().map(|c| c.code()));
+}
+
+fn apply_failure_code(shared: &SessionShared, info: Option<&StmtInfo>, code: Option<&str>) {
+    if code.is_some_and(|c| c.starts_with("42")) {
+        return;
+    }
     if let Some(TxEffect::Commit { .. }) | Some(TxEffect::Rollback { .. }) | Some(TxEffect::PrepareTransaction) = info.map(|i| i.tx) {
         shared.set_in_tx(false);
     }
@@ -186,7 +194,7 @@ impl Body {
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            apply_failure(shared, b.script.statements.get(b.stmt_index));
+                            apply_failure(shared, b.script.statements.get(b.stmt_index), &e);
                             if stream_ended_by(&e) {
                                 break;
                             }
@@ -196,18 +204,18 @@ impl Body {
                 }
             }
             Body::Extended(b) => {
-                let mut failed = false;
+                let mut failed: Option<Option<String>> = None;
                 while let Some(r) = b.stream.next().await {
                     if let Err(e) = r {
-                        failed = true;
+                        failed.get_or_insert_with(|| e.code().map(|c| c.code().to_string()));
                         if stream_ended_by(&e) {
                             break;
                         }
                     }
                     tokio::task::consume_budget().await;
                 }
-                if failed {
-                    apply_failure(shared, Some(&b.info));
+                if let Some(code) = failed {
+                    apply_failure_code(shared, Some(&b.info), code.as_deref());
                 } else {
                     apply_success(shared, Some(&b.info));
                 }
@@ -315,10 +323,10 @@ impl PgCursor {
         let err = self.convert_error(&e);
         match &mut self.body {
             Body::Simple(b) => {
-                apply_failure(&self.shared, b.script.statements.get(b.stmt_index));
+                apply_failure(&self.shared, b.script.statements.get(b.stmt_index), &e);
                 b.stmt_index = b.script.statements.len();
             }
-            Body::Extended(b) => apply_failure(&self.shared, Some(&b.info)),
+            Body::Extended(b) => apply_failure(&self.shared, Some(&b.info), &e),
             _ => {}
         }
         // Only ReadyForQuery is left; drain it so the gate can be released.
@@ -640,11 +648,14 @@ mod tests {
         let s = SessionShared::new();
         apply_success(&s, Some(&crate::sqltext::classify("begin")));
         assert!(s.in_tx());
-        apply_failure(&s, Some(&crate::sqltext::classify("insert into t values (1)")));
+        apply_failure_code(&s, Some(&crate::sqltext::classify("insert into t values (1)")), Some("23505"));
+        assert!(s.in_tx());
+        // A COMMIT that did not parse ran no commit: the transaction stays (aborted).
+        apply_failure_code(&s, Some(&crate::sqltext::classify("commit foo")), Some("42601"));
         assert!(s.in_tx());
         apply_success(&s, Some(&crate::sqltext::classify("commit and chain")));
         assert!(s.in_tx());
-        apply_failure(&s, Some(&crate::sqltext::classify("commit")));
+        apply_failure_code(&s, Some(&crate::sqltext::classify("commit")), Some("23503"));
         assert!(!s.in_tx());
         apply_success(&s, Some(&crate::sqltext::classify("start transaction")));
         apply_success(&s, Some(&crate::sqltext::classify("rollback to savepoint a")));

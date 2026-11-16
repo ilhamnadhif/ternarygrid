@@ -329,7 +329,21 @@ async fn import_rows(source: &mut dyn RowSource, session: &mut dyn Session, mapp
         key_index,
     };
     let handle = session.cancel_handle();
+    // MySQL's upsert follows the table's unique keys, not the chosen columns: unless those
+    // are one of them, rows are replaced by DELETE + INSERT on the chosen columns.
+    let upsert_follows_keys =
+        if mapping.mode == ImportMode::Replace && matches!(dialect.kind(), DbKind::MySql | DbKind::MariaDb) && !mapping.key_columns.is_empty() && !mapping.create_table {
+            match session.table_definition(&mapping.target).await {
+                Ok(def) => keys_are_unique(&def, &mapping.key_columns),
+                Err(_) => false,
+            }
+        } else {
+            true
+        };
     let mut writer = BatchWriter::new(&mut *session, target, mapping.transaction, mapping.on_error, mapping.rows_per_statement, item.clone());
+    if !upsert_follows_keys {
+        writer.without_upsert("The key columns are no unique key of the table: rows are replaced by deleting and inserting them by those columns");
+    }
     let begun = writer.begin().await;
     let begun_failed = begun.is_err();
     let outcome = async {
@@ -530,6 +544,18 @@ pub async fn run_import_job(job: ImportJob, factory: Arc<dyn SessionFactory>, pr
     result
 }
 
+/// `keys` hold the primary key, a unique key or a unique index (plain columns) of `def`.
+pub(crate) fn keys_are_unique(def: &TableDef, keys: &[String]) -> bool {
+    let has = |cols: &[String]| !cols.is_empty() && cols.iter().all(|c| keys.iter().any(|k| k.eq_ignore_ascii_case(c)));
+    def.row_key().is_some_and(|k| has(&k.columns))
+        || def.unique_keys.iter().any(|k| has(&k.columns))
+        || def
+            .indexes
+            .iter()
+            .filter(|i| i.unique && i.predicate.is_none() && i.columns.iter().all(|c| !c.is_expression))
+            .any(|i| has(&i.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +570,22 @@ mod tests {
         assert!(text > 0 && text < 40);
         assert_eq!(cols[40].target_type, "BIGINT");
         assert!((40 - text) * 4002 <= 60_000);
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use ternarygrid_core::ddl::{IndexColumn, IndexDef, KeyDef};
+
+    /// Replace by key uses MySQL's upsert only when the key columns are a unique key.
+    #[test]
+    fn upsert_keys_must_be_unique() {
+        let mut def = TableDef::new(None, "users");
+        def.primary_key = Some(KeyDef { name: None, columns: vec!["id".into()] });
+        assert!(keys_are_unique(&def, &["id".into()]));
+        assert!(!keys_are_unique(&def, &["email".into()]));
+        def.indexes.push(IndexDef { name: "u".into(), columns: vec![IndexColumn::column("email")], unique: true, ..Default::default() });
+        assert!(keys_are_unique(&def, &["EMAIL".into()]));
     }
 }

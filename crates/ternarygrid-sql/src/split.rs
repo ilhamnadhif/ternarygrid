@@ -209,7 +209,7 @@ enum BlockMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Header {
     Start,
-    AfterCreate { definer: bool },
+    AfterCreate { definer: bool, alter: bool },
     Done,
 }
 
@@ -425,7 +425,7 @@ fn word_in(t: &Token, src: &str, list: &[&str]) -> bool {
 fn is_exec_comment(t: &Token, src: &str, syntax: &SqlSyntax) -> bool {
     t.kind == TokenKind::BlockComment
         && (syntax.delimiter_command || syntax.hash_comments)
-        && t.text(src).starts_with("/*!")
+        && (t.text(src).starts_with("/*!") || t.text(src).starts_with("/*M!"))
 }
 
 struct Splitter<'a> {
@@ -527,6 +527,11 @@ impl Splitter<'_> {
                 }
                 TokenKind::LineComment | TokenKind::BlockComment => {
                     pending_newlines = 0;
+                    // MySQL runs the text of `/*! … */`: at the end of a statement it is part
+                    // of it (`… ENGINE=InnoDB /*!50100 PARTITION BY … */`, cut off before).
+                    if seg.first_sig.is_some() && is_exec_comment(&t, self.src, self.syntax) {
+                        seg.last_sig = i;
+                    }
                     if seg.first_sig.is_none() {
                         if is_exec_comment(&t, self.src, self.syntax) {
                             seg.exec_comment =
@@ -757,7 +762,10 @@ impl Splitter<'_> {
                 seg.header = Header::Done;
                 seg.mode = BlockMode::Plain;
                 if self.word(i, "CREATE") || self.word(i, "ALTER") {
-                    seg.header = Header::AfterCreate { definer: false };
+                    seg.header = Header::AfterCreate {
+                        definer: false,
+                        alter: self.word(i, "ALTER"),
+                    };
                     seg.mode = BlockMode::Undecided;
                 } else if self.syntax.compound_blocks {
                     let next = self.next_sig(i);
@@ -775,10 +783,17 @@ impl Splitter<'_> {
                     }
                 }
             }
-            Header::AfterCreate { definer } => {
+            Header::AfterCreate { definer, alter } => {
                 seg.header_len += 1;
-                if word_in(&t, self.src, ROUTINE_WORDS)
-                    || (self.syntax.plsql_blocks && word_in(&t, self.src, PLSQL_ROUTINE_WORDS))
+                // Oracle's ALTER TRIGGER / PROCEDURE … (DISABLE, COMPILE) has no body (a new
+                // one is CREATE OR REPLACE); T-SQL's EVENT SESSION neither: run to the `/` or
+                // the batch's end, they swallowed the statements after them.
+                let bodiless = (alter && self.syntax.plsql_blocks)
+                    || (self.word(i, "EVENT")
+                        && self.next_sig(i).is_some_and(|j| self.word(j, "SESSION")));
+                if !bodiless
+                    && (word_in(&t, self.src, ROUTINE_WORDS)
+                        || (self.syntax.plsql_blocks && word_in(&t, self.src, PLSQL_ROUTINE_WORDS)))
                 {
                     seg.header = Header::Done;
                     seg.mode = if !self.syntax.compound_blocks {
@@ -807,7 +822,10 @@ impl Splitter<'_> {
                     seg.header = Header::Done;
                     seg.mode = BlockMode::Plain;
                 } else if self.word(i, "DEFINER") {
-                    seg.header = Header::AfterCreate { definer: true };
+                    seg.header = Header::AfterCreate {
+                        definer: true,
+                        alter,
+                    };
                 }
             }
         }
@@ -861,6 +879,13 @@ impl Splitter<'_> {
     fn block_word(&self, seg: &mut Seg, i: usize) {
         let t = self.tokens[i];
         if !matches!(t.kind, TokenKind::Keyword | TokenKind::Identifier) {
+            seg.skip_end_word = false;
+            return;
+        }
+        // Part of a qualified name (`e.end`, `begin.x`): a column or table, no block word
+        // (`SELECT e.end FROM ev` closed the procedure's BEGIN there).
+        let dot = |k: Option<usize>| k.is_some_and(|k| self.tokens[k].kind == TokenKind::Dot);
+        if dot(self.prev_sig(i)) || dot(self.next_sig(i)) {
             seg.skip_end_word = false;
             return;
         }
@@ -1060,6 +1085,19 @@ mod tests {
             got[4]
         );
         assert!(got[5].starts_with("SELECT 2 FROM dual / 2"), "{}", got[5]);
+        // ALTER TRIGGER / PROCEDURE has no body in Oracle: each statement on its own.
+        let got = texts(
+            "ALTER TRIGGER trg DISABLE;\nDELETE FROM s;\nALTER TRIGGER trg ENABLE;",
+            &syn,
+        );
+        assert_eq!(got.len(), 3, "{got:#?}");
+        // Oracle q-quoting: a quote inside the text does not end it.
+        let got = texts(
+            "UPDATE t SET n = q'[it's]' WHERE id = 1;\nDELETE FROM a WHERE id = 2;\nSELECT nq'{x'y}' FROM dual;",
+            &syn,
+        );
+        assert_eq!(got.len(), 3, "{got:#?}");
+        assert!(got[0].ends_with("WHERE id = 1"), "{}", got[0]);
         // A line starting with a division is no `/` terminator (`GO 5` only for GO): the
         // UPDATE ran without its WHERE.
         let got = texts(
@@ -1071,6 +1109,30 @@ mod tests {
         // T-SQL keeps DECLARE @x as a statement of its own.
         let tsql = texts("DECLARE @x int;\nSELECT @x;", &tsql());
         assert_eq!(tsql.len(), 2, "{tsql:#?}");
+    }
+
+    /// MySQL executable comments at the end of a statement are sent with it.
+    #[test]
+    fn executable_comments_at_the_end_stay() {
+        let src = "CREATE TABLE t (y INT) ENGINE=InnoDB /*!50100 PARTITION BY RANGE (y) (PARTITION p0 VALUES LESS THAN (10)) */;\nDELETE FROM t /*!WHERE y = 5*/;\n/*M!100000 SET @a = 1 */;";
+        let t = texts(src, &mysql());
+        assert_eq!(t.len(), 3, "{t:#?}");
+        assert!(t[0].ends_with("*/"), "{}", t[0]);
+        assert!(t[1].ends_with("/*!WHERE y = 5*/"), "{}", t[1]);
+        assert!(t[2].starts_with("/*M!"), "{}", t[2]);
+    }
+
+    /// A column named `end` (MySQL lets it go unquoted) is no END of the routine's block.
+    #[test]
+    fn a_qualified_end_column_does_not_end_a_block() {
+        let src = "CREATE PROCEDURE p() BEGIN SELECT e.end FROM ev e; DELETE FROM ev WHERE x < 1; END;\nSELECT 1;";
+        let t = texts(src, &mysql());
+        assert_eq!(t.len(), 2, "{t:#?}");
+        assert!(
+            t[0].contains("DELETE FROM ev") && t[0].ends_with("END"),
+            "{}",
+            t[0]
+        );
     }
 
     #[test]

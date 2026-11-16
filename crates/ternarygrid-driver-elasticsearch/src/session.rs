@@ -149,12 +149,34 @@ struct Http {
     auth: Option<String>,
 }
 
+/// A connect over TLS that failed because the other end does not speak it (or cut the
+/// handshake), not because the server is unreachable: where `prefer` may try plain HTTP.
+fn tls_refused(e: &DbError) -> bool {
+    let text = e.full_text().to_ascii_lowercase();
+    e.kind == ErrorKind::Tls
+        || (e.kind == ErrorKind::Connection
+            && ![
+                "refused",
+                "lookup",
+                "resolve",
+                "dns",
+                "unreachable",
+                "no route",
+            ]
+            .iter()
+            .any(|w| text.contains(w)))
+}
+
 impl Http {
     fn new(params: &ConnectParams) -> DbResult<Self> {
         let https = matches!(
             params.ssl.mode,
             SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull
         ) || params.property("https") == Some("true");
+        Self::build(params, https)
+    }
+
+    fn build(params: &ConnectParams, https: bool) -> DbResult<Self> {
         let mut cfg = Agent::config_builder()
             .http_status_as_error(false)
             // Tunnels and proxies are local forwarders at `host:port`, not
@@ -790,6 +812,8 @@ pub struct SearchSession {
     closed: bool,
     /// Only requests that read are sent.
     read_only: bool,
+    /// Prefer fell back to plain HTTP.
+    plain_fallback: bool,
 }
 
 /// `METHOD /path` and the JSON body after it.
@@ -820,9 +844,36 @@ fn split_request(text: &str) -> (String, String, Option<String>) {
 
 impl SearchSession {
     pub async fn connect(params: &ConnectParams) -> DbResult<Self> {
-        let http = Http::new(params)?;
-        let h = http.clone();
-        let root = blocking(move || h.call("GET", "/", None)).await?;
+        // Prefer tries HTTPS first (it was plain HTTP: the credentials or the API key went
+        // out in clear even to a server with TLS).
+        let prefer = params.ssl.mode == SslMode::Prefer && params.property("https").is_none();
+        let mut plain_fallback = false;
+        let (http, root) = if prefer {
+            let https = Http::build(params, true)?;
+            let h = https.clone();
+            match blocking(move || h.call("GET", "/", None)).await {
+                Ok(root) => (https, root),
+                Err(e) if tls_refused(&e) => {
+                    tracing::debug!(
+                        "HTTPS to {}:{} failed ({}), trying HTTP",
+                        params.host,
+                        params.port,
+                        e.full_text()
+                    );
+                    let http = Http::build(params, false)?;
+                    let h = http.clone();
+                    let root = blocking(move || h.call("GET", "/", None)).await?;
+                    plain_fallback = true;
+                    (http, root)
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            let http = Http::new(params)?;
+            let h = http.clone();
+            let root = blocking(move || h.call("GET", "/", None)).await?;
+            (http, root)
+        };
         let version = root
             .pointer("/version/number")
             .and_then(J::as_str)
@@ -859,6 +910,7 @@ impl SearchSession {
             mode: TransactionMode::Auto,
             closed: false,
             read_only: params.read_only,
+            plain_fallback,
         })
     }
 
@@ -954,6 +1006,14 @@ impl Session for SearchSession {
 
     fn server_info(&self) -> &ServerInfo {
         &self.info
+    }
+
+    fn connect_warnings(&self) -> Vec<String> {
+        if self.plain_fallback {
+            vec![ternarygrid_core::tr("The connection is not encrypted: the server did not answer over TLS, and the SSL mode Prefer fell back to plain HTTP (credentials are sent in clear). Set the SSL mode to Disable for a server without TLS, or Require to refuse such connections.").to_string()]
+        } else {
+            Vec::new()
+        }
     }
 
     fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {
@@ -1540,6 +1600,43 @@ mod tests {
             }
         });
         (port, rx)
+    }
+
+    /// Prefer tries HTTPS first; a server without TLS is reached over HTTP, with a warning.
+    #[tokio::test]
+    async fn prefer_tries_tls_first() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let first = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = first.clone();
+        std::thread::spawn(move || {
+            for (i, c) in l.incoming().take(2).enumerate() {
+                let Ok(mut c) = c else { return };
+                c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut buf = [0u8; 4096];
+                let n = c.read(&mut buf).unwrap_or(0);
+                if i == 0 {
+                    seen.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+                let body = r#"{"version":{"number":"8.15.0"},"cluster_name":"c"}"#;
+                let reply = format!(
+                    "HTTP/1.1 {} \r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    if i == 0 { "400 Bad Request" } else { "200 OK" },
+                    body.len()
+                );
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        let s = SearchSession::connect(&params("127.0.0.1", port, SslMode::Prefer))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.lock().unwrap().first(),
+            Some(&0x16),
+            "the first attempt is no TLS handshake"
+        );
+        assert!(s.http.base.starts_with("http://"));
+        assert_eq!(s.connect_warnings().len(), 1);
     }
 
     #[test]

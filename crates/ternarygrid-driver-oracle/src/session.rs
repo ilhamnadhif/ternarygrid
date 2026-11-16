@@ -233,7 +233,19 @@ struct Cancel {
     params: ConnectParams,
     /// `sid,serial#` of the session.
     target: String,
+    /// Its RAC instance (`SYS_CONTEXT('USERENV', 'INSTANCE')`): the helper connection may land
+    /// on another one, where `sid,serial#` names no session (or another session).
+    instance: Option<String>,
     requested: AtomicBool,
+}
+
+/// `sid,serial#` of a session id as listed (`sid, serial#[, @inst]`), for comparing.
+fn sid_serial(id: &str) -> String {
+    id.split(',')
+        .take(2)
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[async_trait]
@@ -244,11 +256,26 @@ impl CancelHandle for Cancel {
         self.requested.store(true, Ordering::SeqCst);
         let params = self.params.clone();
         let target = self.target.clone();
+        let instance = self.instance.clone();
         tokio::task::spawn_blocking(move || {
             let conn = open(&params)?;
-            let r = conn
-                .execute(&format!("ALTER SYSTEM CANCEL SQL '{target}'"), &[])
-                .db();
+            let mut r = match &instance {
+                Some(i) => conn
+                    .execute(&format!("ALTER SYSTEM CANCEL SQL '{target}, @{i}'"), &[])
+                    .db(),
+                None => conn
+                    .execute(&format!("ALTER SYSTEM CANCEL SQL '{target}'"), &[])
+                    .db(),
+            };
+            // A server that does not take the instance (before 18c): without it.
+            if instance.is_some()
+                && r.as_ref()
+                    .is_err_and(|e| e.code.as_deref() != Some("ORA-01031"))
+            {
+                r = conn
+                    .execute(&format!("ALTER SYSTEM CANCEL SQL '{target}'"), &[])
+                    .db();
+            }
             // Logs the helper connection off.
             drop(conn);
             r.map(|_| ()).map_err(|e| {
@@ -274,10 +301,48 @@ fn open(params: &ConnectParams) -> DbResult<Connection> {
         .set_transport_connect_timeout(Some(params.connect_timeout))
         .set_program(&params.application_name)
         .db()?;
-    if let Some(dir) = params.property("wallet_location").filter(|d| !d.is_empty()) {
+    let tls = matches!(
+        params.ssl.mode,
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull
+    );
+    let set = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let wallet = params.property("wallet_location").filter(|d| !d.is_empty());
+    // The driver takes certificates from a wallet only (a CA file or client certificate was
+    // ignored without a word): a CA file becomes a wallet of its own for the connect.
+    let mut ca_wallet = None;
+    if let Some(dir) = wallet {
         cfg = cfg.set_wallet_location(dir);
         if let Some(pw) = params.property("wallet_password") {
             cfg = cfg.set_wallet_password(pw);
+        }
+        if tls && set(&params.ssl.ca_cert) {
+            tracing::warn!(
+                "Oracle: the wallet's certificates are trusted, the CA file is not used"
+            );
+        }
+    } else if tls {
+        if set(&params.ssl.client_cert) || set(&params.ssl.client_key) {
+            return Err(DbError::config(
+                "Oracle takes a client certificate from a wallet: set the wallet_location property to the wallet's directory (ewallet.pem) instead",
+            ));
+        }
+        if let Some(ca) = params
+            .ssl
+            .ca_cert
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+        {
+            let pem = std::fs::read_to_string(ca.trim()).map_err(|e| {
+                DbError::config(format!("Cannot read the CA certificate {ca}: {e}"))
+            })?;
+            let dir = tempfile::Builder::new()
+                .prefix("ternarygrid-oracle-ca")
+                .tempdir()
+                .map_err(|e| DbError::internal(e.to_string()))?;
+            std::fs::write(dir.path().join("ewallet.pem"), pem)
+                .map_err(|e| DbError::internal(e.to_string()))?;
+            cfg = cfg.set_wallet_location(dir.path().display().to_string());
+            ca_wallet = Some(dir);
         }
     }
     let mode = match params
@@ -292,7 +357,29 @@ fn open(params: &ConnectParams) -> DbResult<Connection> {
         _ => oracledb::AUTH_MODE_DEFAULT,
     };
     cfg = cfg.set_auth_mode(mode);
-    oracledb::connect(cfg).db()
+    let r = oracledb::connect(cfg).db();
+    drop(ca_wallet);
+    r.map_err(|e| if tls { tls_hint(e, params) } else { e })
+}
+
+/// The driver checks the server certificate and its host name in every TLS mode (it has no
+/// unverified TLS), against the host it connects to: say so when a certificate is refused.
+fn tls_hint(e: DbError, params: &ConnectParams) -> DbError {
+    let text = e.full_text();
+    if text.contains("not valid for name") || text.contains("NotValidForName") {
+        if params
+            .tls_server_name
+            .as_deref()
+            .is_some_and(|n| n != params.host)
+        {
+            return e.with_hint("Oracle checks the certificate against the address it connects to: through an SSH tunnel or a proxy that is the local end, not the server's name. Connect to the server directly for TCPS, or use TCP inside the tunnel.");
+        }
+        return e.with_hint("Oracle checks the server certificate's host name in every TLS mode: connect by a name the certificate holds.");
+    }
+    if text.contains("UnknownIssuer") || text.contains("invalid peer certificate") {
+        return e.with_hint("Oracle verifies the server certificate in every TLS mode: give the CA that issued it (CA certificate file, or a wallet in wallet_location).");
+    }
+    e
 }
 
 pub struct OracleSession {
@@ -305,12 +392,15 @@ pub struct OracleSession {
     closed: Arc<AtomicBool>,
     cancel: Arc<Cancel>,
     service: Option<String>,
+    /// The session zone's offset (seconds east of UTC), read at connect: TIMESTAMP WITH
+    /// LOCAL TIME ZONE values arrive as its wall clock.
+    ltz_offset: i32,
 }
 
 impl OracleSession {
     pub async fn connect(params: &ConnectParams) -> DbResult<Self> {
         let p = params.clone();
-        let (conn, info, service) = tokio::task::spawn_blocking(move || -> DbResult<_> {
+        let (conn, info, service, ltz_offset, instance) = tokio::task::spawn_blocking(move || -> DbResult<_> {
             let conn = open(&p)?;
             let version = conn.version().db()?;
             let sid = conn.session_id().db()?;
@@ -330,13 +420,25 @@ impl OracleSession {
             let v = version.to_string();
             let info = ServerInfo { product: "Oracle Database".into(), version_number: parse_version_number(&v), version: v, session_id: Some(format!("{sid},{serial}")) };
             let service = conn.service_name().ok().map(str::to_string).filter(|s| !s.is_empty());
-            Ok((conn, info, service))
+            let instance = conn
+                .query_row("SELECT SYS_CONTEXT('USERENV', 'INSTANCE') FROM DUAL", &[])
+                .ok()
+                .and_then(|r| r.get::<Option<String>>(0).ok().flatten())
+                .filter(|i| !i.is_empty() && i.chars().all(|c| c.is_ascii_digit()));
+            let ltz_offset = conn
+                .query_row("SELECT TZ_OFFSET(SESSIONTIMEZONE) FROM DUAL", &[])
+                .ok()
+                .and_then(|r| r.get::<Option<String>>(0).ok().flatten())
+                .and_then(|t| convert::offset_seconds(&t))
+                .unwrap_or_else(|| chrono::Local::now().offset().local_minus_utc());
+            Ok((conn, info, service, ltz_offset, instance))
         })
         .await
         .map_err(|e| DbError::internal(e.to_string()))??;
         let cancel = Arc::new(Cancel {
             params: params.clone(),
             target: info.session_id.clone().unwrap_or_default(),
+            instance,
             requested: AtomicBool::new(false),
         });
         Ok(OracleSession {
@@ -352,6 +454,7 @@ impl OracleSession {
             closed: Arc::new(AtomicBool::new(false)),
             cancel,
             service,
+            ltz_offset,
         })
     }
 
@@ -483,7 +586,10 @@ fn run(
         let (dml, plsql, ddl) = (stmt.is_dml(), stmt.is_plsql(), stmt.is_ddl());
         let result = stmt.execute(&refs).db()?;
         let rows = result.rows_affected();
-        if auto_commit && (dml || plsql) {
+        // LOCK TABLE is none of these to oracledb: in auto mode its lock was held until some
+        // later DML committed, blocking the other sessions.
+        let lock = leading_words(sql, 1).first().is_some_and(|w| w == "LOCK");
+        if auto_commit && (dml || plsql || lock) {
             conn.commit().db()?;
         }
         let mut messages = Vec::new();
@@ -524,6 +630,29 @@ struct OracleCursor {
     done: bool,
     /// The session's flag: a fetch that loses the connection sets it too.
     closed: Arc<AtomicBool>,
+    /// Committed once the rows are read or the cursor closes (`SELECT … FOR UPDATE` in auto mode).
+    commit_after: Option<Arc<Connection>>,
+}
+
+impl OracleCursor {
+    /// The commit owed by a FOR UPDATE query of auto mode, on a blocking thread.
+    fn commit_owed(&mut self) {
+        if let Some(conn) = self.commit_after.take()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            rt.spawn_blocking(move || {
+                if let Err(e) = conn.commit() {
+                    tracing::warn!("committing after SELECT … FOR UPDATE: {e}");
+                }
+            });
+        }
+    }
+}
+
+impl Drop for OracleCursor {
+    fn drop(&mut self) {
+        self.commit_owed();
+    }
 }
 
 #[async_trait]
@@ -568,6 +697,8 @@ impl QueryCursor for OracleCursor {
         self.done = done;
         if !done {
             self.cursor = Some(cursor);
+        } else {
+            self.commit_owed();
         }
         Ok(rows)
     }
@@ -575,6 +706,7 @@ impl QueryCursor for OracleCursor {
     async fn close(&mut self) -> DbResult<()> {
         self.cursor = None;
         self.done = true;
+        self.commit_owed();
         Ok(())
     }
 
@@ -642,6 +774,7 @@ impl Session for OracleSession {
                 cancel: self.cancel.clone(),
                 done: true,
                 closed: self.closed.clone(),
+                commit_after: None,
             }));
         }
         self.cancel.requested.store(false, Ordering::SeqCst);
@@ -670,14 +803,16 @@ impl Session for OracleSession {
         match outcome {
             Outcome::Rows {
                 columns,
-                reads,
+                mut reads,
                 cursor,
             } => {
-                // Locks held until the end of the transaction (`… FOR UPDATE`, also after WITH).
-                if matches!(first, "SELECT" | "WITH")
-                    && sql.to_ascii_uppercase().contains("FOR UPDATE")
-                    && !auto
-                {
+                convert::in_session_zone(&mut reads, self.ltz_offset);
+                // Locks held until the end of the transaction (`… FOR UPDATE`, also after WITH):
+                // in auto mode committed once the rows are read (a commit before would end the
+                // fetch, ORA-01002), not left to some later DML.
+                let for_update = matches!(first, "SELECT" | "WITH")
+                    && sql.to_ascii_uppercase().contains("FOR UPDATE");
+                if for_update && !auto {
                     self.in_tx = true;
                 }
                 Ok(Box::new(OracleCursor {
@@ -688,6 +823,11 @@ impl Session for OracleSession {
                     cancel,
                     done: false,
                     closed: self.closed.clone(),
+                    commit_after: if for_update && auto {
+                        self.conn.clone()
+                    } else {
+                        None
+                    },
                 }))
             }
             Outcome::Done {
@@ -716,6 +856,7 @@ impl Session for OracleSession {
                     cancel,
                     done: true,
                     closed: self.closed.clone(),
+                    commit_after: None,
                 }))
             }
         }
@@ -975,6 +1116,15 @@ impl Session for OracleSession {
 
     async fn kill_session(&mut self, id: &str, mode: KillMode) -> DbResult<()> {
         let id = id.replace('\'', "");
+        if mode == KillMode::Terminate
+            && self
+                .info
+                .session_id
+                .as_deref()
+                .is_some_and(|own| sid_serial(own) == sid_serial(&id))
+        {
+            return Err(DbError::config("Refusing to kill the current session"));
+        }
         let sql = match mode {
             KillMode::CancelQuery => format!("ALTER SYSTEM CANCEL SQL '{id}'"),
             KillMode::Terminate => format!("ALTER SYSTEM KILL SESSION '{id}' IMMEDIATE"),
@@ -1089,6 +1239,14 @@ mod tests {
         ));
         assert!(!ends_transaction("ALTER SYSTEM CANCEL SQL '1,2'"));
         assert!(!ends_transaction("INSERT INTO t VALUES (1)"));
+    }
+
+    /// The current session is found in a listed id with or without its instance.
+    #[test]
+    fn session_ids_compare_by_sid_and_serial() {
+        assert_eq!(sid_serial("12,345"), "12,345");
+        assert_eq!(sid_serial("12, 345, @2"), "12,345");
+        assert_ne!(sid_serial("12,346"), sid_serial("12,345"));
     }
 
     #[test]

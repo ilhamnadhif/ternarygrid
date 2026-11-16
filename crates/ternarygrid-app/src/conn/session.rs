@@ -370,6 +370,20 @@ impl SessionHandle {
         }
     }
 
+    /// A statement `sql` was cancelled while it ran: it may have finished on the server
+    /// first. The transaction state is read again, and a write is counted as pending in an
+    /// open transaction (closing the tab or quitting asks before rolling it back).
+    pub async fn note_cancelled(&self, sql: &str) {
+        if self.is_closed() {
+            return;
+        }
+        let started = Instant::now();
+        let guard = self.lock().await;
+        self.refresh_tx(guard.as_ref());
+        drop(guard);
+        self.log_tx(sql, started, None, true);
+    }
+
     /// Execute `sql` and keep the cursor open on the session. Returns the first
     /// result header; rows are read with [`SessionHandle::fetch`].
     pub async fn execute(&self, sql: &str, params: &[Value], opts: &ExecOptions) -> DbResult<Executed> {

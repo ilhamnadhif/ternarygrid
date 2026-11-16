@@ -451,23 +451,35 @@ pub async fn open_connection(params: &ConnectParams) -> DbResult<Opened> {
 /// connections opened with the same options.
 pub struct Killer {
     opts: Opts,
-    connection_id: u32,
+    connection_id: u64,
+    /// The server the session is on ([`SERVER_IDENTITY`]): behind a load balancer the side
+    /// connection may reach another one, where the same thread id is another client's.
+    server: Option<String>,
     timeout: Duration,
 }
+
+/// What tells servers apart (MariaDB has no `@@server_uuid`).
+pub const SERVER_IDENTITY: &str = "SELECT CONCAT(@@hostname, '/', @@server_id, '/', @@port)";
 
 impl Killer {
     /// Killer for server connection `connection_id`; `opts` are used for the
     /// side connections.
-    pub fn new(opts: Opts, connection_id: u32, connect_timeout: Duration) -> Arc<Killer> {
+    pub fn new(
+        opts: Opts,
+        connection_id: u64,
+        server: Option<String>,
+        connect_timeout: Duration,
+    ) -> Arc<Killer> {
         Arc::new(Killer {
             opts,
             connection_id,
+            server,
             timeout: connect_timeout.max(Duration::from_secs(1)) + KILL_EXTRA_TIMEOUT,
         })
     }
 
     /// Server id of the target connection.
-    pub fn connection_id(&self) -> u32 {
+    pub fn connection_id(&self) -> u64 {
         self.connection_id
     }
 
@@ -495,14 +507,30 @@ impl Killer {
     /// `Ok(false)`: the server has no thread with that id (already gone).
     async fn kill_checked(&self, sql: String) -> DbResult<bool> {
         let opts = self.opts.clone();
+        let server = self.server.clone();
         let fut = async move {
-            let mut side = Conn::new(opts).await?;
-            let r = side.query_drop(sql).await;
-            let _ = side.disconnect().await;
-            r
+            // Another server (a load balancer spreading connections): a few tries for the right one.
+            for _ in 0..4 {
+                let mut side = Conn::new(opts.clone()).await?;
+                if let Some(want) = &server {
+                    let here: Option<String> =
+                        side.query_first(SERVER_IDENTITY).await.ok().flatten();
+                    if here.as_deref() != Some(want.as_str()) {
+                        let _ = side.disconnect().await;
+                        continue;
+                    }
+                }
+                let r = side.query_drop(sql.clone()).await;
+                let _ = side.disconnect().await;
+                return r.map(|()| true);
+            }
+            Ok(false)
         };
         match tokio::time::timeout(self.timeout, fut).await {
-            Ok(Ok(())) => Ok(true),
+            Ok(Ok(true)) => Ok(true),
+            Ok(Ok(false)) => Err(DbError::connection(
+                "The connection for KILL reached another server (a load balancer or proxy between): the statement was not interrupted",
+            )),
             Ok(Err(mysql_async::Error::Server(e))) if e.code == codes::NO_SUCH_THREAD => Ok(false),
             Ok(Err(e)) => Err(map_error(e, None)),
             Err(_) => Err(DbError::timeout(

@@ -261,6 +261,20 @@ impl ResultPanel {
         // A new store (refresh, requery), or other columns (foreign key navigation, ALTER):
         // the model follows; other columns need their editability resolved again.
         if self.columns_seen != self.src.columns_version {
+            // Other columns when reading on (the table was altered meanwhile): the rows read
+            // before have the old layout, under the new headers, with the key read from the
+            // wrong place. They are read again (edits not saved cannot be kept for them).
+            // (Not the first page, whose columns replace none; not when only the columns'
+            // tables were resolved: the layout is the same.)
+            let layout = |c: &[ColumnMeta]| c.iter().map(|c| (c.name.clone(), c.type_name.clone())).collect::<Vec<_>>();
+            let relaid = !self.model.columns().is_empty() && layout(self.model.columns()) != layout(&self.src.columns);
+            if relaid && Arc::ptr_eq(self.model.store(), &self.src.store) && self.model.stored_row_count() > 0 && !self.src.is_fetching() {
+                if self.model.has_changes() {
+                    self.status = Some((tr("The table's columns changed: the result was read again and the changes not saved were dropped").to_string(), true));
+                }
+                let n = self.model.stored_row_count().max(Self::fetch_size(cx));
+                self.src.refresh(cx.backend, n);
+            }
             self.columns_seen = self.src.columns_version;
             self.editability = None;
             self.foreign_keys.clear();
@@ -323,8 +337,20 @@ impl ResultPanel {
             self.model.set_saving(false);
             match r {
                 Ok((n, committed, inserted, updated)) => {
+                    // Rows a fetch appended meanwhile are synced first: the saved order is built
+                    // over all of them (they stayed hidden until a refresh).
+                    self.model.sync();
                     self.src.rows_deleted(self.model.deleted_below(self.src.server_rows()));
                     self.model.apply_saved_with(&inserted, &updated);
+                    // The save closed the result's cursor on its session: reading on runs the query
+                    // again past the rows already read, but on PostgreSQL an updated row moves
+                    // (a new tuple), so rows were skipped or shown twice. The rows read so far are
+                    // read again instead.
+                    let moves_rows = matches!(self.src.session.kind(), ternarygrid_core::DbKind::Postgres | ternarygrid_core::DbKind::CockroachDb);
+                    if moves_rows && self.src.has_more() && !self.model.has_changes() {
+                        let n = self.src.row_count().max(Self::fetch_size(cx));
+                        self.src.refresh(cx.backend, n);
+                    }
                     self.saved_in_tx = (!committed).then(|| self.src.session.rollbacks());
                     if committed {
                         cx.toasts.success(ternarygrid_core::trn(n as usize, tr("Saved: 1 row changed"), tr("Saved: {} rows changed")));
@@ -689,6 +715,8 @@ impl ResultPanel {
                     Err(e) => cx.toasts.error(tr("Cannot save the default filter"), Some(e.to_string())),
                 }
             }
+            // Not while saving: the save's row order is built over the rows read before it.
+            GridAction::FetchMore if self.save_job.is_some() => {}
             GridAction::FetchMore => self.src.fetch_more(backend, Self::fetch_size(cx), None),
             GridAction::CancelFetch => self.src.stop(backend),
             GridAction::FetchAll => {

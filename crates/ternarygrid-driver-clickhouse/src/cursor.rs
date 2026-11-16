@@ -318,6 +318,9 @@ fn read_rows(head: &ResponseHead, body: crate::http::BodyReader, tx: &mpsc::Send
     }
 
     let mut batch: Vec<Row> = Vec::with_capacity(BATCH_ROWS);
+    // A one-value row that reads as an exception, in a one-column result: the exception
+    // (`http_write_exception_in_output_format`) when the body ends there, a value otherwise.
+    let mut maybe_exception: Option<(Vec<crate::json::Json>, String)> = None;
     loop {
         if state.abort.load(Ordering::SeqCst) {
             return Ok(false);
@@ -340,7 +343,24 @@ fn read_rows(head: &ResponseHead, body: crate::http::BodyReader, tx: &mpsc::Send
                 return Err(io_err(e));
             }
         };
-        match parser.feed(line) {
+        let fed = parser.feed(line);
+        if !matches!(fed, Feed::Nothing)
+            && let Some((cells, _)) = maybe_exception.take()
+        {
+            batch.push(cells.into_iter().zip(&types).map(|(c, t)| json_to_value(t, c)).collect());
+        }
+        match fed {
+            Feed::Row(cells) if exception_row(&cells).is_some() => {
+                let text = exception_row(&cells).unwrap_or_default();
+                if types.len() != 1 {
+                    if !batch.is_empty() {
+                        let full = std::mem::take(&mut batch);
+                        emit(tx, state, Event::Rows(full));
+                    }
+                    return Err(crate::error::exception_to_error(&text, head.exception_code.as_deref()));
+                }
+                maybe_exception = Some((cells, text));
+            }
             Feed::Row(cells) => {
                 if cells.len() != types.len() {
                     return Err(DbError::connection(format!("ClickHouse sent a row with {} values for {} columns", cells.len(), types.len())));
@@ -358,6 +378,12 @@ fn read_rows(head: &ResponseHead, body: crate::http::BodyReader, tx: &mpsc::Send
             }
         }
     }
+    if let Some((_, text)) = maybe_exception {
+        if !batch.is_empty() {
+            emit(tx, state, Event::Rows(batch));
+        }
+        return Err(crate::error::exception_to_error(&text, head.exception_code.as_deref()));
+    }
     if !batch.is_empty() && !emit(tx, state, Event::Rows(batch)) {
         return Ok(false);
     }
@@ -367,17 +393,31 @@ fn read_rows(head: &ResponseHead, body: crate::http::BodyReader, tx: &mpsc::Send
     Ok(true)
 }
 
+/// The exception text of a row `["Code: 241. DB::Exception: …"]`: what ClickHouse writes into
+/// the output format when a query fails mid-stream.
+fn exception_row(cells: &[crate::json::Json]) -> Option<String> {
+    match cells {
+        [crate::json::Json::String(s)] if crate::error::find_exception_start(s) == Some(0) && s.contains("Exception") => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Any other output format (the statement had its own `FORMAT` clause):
 /// one text column, one row per line.
+/// The longest raw output line read as one row.
+const RAW_LINE_CAP: usize = 1 << 20;
+
 fn read_raw(format: &str, head: &ResponseHead, body: crate::http::BodyReader, tx: &mpsc::Sender<Event>, state: &JobState) -> DbResult<bool> {
     let mut reader = LineReader::with_capacity(READ_BUFFER, body);
     let meta = ColumnMeta::new(format, "String", ternarygrid_core::value::DataKind::Text);
-    let note = ServerMessage::new("INFO", format!("The statement requested FORMAT {format}; its output is shown as one text row per line"));
+    let note = ServerMessage::new("INFO", format!("The statement requested FORMAT {format}; its output is shown as one text row per line (a line over 1 MiB in rows of 1 MiB)"));
     if !emit(tx, state, Event::Message(note)) || !emit(tx, state, Event::Header(ResultHeader::Rows(vec![meta]))) {
         return Ok(false);
     }
     let mut exception: Option<BodyParser> = None;
     let mut batch: Vec<Row> = Vec::with_capacity(BATCH_ROWS);
+    // The bytes of a character cut at the end of a piece, for the next one.
+    let mut carry: Vec<u8> = Vec::new();
     loop {
         if state.abort.load(Ordering::SeqCst) {
             return Ok(false);
@@ -388,11 +428,29 @@ fn read_raw(format: &str, head: &ResponseHead, body: crate::http::BodyReader, tx
                 return Ok(false);
             }
         }
-        let line = match reader.next_line() {
+        let (line, whole) = match reader.next_piece(RAW_LINE_CAP) {
             Ok(Some(l)) => l,
             Ok(None) => break,
             Err(e) => return Err(DbError::connection(format!("Error reading the ClickHouse response: {e}"))),
         };
+        if !whole || !carry.is_empty() {
+            carry.extend_from_slice(line);
+            let keep = if whole {
+                0
+            } else {
+                match std::str::from_utf8(&carry) {
+                    Err(e) if e.error_len().is_none() => carry.len() - e.valid_up_to(),
+                    _ => 0,
+                }
+            };
+            let rest = carry.split_off(carry.len() - keep);
+            let mut piece = std::mem::replace(&mut carry, rest);
+            if whole && piece.last() == Some(&b'\r') {
+                piece.pop();
+            }
+            batch.push(vec![Value::text(String::from_utf8_lossy(&piece).into_owned())]);
+            continue;
+        }
         if let Some(p) = exception.as_mut() {
             if let Feed::Error(e) = p.feed(line) {
                 return Err(e);
@@ -611,6 +669,17 @@ mod tests {
 
     fn rows(n: i64) -> Vec<Row> {
         (0..n).map(|i| vec![Value::Int(i)]).collect()
+    }
+
+    /// An exception written into the output format is no row (it showed as the last value).
+    #[test]
+    fn exception_rows_are_recognised() {
+        use crate::json::Json;
+        let e = vec![Json::String("Code: 241. DB::Exception: Memory limit exceeded. (MEMORY_LIMIT_EXCEEDED)".into())];
+        assert!(exception_row(&e).unwrap().starts_with("Code: 241."));
+        assert!(exception_row(&[Json::String("Code: 7. a value".into())]).is_none());
+        assert!(exception_row(&[Json::String("x".into()), Json::Null]).is_none());
+        assert!(exception_row(&[Json::Number("1".into())]).is_none());
     }
 
     #[tokio::test]

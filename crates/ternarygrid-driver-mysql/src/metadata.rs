@@ -98,7 +98,7 @@ pub fn normalize_default(
     if BINARY_TYPES.contains(&base) && raw.starts_with("0x") {
         return Some(raw);
     }
-    Some(ddl::string_literal(&raw))
+    Some(ddl::profile_literal(profile, &raw))
 }
 
 /// `ON UPDATE` expression from `EXTRA` (`DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3)`).
@@ -1299,7 +1299,10 @@ impl MySqlSession {
                         d.push_str(&format!(" RETURNS {ret}"));
                     }
                     if let Some(c) = &comment {
-                        d.push_str(&format!("\n    COMMENT {}", ddl::string_literal(c)));
+                        d.push_str(&format!(
+                            "\n    COMMENT {}",
+                            self.mysql_dialect().string_literal(c)
+                        ));
                     }
                     if read::flag(&r, 5) {
                         d.push_str("\n    DETERMINISTIC");
