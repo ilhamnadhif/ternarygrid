@@ -125,6 +125,9 @@ pub(crate) struct Runtime {
     pub fetch_requested_at: Option<usize>,
     /// Store that count belongs to (a refresh brings a new store, with the same count again).
     pub fetch_store: usize,
+    /// This grid's last plain copy (see [`LastCopy`]): its own comes first, the app's
+    /// last one (another grid's) after.
+    pub last_copy: Option<LastCopy>,
     /// Scroll the active cell into view on the next frame.
     pub scroll_to_active: bool,
     pub copy_dialog: bool,
@@ -184,19 +187,25 @@ pub(crate) struct LastCopy {
     pub gaps: bool,
 }
 
-/// The last plain copy of any grid of the app (pasted into another grid, its NULLs stay
-/// NULL too; one per grid lost them there).
+/// The last plain copy of any grid of the app: pasted into another grid, its NULLs stay
+/// NULL too (they were '' there).
 static LAST_COPY: std::sync::Mutex<Option<LastCopy>> = std::sync::Mutex::new(None);
 
 impl LastCopy {
-    /// Remember (or, with `None`, forget) what the last copy put on the clipboard.
-    pub(crate) fn remember(copy: Option<LastCopy>) {
+    /// Remember (or, with `None`, forget) what the last copy of `state`'s grid put on the
+    /// clipboard, for it and for the app.
+    pub(crate) fn remember(state: &mut DataGridState, copy: Option<LastCopy>) {
+        state.rt.last_copy.clone_from(&copy);
         *LAST_COPY.lock().unwrap_or_else(|e| e.into_inner()) = copy;
     }
 
-    /// The last copy, when `text` is what it put on the clipboard.
-    pub(crate) fn of(text: &str) -> Option<LastCopy> {
-        LAST_COPY.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|c| !text.is_empty() && c.text == text).cloned()
+    /// The copy that put `text` on the clipboard: the grid's own, or the app's last one.
+    pub(crate) fn of(state: &DataGridState, text: &str) -> Option<LastCopy> {
+        let matches = |c: &&LastCopy| !text.is_empty() && c.text == text;
+        if let Some(c) = state.rt.last_copy.as_ref().filter(matches) {
+            return Some(c.clone());
+        }
+        LAST_COPY.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(matches).cloned()
     }
 }
 
