@@ -181,7 +181,8 @@ pub(crate) fn spawn(client: MsClient, stmt: Statement, shared: Arc<Shared>, open
     open_flag.store(NEXT_CURSOR.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
     let task_abandon = abandon.clone();
     tokio::spawn(async move {
-        let client = run(client, &stmt, &shared, &tx, &cancel, &task_abandon).await;
+        // PRINT / RAISERROR ≤ 10 / warnings, which tiberius drops (see `infomsg`).
+        let client = crate::infomsg::collecting(run(client, &stmt, &shared, &tx, &cancel, &task_abandon)).await;
         shared.set_active(None);
         // hand the connection back before signalling the end of results
         let _ = ret_tx.send(TaskReturn { client });
@@ -286,6 +287,9 @@ async fn run(mut client: MsClient, stmt: &Statement, shared: &Shared, tx: &mpsc:
         }
     }
 
+    for m in crate::infomsg::take() {
+        let _ = tx.send(Event::Message(ServerMessage::new("INFO", m))).await;
+    }
     let mut client = Some(client);
     // Delivered after the state refresh below: the session's transaction state is read as
     // soon as the statement's last result (or its error) arrives.
@@ -551,6 +555,12 @@ async fn stream_results(
                 item
             }
         };
+        // Server messages read so far (a PRINT before a result set comes before it).
+        for m in crate::infomsg::take() {
+            if let Err(i) = send(tx, Event::Message(ServerMessage::new("INFO", m)), cancel, abandon).await {
+                return Step::Interrupted(i);
+            }
+        }
         match next {
             None => break,
             Some(Err(e)) => {
