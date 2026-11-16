@@ -16,6 +16,7 @@ use ternarygrid_config::ConnectionStore;
 use ternarygrid_config::settings::TimeZoneChoice;
 use ternarygrid_core::config::{AuthMethod, ConnectionConfig, ConnectionType, SecretSlot};
 use ternarygrid_core::driver::{ConnectParams, Driver, ServerInfo, TransactionMode};
+use ternarygrid_core::meta::{ObjectRef, SchemaRef};
 use ternarygrid_core::registry::DriverRegistry;
 use ternarygrid_core::{DbError, DbKind, DbResult, Dialect, Secret};
 
@@ -134,6 +135,10 @@ pub struct LiveConnection {
     pub current_schema: Option<String>,
     /// Server-level object folders of the dialect (roles, settings …).
     pub catalog_folders: Arc<Vec<ternarygrid_core::catalog::CatalogFolder>>,
+    /// Tables emptied (TRUNCATE), each with the number of its last emptying: their open
+    /// data views read the rows again.
+    emptied: Vec<(ObjectRef, u64)>,
+    emptied_seq: u64,
     /// Stops the keep-alive task when the connection is dropped.
     _keepalive: KeepAlive,
 }
@@ -396,6 +401,66 @@ impl LiveConnection {
     /// Forget sessions that failed to open, so that the next use tries again.
     pub fn retry_failed_sessions(&mut self) {
         self.db_sessions.retain(|_, l| l.error().is_none());
+    }
+
+    /// The rows of tables in `scope` changed in bulk (TRUNCATE, an import): the navigator
+    /// reads the sizes and row counts it shows there again, keeping the old ones until the
+    /// new ones arrive, and the open object editors (statistics) reload. `scope` without
+    /// a schema is the whole database.
+    pub fn reload_sizes(&mut self, backend: &Backend, scope: &SchemaRef) {
+        for key in self.meta.size_lists(scope, self.current_database.as_deref()) {
+            match self.ensure_session(backend, key.database()) {
+                Some(s) => self.meta.reload_list(backend, &s, key),
+                // The session of that database is opening (or failed): read when shown.
+                None => self.meta.forget_list(&key),
+            }
+        }
+        self.meta.invalidations += 1;
+    }
+
+    /// Before a statement that needs its tables to itself (TRUNCATE, DROP, ALTER, VACUUM
+    /// FULL): the results of the connection's other sessions read page by page let go of
+    /// their tables, or the statement would wait for them (an open data tab of the table)
+    /// — see [`SessionHandle::release_idle_cursor`]. They read on when scrolled.
+    pub fn release_idle_cursors(&self, backend: &Backend, except: Option<&SessionHandle>) {
+        for s in self.sessions().into_iter().filter(|s| !except.is_some_and(|e| s.same(e)) && s.has_open_cursor()) {
+            backend.spawn_detached(async move { s.release_idle_cursor().await });
+        }
+    }
+
+    /// `tables` were emptied (TRUNCATE): their open data views read the rows again.
+    pub fn note_emptied(&mut self, tables: &[ObjectRef]) {
+        if tables.is_empty() {
+            return;
+        }
+        self.emptied_seq += 1;
+        let seq = self.emptied_seq;
+        for t in tables {
+            match self.emptied.iter_mut().find(|(e, _)| e == t) {
+                Some(e) => e.1 = seq,
+                None => self.emptied.push((t.clone(), seq)),
+            }
+        }
+    }
+
+    /// Changes whenever tables are emptied ([`note_emptied`](Self::note_emptied)).
+    pub fn emptied_seq(&self) -> u64 {
+        self.emptied_seq
+    }
+
+    /// `table` was emptied after the emptying numbered `seen`. Names compare as the
+    /// server folds unquoted ones; a name written without its schema (or database)
+    /// matches the table in any (one data view too many reads again, never one too few).
+    pub fn emptied_since(&self, seen: u64, table: &ObjectRef) -> bool {
+        let same = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => true,
+        };
+        let current = &self.current_database;
+        let db = |d: &Option<String>| d.clone().or_else(|| current.clone());
+        self.emptied
+            .iter()
+            .any(|(t, seq)| *seq > seen && t.name.eq_ignore_ascii_case(&table.name) && same(&t.schema, &table.schema) && same(&db(&t.database), &db(&table.database)))
     }
 
     /// Open an additional session (separate connection per editor, FR-C7).
@@ -1077,6 +1142,8 @@ impl ConnectionManager {
                                 current_database: c.database,
                                 current_schema: c.schema,
                                 catalog_folders,
+                                emptied: Vec::new(),
+                                emptied_seq: 0,
                                 _keepalive: keepalive,
                             },
                         );

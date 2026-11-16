@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ternarygrid_core::admin::{MaintenanceOp, TabularData};
 use ternarygrid_core::driver::{ExecOptions, ResultHeader, ServerMessage, TransactionMode};
-use ternarygrid_core::meta::{ObjectKind, ObjectRef};
+use ternarygrid_core::meta::{ObjectKind, ObjectRef, SchemaRef};
 use ternarygrid_core::{DbResult, Dialect, tr, trf};
 use ternarygrid_ui::{kit, parts};
 use tokio_util::sync::CancellationToken;
@@ -145,6 +145,22 @@ async fn execute_one(session: &SessionHandle, sql: &str) -> DbResult<StatementRe
     read?;
     out.duration = started.elapsed();
     Ok(out)
+}
+
+/// The schemas whose sizes a run over `targets` changed, each once: an object's
+/// schema, or a whole database for a database target.
+fn changed_scopes(targets: &[ObjectRef]) -> Vec<SchemaRef> {
+    let mut scopes: Vec<SchemaRef> = Vec::new();
+    for t in targets {
+        let scope = match t.kind {
+            ObjectKind::Database => SchemaRef { database: Some(t.name.clone()).filter(|n| !n.is_empty()), schema: None },
+            _ => t.schema_ref(),
+        };
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    scopes
 }
 
 async fn run_all(
@@ -330,6 +346,10 @@ impl MaintenanceTab {
         let Some(op) = self.current_op(cx) else { return };
         let statements = self.preview_sql(cx);
         let title = trf("{} on {}", &[&tr(op.label), &cx.conns.config(&self.conn).map(|c| c.name.clone()).unwrap_or_default()]);
+        // A data tab of the table read page by page would make TRUNCATE (VACUUM FULL …) wait for it.
+        if let Some(live) = cx.conns.live(&self.conn) {
+            live.release_idle_cursors(cx.backend, Some(&session));
+        }
         let handle = cx.ops.start(title);
         let shared = Arc::new(Mutex::new(Shared::default()));
         let cancel = handle.cancel.clone();
@@ -392,8 +412,20 @@ impl MaintenanceTab {
                 }
                 OpState::Succeeded(statements_executed(shared.results.len()))
             };
+            let ran = shared.results.iter().any(|r| r.error.is_none());
             drop(shared);
             cx.ops.finish(run.op.id, state);
+            // TRUNCATE, VACUUM FULL, OPTIMIZE, ANALYZE … change the sizes and row counts
+            // the navigator shows: read them again (also when a later statement failed).
+            if ran {
+                let targets = self.targets(cx);
+                // Truncated: their open data views read again (their rows are gone).
+                let emptied: Vec<ObjectRef> = if self.is_truncate() { targets.iter().filter(|t| t.kind.is_table_like()).cloned().collect() } else { Vec::new() };
+                for (i, scope) in changed_scopes(&targets).into_iter().enumerate() {
+                    let emptied = if i == 0 { emptied.clone() } else { Vec::new() };
+                    cx.push(AppCommand::RowsChanged { connection: self.conn.clone(), scope, emptied });
+                }
+            }
         }
         if let Some(n) = quiet_success {
             cx.toasts.success(statements_executed(n));

@@ -171,6 +171,10 @@ impl DropDialog {
         if drop.get() && !busy && !read_only && !opening {
             let work: Vec<(String, SessionHandle)> = statements.iter().cloned().zip(sessions.iter().flatten().cloned()).collect();
             self.error = None;
+            // An open data tab of a table read page by page would make the DROP wait for it.
+            if let Some(live) = cx.conns.live(&self.conn) {
+                live.release_idle_cursors(cx.backend, None);
+            }
             self.job = Some(backend.spawn(async move {
                 // The sessions are shared: other uncommitted work would be committed with the drop.
                 if work.iter().map(|(_, s)| s).chain(&own).any(|s| s.has_uncommitted_writes()) {

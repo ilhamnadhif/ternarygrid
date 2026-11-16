@@ -143,6 +143,15 @@ pub enum AppCommand {
         object: Option<ObjectRef>,
         schema: Option<SchemaRef>,
     },
+    /// The rows of tables in `scope` changed in bulk (TRUNCATE, VACUUM FULL …): the
+    /// navigator's sizes and row counts there are read again (`scope` without a
+    /// schema: the whole database), and the open data views of the `emptied` tables
+    /// read their rows again.
+    RowsChanged {
+        connection: String,
+        scope: SchemaRef,
+        emptied: Vec<ObjectRef>,
+    },
     CreateTable {
         connection: String,
         schema: SchemaRef,

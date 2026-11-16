@@ -865,7 +865,13 @@ impl TernaryGridApp {
             AppCommand::RefreshMetadata { connection, object, schema } => {
                 if let Some(live) = self.conns.live_mut(&connection) {
                     match (object, schema) {
-                        (Some(o), _) => live.meta.clear_object(&o),
+                        (Some(o), _) => {
+                            live.meta.clear_object(&o);
+                            // A table's size and row count are in its schema's listing.
+                            if o.kind.is_table_like() || o.kind == ternarygrid_core::ObjectKind::MaterializedView {
+                                live.reload_sizes(&self.backend, &o.schema_ref());
+                            }
+                        }
                         // A database without a schema: all of it.
                         (None, Some(s)) if s.schema.is_none() => live.meta.clear_database(s.database.as_deref(), live.current_database.as_deref()),
                         (None, Some(s)) => live.meta.clear_schema(&s),
@@ -874,6 +880,12 @@ impl TernaryGridApp {
                             live.retry_failed_sessions();
                         }
                     }
+                }
+            }
+            AppCommand::RowsChanged { connection, scope, emptied } => {
+                if let Some(live) = self.conns.live_mut(&connection) {
+                    live.reload_sizes(&self.backend, &scope);
+                    live.note_emptied(&emptied);
                 }
             }
             other => crate::router::route(self, ctx, other),

@@ -24,6 +24,8 @@ struct H {
     toasts: Toasts,
     ops: Operations,
     commands: Vec<AppCommand>,
+    /// The commands the tabs sent, in order.
+    sent: Vec<AppCommand>,
     time: f64,
     id: String,
     dir: std::path::PathBuf,
@@ -71,7 +73,7 @@ impl H {
         let services = Services::ephemeral(&dir.join("home"));
         let settings = Settings::default();
         let (keymap, _) = Keymap::from_config(&settings.keymap, ternarygrid_app::keys::IS_MAC);
-        H { backend, ctx, cm, services, settings, keymap, toasts: Toasts::default(), ops: Operations::default(), commands: Vec::new(), time: 0.0, id, dir }
+        H { backend, ctx, cm, services, settings, keymap, toasts: Toasts::default(), ops: Operations::default(), commands: Vec::new(), sent: Vec::new(), time: 0.0, id, dir }
     }
 
     fn frames(&mut self, tab: &mut dyn TabView, n: usize) {
@@ -105,7 +107,47 @@ impl H {
             self.cm.poll(&self.backend);
             std::thread::sleep(Duration::from_millis(3));
         }
-        self.commands.clear();
+        self.sent.append(&mut self.commands);
+    }
+
+    /// Start `tab`'s operation and run frames until it is done.
+    fn run_maintenance(&mut self, tab: &mut ternarygrid_app::tabs::dbtools::MaintenanceTab) {
+        {
+            let mut cx = AppContext {
+                backend: &self.backend,
+                conns: &mut self.cm,
+                services: &self.services,
+                settings: &mut self.settings,
+                commands: &mut self.commands,
+                toasts: &mut self.toasts,
+                ops: &mut self.ops,
+                keymap: &self.keymap,
+                tab_active: true,
+                current_tab: Some(1),
+                popup: false,
+            };
+            tab.start(&mut cx);
+        }
+        let t0 = Instant::now();
+        while tab.is_running() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{}", tab.log_text());
+            self.frames(tab, 1);
+        }
+        assert!(tab.error().is_none() && tab.results().iter().all(|r| r.error.is_none()), "{}", tab.log_text());
+    }
+
+    /// The scopes of the RowsChanged commands sent so far.
+    fn rows_changed(&self) -> Vec<SchemaRef> {
+        self.sent.iter().filter_map(|c| if let AppCommand::RowsChanged { connection, scope, .. } = c { (*connection == self.id).then(|| scope.clone()) } else { None }).collect()
+    }
+
+    /// The row estimate the navigator's Tables folder of `main` shows for `table`.
+    fn listed_rows(&self, table: &str) -> Option<i64> {
+        let live = self.cm.live(&self.id).unwrap();
+        match live.meta.objects.get(&(SchemaRef::schema("main"), ObjectKind::Table)) {
+            Some(ternarygrid_app::backend::Loadable::Loaded(v)) => v.iter().find(|o| o.obj.name == table).and_then(|o| o.row_estimate),
+            other => panic!("the Tables folder is not shown loaded: loading = {}", other.is_some_and(|l| l.is_loading())),
+        }
     }
 }
 
@@ -118,7 +160,7 @@ fn truncate_empties_the_table() {
     h.frames(&mut tab, 3);
     assert_eq!(tab.title(), "Truncate: orders");
     {
-        let mut cx = AppContext {
+        let cx = AppContext {
             backend: &h.backend,
             conns: &mut h.cm,
             services: &h.services,
@@ -133,17 +175,54 @@ fn truncate_empties_the_table() {
         };
         assert!(tab.available_ops(&cx).iter().any(|o| o == "truncate"), "{:?}", tab.available_ops(&cx));
         assert_eq!(tab.preview_sql(&cx), ["DELETE FROM main.orders"]);
-        tab.start(&mut cx);
     }
-    let t0 = Instant::now();
-    while tab.is_running() {
-        assert!(t0.elapsed() < Duration::from_secs(10), "{}", tab.log_text());
-        h.frames(&mut tab, 1);
-    }
-    assert!(tab.error().is_none() && tab.results().iter().all(|r| r.error.is_none()), "{}", tab.log_text());
+    h.run_maintenance(&mut tab);
     let s = h.cm.live(&h.id).unwrap().main.clone();
     let (_, rows) = h.backend.block_on(async move { s.query_all("SELECT COUNT(*) FROM orders", &[]).await }).unwrap();
     assert_eq!(rows[0][0].as_i64(), Some(0));
+    // The navigator is told: the table's size there is read again (it stayed until a Refresh).
+    assert_eq!(h.rows_changed(), [SchemaRef::schema("main")]);
+}
+
+/// After a maintenance run the navigator's row counts and sizes are read again without a
+/// Refresh, and the old ones stay shown meanwhile (no "Loading…" over a large schema).
+#[test]
+fn maintenance_reloads_the_navigator_sizes_in_place() {
+    let mut h = H::new();
+    let s = h.cm.live(&h.id).unwrap().main.clone();
+    h.backend.block_on(async move { s.execute_update("ANALYZE", &[]).await }).unwrap();
+    // The navigator's Tables folder, loaded as when it is unfolded.
+    let main = SchemaRef::schema("main");
+    {
+        let live = h.cm.live_mut(&h.id).unwrap();
+        let s = live.main.clone();
+        live.meta.request_objects(&h.backend, &s, &main, ObjectKind::Table);
+    }
+    let t0 = Instant::now();
+    while !h.cm.live(&h.id).unwrap().meta.objects[&(main.clone(), ObjectKind::Table)].get().is_some() {
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        h.cm.poll(&h.backend);
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    assert_eq!(h.listed_rows("orders"), Some(2));
+    // More rows, then Analyze in the maintenance window.
+    let s = h.cm.live(&h.id).unwrap().main.clone();
+    h.backend.block_on(async move { s.execute_update("INSERT INTO orders VALUES (3, 1, 1.0), (4, 2, 2.0), (5, 1, 3.0)", &[]).await }).unwrap();
+    let orders = ObjectRef::table(Some("main".into()), "orders");
+    let mut tab = ternarygrid_app::tabs::dbtools::MaintenanceTab::new(h.id.clone(), vec![orders]).with_op(Some("analyze".into()));
+    h.frames(&mut tab, 3);
+    h.run_maintenance(&mut tab);
+    let scopes = h.rows_changed();
+    assert_eq!(scopes, std::slice::from_ref(&main));
+    // As the application does with the command.
+    h.cm.live_mut(&h.id).unwrap().reload_sizes(&h.backend, &scopes[0]);
+    assert_eq!(h.listed_rows("orders"), Some(2), "the old count stays shown while reading");
+    let t0 = Instant::now();
+    while h.listed_rows("orders") != Some(5) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the navigator still shows {:?}", h.listed_rows("orders"));
+        h.cm.poll(&h.backend);
+        std::thread::sleep(Duration::from_millis(3));
+    }
 }
 
 /// The connection's Read-only flag stops Truncate (the driver would not stop a DELETE).
@@ -269,4 +348,57 @@ fn connection_dialog_fits_the_screen() {
     let layer = h.ctx.memory(|m| m.areas().top_layer_id(egui::Order::Middle)).expect("dialog drawn");
     let rect = h.ctx.memory(|m| m.area_rect(layer.id)).expect("dialog rect");
     assert!(rect.height() < screen.y - 40.0 && rect.top() >= 0.0 && rect.bottom() <= screen.y, "dialog {rect:?} does not fit {screen:?}");
+}
+
+/// A table emptied by Truncate…: its open data tab reads again (no rows that are gone are
+/// shown), the data tab of another table does not.
+#[test]
+fn an_emptied_tables_data_tab_reads_again() {
+    use ternarygrid_app::tabs::object::ObjectEditorTab;
+    let mut h = H::new();
+    let orders = ObjectRef::table(Some("main".into()), "orders");
+    let customer = ObjectRef::table(Some("main".into()), "customer");
+    let mut tab = ObjectEditorTab::new(h.id.clone(), orders.clone(), ternarygrid_app::command::ObjectPage::Data);
+    let mut other = ObjectEditorTab::new(h.id.clone(), customer.clone(), ternarygrid_app::command::ObjectPage::Data);
+    let rows = |t: &ObjectEditorTab| t.data.as_ref().and_then(|d| d.panel.as_ref()).filter(|p| !p.src.is_fetching()).map(|p| p.src.row_count());
+    let t0 = Instant::now();
+    while rows(&tab) != Some(2) || rows(&other) != Some(2) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?} {:?}", rows(&tab), rows(&other));
+        h.frames(&mut tab, 1);
+        h.frames(&mut other, 1);
+    }
+    let mut m = ternarygrid_app::tabs::dbtools::MaintenanceTab::new(h.id.clone(), vec![orders.clone()]).with_op(Some("truncate".into()));
+    h.frames(&mut m, 3);
+    h.run_maintenance(&mut m);
+    // As the application does with the command.
+    let sent = std::mem::take(&mut h.sent);
+    let mut emptied_tables = Vec::new();
+    for c in sent {
+        if let AppCommand::RowsChanged { scope, emptied, .. } = c {
+            let live = h.cm.live_mut(&h.id).unwrap();
+            live.reload_sizes(&h.backend, &scope);
+            live.note_emptied(&emptied);
+            emptied_tables.extend(emptied);
+        }
+    }
+    assert_eq!(emptied_tables, std::slice::from_ref(&orders));
+    let t0 = Instant::now();
+    while rows(&tab) != Some(0) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the emptied table's tab still shows {:?} rows", rows(&tab));
+        h.frames(&mut tab, 1);
+    }
+    h.frames(&mut other, 20);
+    assert_eq!(rows(&other), Some(2));
+
+    // Names compare as the server folds unquoted ones; one written without a schema
+    // (TRUNCATE orders in an editor) is the table in any schema.
+    let live = h.cm.live_mut(&h.id).unwrap();
+    let seen = live.emptied_seq();
+    assert!(!live.emptied_since(seen, &orders));
+    live.note_emptied(&[ObjectRef::table(None, "ORDERS")]);
+    assert!(live.emptied_since(seen, &orders));
+    assert!(!live.emptied_since(seen, &customer));
+    assert!(!live.emptied_since(seen, &ObjectRef::table(Some("aux".into()), "customer")));
+    live.note_emptied(&[ObjectRef::table(Some("aux".into()), "customer")]);
+    assert!(!live.emptied_since(seen, &customer), "another schema's table of that name");
 }

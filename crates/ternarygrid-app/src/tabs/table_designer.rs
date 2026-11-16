@@ -948,6 +948,10 @@ impl TableDesignerTab {
         }
         let transactional = transactional_ddl(self.kind);
         self.exec_error = None;
+        // An open data tab of the table read page by page would make the ALTER wait for it.
+        if let Some(live) = cx.conns.live(&self.conn) {
+            live.release_idle_cursors(cx.backend, Some(&session));
+        }
         self.creating = self.is_create();
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         self.applied = applied.clone();

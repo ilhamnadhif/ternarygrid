@@ -3,6 +3,15 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.6.9 — 2026-11-16
+
+After Truncate…, the navigator shows the table's new size at once, and the truncate no longer waits for the table's open data tab.
+
+### Fixed
+- **The navigator kept a truncated table's old size** (still 5.9 GB after Truncate…) until the schema was refreshed by hand. Truncate…, the other maintenance operations (Vacuum, Analyze, Optimize …) and a TRUNCATE run in a SQL editor now read the navigator's sizes and row counts again at once. The rows stay on screen meanwhile instead of turning into "Loading…", which matters in a schema of thousands of tables. A partitioned table's size, the sum of its partitions', follows a truncated partition, also one kept in another schema. A TRUNCATE inside a transaction (manual commit) shows once committed: before that, reading the sizes would only wait for its lock. Refresh on a single table now reads its size again too, as do an import, mock data and the synchronisation of a data compare.
+- **Truncate… waited, for up to five minutes, while the table's data was open in a tab.** A result read page by page keeps its query running on the server, and on PostgreSQL and MySQL that query holds a lock the TRUNCATE has to wait for: the window showed Stop until the idle result was closed after five minutes. Before a TRUNCATE, DROP or ALTER (from the navigator, the table designer or a SQL editor), the other tabs' query results now let go of their tables; scrolled further, they read on by running the query again. Results of statements that change data (`UPDATE … RETURNING`) are left alone, since closing them would cancel the change.
+- **An open data tab of a truncated table still showed the rows that were gone.** It now reads again by itself, unless it holds edits not saved yet: those are never thrown away unasked.
+
 ## 0.6.8 — 2026-11-13
 
 After the computer sleeps, a connection's dot tells the truth, and an open table never stays on "Reading data…".
