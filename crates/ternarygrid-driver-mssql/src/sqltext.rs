@@ -594,6 +594,204 @@ pub fn select_shape(sql: &str) -> SelectShape {
     shape
 }
 
+/// Keywords that write data, change schema/security/server state, or invoke
+/// side-effecting operations in T-SQL.
+const FORBIDDEN_READ_ONLY_KEYWORDS: &[&str] = &[
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "TRUNCATE",
+    "EXEC",
+    "EXECUTE",
+    "GRANT",
+    "REVOKE",
+    "DENY",
+    "BACKUP",
+    "RESTORE",
+    "BULK",
+    "WRITETEXT",
+    "UPDATETEXT",
+    "READTEXT",
+    "SHUTDOWN",
+    "KILL",
+    "RECONFIGURE",
+    "CHECKPOINT",
+    "SETUSER",
+    "REVERT",
+    "OPENROWSET",
+    "OPENQUERY",
+    "OPENDATASOURCE",
+    "DBCC",
+    "WAITFOR",
+    "RAISERROR",
+    "THROW",
+    "ENABLE",
+    "DISABLE",
+    "MOVE",
+    "RECEIVE",
+    "SEND",
+    "BEGIN",
+    "INTO",
+    "USE",
+    "DECLARE",
+    "SAVE",
+];
+
+fn is_on_off(tok: &Tok<'_>) -> bool {
+    tok.is("ON") || tok.is("OFF")
+}
+
+/// Consume an optional sign plus integer token (`123`, `-1`, `+5`).
+fn consume_int(toks: &[Tok<'_>]) -> Option<usize> {
+    match toks.first() {
+        Some(t) if t.kind == TokKind::Number => Some(1),
+        Some(t) if t.kind == TokKind::Punct && (t.text == "-" || t.text == "+") => toks.get(1).is_some_and(|n| n.kind == TokKind::Number).then_some(2),
+        _ => None,
+    }
+}
+
+/// If `stmt` starts with a safe read-only `SET` option, return how many tokens it consumes.
+fn consume_safe_set(stmt: &[Tok<'_>]) -> Option<usize> {
+    if !stmt.first().is_some_and(|t| t.is("SET")) {
+        return None;
+    }
+    let opt = stmt.get(1)?;
+    if opt.kind != TokKind::Word {
+        return None;
+    }
+    let upper = opt.text.to_ascii_uppercase();
+    match upper.as_str() {
+        "TRANSACTION" => {
+            if !stmt.get(2).is_some_and(|t| t.is("ISOLATION")) || !stmt.get(3).is_some_and(|t| t.is("LEVEL")) {
+                return None;
+            }
+            let lvl = stmt.get(4)?;
+            if lvl.is("SNAPSHOT") || lvl.is("SERIALIZABLE") {
+                Some(5)
+            } else if (lvl.is("READ") && stmt.get(5).is_some_and(|t| t.is("UNCOMMITTED") || t.is("COMMITTED")))
+                || (lvl.is("REPEATABLE") && stmt.get(5).is_some_and(|t| t.is("READ")))
+            {
+                Some(6)
+            } else {
+                None
+            }
+        }
+        "NOCOUNT" | "ARITHABORT" | "ANSI_NULLS" | "QUOTED_IDENTIFIER" | "SHOWPLAN_XML" => stmt.get(2).is_some_and(is_on_off).then_some(3),
+        "ROWCOUNT" | "DATEFIRST" | "QUERY_GOVERNOR_COST_LIMIT" => stmt.get(2).is_some_and(|t| t.kind == TokKind::Number).then_some(3),
+        "LOCK_TIMEOUT" => consume_int(&stmt[2..]).map(|n| 2 + n),
+        "DATEFORMAT" => stmt.get(2).is_some_and(|t| matches!(t.kind, TokKind::Word | TokKind::Str)).then_some(3),
+        "LANGUAGE" => stmt.get(2).is_some_and(|t| matches!(t.kind, TokKind::Word | TokKind::Str | TokKind::Quoted)).then_some(3),
+        "DEADLOCK_PRIORITY" => {
+            if stmt.get(2).is_some_and(|t| t.is("LOW") || t.is("NORMAL") || t.is("HIGH")) {
+                Some(3)
+            } else {
+                consume_int(&stmt[2..]).map(|n| 2 + n)
+            }
+        }
+        "STATISTICS" => {
+            let mut idx = 2;
+            let mut saw_item = false;
+            while let Some(t) = stmt.get(idx) {
+                if t.is("IO") || t.is("TIME") || t.is("XML") || t.is("PROFILE") {
+                    saw_item = true;
+                    idx += 1;
+                    if stmt.get(idx).is_some_and(|c| c.kind == TokKind::Punct && c.text == ",") {
+                        saw_item = false;
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if saw_item && stmt.get(idx).is_some_and(is_on_off) { Some(idx + 1) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// If `stmt` starts with `COMMIT` or `ROLLBACK`, return how many tokens it consumes.
+fn consume_tx_end(stmt: &[Tok<'_>]) -> Option<usize> {
+    let first = stmt.first()?;
+    if !(first.is("COMMIT") || first.is("ROLLBACK")) {
+        return None;
+    }
+    match stmt.get(1) {
+        Some(t) if t.is("WORK") => Some(2),
+        Some(t) if t.is("TRAN") || t.is("TRANSACTION") => {
+            if let Some(name) = stmt.get(2)
+                && matches!(name.kind, TokKind::Word | TokKind::Quoted | TokKind::Variable)
+                && !(name.is("SELECT") || name.is("WITH") || name.is("SET") || name.is("COMMIT") || name.is("ROLLBACK"))
+            {
+                Some(3)
+            } else {
+                Some(2)
+            }
+        }
+        _ => Some(1),
+    }
+}
+
+fn statement_is_read_only(stmt: &[Tok<'_>]) -> bool {
+    if stmt.is_empty() {
+        return true;
+    }
+    for (i, t) in stmt.iter().enumerate() {
+        if t.kind == TokKind::Word {
+            if FORBIDDEN_READ_ONLY_KEYWORDS.iter().any(|kw| t.text.eq_ignore_ascii_case(kw)) {
+                // `INNER MERGE JOIN` / `OPTION (MERGE JOIN)` is a join hint, not a MERGE statement.
+                if t.is("MERGE") && stmt.get(i + 1).is_some_and(|n| n.is("JOIN")) {
+                    continue;
+                }
+                return false;
+            }
+            if t.is("NEXT") && stmt.get(i + 1).is_some_and(|n| n.is("VALUE")) && stmt.get(i + 2).is_some_and(|n| n.is("FOR")) {
+                return false;
+            }
+        }
+    }
+    let mut pos = 0;
+    while pos < stmt.len() {
+        let rest = &stmt[pos..];
+        if let Some(n) = consume_safe_set(rest).or_else(|| consume_tx_end(rest)) {
+            pos += n;
+            continue;
+        }
+        if rest.iter().skip(1).any(|t| t.is("SET")) {
+            return false;
+        }
+        let mut idx = 0;
+        while rest.get(idx).is_some_and(|t| t.kind == TokKind::Punct && t.text == "(") {
+            idx += 1;
+        }
+        let Some(first) = rest.get(idx) else {
+            return false;
+        };
+        if idx > 0 {
+            return first.is("SELECT");
+        }
+        if first.is("SELECT") {
+            return true;
+        }
+        if first.is("WITH") {
+            return rest[1..].iter().any(|t| t.is("SELECT"));
+        }
+        return false;
+    }
+    true
+}
+
+/// Conservative check for T-SQL statements allowed on a read-only SQL Server connection.
+pub fn is_read_only_sql(sql: &str) -> bool {
+    let toks = tokenize(sql);
+    toks.split(|t| t.kind == TokKind::Punct && t.text == ";").all(statement_is_read_only)
+}
+
 /// Unquote `[a]]b]` / `"x"` identifiers.
 pub fn unquote_ident(s: &str) -> String {
     let s = s.trim();
@@ -712,5 +910,116 @@ mod tests {
         assert!(touches_session_state("BEGIN TRANSACTION"));
         assert!(touches_session_state("use db1"));
         assert!(!touches_session_state("SELECT 'COMMIT'"));
+    }
+
+    #[test]
+    fn read_only_sql_classification() {
+        // Allowed reads, comments, quoted identifiers/strings, safe SET, COMMIT/ROLLBACK.
+        for ok in [
+            "",
+            "   ; ; -- comment only\n/* nested /* comment */ */",
+            "SELECT 1",
+            "SELECT * FROM dbo.orders WHERE id = 1",
+            "(SELECT 1) UNION (SELECT 2)",
+            "SELECT * FROM a INNER MERGE JOIN b ON a.id = b.id",
+            "WITH c AS (SELECT 1 AS a) SELECT * FROM c",
+            "/* DELETE FROM t */ SELECT 'DELETE', N'INTO', [DROP], \"UPDATE\" FROM [CREATE] -- INSERT",
+            "SELECT 1; SELECT 2;",
+            "COMMIT",
+            "COMMIT TRANSACTION",
+            "ROLLBACK TRAN",
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET NOCOUNT ON",
+            "SET NOCOUNT OFF",
+            "SET ROWCOUNT 100",
+            "SET LOCK_TIMEOUT 5000",
+            "SET LOCK_TIMEOUT -1",
+            "SET DATEFORMAT ymd",
+            "SET DATEFIRST 1",
+            "SET LANGUAGE us_english",
+            "SET LANGUAGE N'English'",
+            "SET ARITHABORT ON",
+            "SET ANSI_NULLS ON",
+            "SET QUOTED_IDENTIFIER OFF",
+            "SET SHOWPLAN_XML ON",
+            "SET SHOWPLAN_XML OFF",
+            "SET STATISTICS IO ON",
+            "SET STATISTICS IO, TIME OFF",
+            "SET QUERY_GOVERNOR_COST_LIMIT 100",
+            "SET DEADLOCK_PRIORITY LOW",
+            "SET DEADLOCK_PRIORITY -5",
+            "SET NOCOUNT ON; SELECT * FROM dbo.orders",
+            "SET NOCOUNT ON\nSELECT * FROM dbo.orders",
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED\nSELECT * FROM dbo.orders",
+        ] {
+            assert!(is_read_only_sql(ok), "expected read-only: {ok}");
+        }
+
+        // Rejected writes, DDL, procedures, sequence advancement, SELECT INTO, unsafe SET, multi-statement writes.
+        for bad in [
+            "SELECT * INTO new_table FROM dbo.orders",
+            "SELECT a INTO #tmp FROM dbo.orders",
+            "WITH c AS (SELECT 1 AS a) SELECT a INTO dbo.copy FROM c",
+            "INSERT INTO dbo.t VALUES (1)",
+            "UPDATE dbo.t SET a = 1",
+            "DELETE FROM dbo.t",
+            "MERGE INTO dbo.t USING dbo.s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "WITH c AS (SELECT 1 AS a) DELETE FROM dbo.t WHERE a IN (SELECT a FROM c)",
+            "WITH c AS (SELECT 1 AS a) UPDATE dbo.t SET a = 2",
+            "WITH c AS (SELECT 1 AS a) INSERT INTO dbo.t SELECT a FROM c",
+            "CREATE TABLE dbo.t (a int)",
+            "ALTER TABLE dbo.t ADD b int",
+            "DROP TABLE dbo.t",
+            "TRUNCATE TABLE dbo.t",
+            "EXEC sp_who",
+            "EXECUTE dbo.my_proc",
+            "DBCC CHECKDB",
+            "GRANT SELECT ON dbo.t TO bob",
+            "REVOKE SELECT ON dbo.t FROM bob",
+            "DENY SELECT ON dbo.t TO bob",
+            "BACKUP DATABASE db TO DISK = 'x.bak'",
+            "RESTORE DATABASE db FROM DISK = 'x.bak'",
+            "BULK INSERT dbo.t FROM 'x.csv'",
+            "CHECKPOINT",
+            "RECONFIGURE",
+            "SHUTDOWN",
+            "KILL 55",
+            "WAITFOR DELAY '00:00:01'",
+            "RAISERROR('boom', 16, 1)",
+            "THROW 50000, 'boom', 1",
+            "BEGIN TRANSACTION",
+            "BEGIN DELETE FROM dbo.t; END",
+            "SELECT NEXT VALUE FOR dbo.my_seq",
+            "WITH c AS (SELECT NEXT VALUE FOR dbo.my_seq AS v) SELECT * FROM c",
+            "SELECT * FROM OPENROWSET('SQLNCLI', 'Server=x;', 'SELECT 1')",
+            "SELECT * FROM OPENQUERY(linked, 'DELETE FROM t')",
+            "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'Data Source=x').db.dbo.t",
+            "SELECT 1; DELETE FROM dbo.t",
+            "SELECT 1\nDELETE FROM dbo.t",
+            "SELECT 1\nSELECT * INTO dbo.copy FROM dbo.t",
+            "SELECT 1\nSET IDENTITY_INSERT dbo.t ON",
+            "SET @x = 1",
+            "SET IDENTITY_INSERT dbo.t ON",
+            "SET IMPLICIT_TRANSACTIONS ON",
+            "SET TRANSACTION READ WRITE",
+            "SET CONTEXT_INFO 0x01",
+            "SET NOCOUNT ON\nsp_who",
+            "SET NOCOUNT ON; DELETE FROM dbo.t",
+            "SET STATISTICS IO, ON",
+            "USE master",
+            "DECLARE @x INT",
+            "ENABLE TRIGGER ALL ON dbo.t",
+            "DISABLE TRIGGER ALL ON dbo.t",
+            "RECEIVE TOP (1) * FROM dbo.q",
+            "SEND ON CONVERSATION @h MESSAGE TYPE [m]",
+            "MOVE CONVERSATION @h TO @g",
+            "sp_who",
+        ] {
+            assert!(!is_read_only_sql(bad), "expected rejected: {bad}");
+        }
     }
 }

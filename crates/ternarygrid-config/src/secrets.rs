@@ -354,6 +354,85 @@ impl<S: SecretStore> SecretStore for BundledStore<S> {
     }
 }
 
+/// Stores each secret as its own entry in `inner`, transparently migrating any
+/// legacy [`BundledStore`] entry (`ternarygrid:secrets`) into per-key entries
+/// on first use.
+///
+/// Used with [`KeychainStore`] on Windows, where Windows Credential Manager
+/// enforces a 2,560-byte `CRED_MAX_CREDENTIAL_BLOB_SIZE` limit per credential
+/// (which a single bundled JSON blob quickly exceeds) and does not show
+/// per-entry permission prompts.
+pub struct UnbundlingStore<S: SecretStore> {
+    inner: S,
+    migrated: Mutex<bool>,
+}
+
+impl<S: SecretStore> UnbundlingStore<S> {
+    /// Wraps `inner` with one-time migration from [`BundledStore::BUNDLE_KEY`].
+    pub fn new(inner: S) -> UnbundlingStore<S> {
+        UnbundlingStore {
+            inner,
+            migrated: Mutex::new(false),
+        }
+    }
+
+    /// The underlying store.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    fn migrate_once(&self) -> DbResult<()> {
+        let mut migrated = self.migrated.lock();
+        if *migrated {
+            return Ok(());
+        }
+        let Some(blob) = self.inner.get(BundledStore::<S>::BUNDLE_KEY)? else {
+            *migrated = true;
+            return Ok(());
+        };
+        let parsed: BTreeMap<String, String> = serde_json::from_str(blob.expose())
+            .map_err(|e| DbError::config(format!("The stored secrets cannot be read: {e}")))?;
+        for (k, v) in parsed {
+            if self.inner.get(&k)?.is_none() {
+                self.inner.set(&k, &Secret::new(v))?;
+            }
+        }
+        self.inner.delete(BundledStore::<S>::BUNDLE_KEY)?;
+        *migrated = true;
+        Ok(())
+    }
+}
+
+impl<S: SecretStore> SecretStore for UnbundlingStore<S> {
+    fn get(&self, key: &str) -> DbResult<Option<Secret>> {
+        self.migrate_once()?;
+        self.inner.get(key)
+    }
+
+    fn set(&self, key: &str, value: &Secret) -> DbResult<()> {
+        self.migrate_once()?;
+        self.inner.set(key, value)
+    }
+
+    fn delete(&self, key: &str) -> DbResult<()> {
+        self.migrate_once()?;
+        self.inner.delete(key)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    fn is_locked(&self) -> bool {
+        self.inner.is_locked()
+    }
+
+    fn list_keys(&self) -> DbResult<Vec<String>> {
+        self.migrate_once()?;
+        self.inner.list_keys()
+    }
+}
+
 // ------------------------------------------------------------------- vault
 
 const VAULT_MAGIC: &[u8; 8] = b"TGRIDVLT";
@@ -687,7 +766,6 @@ impl VaultFileLock {
             ))
         })?;
         let locked = loop {
-            #[allow(clippy::incompatible_msrv)]
             match file.lock() {
                 Ok(()) => break Some(file),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1033,29 +1111,36 @@ impl std::fmt::Debug for SecretsManager {
 }
 
 impl SecretsManager {
-    /// Backend chosen in the settings: the OS keychain or `vault.bin`
-    /// (initially locked; see [`SecretsManager::vault`]).
+    /// Platform-appropriate OS keychain store.
     ///
     /// On Windows, entries are stored directly per key in Windows Credential
-    /// Manager because each credential has a hard 2,560-byte
-    /// `CRED_MAX_CREDENTIAL_BLOB_SIZE` limit (which a single bundled JSON blob
-    /// quickly exceeds) and Windows does not display per-entry keychain
-    /// permission prompts. On macOS and other Unix platforms, secrets are
-    /// bundled into one keychain entry so macOS Keychain prompts at most once
-    /// per launch.
+    /// Manager wrapped in [`UnbundlingStore`] (migrating any legacy bundled
+    /// entry) because each credential has a hard 2,560-byte
+    /// `CRED_MAX_CREDENTIAL_BLOB_SIZE` limit and Windows does not display
+    /// per-entry keychain permission prompts. On macOS and other Unix
+    /// platforms, secrets are bundled via [`BundledStore`] into one keychain
+    /// entry so macOS Keychain prompts at most once per launch.
+    pub fn platform_keychain_store() -> Arc<dyn SecretStore> {
+        #[cfg(windows)]
+        {
+            Arc::new(UnbundlingStore::new(KeychainStore::new()))
+        }
+        #[cfg(not(windows))]
+        {
+            Arc::new(BundledStore::new(KeychainStore::new()))
+        }
+    }
+
+    /// Backend chosen in the settings: the OS keychain (via
+    /// [`SecretsManager::platform_keychain_store`]) or `vault.bin`
+    /// (initially locked; see [`SecretsManager::vault`]).
     pub fn new(paths: &AppPaths, security: &SecuritySettings) -> SecretsManager {
         match security.secret_backend {
-            SecretBackend::Keychain => {
-                #[cfg(windows)]
-                let store: Arc<dyn SecretStore> = Arc::new(KeychainStore::new());
-                #[cfg(not(windows))]
-                let store: Arc<dyn SecretStore> = Arc::new(BundledStore::new(KeychainStore::new()));
-                SecretsManager {
-                    backend: SecretBackend::Keychain,
-                    store,
-                    vault: None,
-                }
-            }
+            SecretBackend::Keychain => SecretsManager {
+                backend: SecretBackend::Keychain,
+                store: Self::platform_keychain_store(),
+                vault: None,
+            },
             SecretBackend::EncryptedFile => {
                 let vault = Arc::new(VaultStore::new(paths.vault_file()));
                 SecretsManager {
@@ -1684,14 +1769,12 @@ mod tests {
             .write(true)
             .open(&lock_path)
             .unwrap();
-        #[allow(clippy::incompatible_msrv)]
         let try_res = probe.try_lock();
         assert!(
             matches!(try_res, Err(std::fs::TryLockError::WouldBlock)),
             "expected advisory lock contention, got {try_res:?}"
         );
         drop(lock);
-        #[allow(clippy::incompatible_msrv)]
         probe
             .try_lock()
             .expect("lock must be released when VaultFileLock drops");
@@ -1807,6 +1890,231 @@ mod tests {
                 "ai:anthropic:api-key".to_string(),
                 "conn:b:password".to_string()
             ]
+        );
+    }
+
+    /// Mock store that fails `set` for a chosen key until cleared.
+    struct FailingSetStore {
+        inner: MemoryStore,
+        fail_key: Mutex<Option<String>>,
+    }
+
+    impl FailingSetStore {
+        fn new(fail_key: &str) -> Self {
+            FailingSetStore {
+                inner: MemoryStore::new(),
+                fail_key: Mutex::new(Some(fail_key.to_string())),
+            }
+        }
+
+        fn clear_failure(&self) {
+            *self.fail_key.lock() = None;
+        }
+    }
+
+    impl SecretStore for FailingSetStore {
+        fn get(&self, key: &str) -> DbResult<Option<Secret>> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &str, value: &Secret) -> DbResult<()> {
+            if self.fail_key.lock().as_deref() == Some(key) {
+                return Err(DbError::io(format!("simulated write failure for {key}")));
+            }
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &str) -> DbResult<()> {
+            self.inner.delete(key)
+        }
+        fn backend_name(&self) -> &'static str {
+            self.inner.backend_name()
+        }
+        fn is_locked(&self) -> bool {
+            self.inner.is_locked()
+        }
+        fn list_keys(&self) -> DbResult<Vec<String>> {
+            self.inner.list_keys()
+        }
+    }
+
+    #[test]
+    fn unbundling_store_migrates_bundle_and_deletes_bundle_key() {
+        let inner = MemoryStore::new();
+        let bundle = serde_json::json!({
+            "conn:a:password": "pw-a",
+            "conn:b:password": "pw-b",
+            "ai:openai:api-key": "sk-123"
+        })
+        .to_string();
+        inner
+            .set(
+                BundledStore::<MemoryStore>::BUNDLE_KEY,
+                &Secret::new(bundle),
+            )
+            .unwrap();
+
+        let store = UnbundlingStore::new(inner);
+        assert_eq!(store.backend_name(), "memory");
+        assert!(!store.is_locked());
+        assert_eq!(
+            store.get("conn:a:password").unwrap().unwrap().expose(),
+            "pw-a"
+        );
+        assert_eq!(
+            store.get("conn:b:password").unwrap().unwrap().expose(),
+            "pw-b"
+        );
+        assert_eq!(
+            store.get("ai:openai:api-key").unwrap().unwrap().expose(),
+            "sk-123"
+        );
+        // Legacy bundle key is deleted once every entry has been migrated.
+        assert!(
+            store
+                .inner()
+                .get(BundledStore::<MemoryStore>::BUNDLE_KEY)
+                .unwrap()
+                .is_none()
+        );
+        let mut keys = store.list_keys().unwrap();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "ai:openai:api-key".to_string(),
+                "conn:a:password".to_string(),
+                "conn:b:password".to_string(),
+            ]
+        );
+        // Subsequent writes and deletes delegate cleanly to inner.
+        store.set("conn:c:password", &Secret::new("pw-c")).unwrap();
+        assert_eq!(
+            store
+                .inner()
+                .get("conn:c:password")
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "pw-c"
+        );
+        store.delete("conn:a:password").unwrap();
+        assert!(store.inner().get("conn:a:password").unwrap().is_none());
+
+        // Invalid JSON in the legacy bundle returns a config error without deleting it.
+        let bad_inner = MemoryStore::new();
+        bad_inner
+            .set(
+                BundledStore::<MemoryStore>::BUNDLE_KEY,
+                &Secret::new("{not-json"),
+            )
+            .unwrap();
+        let bad_store = UnbundlingStore::new(bad_inner);
+        assert_eq!(
+            bad_store.get("conn:a:password").unwrap_err().kind,
+            ErrorKind::Config
+        );
+        assert!(
+            bad_store
+                .inner()
+                .get(BundledStore::<MemoryStore>::BUNDLE_KEY)
+                .unwrap()
+                .is_some(),
+            "corrupt bundle must not be deleted"
+        );
+
+        let platform = SecretsManager::platform_keychain_store();
+        assert_eq!(platform.backend_name(), "keychain");
+        assert!(!platform.is_locked());
+    }
+
+    #[test]
+    fn unbundling_store_does_not_clobber_existing_per_key_entries() {
+        let inner = MemoryStore::new();
+        inner
+            .set("conn:a:password", &Secret::new("newer-per-key"))
+            .unwrap();
+        let bundle = serde_json::json!({
+            "conn:a:password": "stale-bundled",
+            "conn:b:password": "from-bundle"
+        })
+        .to_string();
+        inner
+            .set(
+                BundledStore::<MemoryStore>::BUNDLE_KEY,
+                &Secret::new(bundle),
+            )
+            .unwrap();
+
+        let store = UnbundlingStore::new(inner);
+        assert_eq!(
+            store.get("conn:a:password").unwrap().unwrap().expose(),
+            "newer-per-key"
+        );
+        assert_eq!(
+            store.get("conn:b:password").unwrap().unwrap().expose(),
+            "from-bundle"
+        );
+        assert!(
+            store
+                .inner()
+                .get(BundledStore::<MemoryStore>::BUNDLE_KEY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unbundling_store_keeps_bundle_on_write_failure_and_retries() {
+        let failing = FailingSetStore::new("conn:b:password");
+        let bundle = serde_json::json!({
+            "conn:a:password": "pw-a",
+            "conn:b:password": "pw-b",
+            "conn:c:password": "pw-c"
+        })
+        .to_string();
+        failing
+            .inner
+            .set(
+                BundledStore::<MemoryStore>::BUNDLE_KEY,
+                &Secret::new(bundle),
+            )
+            .unwrap();
+
+        let store = UnbundlingStore::new(failing);
+        let err = store.get("conn:a:password").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Io);
+        // Bundle must still exist because migrating `conn:b:password` failed.
+        assert!(
+            store
+                .inner()
+                .inner
+                .get(BundledStore::<MemoryStore>::BUNDLE_KEY)
+                .unwrap()
+                .is_some(),
+            "BUNDLE_KEY must not be deleted when an entry fails to migrate"
+        );
+
+        // Once the transient failure clears, a later operation completes migration.
+        store.inner().clear_failure();
+        assert_eq!(
+            store.get("conn:b:password").unwrap().unwrap().expose(),
+            "pw-b"
+        );
+        assert_eq!(
+            store.get("conn:a:password").unwrap().unwrap().expose(),
+            "pw-a"
+        );
+        assert_eq!(
+            store.get("conn:c:password").unwrap().unwrap().expose(),
+            "pw-c"
+        );
+        assert!(
+            store
+                .inner()
+                .inner
+                .get(BundledStore::<MemoryStore>::BUNDLE_KEY)
+                .unwrap()
+                .is_none(),
+            "BUNDLE_KEY must be deleted after retry succeeds"
         );
     }
 

@@ -531,12 +531,16 @@ fn parse_port(p: &str) -> DbResult<u16> {
 
 /// The URL with any password replaced by `***` (for messages).
 pub fn redact_url(url: &str) -> String {
-    let mut out = url.to_string();
-    // 1. Standard `scheme://user:password@host` (or `scheme://user:password` without `@`).
+    // 1. Redact `password=...`, `pwd=...`, `api_key=...` in query / semicolon properties
+    //    FIRST (including SQL Server JDBC braced values `{p;w}}x}` that may contain
+    //    `@`, `;`, `&`, or `}}`), so an `@` inside a property password cannot confuse
+    //    authority or Oracle `user/pass@` scanning below.
+    let mut out = redact_kv_secrets(url);
+    // 2. Standard `scheme://user:password@host` (or `scheme://user:password` without `@`).
     if let Some(scheme_end) = out.find("://") {
         let auth_start = scheme_end + 3;
         let auth_end = out[auth_start..]
-            .find('/')
+            .find(['/', '?', ';'])
             .map(|i| i + auth_start)
             .unwrap_or(out.len());
         let authority = &out[auth_start..auth_end];
@@ -556,7 +560,7 @@ pub fn redact_url(url: &str) -> String {
             }
         }
     } else if let Some(at) = out.rfind('@') {
-        // 2. Schemes without `://` such as Oracle `jdbc:oracle:thin:user/pass@//host:1521/orcl`
+        // 3. Schemes without `://` such as Oracle `jdbc:oracle:thin:user/pass@//host:1521/orcl`
         //    or `oracle:user/pass@host`. Skip file-path schemes that may contain `@` in paths.
         let lower_prefix = out.to_ascii_lowercase();
         let is_file_scheme = lower_prefix.starts_with("sqlite:")
@@ -570,9 +574,7 @@ pub fn redact_url(url: &str) -> String {
             }
         }
     }
-    // 3. `password=...`, `pwd=...`, `api_key=...` in query / semicolon properties,
-    //    including SQL Server JDBC braced values `{p;w}}x}` that may contain `;`, `&`, or `}}`.
-    redact_kv_secrets(&out)
+    out
 }
 
 /// Redact secret key-value parameters (`password=`, `pwd=`, `api_key=`) across query and
@@ -1071,6 +1073,21 @@ mod tests {
         let e = parse_connection_url("jdbc:unknown:scott/s3cret@host;pwd={x;y}}z}").unwrap_err();
         assert!(!e.message.contains("s3cret"), "{}", e.message);
         assert!(!e.message.contains("x;y"), "{}", e.message);
+
+        // `@` inside query/property passwords (including braced SQL Server values)
+        // must not confuse authority scanning or leak any part of the password.
+        assert_eq!(
+            redact_url("jdbc:sqlserver://host:1433;user=sa;password={p@ss;123};encrypt=true"),
+            "jdbc:sqlserver://host:1433;user=sa;password=***;encrypt=true"
+        );
+        assert_eq!(
+            redact_url("postgres://host:5432?pwd=my@secret"),
+            "postgres://host:5432?pwd=***"
+        );
+        assert_eq!(
+            redact_url("postgres://alice:p@ss@host:5432/db?pwd=x@y"),
+            "postgres://alice:***@host:5432/db?pwd=***"
+        );
     }
 
     #[test]

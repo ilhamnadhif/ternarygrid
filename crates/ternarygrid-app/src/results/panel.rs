@@ -867,8 +867,8 @@ impl ResultPanel {
                 let Some(d) = self.dialect(cx) else { return };
                 let confirm = cx.conns.type_of(&self.conn).confirm_data_change;
                 // Why the changes cannot be saved, instead of an empty preview.
-                // Raw SQL expressions (`CellValue::Expr`) always open the preview so
-                // they are never executed silently without review.
+                // Unvalidated raw SQL expressions (`CellValue::Expr`) always open
+                // the preview so they are never executed silently without review.
                 match self.model.checked_change_set() {
                     Ok(cs) if needs_save_preview(confirm, &cs) => self.save_preview = Some(cs.preview_sql(d.as_ref())),
                     Ok(_) => self.start_save(cx),
@@ -1573,12 +1573,16 @@ fn read_clipboard() -> Option<String> {
 }
 
 /// Whether saving `cs` must show the SQL preview dialog first: whenever the
-/// connection type requires confirmation OR `cs` contains raw SQL expressions
-/// (`CellValue::Expr`), which must never execute silently without user review.
+/// connection type requires confirmation OR `cs` contains an unvalidated raw
+/// SQL expression (`CellValue::Expr` that fails `is_sql_expression`). Validated
+/// expressions typed interactively (e.g. `now()`, `CURRENT_TIMESTAMP`) save
+/// directly when `confirm_data_change` is false; clipboard paste is already
+/// blocked from creating `CellValue::Expr`.
 fn needs_save_preview(confirm_data_change: bool, cs: &ternarygrid_grid::model::ChangeSet) -> bool {
+    let unvalidated_expr = |v: &CellValue| matches!(v, CellValue::Expr(e) if !ternarygrid_core::value::is_sql_expression(e));
     confirm_data_change
-        || cs.updates.iter().any(|u| u.changes.iter().any(|c| matches!(c.value, CellValue::Expr(_))))
-        || cs.inserts.iter().any(|i| i.values.iter().any(|v| matches!(v.value, CellValue::Expr(_))))
+        || cs.updates.iter().any(|u| u.changes.iter().any(|c| unvalidated_expr(&c.value)))
+        || cs.inserts.iter().any(|i| i.values.iter().any(|v| unvalidated_expr(&v.value)))
 }
 
 /// Kind of object a data view can show.
@@ -1661,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_sql_expressions_always_require_save_preview() {
+    fn save_preview_respects_validated_expressions_and_blocks_unvalidated_ones() {
         let mut cs = empty_cs();
         assert!(!needs_save_preview(false, &cs));
         assert!(needs_save_preview(true, &cs));
@@ -1677,17 +1681,32 @@ mod tests {
         });
         assert!(!needs_save_preview(false, &cs));
 
-        // A computed SQL expression in an UPDATE forces preview even on Dev connections.
-        let mut cs_upd = cs.clone();
-        cs_upd.updates[0].changes.push(ChangedValue { column: 2, name: "ts".into(), type_name: "timestamp".into(), value: CellValue::Expr("now()".into()) });
-        assert!(needs_save_preview(false, &cs_upd));
+        // Benign validated SQL expressions save directly on Dev connections
+        // (confirm_data_change = false), matching data_edit_e2e, while still
+        // requiring preview when confirm_data_change = true.
+        let mut cs_benign_upd = cs.clone();
+        cs_benign_upd.updates[0].changes.push(ChangedValue { column: 2, name: "ts".into(), type_name: "timestamp".into(), value: CellValue::Expr("now()".into()) });
+        assert!(!needs_save_preview(false, &cs_benign_upd));
+        assert!(needs_save_preview(true, &cs_benign_upd));
 
-        // A computed SQL expression in an INSERT also forces preview.
-        let mut cs_ins = cs;
-        cs_ins.inserts.push(RowInsert {
+        let mut cs_benign_ins = cs.clone();
+        cs_benign_ins.inserts.push(RowInsert {
             id: 1,
             values: vec![ChangedValue { column: 2, name: "ts".into(), type_name: "timestamp".into(), value: CellValue::Expr("CURRENT_TIMESTAMP".into()) }],
         });
-        assert!(needs_save_preview(false, &cs_ins));
+        assert!(!needs_save_preview(false, &cs_benign_ins));
+        assert!(needs_save_preview(true, &cs_benign_ins));
+
+        // Unvalidated raw SQL expressions always force preview even on Dev connections.
+        let mut cs_unval_upd = cs.clone();
+        cs_unval_upd.updates[0].changes.push(ChangedValue { column: 2, name: "ts".into(), type_name: "timestamp".into(), value: CellValue::Expr("now(), role = 'admin'".into()) });
+        assert!(needs_save_preview(false, &cs_unval_upd));
+
+        let mut cs_unval_ins = cs;
+        cs_unval_ins.inserts.push(RowInsert {
+            id: 1,
+            values: vec![ChangedValue { column: 2, name: "ts".into(), type_name: "timestamp".into(), value: CellValue::Expr("now(), role = 'admin'".into()) }],
+        });
+        assert!(needs_save_preview(false, &cs_unval_ins));
     }
 }

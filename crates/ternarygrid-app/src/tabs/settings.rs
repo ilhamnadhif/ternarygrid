@@ -1659,7 +1659,7 @@ impl SettingsTab {
                         opened.map_err(|e| e.to_string())?;
                         secrets.write().switch_to_vault(vault, &keys, true)
                     } else {
-                        let keychain = std::sync::Arc::new(ternarygrid_config::BundledStore::new(ternarygrid_config::KeychainStore::new()));
+                        let keychain = ternarygrid_config::SecretsManager::platform_keychain_store();
                         secrets.write().switch_backend(SecretBackend::Keychain, keychain, &keys, true)
                     };
                     let r = r.map_err(|e| e.to_string())?;

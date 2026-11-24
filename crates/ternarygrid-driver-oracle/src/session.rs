@@ -103,7 +103,7 @@ enum OraTok {
 }
 
 /// Tokenize Oracle SQL, skipping comments, single-quoted strings, and Oracle
-/// `q'...'` alternative quote literals.
+/// `q'...'` / `nq'...'` alternative quote literals.
 fn oracle_tokens(sql: &str) -> Vec<OraTok> {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = Vec::new();
@@ -123,8 +123,18 @@ fn oracle_tokens(sql: &str) -> Vec<OraTok> {
                 i += 1;
             }
             i += 2;
+        } else if let Some(delim_idx) = if (c == 'n' || c == 'N')
+            && matches!(chars.get(i + 1), Some('q' | 'Q'))
+            && chars.get(i + 2) == Some(&'\'')
+            && i + 3 < chars.len()
+        {
+            Some(i + 3)
         } else if (c == 'q' || c == 'Q') && chars.get(i + 1) == Some(&'\'') && i + 2 < chars.len() {
-            let open = chars[i + 2];
+            Some(i + 2)
+        } else {
+            None
+        } {
+            let open = chars[delim_idx];
             let close = match open {
                 '[' => ']',
                 '{' => '}',
@@ -132,7 +142,7 @@ fn oracle_tokens(sql: &str) -> Vec<OraTok> {
                 '<' => '>',
                 other => other,
             };
-            i += 3;
+            i = delim_idx + 1;
             while i < chars.len() {
                 if chars[i] == close && chars.get(i + 1) == Some(&'\'') {
                     i += 2;
@@ -737,6 +747,8 @@ enum Outcome {
         columns: Vec<ColumnMeta>,
         reads: Vec<Read>,
         cursor: Box<oracledb::Cursor>,
+        /// Whether `run` started a fresh `SET TRANSACTION READ ONLY` transaction.
+        started_ro_tx: bool,
     },
     Done {
         rows: u64,
@@ -747,6 +759,40 @@ enum Outcome {
     },
 }
 
+/// Strategy for establishing `SET TRANSACTION READ ONLY` before executing a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOnlyTxPrep {
+    /// Session is not read-only.
+    None,
+    /// Auto-commit read-only: clear any lingering tx, set read-only (propagating errors),
+    /// and roll back on early error or when the cursor completes/closes/drops.
+    AutoRollbackThenSet,
+    /// Manual read-only without an active tx: set read-only (propagating all errors).
+    ManualStart,
+    /// Manual read-only with an active tx: ensure read-only, tolerating `ORA-01453`.
+    ManualContinue,
+}
+
+fn read_only_tx_prep(read_only: bool, auto_commit: bool, in_tx: bool) -> ReadOnlyTxPrep {
+    if !read_only {
+        ReadOnlyTxPrep::None
+    } else if auto_commit {
+        ReadOnlyTxPrep::AutoRollbackThenSet
+    } else if !in_tx {
+        ReadOnlyTxPrep::ManualStart
+    } else {
+        ReadOnlyTxPrep::ManualContinue
+    }
+}
+
+fn is_ora_01453(err: &DbError) -> bool {
+    err.code.as_deref() == Some("ORA-01453")
+}
+
+fn should_rollback_before_explain(read_only: bool, in_tx: bool) -> bool {
+    read_only && !in_tx
+}
+
 fn run(
     conn: &Connection,
     sql: &str,
@@ -754,12 +800,14 @@ fn run(
     opts: &ExecOptions,
     auto_commit: bool,
     read_only: bool,
+    in_tx: bool,
 ) -> DbResult<Outcome> {
     let binds: Vec<Box<dyn ToDbValue + Send + Sync>> = params.iter().map(convert::bind).collect();
     let refs: Vec<&dyn ToDbValue> = binds.iter().map(|b| b.as_ref() as &dyn ToDbValue).collect();
     if let Some(t) = opts.timeout {
         let _ = conn.set_call_timeout(Some(t));
     }
+    let mut started_ro_tx = false;
     let result = (|| -> DbResult<Outcome> {
         let mut stmt = conn
             .statement(sql)
@@ -768,11 +816,24 @@ fn run(
             .build()
             .db()?;
         if stmt.is_query() {
-            if read_only {
-                if auto_commit {
+            match read_only_tx_prep(read_only, auto_commit, in_tx) {
+                ReadOnlyTxPrep::None => {}
+                ReadOnlyTxPrep::AutoRollbackThenSet => {
                     let _ = conn.rollback();
+                    conn.execute("SET TRANSACTION READ ONLY", &[]).db()?;
+                    started_ro_tx = true;
                 }
-                let _ = conn.execute("SET TRANSACTION READ ONLY", &[]);
+                ReadOnlyTxPrep::ManualStart => {
+                    conn.execute("SET TRANSACTION READ ONLY", &[]).db()?;
+                    started_ro_tx = true;
+                }
+                ReadOnlyTxPrep::ManualContinue => {
+                    match conn.execute("SET TRANSACTION READ ONLY", &[]).db() {
+                        Ok(_) => started_ro_tx = true,
+                        Err(e) if is_ora_01453(&e) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
             }
             let cursor = stmt.query(&refs).db()?;
             let (columns, reads): (Vec<ColumnMeta>, Vec<Read>) =
@@ -781,6 +842,7 @@ fn run(
                 columns,
                 reads,
                 cursor: Box::new(cursor),
+                started_ro_tx,
             });
         }
         let (dml, plsql, ddl) = (stmt.is_dml(), stmt.is_plsql(), stmt.is_ddl());
@@ -823,7 +885,52 @@ fn run(
     if opts.timeout.is_some() {
         let _ = conn.set_call_timeout(None);
     }
+    if result.is_err() && started_ro_tx {
+        let _ = conn.rollback();
+    }
     result
+}
+
+/// Transaction completion owed once an [`OracleCursor`] finishes, closes, or drops.
+enum EndTx {
+    Commit(Arc<Connection>),
+    Rollback(Arc<Connection>),
+}
+
+impl EndTx {
+    fn execute(&self) {
+        match self {
+            Self::Commit(conn) => {
+                if let Err(e) = conn.commit() {
+                    tracing::warn!("committing after SELECT … FOR UPDATE: {e}");
+                }
+            }
+            Self::Rollback(conn) => {
+                if let Err(e) = conn.rollback() {
+                    tracing::warn!("rolling back read-only transaction: {e}");
+                }
+            }
+        }
+    }
+
+    async fn finish_async(self) {
+        let _ = tokio::task::spawn_blocking(move || self.execute()).await;
+    }
+
+    fn finish(&mut self) {
+        let action = match self {
+            Self::Commit(conn) => Self::Commit(conn.clone()),
+            Self::Rollback(conn) => Self::Rollback(conn.clone()),
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(move || action.execute());
+            }
+            Err(_) => {
+                std::thread::spawn(move || action.execute());
+            }
+        }
+    }
 }
 
 struct OracleCursor {
@@ -835,28 +942,29 @@ struct OracleCursor {
     done: bool,
     /// The session's flag: a fetch that loses the connection sets it too.
     closed: Arc<AtomicBool>,
-    /// Committed once the rows are read or the cursor closes (`SELECT … FOR UPDATE` in auto mode).
-    commit_after: Option<Arc<Connection>>,
+    /// Transaction ended once the rows are read, or the cursor closes/drops
+    /// (`SELECT … FOR UPDATE` commits; read-only queries in auto mode roll back).
+    end_tx: Option<EndTx>,
 }
 
 impl OracleCursor {
-    /// The commit owed by a FOR UPDATE query of auto mode, on a blocking thread.
-    fn commit_owed(&mut self) {
-        if let Some(conn) = self.commit_after.take()
-            && let Ok(rt) = tokio::runtime::Handle::try_current()
-        {
-            rt.spawn_blocking(move || {
-                if let Err(e) = conn.commit() {
-                    tracing::warn!("committing after SELECT … FOR UPDATE: {e}");
-                }
-            });
+    async fn finish_tx_async(&mut self) {
+        if let Some(end_tx) = self.end_tx.take() {
+            end_tx.finish_async().await;
+        }
+    }
+
+    fn finish_tx(&mut self) {
+        if let Some(mut end_tx) = self.end_tx.take() {
+            end_tx.finish();
         }
     }
 }
 
 impl Drop for OracleCursor {
     fn drop(&mut self) {
-        self.commit_owed();
+        self.cursor = None;
+        self.finish_tx();
     }
 }
 
@@ -894,16 +1002,23 @@ impl QueryCursor for OracleCursor {
         })
         .await
         .map_err(|e| DbError::internal(e.to_string()))?;
-        let (cursor, rows, done) = fetched.inspect_err(|e| {
-            if e.kind == ErrorKind::Connection {
-                self.closed.store(true, Ordering::SeqCst);
+        let (cursor, rows, done) = match fetched {
+            Ok(v) => v,
+            Err(e) => {
+                if e.kind == ErrorKind::Connection {
+                    self.closed.store(true, Ordering::SeqCst);
+                }
+                self.done = true;
+                self.finish_tx_async().await;
+                return Err(e);
             }
-        })?;
+        };
         self.done = done;
         if !done {
             self.cursor = Some(cursor);
         } else {
-            self.commit_owed();
+            drop(cursor);
+            self.finish_tx_async().await;
         }
         Ok(rows)
     }
@@ -911,7 +1026,7 @@ impl QueryCursor for OracleCursor {
     async fn close(&mut self) -> DbResult<()> {
         self.cursor = None;
         self.done = true;
-        self.commit_owed();
+        self.finish_tx_async().await;
         Ok(())
     }
 
@@ -979,7 +1094,7 @@ impl Session for OracleSession {
                 cancel: self.cancel.clone(),
                 done: true,
                 closed: self.closed.clone(),
-                commit_after: None,
+                end_tx: None,
             }));
         }
         let words = leading_words(&sql, 1);
@@ -997,9 +1112,10 @@ impl Session for OracleSession {
         let opts = opts.clone();
         let auto = self.mode == TransactionMode::Auto;
         let read_only = self.read_only;
+        let in_tx = self.in_tx;
         let text = sql.clone();
         let outcome = match self
-            .blocking(move |c| run(c, &text, &params, &opts, auto, read_only))
+            .blocking(move |c| run(c, &text, &params, &opts, auto, read_only, in_tx))
             .await
         {
             Ok(o) => o,
@@ -1018,6 +1134,7 @@ impl Session for OracleSession {
                 columns,
                 mut reads,
                 cursor,
+                started_ro_tx,
             } => {
                 convert::in_session_zone(&mut reads, self.ltz_offset);
                 // Locks held until the end of the transaction (`… FOR UPDATE`, also after WITH):
@@ -1025,9 +1142,16 @@ impl Session for OracleSession {
                 // fetch, ORA-01002), not left to some later DML.
                 let for_update = matches!(first, "SELECT" | "WITH")
                     && sql.to_ascii_uppercase().contains("FOR UPDATE");
-                if for_update && !auto {
+                if (read_only && !auto && started_ro_tx) || (for_update && !auto) {
                     self.in_tx = true;
                 }
+                let end_tx = if read_only && auto {
+                    self.conn.clone().map(EndTx::Rollback)
+                } else if for_update && auto {
+                    self.conn.clone().map(EndTx::Commit)
+                } else {
+                    None
+                };
                 Ok(Box::new(OracleCursor {
                     header: Some(ResultHeader::Rows(columns)),
                     cursor: Some(cursor),
@@ -1036,11 +1160,7 @@ impl Session for OracleSession {
                     cancel,
                     done: false,
                     closed: self.closed.clone(),
-                    commit_after: if for_update && auto {
-                        self.conn.clone()
-                    } else {
-                        None
-                    },
+                    end_tx,
                 }))
             }
             Outcome::Done {
@@ -1052,8 +1172,16 @@ impl Session for OracleSession {
             } => {
                 if ends_tx {
                     self.in_tx = false;
-                } else if !auto && (dml || plsql || first == "LOCK") {
-                    // LOCK TABLE holds its lock until the end of the transaction.
+                } else if !auto
+                    && (dml
+                        || plsql
+                        || first == "LOCK"
+                        || (first == "SET"
+                            && leading_words(&sql, 2).get(1).map(String::as_str)
+                                == Some("TRANSACTION")))
+                {
+                    // LOCK TABLE holds its lock until the end of the transaction, and
+                    // SET TRANSACTION begins a transaction.
                     self.in_tx = true;
                 }
                 let rows_affected = if dml { Some(rows) } else { None };
@@ -1069,7 +1197,7 @@ impl Session for OracleSession {
                     cancel,
                     done: true,
                     closed: self.closed.clone(),
-                    commit_after: None,
+                    end_tx: None,
                 }))
             }
         }
@@ -1285,7 +1413,13 @@ impl Session for OracleSession {
                     .map(|d| d.subsec_millis())
                     .unwrap_or(0) as u64)
         );
+        let clear_ro_tx = should_rollback_before_explain(self.read_only, self.in_tx);
         self.blocking(move |c| {
+            // Clear any lingering read-only transaction (when no manual tx is open)
+            // so EXPLAIN PLAN does not hit ORA-01456 when writing to PLAN_TABLE.
+            if clear_ro_tx {
+                let _ = c.rollback();
+            }
             // EXPLAIN PLAN writes PLAN_TABLE rows in the open transaction: they are undone
             // to a savepoint, so the user's transaction is neither committed nor ended.
             let transaction_before = transaction_open(c);
@@ -1538,6 +1672,8 @@ mod tests {
             "SELECT 1 FROM dual",
             "  -- comment\n((SELECT * FROM users WHERE note = 'FOR UPDATE'))",
             "SELECT q'[FOR UPDATE; DELETE FROM t]' FROM dual",
+            "SELECT nq'[FOR UPDATE]' FROM dual",
+            "SELECT NQ'{my_seq.NEXTVAL}' FROM dual",
             "SELECT nextval_note FROM t",
             "WITH c AS (SELECT 1 AS a FROM dual) SELECT * FROM c",
             "SET TRANSACTION READ ONLY",
@@ -1563,6 +1699,8 @@ mod tests {
             "SELECT * FROM t FOR UPDATE NOWAIT",
             "SELECT my_seq.NEXTVAL FROM dual",
             "SELECT my_seq.\"NEXTVAL\" FROM dual",
+            "SELECT nq'[']' FROM t FOR UPDATE -- '",
+            "SELECT NQ'[']', my_seq.NEXTVAL FROM dual -- '",
             "WITH FUNCTION f RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN DELETE FROM t; COMMIT; RETURN 1; END; SELECT f() FROM dual",
             "SET TRANSACTION READ WRITE",
             "/* SELECT 1 */ DELETE FROM t",
@@ -1570,6 +1708,42 @@ mod tests {
         ] {
             assert!(!is_read_only_sql(w), "expected write: {w}");
         }
+    }
+
+    #[test]
+    fn read_only_transaction_lifecycle_decisions() {
+        assert_eq!(read_only_tx_prep(false, true, false), ReadOnlyTxPrep::None);
+        assert_eq!(read_only_tx_prep(false, false, true), ReadOnlyTxPrep::None);
+        assert_eq!(
+            read_only_tx_prep(true, true, false),
+            ReadOnlyTxPrep::AutoRollbackThenSet
+        );
+        assert_eq!(
+            read_only_tx_prep(true, true, true),
+            ReadOnlyTxPrep::AutoRollbackThenSet
+        );
+        assert_eq!(
+            read_only_tx_prep(true, false, false),
+            ReadOnlyTxPrep::ManualStart
+        );
+        assert_eq!(
+            read_only_tx_prep(true, false, true),
+            ReadOnlyTxPrep::ManualContinue
+        );
+
+        assert!(is_ora_01453(
+            &DbError::query("SET TRANSACTION must be first statement of transaction")
+                .with_code("ORA-01453")
+        ));
+        assert!(!is_ora_01453(
+            &DbError::query("cannot perform DML in READ ONLY transaction").with_code("ORA-01456")
+        ));
+        assert!(!is_ora_01453(&DbError::query("other")));
+
+        assert!(should_rollback_before_explain(true, false));
+        assert!(!should_rollback_before_explain(true, true));
+        assert!(!should_rollback_before_explain(false, false));
+        assert!(!should_rollback_before_explain(false, true));
     }
 
     #[test]

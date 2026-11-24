@@ -118,7 +118,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: CockroachDB (single node; services cannot pass a command)
         run: |
-          docker run -d --name crdb -p 26257:26257 cockroachdb/cockroach:v25.4.21 start-single-node --insecure
+          docker run -d --name crdb -p 26257:26257 cockroachdb/cockroach:v26.4.1 start-single-node --insecure
           for i in $(seq 1 60); do docker exec crdb ./cockroach sql --insecure -e "select 1" && break; sleep 2; done
       - name: Driver and end-to-end integration tests
         run: >-

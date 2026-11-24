@@ -544,7 +544,7 @@ pub fn schtasks_xml(task: &TaskDef, exe: &Path) -> DbResult<String> {
          \x20   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
          \x20   <Enabled>true</Enabled>\n\
          \x20 </Settings>\n\
-         \x20 <Actions Context=\"Author\">\n\
+         \x20 <Actions>\n\
          \x20   <Exec>\n\
          \x20     <Command>{}</Command>\n\
          \x20     <Arguments>{}</Arguments>\n\
@@ -765,6 +765,8 @@ mod tests {
         assert!(doc.contains("<Description>Nightly &lt;backup&gt;</Description>"), "{doc}");
         assert!(doc.contains("<Command>C:\\Program Files\\R&amp;D &lt;test&gt;\\ternarygrid.exe</Command>"), "{doc}");
         assert!(doc.contains("<Arguments>--run-task &quot;a&amp;b &lt;c&gt;&quot;</Arguments>"), "{doc}");
+        assert!(doc.contains("<Actions>"), "{doc}");
+        assert!(!doc.contains("Context=\"Author\""), "{doc}");
 
         // Weekly & interval XML triggers.
         let weekly = schtasks_xml(&task(Schedule::Daily { at: "22:00".into(), weekdays: vec![1, 7] }), win_exe).unwrap();

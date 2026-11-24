@@ -15,6 +15,7 @@
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::path::PathBuf;
@@ -77,8 +78,8 @@ fn read_pem(source: &str, what: &str) -> DbResult<Vec<u8>> {
 
 fn load_certs(source: &str, what: &str) -> DbResult<Vec<CertificateDer<'static>>> {
     let pem = read_pem(source, what)?;
-    let mut rd = std::io::BufReader::new(pem.as_slice());
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd).collect::<Result<_, _>>().map_err(|e| DbError::config(format!("Invalid PEM in the {what}: {e}")))?;
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(&pem).collect::<Result<_, _>>().map_err(|e| DbError::config(format!("Invalid PEM in the {what}: {e}")))?;
     if certs.is_empty() {
         return Err(DbError::config(format!("The {what} contains no PEM certificate")));
     }
@@ -87,10 +88,10 @@ fn load_certs(source: &str, what: &str) -> DbResult<Vec<CertificateDer<'static>>
 
 fn load_key(source: &str) -> DbResult<PrivateKeyDer<'static>> {
     let pem = read_pem(source, "client key")?;
-    let mut rd = std::io::BufReader::new(pem.as_slice());
-    rustls_pemfile::private_key(&mut rd)
-        .map_err(|e| DbError::config(format!("Invalid PEM in the client key: {e}")))?
-        .ok_or_else(|| DbError::config("The client key file contains no private key (PKCS#1, PKCS#8 or SEC1 PEM)"))
+    PrivateKeyDer::from_pem_slice(&pem).map_err(|e| match e {
+        PemError::NoItemsFound => DbError::config("The client key file contains no private key (PKCS#1, PKCS#8 or SEC1 PEM)"),
+        other => DbError::config(format!("Invalid PEM in the client key: {other}")),
+    })
 }
 
 fn root_store(ssl: &SslConfig) -> DbResult<Arc<RootCertStore>> {
@@ -282,5 +283,40 @@ mod tests {
         // verify-ca trusts only the CA given: an unusable one is an error, not the public roots.
         let ssl = SslConfig { mode: SslMode::VerifyCa, ca_cert: Some("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".into()), ..Default::default() };
         assert!(build(&ssl, "h").is_err());
+    }
+
+    #[test]
+    fn pem_loading_certs_and_keys() {
+        let cert_pem = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n\
+                        -----BEGIN CERTIFICATE-----\nBAUG\n-----END CERTIFICATE-----\n";
+        let certs = load_certs(cert_pem, "CA certificate").unwrap();
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].as_ref(), &[1, 2, 3]);
+        assert_eq!(certs[1].as_ref(), &[4, 5, 6]);
+
+        let no_cert = load_certs("-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n", "CA certificate").unwrap_err();
+        assert_eq!(no_cert.kind, ternarygrid_core::ErrorKind::Config);
+        assert_eq!(no_cert.message, "The CA certificate contains no PEM certificate");
+
+        let bad_cert = load_certs("-----BEGIN CERTIFICATE-----\n!!!invalid!!!\n-----END CERTIFICATE-----\n", "CA certificate").unwrap_err();
+        assert_eq!(bad_cert.kind, ternarygrid_core::ErrorKind::Config);
+        assert!(bad_cert.message.starts_with("Invalid PEM in the CA certificate:"), "{}", bad_cert.message);
+
+        // PKCS#8, PKCS#1, and SEC1 private keys all parse via rustls-pki-types.
+        for header in ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"] {
+            let key_pem = format!("-----BEGIN {header}-----\nAQID\n-----END {header}-----\n");
+            let key = load_key(&key_pem).unwrap();
+            assert_eq!(key.secret_der(), &[1, 2, 3], "{header}");
+        }
+
+        // No private key found maps PemError::NoItemsFound to the friendly message.
+        let no_key = load_key(cert_pem).unwrap_err();
+        assert_eq!(no_key.kind, ternarygrid_core::ErrorKind::Config);
+        assert_eq!(no_key.message, "The client key file contains no private key (PKCS#1, PKCS#8 or SEC1 PEM)");
+
+        // Malformed PEM maps to "Invalid PEM in the client key: ...".
+        let bad_key = load_key("-----BEGIN PRIVATE KEY-----\n!!!invalid!!!\n-----END PRIVATE KEY-----\n").unwrap_err();
+        assert_eq!(bad_key.kind, ternarygrid_core::ErrorKind::Config);
+        assert!(bad_key.message.starts_with("Invalid PEM in the client key:"), "{}", bad_key.message);
     }
 }

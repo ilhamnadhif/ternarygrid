@@ -63,10 +63,13 @@ fn kill_and_reap(child: &mut std::process::Child) {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let pid = child.id();
         if pid > 0 {
             let _ = std::process::Command::new("taskkill")
                 .args(["/F", "/T", "/PID", &pid.to_string()])
+                // CREATE_NO_WINDOW
+                .creation_flags(0x0800_0000)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())

@@ -33,7 +33,7 @@ pub fn current_exe() -> DbResult<PathBuf> {
 }
 
 /// Text of the entry for `task` (launchd property list, crontab line or
-/// schtasks command). Fails when the schedule cannot be expressed.
+/// Windows Task Scheduler XML). Fails when the schedule cannot be expressed.
 pub fn entry_preview(task: &TaskDef, exe: &Path) -> DbResult<String> {
     #[cfg(target_os = "macos")]
     {
@@ -41,7 +41,7 @@ pub fn entry_preview(task: &TaskDef, exe: &Path) -> DbResult<String> {
     }
     #[cfg(windows)]
     {
-        os::schtasks_create(task, exe).map(|c| c.display())
+        os::schtasks_xml(task, exe)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -177,9 +177,19 @@ pub async fn sync(task: TaskDef) -> DbResult<Synced> {
         return remove(task.id.clone()).await.map(Synced::Removed);
     }
     let exe = current_exe()?;
-    let cmd = os::schtasks_create(&task, &exe)?;
+    let tmp_dir = std::env::temp_dir().join(format!("ternarygrid-task-{}", uuid::Uuid::new_v4().simple()));
+    let xml_path = match os::install_windows_task_xml(&task, &exe, &tmp_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+    };
+    let cmd = os::schtasks_create_from_xml(&task.id, &xml_path);
     let shown = cmd.display();
-    run(cmd, None).await?;
+    let res = run(cmd, None).await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    res?;
     Ok(Synced::Installed(shown))
 }
 

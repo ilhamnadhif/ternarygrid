@@ -20,7 +20,6 @@ tokio-postgres-rustls.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
-rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -31,6 +31,17 @@ grep -q "^version = \"$VERSION\"" Cargo.toml || fail "Cargo.toml is not at versi
 grep -q "^## $VERSION " CHANGELOG.md || fail "CHANGELOG.md has no section for $VERSION"
 for f in "${FILES[@]}"; do [ -f "$f" ] || fail "missing $f"; done
 
+echo "==> Checksums"
+(
+    cd dist
+    BASENAMES=()
+    for f in "${FILES[@]}"; do
+        BASENAMES+=("$(basename "$f")")
+    done
+    shasum -a 256 "${BASENAMES[@]}" > SHA256SUMS.txt
+)
+FILES+=("dist/SHA256SUMS.txt")
+
 STATE="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
 if [ "$STATE" = "false" ]; then
     echo "==> $TAG is already published"

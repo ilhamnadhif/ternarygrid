@@ -1066,8 +1066,10 @@ fn balanced(t: &str) -> bool {
         "COMMIT",
         "ROLLBACK",
         "SAVEPOINT",
+        "TABLE",
+        "WITH",
     ];
-    const FORBIDDEN_TOP_LEVEL: &[&str] = &["FROM", "VALUES", "LIMIT", "OFFSET", "ORDER", "GROUP", "HAVING", "FOR", "WITH", "ON", "JOIN"];
+    const FORBIDDEN_TOP_LEVEL: &[&str] = &["FROM", "VALUES", "LIMIT", "OFFSET", "ORDER", "GROUP", "HAVING", "FOR", "ON", "JOIN"];
     let check_word = |word: &str, depth: i32| -> bool {
         if word.is_empty() {
             return true;
@@ -1730,6 +1732,10 @@ mod tests {
             "f(E'a\\''), is_admin = 1",
             "f(q'[a']'), is_admin = 1",
             "coalesce((SELECT secret FROM users LIMIT 1), 'x')",
+            "coalesce((TABLE secret_table LIMIT 1), 'x')",
+            "coalesce((table users), 'x')",
+            "coalesce((WITH x AS (VALUES (1)) TABLE x), 'x')",
+            "f((WITH cte AS (VALUES (1)) VALUES (2)))",
             "f('a\0b')",
         ] {
             assert!(!is_sql_expression(t), "expected rejection for: {t}");

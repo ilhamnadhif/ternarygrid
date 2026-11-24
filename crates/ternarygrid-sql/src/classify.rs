@@ -439,9 +439,10 @@ pub fn classify_command(
                     .unwrap_or("")
                     .split('&')
                     .filter_map(|kv| {
-                        kv.split_once('=')
-                            .filter(|(k, _)| *k == "sql" || *k == "query")
-                            .map(|(_, v)| percent_decode(&v.replace('+', " ")))
+                        let (k, v) = kv.split_once('=')?;
+                        let key = percent_decode(&k.replace('+', " "));
+                        (key.eq_ignore_ascii_case("sql") || key.eq_ignore_ascii_case("query"))
+                            .then(|| percent_decode(&v.replace('+', " ")))
                     })
                     .any(|q| search_has_dml_keyword(&q));
                 let rest_on_line = words.collect::<Vec<_>>().join(" ");
@@ -2672,6 +2673,9 @@ mod tests {
             "POST /_sql\n{\"query\":\"\\u0044ELETE FROM t\"}",
             "POST /_plugins/_sql\n{\"query\":\"\\u0064elete FROM t\"}",
             "GET /_plugins/_sql?sql=%44ELETE+FROM+t",
+            "GET /_plugins/_sql?%73ql=DELETE+FROM+logs",
+            "GET /_plugins/_sql?%71uery=DELETE+FROM+logs",
+            "GET /_plugins/_sql?%53QL=DELETE+FROM+logs",
         ] {
             assert!(w(write_req), "expected write: {write_req}");
         }
@@ -2680,6 +2684,7 @@ mod tests {
             "POST /_sql/close\n{\"cursor\":\"abc\"}",
             "POST /_plugins/_ppl\n{\"query\":\"source=logs | fields a\"}",
             "GET /_plugins/_sql?sql=SELECT+1",
+            "GET /_plugins/_sql?%73ql=SELECT+1",
         ] {
             assert!(!w(read_req), "expected read: {read_req}");
         }

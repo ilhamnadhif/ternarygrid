@@ -412,6 +412,9 @@ impl SqlServerSession {
     }
 
     async fn explain_impl(&mut self, sql: &str, analyze: bool) -> DbResult<QueryPlan> {
+        if analyze && self.params.read_only && !sqltext::is_read_only_sql(sql) {
+            return Err(DbError::read_only("The connection is read-only"));
+        }
         self.recover_explain_if_dirty().await?;
         let (on, off) = if analyze { ("SET STATISTICS XML ON", "SET STATISTICS XML OFF") } else { ("SET SHOWPLAN_XML ON", "SET SHOWPLAN_XML OFF") };
         // STATISTICS XML runs the statement: its changes are rolled back (in a transaction
@@ -529,6 +532,9 @@ impl Session for SqlServerSession {
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value], opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
+        if self.params.read_only && !sqltext::is_read_only_sql(sql) {
+            return Err(DbError::read_only("The connection is read-only"));
+        }
         self.exec_with(sql, params, None, opts).await
     }
 
@@ -738,5 +744,53 @@ mod tests {
         }
         assert!(!suppress.load(Ordering::SeqCst));
         assert_eq!(ExplainDirty::from_u8(dirty.load(Ordering::SeqCst)), ExplainDirty::Clean);
+    }
+
+    #[tokio::test]
+    async fn read_only_session_rejects_writes_in_execute_and_explain_analyze() {
+        let mut cfg = ternarygrid_core::config::ConnectionConfig::new(DbKind::SqlServer, "ro");
+        cfg.read_only = true;
+        let params = ConnectParams::from_config(&cfg, None);
+        let shared = Arc::new(Shared::default());
+        let mut session = SqlServerSession {
+            params,
+            client: None,
+            pending: None,
+            cancel: Arc::new(SqlServerCancelHandle { shared: shared.clone() }),
+            shared,
+            cursor_open: Arc::new(AtomicU64::new(0)),
+            info: ServerInfo { product: "Microsoft SQL Server".into(), version: "16.0".into(), version_number: (16, 0, 0), session_id: Some("1".into()) },
+            dialect: Arc::new(MsSqlDialect::new()),
+            mode: TransactionMode::Auto,
+            closed: true,
+            lost_transaction: false,
+            reconnect_notice: None,
+            suppress_refresh: Arc::new(AtomicBool::new(false)),
+            explain_dirty: Arc::new(AtomicU8::new(ExplainDirty::Clean as u8)),
+            engine_edition: 0,
+            implicit_transactions: false,
+            plain_fallback: false,
+        };
+
+        let err = match session.execute("DELETE FROM dbo.orders", &[], &ExecOptions::default()).await {
+            Ok(_) => panic!("expected read-only error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly);
+
+        let err = session.explain("DELETE FROM dbo.orders", true).await.unwrap_err();
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly);
+
+        // Non-analyze EXPLAIN (SET SHOWPLAN_XML ON) is not blocked by read-only enforcement
+        // (it reaches acquire() and reports the closed session instead of ReadOnly).
+        let err = session.explain("DELETE FROM dbo.orders", false).await.unwrap_err();
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::Connection);
+
+        // Read-only SELECT passes the read-only guard (reaches acquire() and reports closed).
+        let err = match session.execute("SELECT 1", &[], &ExecOptions::default()).await {
+            Ok(_) => panic!("expected closed connection error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::Connection);
     }
 }

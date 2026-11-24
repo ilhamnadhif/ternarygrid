@@ -643,6 +643,23 @@ fn sql_reads(sql: &str) -> bool {
     )
 }
 
+/// PPL that only reads (allows standard PPL read commands and rejects DML/DDL).
+fn ppl_reads(query: &str) -> bool {
+    matches!(
+        sql_keyword(query).as_str(),
+        "SOURCE" | "SEARCH" | "DESCRIBE" | "DESC" | "EXPLAIN" | "SHOW" | ""
+    ) && !query
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| {
+            [
+                "DELETE", "UPDATE", "INSERT", "DROP", "CREATE", "ALTER", "TRUNCATE", "REPLACE",
+                "MERGE", "UPSERT",
+            ]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k))
+        })
+}
+
 /// `%XX` escapes of a URL path decoded (as the server reads them).
 fn percent_decode(path: &str) -> String {
     let b = path.as_bytes();
@@ -684,8 +701,9 @@ const READ_ENDPOINTS: &[&str] = &[
 /// GET/HEAD endpoints that still mutate index or cluster state.
 const SIDE_EFFECT_ENDPOINTS: &[&str] = &["_refresh", "_flush", "_forcemerge", "_cache"];
 
-/// Check query string `?sql=` / `?query=` parameters for read-only SQL.
-fn query_string_sql_reads(path: &str) -> bool {
+/// Check query string `?sql=` / `?query=` parameters (case-insensitively after
+/// percent-decoding keys) with `is_read`.
+fn query_string_reads(path: &str, is_read: impl Fn(&str) -> bool) -> bool {
     let query = path
         .split_once('?')
         .map(|(_, q)| q.split('#').next().unwrap_or(q))
@@ -693,11 +711,12 @@ fn query_string_sql_reads(path: &str) -> bool {
     query
         .split('&')
         .filter_map(|kv| {
-            kv.split_once('=')
-                .filter(|(k, _)| *k == "sql" || *k == "query")
-                .map(|(_, v)| percent_decode(&v.replace('+', " ")))
+            let (k, v) = kv.split_once('=')?;
+            let key = percent_decode(&k.replace('+', " "));
+            (key.eq_ignore_ascii_case("sql") || key.eq_ignore_ascii_case("query"))
+                .then(|| percent_decode(&v.replace('+', " ")))
         })
-        .all(|q| sql_reads(&q))
+        .all(|q| is_read(&q))
 }
 
 /// A REST request that only reads: GET and HEAD (without side-effect or
@@ -719,18 +738,23 @@ fn rest_reads(method: &str, path: &str, body: Option<&str>) -> bool {
             if segments.iter().any(|s| SIDE_EFFECT_ENDPOINTS.contains(s)) {
                 return false;
             }
-            if !segments.iter().any(|s| *s == "_sql" || *s == "_ppl") {
+            let has_sql = segments.contains(&"_sql");
+            let has_ppl = segments.contains(&"_ppl");
+            if !has_sql && !has_ppl {
                 return true;
             }
-            if !query_string_sql_reads(path) {
+            let check = |q: &str| (!has_sql || sql_reads(q)) && (!has_ppl || ppl_reads(q));
+            if !query_string_reads(path, check) {
                 return false;
             }
             match body.map(str::trim).filter(|b| !b.is_empty()) {
                 None => true,
                 Some(b) => match serde_json::from_str::<J>(b) {
                     Ok(J::Object(obj)) => match obj.get("query") {
-                        Some(v) => v.as_str().is_some_and(sql_reads),
-                        None => obj.get("cursor").and_then(J::as_str).is_some(),
+                        Some(v) => v.as_str().is_some_and(check),
+                        None => {
+                            has_sql && !has_ppl && obj.get("cursor").and_then(J::as_str).is_some()
+                        }
                     },
                     _ => false,
                 },
@@ -743,9 +767,9 @@ fn rest_reads(method: &str, path: &str, body: Option<&str>) -> bool {
                 endpoint = api.next();
             }
             match endpoint {
-                // The SQL / PPL API (also `/translate`, `/close`, cursors).
-                Some("_sql" | "_ppl") => {
-                    if !query_string_sql_reads(path) {
+                // The SQL API (also `/translate`, `/close`, cursors).
+                Some("_sql") => {
+                    if !query_string_reads(path, sql_reads) {
                         return false;
                     }
                     let Some(b) = body.map(str::trim).filter(|b| !b.is_empty()) else {
@@ -756,11 +780,21 @@ fn rest_reads(method: &str, path: &str, body: Option<&str>) -> bool {
                     };
                     match obj.get("query") {
                         Some(v) => v.as_str().is_some_and(sql_reads),
-                        None => {
-                            endpoint == Some("_sql")
-                                && obj.get("cursor").and_then(J::as_str).is_some()
-                        }
+                        None => obj.get("cursor").and_then(J::as_str).is_some(),
                     }
+                }
+                // The PPL API (OpenSearch Piped Processing Language).
+                Some("_ppl") => {
+                    if !query_string_reads(path, ppl_reads) {
+                        return false;
+                    }
+                    let Some(b) = body.map(str::trim).filter(|b| !b.is_empty()) else {
+                        return false;
+                    };
+                    let Ok(J::Object(obj)) = serde_json::from_str::<J>(b) else {
+                        return false;
+                    };
+                    obj.get("query").and_then(J::as_str).is_some_and(ppl_reads)
                 }
                 Some(e) => READ_ENDPOINTS.contains(&e),
                 None => false,
@@ -1801,7 +1835,41 @@ mod tests {
             ("POST", "/logs/_pit?keep_alive=1m", None),
             ("POST", "/%5Fsearch", None),
             ("GET", "/_plugins/_sql?sql=SELECT+1", None),
+            ("GET", "/_plugins/_sql?%73ql=SELECT+1", None),
             ("GET", "/logs/_search", None),
+            // PPL read queries.
+            (
+                "POST",
+                "/_plugins/_ppl",
+                Some("{\"query\":\"source=logs | fields a\"}"),
+            ),
+            (
+                "POST",
+                "/_plugins/_ppl",
+                Some("{\"query\":\"search source=logs | where a = 1\"}"),
+            ),
+            (
+                "POST",
+                "/_plugins/_ppl",
+                Some("{\"query\":\"describe logs\"}"),
+            ),
+            (
+                "POST",
+                "/_plugins/_ppl",
+                Some("{\"query\":\"explain source=logs\"}"),
+            ),
+            (
+                "POST",
+                "/_plugins/_ppl",
+                Some("{\"query\":\"show datasources\"}"),
+            ),
+            ("GET", "/_plugins/_ppl?query=source%3Dlogs", None),
+            ("GET", "/_plugins/_ppl?%71uery=source%3Dlogs", None),
+            (
+                "GET",
+                "/_plugins/_ppl",
+                Some("{\"query\":\"source=logs | fields a\"}"),
+            ),
         ] {
             assert!(rest_reads(m, p, b), "{m} {p}");
         }
@@ -1835,6 +1903,11 @@ mod tests {
                 Some("{\"query\": \"DELETE FROM logs\"}"),
             ),
             ("GET", "/_opendistro/_sql?sql=DELETE+FROM+logs", None),
+            // Percent-encoded and case-variant query parameter keys.
+            ("GET", "/_plugins/_sql?%73ql=DELETE+FROM+logs", None),
+            ("GET", "/_plugins/_sql?%71uery=DELETE+FROM+logs", None),
+            ("GET", "/_plugins/_sql?%53QL=DELETE+FROM+logs", None),
+            ("GET", "/_plugins/_ppl?%71uery=DELETE+FROM+logs", None),
             // GET/HEAD side-effect & traversal bypasses.
             ("GET", "/_refresh", None),
             ("GET", "/%5frefresh", None),
@@ -1854,8 +1927,21 @@ mod tests {
                 "/_plugins/_ppl",
                 Some("{\"query\": \"DELETE FROM logs\"}"),
             ),
+            (
+                "POST",
+                "/_plugins/_ppl",
+                Some("{\"query\": \"source=logs; DELETE FROM logs\"}"),
+            ),
+            (
+                "POST",
+                "/_plugins/_ppl",
+                Some("{\"query\": \"\\u0044ELETE FROM logs\"}"),
+            ),
             ("POST", "/_plugins/_ppl", Some("not json")),
             ("POST", "/_plugins/_ppl", None),
+            ("POST", "/_plugins/_ppl", Some("{}")),
+            ("GET", "/_plugins/_ppl", Some("not json")),
+            ("GET", "/_plugins/_ppl?query=DELETE+FROM+logs", None),
             ("POST", "/_sql", Some("not json")),
             ("POST", "/_sql", None),
             ("POST", "/_sql", Some("{}")),
@@ -1868,6 +1954,11 @@ mod tests {
         assert!(sql_reads("DESCRIBE logs"));
         assert!(!sql_reads("DELETE FROM logs WHERE a = 1"));
         assert_eq!(sql_keyword("/* x */ delete from t"), "DELETE");
+        assert!(ppl_reads("source=logs | fields a"));
+        assert!(ppl_reads("search source=logs | where a = 1"));
+        assert!(ppl_reads("describe logs"));
+        assert!(!ppl_reads("DELETE FROM logs"));
+        assert!(!ppl_reads("DROP INDEX logs"));
     }
 
     #[test]
