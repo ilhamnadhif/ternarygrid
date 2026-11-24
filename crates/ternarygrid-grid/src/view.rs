@@ -5,7 +5,7 @@
 //! [`RowStore`](ternarygrid_core::RowStore) in short chunks so the UI thread (which
 //! locks it once per frame) and the fetch task never wait long.
 
-use crate::expr::{Expr, ExprError, Node, RowValues, compare_values};
+use crate::expr::{Expr, ExprError, Node, RowValues};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -418,26 +418,11 @@ fn compute_view_counting(store: &SharedRowStore, spec: &ViewSpec, ctx: &ViewCont
     (Some(ViewIndex { rows, source_len }), lost)
 }
 
-/// Total order for sorting: NULLs first, numbers numerically, text by its
-/// bytes (case-sensitive, as `ORDER BY` with a binary collation), other values
-/// by [`Value::cmp_for_sort`].
+/// Total order for sorting: NULLs first, numbers numerically (exact across
+/// integers, floats and decimals), text by its bytes (case-sensitive, as
+/// `ORDER BY` with a binary collation), other values by [`Value::cmp_for_sort`].
 pub fn sort_cmp(a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Less,
-        (_, Value::Null) => Ordering::Greater,
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
-        // Decimals exactly, but only against numbers: comparing them numerically with
-        // text too would make the order intransitive (sort_by may then panic).
-        _ => {
-            let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Decimal(_));
-            if (matches!(a, Value::Decimal(_)) || matches!(b, Value::Decimal(_))) && numeric(a) && numeric(b) {
-                compare_values(a, b).unwrap_or_else(|| a.cmp_for_sort(b))
-            } else {
-                a.cmp_for_sort(b)
-            }
-        }
-    }
+    a.cmp_for_sort(b)
 }
 
 /// Stable sort of all stored rows by `keys` (store columns only).

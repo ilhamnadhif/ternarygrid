@@ -574,6 +574,20 @@ impl Gen<'_> {
     }
 }
 
+/// Sanitize text for inclusion inside an XML 1.0 comment (`<!-- ... -->`):
+/// strips/escapes invalid XML characters, removes every `--` sequence (even
+/// overlapping runs like `---`), and avoids a trailing `-` before `-->`.
+fn sanitize_xml_comment(s: &str) -> String {
+    let mut text = xml_escape(s);
+    while text.contains("--") {
+        text = text.replace("--", "- -");
+    }
+    if text.ends_with('-') {
+        text.push(' ');
+    }
+    text
+}
+
 /// Liquibase XML changelog (`databaseChangeLog` with namespace and schema
 /// location) applying the differences of `diff` to the target, one change
 /// per changeSet.
@@ -592,12 +606,26 @@ pub fn liquibase_changelog(diff: &SchemaDiff, source: &SchemaSnapshot, target: &
     g.xml.depth = 1;
     for w in &plan.warnings {
         g.xml.indent();
-        let text = w.replace("--", "- -");
-        g.xml.out.push_str(&format!("<!-- WARNING: {} -->\n", xml_escape(&text)));
+        g.xml.out.push_str(&format!("<!-- WARNING: {} -->\n", sanitize_xml_comment(w)));
     }
     for step in &plan.steps {
         g.step(step);
     }
     g.xml.out.push_str("</databaseChangeLog>\n");
     g.xml.out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_xml_comment;
+
+    #[test]
+    fn xml_comment_sanitizes_repeated_hyphens_and_trailing_dash() {
+        for input in ["--", "---", "----", "-----", "a---b", "end-", "a--", "\u{1}---"] {
+            let out = sanitize_xml_comment(input);
+            assert!(!out.contains("--"), "input={input:?} -> out={out:?}");
+            assert!(!out.ends_with('-'), "input={input:?} -> out={out:?}");
+            assert!(!out.contains('\u{1}'), "input={input:?} -> out={out:?}");
+        }
+    }
 }

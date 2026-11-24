@@ -8,7 +8,7 @@ use crate::sqltext::{self, StmtClass};
 use crate::{admin, catalog, plan};
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use ternarygrid_core::admin::*;
 use ternarygrid_core::ddl::*;
 use ternarygrid_core::dialect::Dialect;
@@ -29,6 +29,72 @@ impl CancelHandle for SqlServerCancelHandle {
     async fn cancel(&self) -> DbResult<()> {
         self.shared.cancel_active();
         Ok(())
+    }
+}
+
+/// Session state left behind when `explain_impl` is cancelled mid-flight or fails cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ExplainDirty {
+    Clean = 0,
+    Showplan = 1,
+    StatisticsOnly = 2,
+    AnalyzeNewTx = 3,
+    AnalyzeSavepoint = 4,
+}
+
+impl ExplainDirty {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Showplan,
+            2 => Self::StatisticsOnly,
+            3 => Self::AnalyzeNewTx,
+            4 => Self::AnalyzeSavepoint,
+            _ => Self::Clean,
+        }
+    }
+
+    fn cleanup_batches(self) -> &'static [&'static str] {
+        match self {
+            Self::Clean => &[],
+            Self::Showplan => &["SET SHOWPLAN_XML OFF"],
+            Self::StatisticsOnly => &["SET STATISTICS XML OFF"],
+            Self::AnalyzeNewTx => &["IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", "SET STATISTICS XML OFF"],
+            Self::AnalyzeSavepoint => &["IF XACT_STATE() = 1 ROLLBACK TRANSACTION ternarygrid_explain", "SET STATISTICS XML OFF"],
+        }
+    }
+}
+
+/// Drop guard that unconditionally clears `suppress_refresh` even when an
+/// `explain_impl` future is dropped/cancelled mid-flight, while leaving
+/// `explain_dirty` armed until cleanup succeeds.
+struct ExplainGuard {
+    suppress_refresh: Arc<AtomicBool>,
+    dirty: Arc<AtomicU8>,
+}
+
+impl ExplainGuard {
+    fn enter(suppress_refresh: Arc<AtomicBool>, dirty: Arc<AtomicU8>) -> Self {
+        suppress_refresh.store(true, Ordering::SeqCst);
+        Self { suppress_refresh, dirty }
+    }
+
+    fn arm(&self, state: ExplainDirty) {
+        self.dirty.store(state as u8, Ordering::SeqCst);
+    }
+
+    fn resume_refresh(&self) {
+        self.suppress_refresh.store(false, Ordering::SeqCst);
+    }
+
+    fn disarm(&self) {
+        self.dirty.store(ExplainDirty::Clean as u8, Ordering::SeqCst);
+    }
+}
+
+impl Drop for ExplainGuard {
+    fn drop(&mut self) {
+        self.suppress_refresh.store(false, Ordering::SeqCst);
     }
 }
 
@@ -55,7 +121,9 @@ pub struct SqlServerSession {
     reconnect_notice: Option<ServerMessage>,
     /// Skip the post-statement `@@TRANCOUNT` refresh (while a SHOWPLAN /
     /// STATISTICS XML option is on, it would return a plan).
-    suppress_refresh: bool,
+    suppress_refresh: Arc<AtomicBool>,
+    /// Non-clean when a previous `explain_impl` was cancelled or failed cleanup.
+    explain_dirty: Arc<AtomicU8>,
     /// `SERVERPROPERTY('EngineEdition')` (5 = Azure SQL Database).
     pub(crate) engine_edition: i32,
     /// The session ran `SET IMPLICIT_TRANSACTIONS` / `SET ANSI_DEFAULTS`: any later statement
@@ -162,7 +230,8 @@ impl SqlServerSession {
             closed: false,
             lost_transaction: false,
             reconnect_notice: None,
-            suppress_refresh: false,
+            suppress_refresh: Arc::new(AtomicBool::new(false)),
+            explain_dirty: Arc::new(AtomicU8::new(ExplainDirty::Clean as u8)),
             engine_edition: init.edition,
             implicit_transactions: false,
             plain_fallback,
@@ -234,20 +303,21 @@ impl SqlServerSession {
         Box::new(cur)
     }
 
-    /// Execute with an explicit mode (internal use).
-    pub(crate) async fn exec_with(&mut self, sql: &str, params: &[Value], mode: Option<ExecMode>, opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
+    /// Execute without checking `explain_dirty` (used by `explain_impl` and its recovery).
+    async fn exec_with_raw(&mut self, sql: &str, params: &[Value], mode: Option<ExecMode>, opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
         let client = self.acquire().await?;
         if sqltext::sets_implicit_transactions(sql) {
             self.implicit_transactions = true;
         }
+        let suppress = self.suppress_refresh.load(Ordering::SeqCst);
         let stmt = Statement {
             sql: sql.to_string(),
             params: params.to_vec(),
             mode: mode.unwrap_or_else(|| exec_mode(sql, params)),
             timeout: opts.timeout,
             resolve_sources: opts.resolve_sources,
-            refresh_state: !self.suppress_refresh && (self.implicit_transactions || refresh_after(self.mode, self.shared.in_transaction.load(Ordering::SeqCst), sql)),
-            refresh_on_error: !self.suppress_refresh,
+            refresh_state: !suppress && (self.implicit_transactions || refresh_after(self.mode, self.shared.in_transaction.load(Ordering::SeqCst), sql)),
+            refresh_on_error: !suppress,
             tag: sqltext::first_keyword(sql),
             notice: self.reconnect_notice.take(),
             zone: crate::types::Zone::of(self.params.property("time_zone")),
@@ -255,10 +325,9 @@ impl SqlServerSession {
         Ok(self.start(client, stmt))
     }
 
-    /// All result sets of `sql` (batch mode).
-    pub(crate) async fn results(&mut self, sql: &str, params: &[Value]) -> DbResult<Vec<(Vec<ColumnMeta>, Vec<Row>)>> {
+    async fn results_raw(&mut self, sql: &str, params: &[Value]) -> DbResult<Vec<(Vec<ColumnMeta>, Vec<Row>)>> {
         let mode = if params.is_empty() { Some(ExecMode::Batch) } else { Some(ExecMode::Rpc) };
-        let mut c = self.exec_with(sql, params, mode, &ExecOptions::default()).await?;
+        let mut c = self.exec_with_raw(sql, params, mode, &ExecOptions::default()).await?;
         let mut out = Vec::new();
         let res = async {
             while let Some(h) = c.next_result().await? {
@@ -279,6 +348,47 @@ impl SqlServerSession {
         .await;
         c.close().await?;
         res.map(|_| out)
+    }
+
+    async fn batch_raw(&mut self, sql: &str) -> DbResult<()> {
+        self.results_raw(sql, &[]).await.map(|_| ())
+    }
+
+    /// Recover session state if a previous `explain_impl` was cancelled or failed
+    /// cleanup. If recovery fails, closes the session so a tainted connection is
+    /// never silently reused.
+    async fn recover_explain_if_dirty(&mut self) -> DbResult<()> {
+        let state = ExplainDirty::from_u8(self.explain_dirty.load(Ordering::SeqCst));
+        if state == ExplainDirty::Clean {
+            return Ok(());
+        }
+        let guard = ExplainGuard::enter(self.suppress_refresh.clone(), self.explain_dirty.clone());
+        let batches = state.cleanup_batches();
+        for (idx, sql) in batches.iter().enumerate() {
+            if idx + 1 == batches.len() {
+                guard.resume_refresh();
+            }
+            if let Err(e) = self.batch_raw(sql).await {
+                self.closed = true;
+                self.client = None;
+                self.pending = None;
+                return Err(DbError::connection(format!("Failed to recover SQL Server session after interrupted EXPLAIN: {}", e.message)));
+            }
+        }
+        guard.disarm();
+        Ok(())
+    }
+
+    /// Execute with an explicit mode (internal use).
+    pub(crate) async fn exec_with(&mut self, sql: &str, params: &[Value], mode: Option<ExecMode>, opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
+        self.recover_explain_if_dirty().await?;
+        self.exec_with_raw(sql, params, mode, opts).await
+    }
+
+    /// All result sets of `sql` (batch mode).
+    pub(crate) async fn results(&mut self, sql: &str, params: &[Value]) -> DbResult<Vec<(Vec<ColumnMeta>, Vec<Row>)>> {
+        self.recover_explain_if_dirty().await?;
+        self.results_raw(sql, params).await
     }
 
     /// Rows of the first result set.
@@ -302,8 +412,8 @@ impl SqlServerSession {
     }
 
     async fn explain_impl(&mut self, sql: &str, analyze: bool) -> DbResult<QueryPlan> {
+        self.recover_explain_if_dirty().await?;
         let (on, off) = if analyze { ("SET STATISTICS XML ON", "SET STATISTICS XML OFF") } else { ("SET SHOWPLAN_XML ON", "SET SHOWPLAN_XML OFF") };
-        self.suppress_refresh = true;
         // STATISTICS XML runs the statement: its changes are rolled back (in a transaction
         // of its own, or to a savepoint of the one open), as EXPLAIN ANALYZE elsewhere.
         let in_tx = analyze && self.scalar("SELECT @@TRANCOUNT", &[]).await.ok().and_then(|v| v.as_i64()).unwrap_or(0) > 0;
@@ -312,18 +422,29 @@ impl SqlServerSession {
         } else {
             ("BEGIN TRANSACTION", "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
         };
-        let mut on_res = self.batch(on).await;
+        let guard = ExplainGuard::enter(self.suppress_refresh.clone(), self.explain_dirty.clone());
+        guard.arm(if analyze { ExplainDirty::StatisticsOnly } else { ExplainDirty::Showplan });
+        let mut on_res = self.batch_raw(on).await;
+        let mut began = false;
         if analyze && on_res.is_ok() {
-            on_res = self.batch(begin).await;
+            guard.arm(if in_tx { ExplainDirty::AnalyzeSavepoint } else { ExplainDirty::AnalyzeNewTx });
+            began = true;
+            on_res = self.batch_raw(begin).await;
         }
         let res = match on_res {
-            Ok(()) => self.results(sql, &[]).await,
+            Ok(()) => self.results_raw(sql, &[]).await,
             Err(e) => Err(e),
         };
-        let undo_res = if analyze { self.batch(undo).await } else { Ok(()) };
-        self.suppress_refresh = false;
+        let undo_res = if began { self.batch_raw(undo).await } else { Ok(()) };
+        if began && undo_res.is_ok() {
+            guard.arm(ExplainDirty::StatisticsOnly);
+        }
+        guard.resume_refresh();
         // the OFF batch refreshes the transaction state (STATISTICS XML executes the statement)
-        let off_res = self.batch(off).await;
+        let off_res = self.batch_raw(off).await;
+        if undo_res.is_ok() && off_res.is_ok() {
+            guard.disarm();
+        }
         let results = res?;
         undo_res?;
         off_res?;
@@ -395,6 +516,8 @@ impl Session for SqlServerSession {
             self.client = r.client;
         }
         self.closed = true;
+        self.suppress_refresh.store(false, Ordering::SeqCst);
+        self.explain_dirty.store(ExplainDirty::Clean as u8, Ordering::SeqCst);
         if let Some(c) = self.client.take() {
             c.close().await.map_err(|e| map_error(e, None))?;
         }
@@ -568,5 +691,52 @@ mod tests {
         // an open explicit transaction can end without transaction SQL (procedure, deadlock)
         assert!(refresh_after(Auto, true, "UPDATE t SET a = 1"));
         assert!(refresh_after(Manual, false, "SELECT 1"));
+    }
+
+    #[tokio::test]
+    async fn explain_guard_resets_suppress_and_tracks_dirty_on_cancellation() {
+        let suppress = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(AtomicU8::new(ExplainDirty::Clean as u8));
+
+        // Simulate `explain_impl` getting cancelled while suspended in the middle of EXPLAIN ANALYZE.
+        let s = suppress.clone();
+        let d = dirty.clone();
+        let fut = async move {
+            let guard = ExplainGuard::enter(s, d);
+            guard.arm(ExplainDirty::AnalyzeNewTx);
+            std::future::pending::<()>().await;
+            guard.disarm();
+        };
+        let mut fut = Box::pin(fut);
+        // Poll once so the future enters ExplainGuard, arms dirty, and suspends.
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert!(suppress.load(Ordering::SeqCst));
+        assert_eq!(ExplainDirty::from_u8(dirty.load(Ordering::SeqCst)), ExplainDirty::AnalyzeNewTx);
+
+        // Dropping (cancelling) the future resets `suppress_refresh` immediately,
+        // while keeping `explain_dirty` armed for recovery before the next query.
+        drop(fut);
+        assert!(!suppress.load(Ordering::SeqCst));
+        let state = ExplainDirty::from_u8(dirty.load(Ordering::SeqCst));
+        assert_eq!(state, ExplainDirty::AnalyzeNewTx);
+        assert_eq!(state.cleanup_batches(), &["IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", "SET STATISTICS XML OFF"]);
+
+        // Savepoint variant rolls back only to the explain savepoint.
+        assert_eq!(ExplainDirty::AnalyzeSavepoint.cleanup_batches(), &["IF XACT_STATE() = 1 ROLLBACK TRANSACTION ternarygrid_explain", "SET STATISTICS XML OFF"]);
+        assert_eq!(ExplainDirty::Showplan.cleanup_batches(), &["SET SHOWPLAN_XML OFF"]);
+        assert_eq!(ExplainDirty::StatisticsOnly.cleanup_batches(), &["SET STATISTICS XML OFF"]);
+
+        // Completing recovery disarms `explain_dirty` and leaves `suppress_refresh` false.
+        {
+            let guard = ExplainGuard::enter(suppress.clone(), dirty.clone());
+            assert!(suppress.load(Ordering::SeqCst));
+            guard.resume_refresh();
+            assert!(!suppress.load(Ordering::SeqCst));
+            guard.disarm();
+        }
+        assert!(!suppress.load(Ordering::SeqCst));
+        assert_eq!(ExplainDirty::from_u8(dirty.load(Ordering::SeqCst)), ExplainDirty::Clean);
     }
 }

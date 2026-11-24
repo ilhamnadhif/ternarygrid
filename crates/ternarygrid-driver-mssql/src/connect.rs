@@ -50,7 +50,7 @@ pub fn build_config(params: &ConnectParams, host: &str, port: u16, level: Encryp
     if let Some(ps) = params.property("packet_size").and_then(|p| p.parse::<u32>().ok()) {
         config.packet_size(ps);
     }
-    if params.property("application_intent").is_some_and(|v| v.eq_ignore_ascii_case("readonly")) {
+    if params.read_only || params.property("application_intent").is_some_and(|v| v.eq_ignore_ascii_case("readonly")) {
         config.readonly(true);
     }
     if truthy(params.property("multi_subnet_failover")) {
@@ -206,5 +206,12 @@ mod tests {
         cfg.user = None;
         let p = ConnectParams::from_config(&cfg, None);
         assert!(build_config(&p, "h", 1433, EncryptionLevel::Off, false).is_err());
+
+        // read_only connection sets ApplicationIntent=ReadOnly on the TDS config.
+        let mut cfg = ConnectionConfig::new(DbKind::SqlServer, "x");
+        cfg.read_only = true;
+        let p = ConnectParams::from_config(&cfg, Some(Secret::new("pw")));
+        let c = build_config(&p, &p.host, p.port, EncryptionLevel::Required, false).unwrap();
+        assert!(format!("{c:?}").contains("readonly: true"), "{c:?}");
     }
 }

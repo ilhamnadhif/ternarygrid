@@ -66,6 +66,27 @@ pub(crate) fn quote(name: &str) -> String {
     }
 }
 
+/// Percent-encode a single REST URL path segment (RFC 3986 unreserved
+/// `A-Z a-z 0-9 - . _ ~` stay unencoded, except bare `.` / `..` dot segments).
+pub(crate) fn pct_segment(s: &str) -> String {
+    if s == "." {
+        return "%2E".into();
+    }
+    if s == ".." {
+        return "%2E%2E".into();
+    }
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 /// A REST request: `METHOD /path` (SQL starts with SELECT, SHOW, DESCRIBE).
 pub(crate) fn is_rest(text: &str) -> bool {
     let mut words = text.split_whitespace();
@@ -174,7 +195,7 @@ impl Dialect for SearchDialect {
     fn truncate_table(&self, table: &ObjectRef) -> String {
         format!(
             "POST /{}/_delete_by_query\n{{\"query\": {{\"match_all\": {{}}}}}}",
-            table.name
+            pct_segment(&table.name)
         )
     }
 }
@@ -192,18 +213,21 @@ impl DdlGenerator for SearchDdl {
             .collect();
         vec![format!(
             "PUT /{}\n{}",
-            t.name,
+            pct_segment(&t.name),
             serde_json::to_string_pretty(&serde_json::json!({"mappings": {"properties": props}}))
                 .unwrap_or_default()
         )]
     }
     fn drop_table(&self, _schema: Option<&str>, name: &str, _cascade: bool) -> String {
-        format!("DELETE /{name}")
+        format!("DELETE /{}", pct_segment(name))
     }
     fn rename_table(&self, _schema: Option<&str>, old_name: &str, new_name: &str) -> String {
-        format!(
-            "POST /_reindex\n{{\"source\": {{\"index\": \"{old_name}\"}}, \"dest\": {{\"index\": \"{new_name}\"}}}}"
-        )
+        let body = serde_json::to_string(&serde_json::json!({
+            "source": { "index": old_name },
+            "dest": { "index": new_name },
+        }))
+        .unwrap_or_default();
+        format!("POST /_reindex\n{body}")
     }
     fn alter_table(
         &self,
@@ -215,9 +239,15 @@ impl DdlGenerator for SearchDdl {
         Vec::new()
     }
     fn add_column(&self, table: &TableDef, column: &ColumnDef) -> Vec<String> {
+        let body = serde_json::to_string(&serde_json::json!({
+            "properties": {
+                &column.name: { "type": &column.data_type }
+            }
+        }))
+        .unwrap_or_default();
         vec![format!(
-            "PUT /{}/_mapping\n{{\"properties\": {{\"{}\": {{\"type\": \"{}\"}}}}}}",
-            table.name, column.name, column.data_type
+            "PUT /{}/_mapping\n{body}",
+            pct_segment(&table.name)
         )]
     }
     fn drop_column(&self, _t: &TableDef, _c: &str) -> String {
@@ -263,7 +293,7 @@ impl DdlGenerator for SearchDdl {
         vec![view.definition.clone()]
     }
     fn drop_view(&self, view: &ViewDef) -> String {
-        format!("DELETE /_all/_alias/{}", view.name)
+        format!("DELETE /_all/_alias/{}", pct_segment(&view.name))
     }
     fn create_sequence(&self, _s: &SequenceDef) -> String {
         NOT_SEARCH.into()
@@ -329,5 +359,51 @@ mod tests {
         assert!(is_rest("post _bulk"));
         assert!(!is_rest("SELECT 1"));
         assert_eq!(d.ddl().drop_table(None, "logs", false), "DELETE /logs");
+    }
+
+    #[test]
+    fn path_encoding_and_json_escaping() {
+        let d = SearchDialect::new();
+        assert_eq!(pct_segment("logs-2024.01_~"), "logs-2024.01_~");
+        assert_eq!(pct_segment(".."), "%2E%2E");
+        assert_eq!(pct_segment("."), "%2E");
+        assert_eq!(pct_segment("a/b?c=1#d"), "a%2Fb%3Fc%3D1%23d");
+        assert_eq!(
+            d.ddl().drop_table(None, "../_all", false),
+            "DELETE /..%2F_all"
+        );
+        assert_eq!(
+            d.truncate_table(&ObjectRef::new(ObjectKind::Table, None, "a/b?x=1")),
+            "POST /a%2Fb%3Fx%3D1/_delete_by_query\n{\"query\": {\"match_all\": {}}}"
+        );
+        let view = ViewDef {
+            name: "a/b?x=1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            d.ddl().drop_view(&view),
+            "DELETE /_all/_alias/a%2Fb%3Fx%3D1"
+        );
+
+        // JSON payloads in rename_table and add_column must escape quotes/control chars.
+        let rename = d
+            .ddl()
+            .rename_table(None, "old\"idx", "new\\idx\n{\"injected\":1}");
+        let (head, body) = rename.split_once('\n').unwrap();
+        assert_eq!(head, "POST /_reindex");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["source"]["index"], "old\"idx");
+        assert_eq!(parsed["dest"]["index"], "new\\idx\n{\"injected\":1}");
+
+        let t = TableDef::new(None, "idx/1");
+        let col = ColumnDef::new("col\"1", "text\",\"x\":{\"type\":\"keyword");
+        let add = &d.ddl().add_column(&t, &col)[0];
+        let (head, body) = add.split_once('\n').unwrap();
+        assert_eq!(head, "PUT /idx%2F1/_mapping");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed["properties"]["col\"1"]["type"],
+            "text\",\"x\":{\"type\":\"keyword"
+        );
     }
 }

@@ -335,6 +335,12 @@ fn is_read(name: &str, args: &[Vec<u8>]) -> bool {
     match name {
         "CLIENT" => matches!(sub.as_str(), "LIST" | "INFO" | "GETNAME" | "ID"),
         "CONFIG" => sub == "GET",
+        "SLOWLOG" => matches!(sub.as_str(), "GET" | "LEN"),
+        "LATENCY" => matches!(
+            sub.as_str(),
+            "LATEST" | "HISTORY" | "GRAPH" | "DOCTOR" | "HISTOGRAM"
+        ),
+        "MEMORY" => matches!(sub.as_str(), "USAGE" | "STATS" | "DOCTOR" | "MALLOC-STATS"),
         _ => matches!(
             name,
             "GET"
@@ -409,14 +415,10 @@ fn is_read(name: &str, args: &[Vec<u8>]) -> bool {
                 | "LASTSAVE"
                 | "RANDOMKEY"
                 | "OBJECT"
-                | "MEMORY"
-                | "SLOWLOG"
-                | "LATENCY"
                 | "COMMAND"
                 | "SELECT"
                 | "DUMP"
                 | "PUBSUB"
-                | "TOUCH"
         ),
     }
 }
@@ -1775,7 +1777,20 @@ mod tests {
             "INFO",
             "CLIENT LIST",
             "client info",
+            "CLIENT GETNAME",
+            "CLIENT ID",
             "CONFIG GET maxmemory",
+            "SLOWLOG GET 10",
+            "SLOWLOG LEN",
+            "LATENCY LATEST",
+            "LATENCY HISTORY cmd",
+            "LATENCY GRAPH cmd",
+            "LATENCY DOCTOR",
+            "LATENCY HISTOGRAM",
+            "MEMORY USAGE k",
+            "MEMORY STATS",
+            "MEMORY DOCTOR",
+            "MEMORY MALLOC-STATS",
             "SELECT 3",
             "JSON.GET j",
         ] {
@@ -1789,8 +1804,14 @@ mod tests {
             "EVAL \"return 1\" 0",
             "SORT l STORE x",
             "CLIENT KILL ID 3",
+            "CLIENT KILL ID 3 LIST",
             "CLIENT KILL USER blacklist",
+            "CLIENT SETNAME LIST",
             "CONFIG SET maxmemory 1",
+            "SLOWLOG RESET",
+            "LATENCY RESET",
+            "MEMORY PURGE",
+            "TOUCH k",
             "XREADGROUP GROUP g c STREAMS s >",
             "TERNARYGRID.COUNT GET k",
         ] {

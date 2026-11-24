@@ -62,12 +62,13 @@ fetch -sS -H "Accept: application/vnd.github+json" -o "$TMP/release.json" "$API"
 json() { plutil -extract "$1" raw -o - "$TMP/release.json" 2>/dev/null; }
 VERSION="$(json tag_name)" || die "unexpected answer from GitHub"
 VERSION="${VERSION#v}"
-ZIP="" DMG=""
+ZIP="" DMG="" SUMS=""
 i=0
 while name="$(json "assets.$i.name")"; do
     case "$name" in
         "TernaryGrid-$VERSION.zip") ZIP=$i ;;
         "TernaryGrid-$VERSION.dmg") DMG=$i ;;
+        "SHA256SUMS.txt") SUMS=$i ;;
     esac
     i=$((i + 1))
 done
@@ -80,13 +81,35 @@ case "$URL" in https://*) ;; *) die "unexpected download address: $URL" ;; esac
 
 say "Downloading $NAME"
 fetch --progress-bar -o "$TMP/$NAME" "$URL"
+expected=""
+checksum_src=""
 if [ -n "$DIGEST" ]; then
-    expected="$(printf '%s' "${DIGEST#sha256:}" | tr 'A-F' 'a-f')"
+    case "$DIGEST" in
+        sha256:*)
+            expected="$(printf '%s' "${DIGEST#sha256:}" | tr 'A-F' 'a-f')"
+            checksum_src="GitHub"
+            ;;
+    esac
+fi
+if [ -z "$expected" ] && [ -n "$SUMS" ]; then
+    SUMS_URL="$(json "assets.$SUMS.browser_download_url")"
+    case "$SUMS_URL" in https://*) ;; *) die "unexpected checksum address: $SUMS_URL" ;; esac
+    fetch -sS -o "$TMP/SHA256SUMS.txt" "$SUMS_URL" || die "could not download SHA256SUMS.txt"
+    expected="$(awk -v f="$NAME" 'NF >= 2 { n = $2; sub(/^\*/, "", n); if (n == f) { print tolower($1); exit } }' "$TMP/SHA256SUMS.txt")"
+    checksum_src="SHA256SUMS.txt"
+fi
+if [ -n "$expected" ]; then
+    case "$expected" in
+        *[!0-9a-f]*) die "invalid SHA-256 checksum from $checksum_src" ;;
+    esac
+    [ "${#expected}" -eq 64 ] || die "invalid SHA-256 checksum length from $checksum_src"
     actual="$(shasum -a 256 "$TMP/$NAME" | awk '{print $1}')"
-    [ "$actual" = "$expected" ] || die "the download does not match the SHA-256 GitHub published"
-    say "Checksum verified"
+    [ "$actual" = "$expected" ] || die "the download does not match the SHA-256 checksum from $checksum_src"
+    say "Checksum verified ($checksum_src)"
+elif [ "${TERNARYGRID_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+    say "Warning: no SHA-256 checksum published for $NAME; proceeding because TERNARYGRID_ALLOW_UNVERIFIED=1"
 else
-    say "GitHub published no checksum for this file; relying on the code signature"
+    die "no SHA-256 checksum is published for $NAME (neither GitHub asset digest nor SHA256SUMS.txt); set TERNARYGRID_ALLOW_UNVERIFIED=1 to install relying on code signature only"
 fi
 
 if [ -n "$ZIP" ]; then
@@ -123,7 +146,11 @@ fi
 running() { pgrep -qf "^$APP/Contents/MacOS/ternarygrid"; }
 if running; then
     say "Quitting the running TernaryGrid"
-    osascript -e "tell application \"$APP\" to quit" >/dev/null 2>&1 || true
+    osascript - "$APP" <<'EOF' >/dev/null 2>&1 || true
+on run argv
+  tell application (item 1 of argv) to quit
+end run
+EOF
     for _ in $(seq 1 60); do running || break; sleep 0.5; done
     running && die "TernaryGrid is still running; quit it and run this again."
 fi

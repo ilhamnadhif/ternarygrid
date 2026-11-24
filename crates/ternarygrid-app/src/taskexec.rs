@@ -191,6 +191,12 @@ impl AppTaskExecutor {
     }
 }
 
+/// Check whether `stmt` modifies data or schema according to the connection's
+/// query language (Redis / MongoDB / Elasticsearch commands first, then SQL / CQL).
+fn statement_is_write(stmt: &str, syntax: &ternarygrid_core::SqlSyntax, lang: ternarygrid_core::QueryLanguage) -> bool {
+    ternarygrid_sql::classify_command(stmt, lang).unwrap_or_else(|| ternarygrid_sql::classify(stmt, syntax)).is_write
+}
+
 /// Run a script statement by statement on a headless session. `read_only`: the name of
 /// a read-only connection; a script with a statement that writes is refused before any
 /// runs (SQL Server and Oracle sessions do not stop writes themselves).
@@ -211,10 +217,12 @@ pub async fn run_script(
     if let Some(sc) = schema.filter(|d| !d.is_empty()) {
         s.set_current_schema(sc).await?;
     }
-    let syntax = s.dialect().syntax().clone();
+    let dialect = s.dialect();
+    let syntax = dialect.syntax().clone();
+    let lang = dialect.kind().language();
     let spans = ternarygrid_sql::split_statements(text, &syntax, &ternarygrid_sql::SplitOptions::default());
     if let Some(name) = read_only
-        && let Some((i, _)) = spans.iter().enumerate().find(|(_, span)| !span.is_client_command && ternarygrid_sql::classify(span.text(text), &syntax).is_write)
+        && let Some((i, _)) = spans.iter().enumerate().find(|(_, span)| !span.is_client_command && statement_is_write(span.text(text), &syntax, lang))
     {
         return Err(DbError::read_only(format!("The connection \"{name}\" is read-only; statement {} changes data or schema", i + 1)));
     }
@@ -293,5 +301,159 @@ impl AppTaskExecutor {
     /// Open a saved connection (used by the transfer task runners).
     pub async fn connection(&self, id: &str) -> DbResult<HeadlessConnection> {
         self.open(id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ternarygrid_core::ddl::{SchemaSnapshot, TableDef};
+    use ternarygrid_core::driver::{CancelHandle, ExecOptions, QueryCursor, ResultHeader, ServerInfo};
+    use ternarygrid_core::meta::{DatabaseInfo, MetadataSearch, ObjectInfo, ObjectKind, ObjectRef, SchemaInfo};
+    use ternarygrid_core::plan::QueryPlan;
+    use ternarygrid_core::{DbKind, Dialect, Row, Value};
+
+    struct EmptyCursor;
+
+    #[async_trait::async_trait]
+    impl QueryCursor for EmptyCursor {
+        async fn next_result(&mut self) -> DbResult<Option<ResultHeader>> {
+            Ok(None)
+        }
+        async fn fetch(&mut self, _max_rows: usize) -> DbResult<Vec<Row>> {
+            Ok(Vec::new())
+        }
+        fn take_messages(&mut self) -> Vec<ternarygrid_core::ServerMessage> {
+            Vec::new()
+        }
+        async fn close(&mut self) -> DbResult<()> {
+            Ok(())
+        }
+    }
+
+    struct RecordingSession {
+        dialect: Arc<dyn Dialect>,
+        server: ServerInfo,
+        executed: Vec<String>,
+    }
+
+    impl RecordingSession {
+        fn for_kind(kind: DbKind) -> Self {
+            let dialect = crate::driver_registry().get(kind).unwrap().dialect();
+            Self { dialect, server: ServerInfo::default(), executed: Vec::new() }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Session for RecordingSession {
+        fn kind(&self) -> DbKind {
+            self.dialect.kind()
+        }
+        fn dialect(&self) -> Arc<dyn Dialect> {
+            self.dialect.clone()
+        }
+        fn server_info(&self) -> &ServerInfo {
+            &self.server
+        }
+        fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {
+            None
+        }
+        async fn ping(&mut self) -> DbResult<()> {
+            Ok(())
+        }
+        async fn close(&mut self) -> DbResult<()> {
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        async fn execute(&mut self, sql: &str, _params: &[Value], _opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
+            self.executed.push(sql.to_string());
+            Ok(Box::new(EmptyCursor))
+        }
+        fn transaction_mode(&self) -> TransactionMode {
+            TransactionMode::Auto
+        }
+        async fn set_transaction_mode(&mut self, _mode: TransactionMode) -> DbResult<()> {
+            Ok(())
+        }
+        fn in_transaction(&self) -> bool {
+            false
+        }
+        async fn commit(&mut self) -> DbResult<()> {
+            Ok(())
+        }
+        async fn rollback(&mut self) -> DbResult<()> {
+            Ok(())
+        }
+        async fn current_database(&mut self) -> DbResult<Option<String>> {
+            Ok(None)
+        }
+        async fn current_schema(&mut self) -> DbResult<Option<String>> {
+            Ok(None)
+        }
+        async fn set_current_schema(&mut self, _schema: &str) -> DbResult<()> {
+            Ok(())
+        }
+        async fn list_databases(&mut self) -> DbResult<Vec<DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_schemas(&mut self) -> DbResult<Vec<SchemaInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_objects(&mut self, _schema: &SchemaRef, _kind: ObjectKind) -> DbResult<Vec<ObjectInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_children(&mut self, _parent: &ObjectRef, _kind: ObjectKind) -> DbResult<Vec<ObjectInfo>> {
+            Ok(Vec::new())
+        }
+        async fn table_definition(&mut self, _table: &ObjectRef) -> DbResult<TableDef> {
+            Err(DbError::unsupported("test"))
+        }
+        async fn object_ddl(&mut self, _obj: &ObjectRef) -> DbResult<String> {
+            Err(DbError::unsupported("test"))
+        }
+        async fn search_metadata(&mut self, _search: &MetadataSearch) -> DbResult<Vec<ObjectInfo>> {
+            Ok(Vec::new())
+        }
+        async fn schema_snapshot(&mut self, _schema: &SchemaRef, _opts: &SnapshotOptions) -> DbResult<SchemaSnapshot> {
+            Err(DbError::unsupported("test"))
+        }
+        async fn explain(&mut self, _sql: &str, _analyze: bool) -> DbResult<QueryPlan> {
+            Err(DbError::unsupported("test"))
+        }
+    }
+
+    fn test_ctx() -> RunContext {
+        RunContext::new("run", "task", ternarygrid_tasks::Trigger::Manual, tokio_util::sync::CancellationToken::new(), Arc::new(|_| {}))
+    }
+
+    #[tokio::test]
+    async fn run_script_uses_command_classifier_for_non_sql_read_only_sessions() {
+        let ctx = test_ctx();
+
+        // Redis: `SET k v` is a write (SQL classify would misclassify `SET` as a session setting).
+        let mut redis = RecordingSession::for_kind(DbKind::Redis);
+        let err = run_script(&ctx, &mut redis, "GET k;\nSET k v", None, None, true, true, Some("prod-redis")).await.unwrap_err();
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly);
+        assert!(redis.executed.is_empty(), "nothing must run when a statement writes");
+        run_script(&ctx, &mut redis, "GET k", None, None, true, true, Some("prod-redis")).await.unwrap();
+        assert_eq!(redis.executed, vec!["GET k"]);
+
+        // MongoDB: `deleteMany` is a write, `find` is a read.
+        let mut mongo = RecordingSession::for_kind(DbKind::MongoDb);
+        let err = run_script(&ctx, &mut mongo, "db.users.deleteMany({})", None, None, true, true, Some("prod-mongo")).await.unwrap_err();
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly);
+        assert!(mongo.executed.is_empty());
+        run_script(&ctx, &mut mongo, "db.users.find({})", None, None, true, true, Some("prod-mongo")).await.unwrap();
+        assert_eq!(mongo.executed, vec!["db.users.find({})"]);
+
+        // Elasticsearch: `POST /idx/_doc` and `DELETE /idx` are writes; `GET /idx/_search` is a read.
+        let mut es = RecordingSession::for_kind(DbKind::Elasticsearch);
+        let err = run_script(&ctx, &mut es, "POST /users/_doc\n{\"name\":\"a\"}", None, None, true, true, Some("prod-es")).await.unwrap_err();
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly);
+        assert!(es.executed.is_empty());
+        run_script(&ctx, &mut es, "GET /users/_search", None, None, true, true, Some("prod-es")).await.unwrap();
+        assert_eq!(es.executed, vec!["GET /users/_search"]);
     }
 }

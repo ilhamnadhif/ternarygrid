@@ -221,91 +221,100 @@ pub fn classify_command(
     let mut info = StatementInfo::new(StatementKind::Other, first.clone());
     match language {
         L::Redis => {
-            let read = matches!(
-                first.as_str(),
-                "GET"
-                    | "MGET"
-                    | "GETRANGE"
-                    | "STRLEN"
-                    | "EXISTS"
-                    | "TYPE"
-                    | "TTL"
-                    | "PTTL"
-                    | "EXPIRETIME"
-                    | "KEYS"
-                    | "SCAN"
-                    | "HGET"
-                    | "HMGET"
-                    | "HGETALL"
-                    | "HKEYS"
-                    | "HVALS"
-                    | "HLEN"
-                    | "HEXISTS"
-                    | "HSCAN"
-                    | "HSTRLEN"
-                    | "HRANDFIELD"
-                    | "LRANGE"
-                    | "LINDEX"
-                    | "LLEN"
-                    | "LPOS"
-                    | "SMEMBERS"
-                    | "SISMEMBER"
-                    | "SMISMEMBER"
-                    | "SCARD"
-                    | "SSCAN"
-                    | "SRANDMEMBER"
-                    | "SINTER"
-                    | "SUNION"
-                    | "SDIFF"
-                    | "SINTERCARD"
-                    | "ZRANGE"
-                    | "ZREVRANGE"
-                    | "ZRANGEBYSCORE"
-                    | "ZREVRANGEBYSCORE"
-                    | "ZRANGEBYLEX"
-                    | "ZSCORE"
-                    | "ZMSCORE"
-                    | "ZRANK"
-                    | "ZREVRANK"
-                    | "ZCARD"
-                    | "ZCOUNT"
-                    | "ZLEXCOUNT"
-                    | "ZSCAN"
-                    | "ZRANDMEMBER"
-                    | "XRANGE"
-                    | "XREVRANGE"
-                    | "XLEN"
-                    | "XINFO"
-                    | "XREAD"
-                    | "XPENDING"
-                    | "PFCOUNT"
-                    | "BITCOUNT"
-                    | "BITPOS"
-                    | "GETBIT"
-                    | "GEOPOS"
-                    | "GEODIST"
-                    | "GEOSEARCH"
-                    | "JSON.GET"
-                    | "JSON.TYPE"
-                    | "INFO"
-                    | "PING"
-                    | "ECHO"
-                    | "TIME"
-                    | "DBSIZE"
-                    | "LASTSAVE"
-                    | "RANDOMKEY"
-                    | "OBJECT"
-                    | "MEMORY"
-                    | "SLOWLOG"
-                    | "LATENCY"
-                    | "COMMAND"
-                    | "SELECT"
-                    | "DUMP"
-                    | "PUBSUB"
-                    | "TOUCH"
-            ) || first == "CLIENT" && text.to_ascii_uppercase().contains("LIST")
-                || first == "CONFIG"
-                    && text.to_ascii_uppercase().split_whitespace().nth(1) == Some("GET");
+            let sub = text
+                .split_whitespace()
+                .nth(1)
+                .map(str::to_ascii_uppercase)
+                .unwrap_or_default();
+            let read = match first.as_str() {
+                "CLIENT" => matches!(sub.as_str(), "LIST" | "INFO" | "GETNAME" | "ID"),
+                "CONFIG" => sub == "GET",
+                "SLOWLOG" => matches!(sub.as_str(), "GET" | "LEN"),
+                "LATENCY" => matches!(
+                    sub.as_str(),
+                    "LATEST" | "HISTORY" | "GRAPH" | "DOCTOR" | "HISTOGRAM"
+                ),
+                "MEMORY" => matches!(sub.as_str(), "USAGE" | "STATS" | "DOCTOR" | "MALLOC-STATS"),
+                _ => matches!(
+                    first.as_str(),
+                    "GET"
+                        | "MGET"
+                        | "GETRANGE"
+                        | "STRLEN"
+                        | "EXISTS"
+                        | "TYPE"
+                        | "TTL"
+                        | "PTTL"
+                        | "EXPIRETIME"
+                        | "KEYS"
+                        | "SCAN"
+                        | "HGET"
+                        | "HMGET"
+                        | "HGETALL"
+                        | "HKEYS"
+                        | "HVALS"
+                        | "HLEN"
+                        | "HEXISTS"
+                        | "HSCAN"
+                        | "HSTRLEN"
+                        | "HRANDFIELD"
+                        | "LRANGE"
+                        | "LINDEX"
+                        | "LLEN"
+                        | "LPOS"
+                        | "SMEMBERS"
+                        | "SISMEMBER"
+                        | "SMISMEMBER"
+                        | "SCARD"
+                        | "SSCAN"
+                        | "SRANDMEMBER"
+                        | "SINTER"
+                        | "SUNION"
+                        | "SDIFF"
+                        | "SINTERCARD"
+                        | "ZRANGE"
+                        | "ZREVRANGE"
+                        | "ZRANGEBYSCORE"
+                        | "ZREVRANGEBYSCORE"
+                        | "ZRANGEBYLEX"
+                        | "ZSCORE"
+                        | "ZMSCORE"
+                        | "ZRANK"
+                        | "ZREVRANK"
+                        | "ZCARD"
+                        | "ZCOUNT"
+                        | "ZLEXCOUNT"
+                        | "ZSCAN"
+                        | "ZRANDMEMBER"
+                        | "XRANGE"
+                        | "XREVRANGE"
+                        | "XLEN"
+                        | "XINFO"
+                        | "XREAD"
+                        | "XPENDING"
+                        | "PFCOUNT"
+                        | "BITCOUNT"
+                        | "BITPOS"
+                        | "GETBIT"
+                        | "GEOPOS"
+                        | "GEODIST"
+                        | "GEOSEARCH"
+                        | "JSON.GET"
+                        | "JSON.TYPE"
+                        | "INFO"
+                        | "PING"
+                        | "ECHO"
+                        | "TIME"
+                        | "DBSIZE"
+                        | "LASTSAVE"
+                        | "RANDOMKEY"
+                        | "OBJECT"
+                        | "COMMAND"
+                        | "SELECT"
+                        | "DUMP"
+                        | "PUBSUB"
+                ),
+            };
             info.is_write = !read;
             info.returns_rows = read;
             info.kind = if read {
@@ -383,7 +392,11 @@ pub fn classify_command(
             let mut words = line.split_whitespace().skip(1);
             let target = words.next().unwrap_or("/");
             let path = target.split(['?', '#']).next().unwrap_or("");
-            let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            let decoded_path = percent_decode(path);
+            let raw_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            let segments: Vec<&str> = decoded_path.split('/').filter(|s| !s.is_empty()).collect();
+            let has_traversal = raw_segments.iter().any(|s| matches!(*s, "." | ".."))
+                || segments.iter().any(|s| matches!(*s, "." | ".."));
             // The endpoint is the first `_` segment (index names cannot start with `_`):
             // `/product_catalog/_doc` is `_doc`, `/logs/_search/scroll` is `_search`.
             let api = segments
@@ -392,7 +405,7 @@ pub fn classify_command(
                 .find(|s| s.starts_with('_') && !matches!(*s, "_plugins" | "_opendistro"))
                 .unwrap_or("");
             // Encoded or relative paths may reach another endpoint.
-            let plain = !path.contains('%') && !segments.iter().any(|s| matches!(*s, "." | ".."));
+            let plain = !path.contains('%') && !has_traversal;
             let reads = [
                 "_search",
                 "_msearch",
@@ -415,28 +428,44 @@ pub fn classify_command(
                 "_terms_enum",
                 "_render",
             ];
-            // GET requests that still change the index.
+            // GET/HEAD requests that still change the index.
             let side_effects = ["_refresh", "_flush", "_forcemerge", "_cache"];
-            // OpenSearch SQL / PPL can delete documents.
+            // OpenSearch SQL / PPL can delete documents (and JSON unicode escapes
+            // like `\u0044ELETE` must be decoded before checking keywords).
             let dml = matches!(api, "_sql" | "_ppl") && {
-                let request: String = words
-                    .chain(body.split_whitespace())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                request
-                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    .any(|w| {
-                        [
-                            "DELETE", "INSERT", "UPDATE", "REPLACE", "UPSERT", "MERGE", "CREATE",
-                            "ALTER", "DROP", "TRUNCATE",
-                        ]
-                        .iter()
-                        .any(|k| w.eq_ignore_ascii_case(k))
+                let query_dml = target
+                    .split_once('?')
+                    .map(|(_, q)| q.split('#').next().unwrap_or(q))
+                    .unwrap_or("")
+                    .split('&')
+                    .filter_map(|kv| {
+                        kv.split_once('=')
+                            .filter(|(k, _)| *k == "sql" || *k == "query")
+                            .map(|(_, v)| percent_decode(&v.replace('+', " ")))
                     })
+                    .any(|q| search_has_dml_keyword(&q));
+                let rest_on_line = words.collect::<Vec<_>>().join(" ");
+                let full_body = match (rest_on_line.trim(), body.trim()) {
+                    ("", "") => String::new(),
+                    (a, "") => a.to_string(),
+                    ("", b) => b.to_string(),
+                    (a, b) => format!("{a}\n{b}"),
+                };
+                let body_dml = if full_body.is_empty() {
+                    method == "POST"
+                } else {
+                    match serde_json::from_str::<serde_json::Value>(&full_body) {
+                        Ok(val) if val.is_object() => search_json_has_dml(&val),
+                        _ => true,
+                    }
+                };
+                query_dml || body_dml
             };
             info.is_write = dml
                 || match method {
-                    "GET" | "HEAD" => segments.iter().any(|s| side_effects.contains(s)),
+                    "GET" | "HEAD" => {
+                        has_traversal || segments.iter().any(|s| side_effects.contains(s))
+                    }
                     "POST" => !(plain && reads.contains(&api)),
                     _ => true,
                 };
@@ -455,6 +484,48 @@ pub fn classify_command(
         _ => return None,
     }
     Some(info)
+}
+
+/// `%XX` escapes of a URL path or query value decoded.
+fn percent_decode(input: &str) -> String {
+    let b = input.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) = input
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn search_has_dml_keyword(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| {
+            [
+                "DELETE", "INSERT", "UPDATE", "REPLACE", "UPSERT", "MERGE", "CREATE", "ALTER",
+                "DROP", "TRUNCATE",
+            ]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k))
+        })
+}
+
+fn search_json_has_dml(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => search_has_dml_keyword(s),
+        serde_json::Value::Array(items) => items.iter().any(search_json_has_dml),
+        serde_json::Value::Object(map) => map.values().any(search_json_has_dml),
+        _ => false,
+    }
 }
 
 /// MongoDB collection, cursor and database methods that only read.
@@ -2535,5 +2606,82 @@ mod tests {
             Some(Danger::DeleteWithoutWhere)
         );
         assert!(classify_command("GET", L::Search).is_none());
+    }
+
+    #[test]
+    fn redis_subcommand_read_only_sandbox() {
+        use ternarygrid_core::QueryLanguage as L;
+        let w = |s: &str| classify_command(s, L::Redis).unwrap().is_write;
+        for write_cmd in [
+            "CLIENT KILL ID 1 LIST",
+            "CLIENT KILL USER blacklist",
+            "CLIENT SETNAME LIST",
+            "CLIENT PAUSE 1000",
+            "CONFIG SET maxmemory 0",
+            "SLOWLOG RESET",
+            "LATENCY RESET",
+            "MEMORY PURGE",
+            "TOUCH k",
+            "touch key1 key2",
+        ] {
+            assert!(w(write_cmd), "expected write: {write_cmd}");
+        }
+        for read_cmd in [
+            "CLIENT LIST",
+            "client   info",
+            "CLIENT GETNAME",
+            "CLIENT ID",
+            "CONFIG GET maxmemory",
+            "SLOWLOG GET 10",
+            "SLOWLOG LEN",
+            "LATENCY LATEST",
+            "LATENCY HISTORY cmd",
+            "LATENCY GRAPH cmd",
+            "LATENCY DOCTOR",
+            "LATENCY HISTOGRAM",
+            "MEMORY USAGE k",
+            "MEMORY STATS",
+            "MEMORY DOCTOR",
+            "MEMORY MALLOC-STATS",
+        ] {
+            assert!(!w(read_cmd), "expected read: {read_cmd}");
+        }
+    }
+
+    #[test]
+    fn search_read_only_bypass_regressions() {
+        use ternarygrid_core::QueryLanguage as L;
+        let w = |s: &str| classify_command(s, L::Search).unwrap().is_write;
+        for write_req in [
+            "GET /_refresh",
+            "GET /%5frefresh",
+            "GET /%5Frefresh",
+            "GET /idx/_flush",
+            "GET /idx/%5fforcemerge",
+            "GET /idx/%5fcache/clear",
+            "HEAD /_refresh",
+            "HEAD /%5frefresh",
+            "GET /idx/../_search",
+            "GET /idx/%2e%2e/_search",
+            "GET /./idx/_search",
+            "POST /_plugins/_ppl\n{\"query\": \"DELETE FROM logs\"}",
+            "POST /_plugins/_ppl\nnot-json",
+            "POST /_plugins/_ppl",
+            "POST /_sql\nnot-json",
+            "POST /_sql",
+            "POST /_sql\n{\"query\":\"\\u0044ELETE FROM t\"}",
+            "POST /_plugins/_sql\n{\"query\":\"\\u0064elete FROM t\"}",
+            "GET /_plugins/_sql?sql=%44ELETE+FROM+t",
+        ] {
+            assert!(w(write_req), "expected write: {write_req}");
+        }
+        for read_req in [
+            "POST /_sql\n{\"query\":\"SELECT * FROM t\"}",
+            "POST /_sql/close\n{\"cursor\":\"abc\"}",
+            "POST /_plugins/_ppl\n{\"query\":\"source=logs | fields a\"}",
+            "GET /_plugins/_sql?sql=SELECT+1",
+        ] {
+            assert!(!w(read_req), "expected read: {read_req}");
+        }
     }
 }

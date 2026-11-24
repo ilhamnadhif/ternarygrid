@@ -3,7 +3,7 @@
 //! through and their hits shown as rows. The blocking HTTP client runs on
 //! blocking threads.
 
-use crate::dialect::{SearchDialect, is_rest};
+use crate::dialect::{SearchDialect, is_rest, pct_segment};
 use async_trait::async_trait;
 use base64::Engine;
 use serde_json::{Value as J, json};
@@ -35,6 +35,24 @@ const FETCH: u64 = 1000;
 /// How long Elasticsearch keeps an SQL cursor between pages: longer than the
 /// application leaves an unread cursor open (5 minutes) before closing it.
 const PAGE_TIMEOUT: &str = "10m";
+/// Maximum HTTP response body size read into memory (64 MiB).
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read up to `limit` bytes from `reader` as UTF-8 text; return an error if
+/// the response exceeds `limit` instead of allocating without bound.
+fn read_bounded_body(reader: impl Read, limit: usize) -> DbResult<String> {
+    let mut buf = Vec::new();
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| DbError::connection(e.to_string()))?;
+    if buf.len() > limit {
+        return Err(DbError::query(format!(
+            "Elasticsearch response body exceeded the {limit}-byte limit"
+        )));
+    }
+    String::from_utf8(buf).map_err(|e| DbError::connection(e.to_string()))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Product {
@@ -306,12 +324,7 @@ impl Http {
             _ => DbError::connection(format!("{}: {e}", self.base)),
         })?;
         let status = response.status().as_u16();
-        let mut text = String::new();
-        response
-            .into_body()
-            .into_reader()
-            .read_to_string(&mut text)
-            .map_err(|e| DbError::connection(e.to_string()))?;
+        let text = read_bounded_body(response.into_body().into_reader(), MAX_RESPONSE_BYTES)?;
         let json: J = if text.trim().is_empty() {
             json!({"status": status})
         } else {
@@ -651,7 +664,7 @@ fn percent_decode(path: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// POST endpoints that only read: searches, counts, SQL and the like.
+/// POST endpoints that only read: searches, counts, EQL and the like.
 const READ_ENDPOINTS: &[&str] = &[
     "_search",
     "_msearch",
@@ -666,60 +679,95 @@ const READ_ENDPOINTS: &[&str] = &[
     "_mtermvectors",
     "_terms_enum",
     "_eql",
-    "_ppl",
 ];
 
-/// A REST request that only reads: GET and HEAD, and POST to a read endpoint
-/// (the path's first `_` segment, so `/i/_doc/_search` indexes a document).
+/// GET/HEAD endpoints that still mutate index or cluster state.
+const SIDE_EFFECT_ENDPOINTS: &[&str] = &["_refresh", "_flush", "_forcemerge", "_cache"];
+
+/// Check query string `?sql=` / `?query=` parameters for read-only SQL.
+fn query_string_sql_reads(path: &str) -> bool {
+    let query = path
+        .split_once('?')
+        .map(|(_, q)| q.split('#').next().unwrap_or(q))
+        .unwrap_or("");
+    query
+        .split('&')
+        .filter_map(|kv| {
+            kv.split_once('=')
+                .filter(|(k, _)| *k == "sql" || *k == "query")
+                .map(|(_, v)| percent_decode(&v.replace('+', " ")))
+        })
+        .all(|q| sql_reads(&q))
+}
+
+/// A REST request that only reads: GET and HEAD (without side-effect or
+/// traversal segments), and POST to a read endpoint (the path's first `_`
+/// segment, so `/i/_doc/_search` indexes a document).
 fn rest_reads(method: &str, path: &str, body: Option<&str>) -> bool {
+    let raw_path = path.split(['?', '#']).next().unwrap_or("");
+    let decoded = percent_decode(raw_path);
+    let raw_segments = raw_path.split('/').filter(|s| !s.is_empty());
+    let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
+    if raw_segments.into_iter().any(|s| s == "." || s == "..")
+        || segments.iter().any(|s| *s == "." || *s == "..")
+    {
+        return false;
+    }
     match method {
-        "HEAD" => true,
-        // A GET reads, except the SQL API's (OpenSearch takes `GET /_plugins/_sql` with a
-        // body or `?sql=`, and its SQL may DELETE).
-        "GET" if !is_sql_endpoint(path) => true,
+        "HEAD" => !segments.iter().any(|s| SIDE_EFFECT_ENDPOINTS.contains(s)),
         "GET" => {
-            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let in_query = query.split('&').find_map(|kv| {
-                kv.split_once('=')
-                    .filter(|(k, _)| *k == "sql" || *k == "query")
-                    .map(|(_, v)| percent_decode(&v.replace('+', " ")))
-            });
-            let in_body = body
-                .and_then(|b| serde_json::from_str::<J>(b).ok())
-                .and_then(|b| b.get("query").and_then(J::as_str).map(str::to_string));
-            in_query.into_iter().chain(in_body).all(|q| sql_reads(&q))
-        }
-        "POST" => {
-            let path = percent_decode(path.split(['?', '#']).next().unwrap_or(""));
-            let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            if segments.iter().any(|s| *s == "." || *s == "..") {
+            if segments.iter().any(|s| SIDE_EFFECT_ENDPOINTS.contains(s)) {
                 return false;
             }
+            if !segments.iter().any(|s| *s == "_sql" || *s == "_ppl") {
+                return true;
+            }
+            if !query_string_sql_reads(path) {
+                return false;
+            }
+            match body.map(str::trim).filter(|b| !b.is_empty()) {
+                None => true,
+                Some(b) => match serde_json::from_str::<J>(b) {
+                    Ok(J::Object(obj)) => match obj.get("query") {
+                        Some(v) => v.as_str().is_some_and(sql_reads),
+                        None => obj.get("cursor").and_then(J::as_str).is_some(),
+                    },
+                    _ => false,
+                },
+            }
+        }
+        "POST" => {
             let mut api = segments.into_iter().skip_while(|s| !s.starts_with('_'));
             let mut endpoint = api.next();
             if matches!(endpoint, Some("_plugins" | "_opendistro")) {
                 endpoint = api.next();
             }
             match endpoint {
-                // The SQL API (also `/translate`, `/close`, cursors).
-                Some("_sql") => body
-                    .and_then(|b| serde_json::from_str::<J>(b).ok())
-                    .and_then(|b| b.get("query").and_then(J::as_str).map(sql_reads))
-                    .unwrap_or(true),
+                // The SQL / PPL API (also `/translate`, `/close`, cursors).
+                Some("_sql" | "_ppl") => {
+                    if !query_string_sql_reads(path) {
+                        return false;
+                    }
+                    let Some(b) = body.map(str::trim).filter(|b| !b.is_empty()) else {
+                        return false;
+                    };
+                    let Ok(J::Object(obj)) = serde_json::from_str::<J>(b) else {
+                        return false;
+                    };
+                    match obj.get("query") {
+                        Some(v) => v.as_str().is_some_and(sql_reads),
+                        None => {
+                            endpoint == Some("_sql")
+                                && obj.get("cursor").and_then(J::as_str).is_some()
+                        }
+                    }
+                }
                 Some(e) => READ_ENDPOINTS.contains(&e),
                 None => false,
             }
         }
         _ => false,
     }
-}
-
-/// The path is the SQL API (`/_sql`, `/_plugins/_sql`, `/_opendistro/_sql`).
-fn is_sql_endpoint(path: &str) -> bool {
-    let path = percent_decode(path.split(['?', '#']).next().unwrap_or(""));
-    path.split('/')
-        .filter(|s| !s.is_empty())
-        .any(|s| s == "_sql")
 }
 
 struct SearchCursor {
@@ -973,7 +1021,7 @@ impl SearchSession {
 
     async fn mapping(&self, index: &str) -> DbResult<Vec<(String, String)>> {
         let r = self
-            .call("GET", &format!("/{index}/_mapping"), None)
+            .call("GET", &format!("/{}/_mapping", pct_segment(index)), None)
             .await?;
         let mut out = Vec::new();
         if let Some(m) = r.as_object() {
@@ -1240,7 +1288,9 @@ impl Session for SearchSession {
 
     /// `PUT /index` with its settings and mappings.
     async fn object_ddl(&mut self, obj: &ObjectRef) -> DbResult<String> {
-        let r = self.call("GET", &format!("/{}", obj.name), None).await?;
+        let r = self
+            .call("GET", &format!("/{}", pct_segment(&obj.name)), None)
+            .await?;
         let Some((name, def)) = r.as_object().and_then(|m| m.iter().next()) else {
             return Err(DbError::query(format!("Index {} not found", obj.name)));
         };
@@ -1265,7 +1315,8 @@ impl Session for SearchSession {
             body["aliases"] = a.clone();
         }
         Ok(format!(
-            "PUT /{name}\n{}",
+            "PUT /{}\n{}",
+            pct_segment(name),
             serde_json::to_string_pretty(&body).unwrap_or_default()
         ))
     }
@@ -1274,7 +1325,10 @@ impl Session for SearchSession {
         let r = self
             .call(
                 "GET",
-                &format!("/_cat/indices/{}?format=json&bytes=b", obj.name),
+                &format!(
+                    "/_cat/indices/{}?format=json&bytes=b",
+                    pct_segment(&obj.name)
+                ),
                 None,
             )
             .await?;
@@ -1435,9 +1489,13 @@ impl Session for SearchSession {
     }
 
     async fn kill_session(&mut self, id: &str, _mode: KillMode) -> DbResult<()> {
-        self.call("POST", &format!("/_tasks/{id}/_cancel"), None)
-            .await
-            .map(|_| ())
+        self.call(
+            "POST",
+            &format!("/_tasks/{}/_cancel", pct_segment(id)),
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn server_metrics(&mut self) -> DbResult<Vec<Metric>> {
@@ -1777,6 +1835,32 @@ mod tests {
                 Some("{\"query\": \"DELETE FROM logs\"}"),
             ),
             ("GET", "/_opendistro/_sql?sql=DELETE+FROM+logs", None),
+            // GET/HEAD side-effect & traversal bypasses.
+            ("GET", "/_refresh", None),
+            ("GET", "/%5frefresh", None),
+            ("GET", "/%5Frefresh", None),
+            ("GET", "/idx/_flush", None),
+            ("GET", "/idx/_forcemerge", None),
+            ("GET", "/idx/_cache/clear", None),
+            ("GET", "/idx/%5fcache/clear", None),
+            ("HEAD", "/_refresh", None),
+            ("HEAD", "/%5frefresh", None),
+            ("GET", "/idx/../_search", None),
+            ("GET", "/idx/%2e%2e/_search", None),
+            ("GET", "/./idx/_search", None),
+            // _sql / _ppl non-JSON, empty, DML, and JSON unicode-escape bypasses.
+            (
+                "POST",
+                "/_plugins/_ppl",
+                Some("{\"query\": \"DELETE FROM logs\"}"),
+            ),
+            ("POST", "/_plugins/_ppl", Some("not json")),
+            ("POST", "/_plugins/_ppl", None),
+            ("POST", "/_sql", Some("not json")),
+            ("POST", "/_sql", None),
+            ("POST", "/_sql", Some("{}")),
+            ("POST", "/_sql", Some("{\"query\":\"\\u0044ELETE FROM t\"}")),
+            ("GET", "/_plugins/_sql", Some("not json")),
         ] {
             assert!(!rest_reads(m, p, b), "{m} {p}");
         }
@@ -1784,6 +1868,20 @@ mod tests {
         assert!(sql_reads("DESCRIBE logs"));
         assert!(!sql_reads("DELETE FROM logs WHERE a = 1"));
         assert_eq!(sql_keyword("/* x */ delete from t"), "DELETE");
+    }
+
+    #[test]
+    fn response_body_is_bounded() {
+        let ok = read_bounded_body("{\"ok\":true}".as_bytes(), 16).unwrap();
+        assert_eq!(ok, "{\"ok\":true}");
+        // Exact boundary succeeds.
+        let exact = read_bounded_body("1234567890123456".as_bytes(), 16).unwrap();
+        assert_eq!(exact.len(), 16);
+        // Exceeding the cap returns a query error instead of reading unbounded bytes
+        // (even when the cut falls in the middle of a multi-byte UTF-8 sequence).
+        let over = read_bounded_body("aaaaaaaaaaaaaaa\u{1F600}".as_bytes(), 16).unwrap_err();
+        assert_eq!(over.kind, ErrorKind::Query);
+        assert!(over.message.contains("16-byte limit"), "{over}");
     }
 
     #[test]

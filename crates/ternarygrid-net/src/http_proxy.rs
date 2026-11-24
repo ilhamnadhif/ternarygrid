@@ -30,12 +30,65 @@ impl std::fmt::Debug for HttpProxyCredentials<'_> {
     }
 }
 
+/// Validates the target `host` and `port` before interpolating them into an
+/// HTTP `CONNECT` request line and `Host` header (RFC 9110 §9.3.6).
+fn validate_target(host: &str, port: u16) -> DbResult<()> {
+    if port == 0 {
+        return Err(DbError::config(
+            "Invalid HTTP proxy target port: port must be between 1 and 65535",
+        ));
+    }
+    if host.is_empty() {
+        return Err(DbError::config(
+            "Invalid HTTP proxy target host: empty host",
+        ));
+    }
+    if host.chars().any(|c| {
+        c.is_ascii_control() || c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@' | '\\')
+    }) {
+        return Err(DbError::config(
+            "Invalid HTTP proxy target host: contains forbidden characters",
+        ));
+    }
+    let has_open = host.starts_with('[');
+    let has_close = host.ends_with(']');
+    if has_open != has_close {
+        return Err(DbError::config(
+            "Invalid HTTP proxy target host: mismatched brackets",
+        ));
+    }
+    let bare = crate::stream::unbracket(host);
+    if bare.is_empty() || bare.contains('[') || bare.contains(']') {
+        return Err(DbError::config(
+            "Invalid HTTP proxy target host: malformed host",
+        ));
+    }
+    if (has_open || bare.contains(':')) && bare.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(DbError::config(
+            "Invalid HTTP proxy target host: invalid IPv6 literal",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_credentials(credentials: Option<HttpProxyCredentials<'_>>) -> DbResult<()> {
+    if let Some(c) = credentials
+        && (c.user.contains(':') || c.user.chars().any(char::is_control))
+    {
+        return Err(DbError::config(
+            "Invalid HTTP proxy user name: contains forbidden characters",
+        ));
+    }
+    Ok(())
+}
+
 /// Asks the HTTP proxy on `stream` to open a tunnel to `host:port`.
 /// On success `stream` is a transparent pipe to the target.
 ///
-/// Errors: [`ternarygrid_core::ErrorKind::Auth`] for `407 Proxy Authentication
-/// Required`, [`ternarygrid_core::ErrorKind::Connection`] for any other non-2xx
-/// status or a malformed response.
+/// Errors: [`ternarygrid_core::ErrorKind::Config`] for an invalid target host,
+/// port or credentials, [`ternarygrid_core::ErrorKind::Auth`] for `407 Proxy
+/// Authentication Required`, [`ternarygrid_core::ErrorKind::Connection`] for
+/// any other non-2xx status or a malformed response.
 pub async fn http_connect<S>(
     stream: &mut S,
     host: &str,
@@ -45,6 +98,8 @@ pub async fn http_connect<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
+    validate_target(host, port)?;
+    validate_credentials(credentials)?;
     let authority = display_addr(host, port);
     let mut req = Zeroizing::new(Vec::with_capacity(256));
     req.extend_from_slice(
@@ -216,5 +271,94 @@ mod tests {
             err.message
         );
         let _ = srv.await;
+    }
+
+    #[tokio::test]
+    async fn rejects_malicious_hosts_and_port_before_writing() {
+        let bad_hosts = [
+            "",
+            "[]",
+            "db.example\r\nX-Injected: 1",
+            "db.example\nGET / HTTP/1.1",
+            "db.example\rfoo",
+            "db.example\0evil",
+            "db.example HTTP/1.1",
+            "db.example\tevil",
+            "db.example/path",
+            "db.example?query=1",
+            "db.example#frag",
+            "user@db.example",
+            "db.example:3306",
+            "[::1",
+            "::1]",
+            "[[::1]]",
+            "[not-ipv6]",
+        ];
+        for host in bad_hosts {
+            let (mut client, mut server) = duplex(4096);
+            let err = http_connect(&mut client, host, 5432, None)
+                .await
+                .expect_err(&format!("expected rejection for host {host:?}"));
+            assert_eq!(
+                err.kind,
+                ternarygrid_core::ErrorKind::Config,
+                "{host:?}: {err}"
+            );
+            drop(client);
+            let mut written = Vec::new();
+            server.read_to_end(&mut written).await.unwrap();
+            assert!(
+                written.is_empty(),
+                "must not write any bytes for invalid host {host:?}, wrote {:?}",
+                String::from_utf8_lossy(&written)
+            );
+        }
+
+        // Port 0 is rejected before any bytes are written.
+        let (mut client, mut server) = duplex(4096);
+        let err = http_connect(&mut client, "db.example", 0, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::Config);
+        drop(client);
+        let mut written = Vec::new();
+        server.read_to_end(&mut written).await.unwrap();
+        assert!(written.is_empty());
+
+        // User name containing ':' or control characters is rejected before writing.
+        let pw = Secret::new("pw");
+        for bad_user in ["alice:bob", "alice\r\nbob", "alice\0"] {
+            let (mut client, mut server) = duplex(4096);
+            let err = http_connect(
+                &mut client,
+                "db.example",
+                5432,
+                Some(HttpProxyCredentials {
+                    user: bad_user,
+                    password: &pw,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.kind, ternarygrid_core::ErrorKind::Config);
+            drop(client);
+            let mut written = Vec::new();
+            server.read_to_end(&mut written).await.unwrap();
+            assert!(written.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_bracketed_ipv6_target() {
+        let (mut client, server) = duplex(4096);
+        let srv = tokio::spawn(scripted(
+            server,
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        ));
+        http_connect(&mut client, "[::1]", 5432, None)
+            .await
+            .unwrap();
+        let req = srv.await.unwrap();
+        assert!(req.starts_with("CONNECT [::1]:5432 HTTP/1.1\r\n"), "{req}");
     }
 }

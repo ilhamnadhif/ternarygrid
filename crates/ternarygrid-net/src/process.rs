@@ -211,9 +211,10 @@ async fn run_capture(command: &str, timeout: Duration) -> DbResult<CommandOutput
 
 #[cfg(unix)]
 fn kill_process_group(pid: Option<u32>) {
-    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
-        // SAFETY: killpg only sends a signal; the process group was created
-        // for this child with `process_group(0)` so its id equals the pid.
+    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()).filter(|&p| p > 0) {
+        // SAFETY: `pid > 0` guarantees `killpg` targets only the child's own
+        // process group (created with `process_group(0)`), never the caller's
+        // process group (`0`).
         unsafe {
             libc::killpg(pid, libc::SIGKILL);
         }
@@ -251,6 +252,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn kill_process_group_ignores_zero_and_none() {
+        // Must never signal our own process group (`pid == 0`).
+        kill_process_group(None);
+        kill_process_group(Some(0));
     }
 
     #[tokio::test]

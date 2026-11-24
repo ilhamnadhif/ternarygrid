@@ -24,6 +24,9 @@ cd "$ROOT"
 
 NFPM_VERSION=2.47.0
 APPIMAGETOOL_VERSION=1.9.1
+# Official SHA-256 digests from AppImage/appimagetool release 1.9.1.
+APPIMAGETOOL_SHA256_X86_64=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+APPIMAGETOOL_SHA256_AARCH64=f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
 
 # GitHub's release downloads fail now and then (502, 504, a dropped connection): a
 # failed one is tried again instead of failing the release after the whole build.
@@ -40,8 +43,8 @@ done
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
 ARCH="$(uname -m)"
 case "$ARCH" in
-  x86_64) NFPM_ARCH=amd64; DEB_ARCH=amd64 ;;
-  aarch64) NFPM_ARCH=arm64; DEB_ARCH=arm64 ;;
+  x86_64) NFPM_ARCH=amd64; DEB_ARCH=amd64; APPIMAGETOOL_SHA256="$APPIMAGETOOL_SHA256_X86_64" ;;
+  aarch64) NFPM_ARCH=arm64; DEB_ARCH=arm64; APPIMAGETOOL_SHA256="$APPIMAGETOOL_SHA256_AARCH64" ;;
   *) echo "unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
 DIST="$ROOT/dist"
@@ -76,8 +79,14 @@ tar -C "$STAGE/tar" -czf "$DIST/$NAME-$ARCH.tar.gz" "$NAME-$ARCH"
 echo "==> $NAME-$ARCH.AppImage"
 APPIMAGETOOL="$TOOLS/appimagetool-$APPIMAGETOOL_VERSION-$ARCH.AppImage"
 if [[ ! -x "$APPIMAGETOOL" ]]; then
-  fetch -o "$APPIMAGETOOL" "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$ARCH.AppImage"
-  chmod +x "$APPIMAGETOOL"
+  APPIMAGETOOL_TMP="$APPIMAGETOOL.tmp"
+  rm -f "$APPIMAGETOOL_TMP"
+  fetch -o "$APPIMAGETOOL_TMP" "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$ARCH.AppImage"
+  printf '%s  %s\n' "$APPIMAGETOOL_SHA256" "$APPIMAGETOOL_TMP" | sha256sum --check --quiet
+  chmod +x "$APPIMAGETOOL_TMP"
+  mv -f "$APPIMAGETOOL_TMP" "$APPIMAGETOOL"
+else
+  printf '%s  %s\n' "$APPIMAGETOOL_SHA256" "$APPIMAGETOOL" | sha256sum --check --quiet
 fi
 APPDIR="$STAGE/TernaryGrid.AppDir"
 mkdir -p "$APPDIR"

@@ -168,23 +168,32 @@ fn load_client_cert(cert_path: &str, key_path: &str) -> DbResult<ClientCert> {
 
 fn tls_config(params: &ConnectParams, verify: bool) -> DbResult<TlsConfig> {
     let mut b = TlsConfig::builder().provider(TlsProvider::Rustls).unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let ca_cert = params.ssl.ca_cert.as_deref().map(str::trim).filter(|c| !c.is_empty());
     if verify {
         let mut roots: Vec<Certificate<'static>> = Vec::new();
-        if !params.ssl.only_custom_ca || params.ssl.ca_cert.is_none() {
+        if !params.ssl.only_custom_ca || ca_cert.is_none() {
             let native = rustls_native_certs::load_native_certs();
             for c in native.certs {
                 roots.push(Certificate::from_der(c.as_ref()).to_owned());
             }
         }
-        if let Some(ca) = params.ssl.ca_cert.as_deref().filter(|c| !c.is_empty()) {
+        if let Some(ca) = ca_cert {
             roots.extend(load_pem_certs(ca)?);
         }
         b = if roots.is_empty() { b.root_certs(RootCerts::WebPki) } else { b.root_certs(RootCerts::new_with_certs(&roots)) };
     } else {
         b = b.disable_verification(true);
     }
-    if let (Some(cert), Some(key)) = (params.ssl.client_cert.as_deref().filter(|c| !c.is_empty()), params.ssl.client_key.as_deref().filter(|c| !c.is_empty())) {
-        b = b.client_cert(Some(load_client_cert(cert, key)?));
+    let client_cert = params.ssl.client_cert.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let client_key = params.ssl.client_key.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    match (client_cert, client_key) {
+        (Some(cert), Some(key)) => {
+            b = b.client_cert(Some(load_client_cert(cert, key)?));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(DbError::config("Both client certificate and client key must be provided for mTLS"));
+        }
     }
     Ok(b.build())
 }
@@ -407,5 +416,48 @@ mod tests {
     #[test]
     fn string_literal() {
         assert_eq!(sql_string("a'b\\c"), "'a\\'b\\\\c'");
+    }
+
+    #[test]
+    fn tls_empty_ca_and_partial_mtls() {
+        const CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIBcTCCARagAwIBAgIUXncsfltQcBJt91kTkYx4Z2FkT8swCgYIKoZIzj0EAwIw\nHTEbMBkGA1UEAwwSY2xpZW50LmV4YW1wbGUuY29tMCAXDTI2MTEyNDE2MzE1OVoY\nDzIxMjYxMDMxMTYzMTU5WjAdMRswGQYDVQQDDBJjbGllbnQuZXhhbXBsZS5jb20w\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATyCHaN3oOur6N6c+fXM7CRWFDL13cp\nVxPmNgJ4r9HyOIduEVReL0apn0oM6f+RNKMCKiZFs4CrgZINQ1GfMotAozIwMDAd\nBgNVHQ4EFgQU4xZGbCRxY4b2Ybn7aAT9hnYPnHkwDwYDVR0TAQH/BAUwAwEB/zAK\nBggqhkjOPQQDAgNJADBGAiEAm8i53aJ+BvKwGQxk6R766Bqd82wv2vx4Gh77m5Bh\n1IMCIQChRadsANIzaacUxr02qisAdchpDGcWRU0f3VBxidRV4A==\n-----END CERTIFICATE-----\n";
+        const KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgMNh+jHt4yPcPfLAO\ngxYtUdM7oCaM1b13xSmifn1/sq+hRANCAATyCHaN3oOur6N6c+fXM7CRWFDL13cp\nVxPmNgJ4r9HyOIduEVReL0apn0oM6f+RNKMCKiZFs4CrgZINQ1GfMotA\n-----END PRIVATE KEY-----\n";
+
+        let dir = std::env::temp_dir().join(format!("tg-ch-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("client.crt");
+        let key = dir.join("client.key");
+        std::fs::write(&cert, CERT).unwrap();
+        std::fs::write(&key, KEY).unwrap();
+
+        // Empty / whitespace ca_cert with only_custom_ca still builds TLS cleanly.
+        let mut cfg = ConnectionConfig::new(DbKind::ClickHouse, "x");
+        cfg.ssl.mode = SslMode::VerifyFull;
+        cfg.ssl.only_custom_ca = true;
+        cfg.ssl.ca_cert = Some("   ".into());
+        let p = ConnectParams::from_config(&cfg, None);
+        assert!(tls_config(&p, true).is_ok());
+
+        // Partial mTLS (only cert or only key, or whitespace for the other) returns Config error.
+        cfg.ssl.client_cert = Some(cert.display().to_string());
+        cfg.ssl.client_key = None;
+        let e = tls_config(&ConnectParams::from_config(&cfg, None), true).unwrap_err();
+        assert_eq!(e.kind, ternarygrid_core::ErrorKind::Config);
+        assert!(e.message.contains("Both client certificate and client key"), "{e}");
+
+        cfg.ssl.client_key = Some("   ".into());
+        let e = tls_config(&ConnectParams::from_config(&cfg, None), true).unwrap_err();
+        assert_eq!(e.kind, ternarygrid_core::ErrorKind::Config);
+
+        cfg.ssl.client_cert = None;
+        cfg.ssl.client_key = Some(key.display().to_string());
+        let e = tls_config(&ConnectParams::from_config(&cfg, None), true).unwrap_err();
+        assert_eq!(e.kind, ternarygrid_core::ErrorKind::Config);
+
+        // Both cert and key succeeds.
+        cfg.ssl.client_cert = Some(cert.display().to_string());
+        assert!(tls_config(&ConnectParams::from_config(&cfg, None), true).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

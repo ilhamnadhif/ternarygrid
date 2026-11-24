@@ -267,6 +267,28 @@ pub struct Updates {
     install_visible: bool,
 }
 
+/// A downloaded update owned by an in-flight download job: if the download is
+/// cancelled or superseded before being handed off to [`Install::Ready`],
+/// dropping it removes its temporary directory so nothing leaks on disk.
+#[cfg(target_os = "macos")]
+struct StagedDownload(Option<crate::selfupdate::Prepared>);
+
+#[cfg(target_os = "macos")]
+impl StagedDownload {
+    fn take(mut self) -> crate::selfupdate::Prepared {
+        self.0.take().expect("StagedDownload taken once")
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for StagedDownload {
+    fn drop(&mut self) {
+        if let Some(prepared) = self.0.take() {
+            let _ = std::fs::remove_dir_all(&prepared.dir);
+        }
+    }
+}
+
 /// Installing an update (macOS).
 #[cfg(target_os = "macos")]
 #[derive(Default)]
@@ -276,8 +298,8 @@ enum Install {
     Downloading {
         release: Release,
         stage: std::sync::Arc<parking_lot::Mutex<crate::selfupdate::Stage>>,
-        job: Job<Result<crate::selfupdate::Prepared, String>>,
-        /// Set by "Cancel download": the download stops and its files are removed.
+        job: Job<Result<StagedDownload, String>>,
+        /// Set by "Cancel download" or a newer release: the download stops and its files are removed.
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     Ready {
@@ -360,6 +382,27 @@ impl Updates {
         self.check = Some((job, manual));
     }
 
+    /// Cancel any in-progress or staged install and clean up its temporary directory.
+    #[cfg(target_os = "macos")]
+    fn cancel_install(&mut self) {
+        match std::mem::take(&mut self.install) {
+            Install::Downloading { cancel, mut job, .. } => {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                // If the download already finished before cancellation took effect,
+                // taking and dropping the StagedDownload removes its temp dir immediately;
+                // if still running, the worker sees `cancel` (or drops the StagedDownload
+                // when it returns) and removes the temp dir too.
+                let _ = job.poll();
+                job.abort();
+            }
+            Install::Ready { prepared, .. } => {
+                let _ = std::fs::remove_dir_all(&prepared.dir);
+            }
+            Install::Failed(_) | Install::Idle => {}
+        }
+        self.install_visible = false;
+    }
+
     /// A release newer than the update being installed replaces it: the
     /// install starts over from the offer. True when one was dropped.
     #[cfg(target_os = "macos")]
@@ -370,10 +413,7 @@ impl Updates {
             Install::Idle => false,
         };
         if outdated {
-            if let Install::Ready { prepared, .. } = std::mem::take(&mut self.install) {
-                let _ = std::fs::remove_dir_all(&prepared.dir);
-            }
-            self.install_visible = false;
+            self.cancel_install();
         }
         outdated
     }
@@ -723,11 +763,29 @@ impl Updates {
     #[cfg(target_os = "macos")]
     fn start_install(&mut self, backend: &Backend, release: Release) {
         let Some(asset) = release.archive.clone() else { return };
+        self.cancel_install();
         let stage = std::sync::Arc::new(parking_lot::Mutex::new(crate::selfupdate::Stage::Starting));
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (st, version, stop) = (stage.clone(), release.version.clone(), cancel.clone());
-        let job = backend
-            .spawn(async move { tokio::task::spawn_blocking(move || crate::selfupdate::download(&version, &asset, &st, &stop)).await.unwrap_or_else(|e| Err(e.to_string())) });
+        let job = backend.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let res = crate::selfupdate::download(&version, &asset, &st, &stop);
+                match res {
+                    Ok(prepared) => {
+                        let staged = StagedDownload(Some(prepared));
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            drop(staged);
+                            Err(crate::selfupdate::CANCELLED.to_string())
+                        } else {
+                            Ok(staged)
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        });
         self.install = Install::Downloading { release, stage, job, cancel };
         self.install_visible = true;
     }
@@ -739,9 +797,9 @@ impl Updates {
         let _ = backend;
         if let Install::Downloading { job, .. } = &mut self.install {
             match job.poll() {
-                Some(Ok(prepared)) => {
+                Some(Ok(staged)) => {
                     let Install::Downloading { release, .. } = std::mem::take(&mut self.install) else { unreachable!() };
-                    self.install = Install::Ready { release, prepared };
+                    self.install = Install::Ready { release, prepared: staged.take() };
                     self.install_visible = true;
                 }
                 Some(Err(e)) => {
@@ -827,13 +885,9 @@ impl Updates {
         if releases.get() {
             ctx.open_url(egui::OpenUrl::new_tab(RELEASES_PAGE));
         }
-        if cancel_c.get()
-            && let Install::Downloading { cancel, .. } = &self.install
-        {
+        if cancel_c.get() && matches!(self.install, Install::Downloading { .. }) {
             // The download stops and removes its files; the Update button offers it again.
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            self.install = Install::Idle;
-            self.install_visible = false;
+            self.cancel_install();
             return false;
         }
         let (mut hide, restart, dismiss) = (hide_c.get(), restart_c.get(), dismiss_c.get());
@@ -1042,5 +1096,103 @@ mod tests {
         let mut u = Updates::default();
         u.start(&backend, &mut s, true);
         assert!(u.checking() && u.launch_check);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drop_outdated_install_cancels_download_and_cleans_up() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let backend = Backend::new().unwrap();
+
+        // 1. Mid-flight download superseded by a newer release: cancel token is set
+        //    and any temp dir produced right around cancellation is removed.
+        let tmp = tempfile::tempdir().unwrap();
+        let staged_dir = tmp.path().join("download-1");
+        std::fs::create_dir_all(&staged_dir).unwrap();
+        let staged_app = staged_dir.join("TernaryGrid.app");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (dir_bg, app_bg, cancel_bg) = (staged_dir.clone(), staged_app.clone(), cancel.clone());
+        let job = backend.spawn(async move {
+            // Simulate a download that already finished just before cancellation.
+            Ok(StagedDownload(Some(crate::selfupdate::Prepared { version: "1.0.0".into(), dir: dir_bg, app: app_bg })))
+        });
+        // Wait for the job to populate its slot before dropping.
+        for _ in 0..200 {
+            if job.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(job.is_finished());
+
+        let mut u = Updates {
+            install: Install::Downloading {
+                release: Release { version: "1.0.0".into(), ..Default::default() },
+                stage: Arc::new(parking_lot::Mutex::new(crate::selfupdate::Stage::Verifying)),
+                job,
+                cancel: cancel.clone(),
+            },
+            install_visible: true,
+            ..Default::default()
+        };
+
+        // Same version does not cancel or drop.
+        assert!(!u.drop_outdated_install(&Release { version: "1.0.0".into(), ..Default::default() }));
+        assert!(!cancel_bg.load(Ordering::Acquire));
+        assert!(staged_dir.exists());
+
+        // Newer version cancels the download, resets state, and removes the temp dir.
+        assert!(u.drop_outdated_install(&Release { version: "1.1.0".into(), ..Default::default() }));
+        assert!(cancel_bg.load(Ordering::Acquire));
+        assert!(matches!(u.install, Install::Idle));
+        assert!(!u.install_visible);
+        assert!(!staged_dir.exists(), "superseded download temp dir should be deleted");
+
+        // 2. Download that is already in-flight and completes AFTER drop_outdated_install also cleans up its temp dir.
+        let late_dir = tmp.path().join("download-2");
+        let late_app = late_dir.join("TernaryGrid.app");
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let (ld, la, c2) = (late_dir.clone(), late_app.clone(), cancel2.clone());
+        let job2 = backend.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&ld).unwrap();
+                let _ = started_tx.send(());
+                let _ = rx.blocking_recv();
+                let staged = StagedDownload(Some(crate::selfupdate::Prepared { version: "1.1.0".into(), dir: ld, app: la }));
+                if c2.load(Ordering::Acquire) {
+                    drop(staged);
+                    Err(crate::selfupdate::CANCELLED.to_string())
+                } else {
+                    Ok(staged)
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        });
+        // Ensure the blocking worker is actually running and has created its staging dir.
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("blocking worker should start");
+        assert!(late_dir.exists());
+        u.install = Install::Downloading {
+            release: Release { version: "1.1.0".into(), ..Default::default() },
+            stage: Arc::new(parking_lot::Mutex::new(crate::selfupdate::Stage::Starting)),
+            job: job2,
+            cancel: cancel2.clone(),
+        };
+        assert!(u.drop_outdated_install(&Release { version: "1.2.0".into(), ..Default::default() }));
+        assert!(cancel2.load(Ordering::Acquire));
+        let _ = tx.send(());
+        let removed = (0..200).any(|_| {
+            if !late_dir.exists() {
+                true
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(removed, "temp dir from cancelled in-flight download should be removed when worker finishes");
     }
 }

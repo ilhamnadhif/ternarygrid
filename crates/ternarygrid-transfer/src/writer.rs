@@ -532,7 +532,6 @@ impl<'a> BatchWriter<'a> {
             let rows = dedupe_by_key(rows, &self.target.key_index);
             let mut conds = Vec::new();
             let mut params = Vec::new();
-            let mut p = 1;
             for (_, row) in &rows {
                 if self.target.key_index.iter().any(|&k| row.get(k).is_none_or(Value::is_null)) {
                     continue;
@@ -542,13 +541,11 @@ impl<'a> BatchWriter<'a> {
                     .key_index
                     .iter()
                     .map(|&k| {
-                        let s = format!("{} = {}", self.target.columns[k], self.dialect.placeholder(p));
-                        p += 1;
-                        s
+                        let rhs = self.value_expr(k, &row[k], &mut params);
+                        format!("{} = {rhs}", self.target.columns[k])
                     })
                     .collect();
                 conds.push(format!("({})", parts.join(" AND ")));
-                params.extend(self.target.key_index.iter().map(|&k| row[k].clone()));
             }
             if !conds.is_empty() {
                 let sql = format!("DELETE FROM {} WHERE {}", self.target.table_sql, conds.join(" OR "));
@@ -561,20 +558,20 @@ impl<'a> BatchWriter<'a> {
         self.insert_rows(rows, ncols).await
     }
 
+    /// Placeholder (pushing `v` to `params`) or inline SQL literal for column `col`.
+    fn value_expr(&self, col: usize, v: &Value, params: &mut Vec<Value>) -> String {
+        let ty = self.target.types.get(col).map(String::as_str).filter(|t| !t.trim().is_empty());
+        if self.inline.get(col).copied().unwrap_or(false) && !v.is_null() {
+            self.dialect.literal(v, ty)
+        } else {
+            params.push(v.clone());
+            self.dialect.placeholder(params.len())
+        }
+    }
+
     /// Placeholders (their values pushed to `params`) or literals of one row.
     fn row_values(&self, row: &[Value], params: &mut Vec<Value>) -> Vec<String> {
-        row.iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let ty = self.target.types.get(i).map(String::as_str).filter(|t| !t.trim().is_empty());
-                if self.inline.get(i).copied().unwrap_or(false) && !v.is_null() {
-                    self.dialect.literal(v, ty)
-                } else {
-                    params.push(v.clone());
-                    self.dialect.placeholder(params.len())
-                }
-            })
-            .collect()
+        row.iter().enumerate().map(|(i, v)| self.value_expr(i, v, params)).collect()
     }
 
     async fn insert_rows(&mut self, rows: Vec<(u64, Row)>, ncols: usize) -> Result<(), (DbError, Vec<(u64, Row)>)> {
@@ -732,5 +729,166 @@ mod tests {
         assert_eq!(e.context.as_deref(), Some("Rows 3-7"));
         let e = with_rows(DbError::query("bad"), 4, 4);
         assert_eq!(e.context.as_deref(), Some("Row 4"));
+    }
+
+    #[tokio::test]
+    async fn replace_mode_delete_inlines_inline_value_key_columns() {
+        use async_trait::async_trait;
+        use ternarygrid_core::ddl::{DdlGenerator, SchemaSnapshot, SnapshotOptions, TableDef};
+        use ternarygrid_core::dialect::{GenericDialect, SqlSyntax};
+        use ternarygrid_core::driver::{CancelHandle, ExecOptions, MemoryCursor, QueryCursor, ServerInfo};
+        use ternarygrid_core::meta::{DatabaseInfo, MetadataSearch, ObjectInfo, ObjectKind, SchemaInfo, SchemaRef};
+        use ternarygrid_core::plan::QueryPlan;
+
+        struct InlineKeyDialect(GenericDialect);
+        impl Dialect for InlineKeyDialect {
+            fn kind(&self) -> DbKind {
+                DbKind::Generic
+            }
+            fn syntax(&self) -> &SqlSyntax {
+                self.0.syntax()
+            }
+            fn ddl(&self) -> &dyn DdlGenerator {
+                self.0.ddl()
+            }
+            fn placeholder(&self, index: usize) -> String {
+                format!("${index}")
+            }
+            fn inline_value(&self, type_name: &str) -> bool {
+                type_name.eq_ignore_ascii_case("bit(4)")
+            }
+            fn literal(&self, value: &Value, type_name: Option<&str>) -> String {
+                if type_name.is_some_and(|t| t.eq_ignore_ascii_case("bit(4)")) { format!("b'{}'", value.to_text()) } else { self.0.literal(value, type_name) }
+            }
+            fn upsert(&self, _table: &str, _cols: &[String], _keys: &[String], _vals: &[String]) -> Option<String> {
+                None
+            }
+        }
+
+        struct RecordingSession {
+            dialect: Arc<dyn Dialect>,
+            info: ServerInfo,
+            mode: TransactionMode,
+            in_tx: bool,
+            calls: Vec<(String, Vec<Value>)>,
+        }
+
+        #[async_trait]
+        impl Session for RecordingSession {
+            fn kind(&self) -> DbKind {
+                self.dialect.kind()
+            }
+            fn dialect(&self) -> Arc<dyn Dialect> {
+                self.dialect.clone()
+            }
+            fn server_info(&self) -> &ServerInfo {
+                &self.info
+            }
+            fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {
+                None
+            }
+            async fn ping(&mut self) -> DbResult<()> {
+                Ok(())
+            }
+            async fn close(&mut self) -> DbResult<()> {
+                Ok(())
+            }
+            fn is_closed(&self) -> bool {
+                false
+            }
+            async fn execute(&mut self, sql: &str, params: &[Value], _opts: &ExecOptions) -> DbResult<Box<dyn QueryCursor>> {
+                self.calls.push((sql.to_string(), params.to_vec()));
+                if self.mode == TransactionMode::Manual {
+                    self.in_tx = true;
+                }
+                Ok(Box::new(MemoryCursor::update(Some(1), None)))
+            }
+            fn transaction_mode(&self) -> TransactionMode {
+                self.mode
+            }
+            async fn set_transaction_mode(&mut self, mode: TransactionMode) -> DbResult<()> {
+                self.mode = mode;
+                Ok(())
+            }
+            fn in_transaction(&self) -> bool {
+                self.in_tx
+            }
+            async fn commit(&mut self) -> DbResult<()> {
+                self.in_tx = false;
+                Ok(())
+            }
+            async fn rollback(&mut self) -> DbResult<()> {
+                self.in_tx = false;
+                Ok(())
+            }
+            async fn current_database(&mut self) -> DbResult<Option<String>> {
+                Ok(None)
+            }
+            async fn current_schema(&mut self) -> DbResult<Option<String>> {
+                Ok(None)
+            }
+            async fn set_current_schema(&mut self, _schema: &str) -> DbResult<()> {
+                Ok(())
+            }
+            async fn list_databases(&mut self) -> DbResult<Vec<DatabaseInfo>> {
+                Ok(Vec::new())
+            }
+            async fn list_schemas(&mut self) -> DbResult<Vec<SchemaInfo>> {
+                Ok(Vec::new())
+            }
+            async fn list_objects(&mut self, _schema: &SchemaRef, _kind: ObjectKind) -> DbResult<Vec<ObjectInfo>> {
+                Ok(Vec::new())
+            }
+            async fn list_children(&mut self, _parent: &ObjectRef, _kind: ObjectKind) -> DbResult<Vec<ObjectInfo>> {
+                Ok(Vec::new())
+            }
+            async fn table_definition(&mut self, _table: &ObjectRef) -> DbResult<TableDef> {
+                Err(DbError::unsupported("test"))
+            }
+            async fn object_ddl(&mut self, _obj: &ObjectRef) -> DbResult<String> {
+                Err(DbError::unsupported("test"))
+            }
+            async fn search_metadata(&mut self, _search: &MetadataSearch) -> DbResult<Vec<ObjectInfo>> {
+                Ok(Vec::new())
+            }
+            async fn schema_snapshot(&mut self, _schema: &SchemaRef, _opts: &SnapshotOptions) -> DbResult<SchemaSnapshot> {
+                Err(DbError::unsupported("test"))
+            }
+            async fn explain(&mut self, _sql: &str, _analyze: bool) -> DbResult<QueryPlan> {
+                Err(DbError::unsupported("test"))
+            }
+        }
+
+        let mut session = RecordingSession {
+            dialect: Arc::new(InlineKeyDialect(GenericDialect::new())),
+            info: ServerInfo::default(),
+            mode: TransactionMode::Auto,
+            in_tx: false,
+            calls: Vec::new(),
+        };
+        let target = TableTarget {
+            table_sql: "flags".into(),
+            columns: vec!["mask".into(), "id".into(), "name".into()],
+            types: vec!["bit(4)".into(), "int".into(), "text".into()],
+            key_index: vec![0, 1],
+        };
+        let progress = Progress::new();
+        {
+            let mut w = BatchWriter::new(&mut session, target, TransactionScope::PerBatch, OnError::Abort, 10, "flags");
+            w.begin().await.unwrap();
+            w.write(vec![(1, vec![Value::text("1010"), Value::Int(1), Value::text("first")]), (2, vec![Value::text("0101"), Value::Int(2), Value::text("second")])], &progress)
+                .await
+                .unwrap();
+            w.finish().await.unwrap();
+        }
+        assert_eq!(session.calls.len(), 2, "{:?}", session.calls);
+        assert_eq!(session.calls[0], ("DELETE FROM flags WHERE (mask = b'1010' AND id = $1) OR (mask = b'0101' AND id = $2)".to_string(), vec![Value::Int(1), Value::Int(2)],));
+        assert_eq!(
+            session.calls[1],
+            (
+                "INSERT INTO flags (mask, id, name) VALUES (b'1010', $1, $2), (b'0101', $3, $4)".to_string(),
+                vec![Value::Int(1), Value::text("first"), Value::Int(2), Value::text("second")],
+            )
+        );
     }
 }

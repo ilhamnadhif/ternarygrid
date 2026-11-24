@@ -1,19 +1,133 @@
 //! HTTP client for the AI services.
 //!
 //! Requests run on a blocking thread (`ureq`) inside `spawn_blocking`;
-//! streamed text is passed to the caller's callback as it arrives and
-//! cancellation is checked between chunks (the async call returns at once
-//! when cancelled; the blocking thread stops at the next chunk).
+//! streamed text is passed to the caller's callback as it arrives. Socket reads
+//! are polled in short slices ([`READ_POLL_INTERVAL`]) so cancellation wakes
+//! the blocking worker promptly, closes the socket, and avoids leaking the
+//! thread until the overall request timeout expires.
 
 use crate::config::{AiConfig, AiProviderKind};
 use crate::protocol::{ApiError, Control, Flags, HttpRequest, MAX_SSE_EVENT, MAX_SSE_LINE, SseParser, StreamState, build_request, parse_retry_after};
 use crate::types::{ChatRequest, ChatResponse};
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ternarygrid_core::{DbError, DbResult, tr, trf};
 use tokio_util::sync::CancellationToken;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::time::Duration as UreqDuration;
+use ureq::unversioned::transport::{Buffers, ConnectProxyConnector, ConnectionDetails, Connector, NextTimeout, RustlsConnector, TcpConnector, Transport};
+
+/// Maximum duration a single blocking socket read waits before waking to check
+/// cancellation and the overall request deadline.
+const READ_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+thread_local! {
+    static ACTIVE_CANCEL: RefCell<Option<CancellationToken>> = const { RefCell::new(None) };
+}
+
+/// Binds a [`CancellationToken`] to the current blocking thread for the
+/// lifetime of one [`run_blocking`] call so the transport layer can observe it.
+struct CancelScope(Option<CancellationToken>);
+
+impl CancelScope {
+    fn enter(token: &CancellationToken) -> Self {
+        let prev = ACTIVE_CANCEL.with(|slot| slot.borrow_mut().replace(token.clone()));
+        CancelScope(prev)
+    }
+}
+
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        ACTIVE_CANCEL.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+fn is_cancelled_on_thread() -> bool {
+    ACTIVE_CANCEL.with(|slot| slot.borrow().as_ref().is_some_and(CancellationToken::is_cancelled))
+}
+
+fn cancelled_transport_error() -> ureq::Error {
+    // Use `ErrorKind::Other` (not `Interrupted`, which `BufRead::read_until`
+    // retries, and not `ConnectionAborted`, which `ureq` treats as clean EOF).
+    ureq::Error::Io(std::io::Error::other("AI request cancelled"))
+}
+
+/// Connector wrapping the underlying TCP/proxy transport so blocking reads wake
+/// up periodically to check the current thread's [`CancellationToken`].
+#[derive(Debug, Default)]
+struct CancellableConnector;
+
+impl<In: Transport> Connector<In> for CancellableConnector {
+    type Out = CancellableTransport<In>;
+
+    fn connect(&self, _details: &ConnectionDetails, chained: Option<In>) -> Result<Option<Self::Out>, ureq::Error> {
+        if is_cancelled_on_thread() {
+            return Err(cancelled_transport_error());
+        }
+        Ok(chained.map(|inner| CancellableTransport { inner, cancelled: false }))
+    }
+}
+
+#[derive(Debug)]
+struct CancellableTransport<T: Transport> {
+    inner: T,
+    cancelled: bool,
+}
+
+impl<T: Transport> Transport for CancellableTransport<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        if is_cancelled_on_thread() {
+            self.cancelled = true;
+            return Err(cancelled_transport_error());
+        }
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let start = Instant::now();
+        let total = match timeout.after {
+            UreqDuration::Exact(d) => Some(d),
+            UreqDuration::NotHappening => None,
+        };
+        loop {
+            if is_cancelled_on_thread() {
+                self.cancelled = true;
+                return Err(cancelled_transport_error());
+            }
+            let step = match total {
+                Some(limit) => {
+                    let elapsed = start.elapsed();
+                    if elapsed >= limit {
+                        return Err(ureq::Error::Timeout(timeout.reason));
+                    }
+                    (limit - elapsed).min(READ_POLL_INTERVAL).max(Duration::from_millis(1))
+                }
+                None => READ_POLL_INTERVAL,
+            };
+            let slice = NextTimeout { after: UreqDuration::Exact(step), reason: timeout.reason };
+            match self.inner.await_input(slice) {
+                Err(ureq::Error::Timeout(_)) => continue,
+                Err(ureq::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    fn is_open(&mut self) -> bool {
+        !self.cancelled && self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
 
 /// Client for one AI configuration. Cheap to clone; safe to share.
 #[derive(Clone)]
@@ -43,7 +157,8 @@ fn agent_for(cfg: &AiConfig) -> ureq::Agent {
     if cfg.is_loopback() {
         b = b.proxy(None);
     }
-    b.build().new_agent()
+    let connector = ().chain(ConnectProxyConnector::default()).chain(TcpConnector::default()).chain(CancellableConnector).chain(RustlsConnector::default());
+    ureq::Agent::with_parts(b.build(), connector, DefaultResolver::default())
 }
 
 impl AiClient {
@@ -151,7 +266,13 @@ fn read_stream(provider: AiProviderKind, resp: ureq::http::Response<ureq::Body>,
 /// Read one line (terminator included) into `buf`, failing when it is longer
 /// than `max` bytes instead of buffering without limit.
 fn read_line_capped(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> DbResult<usize> {
-    let n = reader.by_ref().take(max as u64 + 1).read_until(b'\n', buf).map_err(|e| DbError::connection(trf("Reading the AI response failed: {}", &[&e])))?;
+    let n = reader.by_ref().take(max as u64 + 1).read_until(b'\n', buf).map_err(|e| {
+        if let Some(ureq::Error::Timeout(t)) = e.get_ref().and_then(|inner| inner.downcast_ref::<ureq::Error>()) {
+            DbError::timeout(trf("The AI service did not answer in time ({})", &[&t]))
+        } else {
+            DbError::connection(trf("Reading the AI response failed: {}", &[&e]))
+        }
+    })?;
     if n > max {
         return Err(DbError::connection(trf("The AI response contains a line longer than {} bytes", &[&max])));
     }
@@ -185,7 +306,11 @@ fn read_events(
             return Err(DbError::cancelled());
         }
         line.clear();
-        let n = read_line_capped(&mut reader, &mut line, max_line)?;
+        let n = match read_line_capped(&mut reader, &mut line, max_line) {
+            Ok(n) => n,
+            Err(_) if cancel.is_cancelled() => return Err(DbError::cancelled()),
+            Err(e) => return Err(e),
+        };
         let ev = if n == 0 { parser.finish() } else { parser.push_line(&String::from_utf8_lossy(&line)) };
         if parser.pending_bytes() > max_event {
             return Err(DbError::connection(trf("The AI response contains an event larger than {} bytes", &[&max_event])));
@@ -216,6 +341,7 @@ fn read_error_body(resp: ureq::http::Response<ureq::Body>) -> String {
 /// The request loop: retries transient failures, drops rejected optional
 /// features once, streams the answer.
 fn run_blocking(cfg: &AiConfig, agent: &ureq::Agent, req: &ChatRequest, initial: Flags, on_delta: &mut dyn FnMut(&str), cancel: &CancellationToken) -> DbResult<ChatResponse> {
+    let _cancel_scope = CancelScope::enter(cancel);
     let mut flags = initial;
     let (mut fallback_dropped, mut effort_dropped, mut mct_switched) = (false, false, false);
     let mut attempt = 0u32;
@@ -228,6 +354,9 @@ fn run_blocking(cfg: &AiConfig, agent: &ureq::Agent, req: &ChatRequest, initial:
         let resp = match send(agent, &request) {
             Ok(r) => r,
             Err(e) => {
+                if cancel.is_cancelled() {
+                    return Err(DbError::cancelled());
+                }
                 let (err, transient) = transport_error(e);
                 if transient && attempt < cfg.retry.max_retries {
                     wait(backoff(cfg, attempt, None), cancel)?;
@@ -242,6 +371,9 @@ fn run_blocking(cfg: &AiConfig, agent: &ureq::Agent, req: &ChatRequest, initial:
             let retry_after = header(&resp, "retry-after").and_then(|v| parse_retry_after(&v));
             let request_id = header(&resp, "request-id").or_else(|| header(&resp, "x-request-id"));
             let body = read_error_body(resp);
+            if cancel.is_cancelled() {
+                return Err(DbError::cancelled());
+            }
             let err = ApiError::parse(cfg.provider, Some(status), &body, request_id, retry_after);
             if flags.fallback && !fallback_dropped && err.about_fallback() {
                 tracing::info!("the AI service rejected the fallback beta; retrying without it");
@@ -297,3 +429,184 @@ fn run_blocking(cfg: &AiConfig, agent: &ureq::Agent, req: &ChatRequest, initial:
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use crate::config::RetryPolicy;
+    use crate::types::ChatMessage;
+    use ternarygrid_core::ErrorKind;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::{Notify, oneshot};
+
+    struct DropNotify(Arc<Notify>);
+    impl Drop for DropNotify {
+        fn drop(&mut self) {
+            self.0.notify_waiters();
+        }
+    }
+
+    fn stalled_cfg(base: &str, timeout_secs: u64) -> AiConfig {
+        AiConfig {
+            base_url: Some(base.to_string()),
+            api_key: Some("sk-ant-test-key".into()),
+            retry: RetryPolicy { max_retries: 0, base_delay_ms: 10, max_delay_ms: 100 },
+            timeout_secs,
+            ..Default::default()
+        }
+    }
+
+    fn sample_req() -> ChatRequest {
+        ChatRequest::new("system", vec![ChatMessage::user("hello")])
+    }
+
+    async fn read_request_head(sock: &mut tokio::net::TcpStream) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_stalled_response_closes_socket_and_exits_worker_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (connected_tx, connected_rx) = oneshot::channel();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request_head(&mut sock).await;
+            let _ = connected_tx.send(());
+            // Stall without sending any response bytes until the client closes the socket.
+            let mut drain = [0u8; 64];
+            loop {
+                match sock.read(&mut drain).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+
+        // Use a long 900s timeout to ensure cancellation does NOT wait for timeout_secs.
+        let client = AiClient::new(stalled_cfg(&base, 900)).unwrap();
+        let cancel = CancellationToken::new();
+        let worker_done = Arc::new(Notify::new());
+        let guard = DropNotify(worker_done.clone());
+        let cancel_trigger = cancel.clone();
+        let worker_done_wait = worker_done.notified();
+
+        let call = tokio::spawn(async move {
+            client
+                .chat_stream(
+                    sample_req(),
+                    move |_| {
+                        let _keep = &guard;
+                    },
+                    cancel,
+                )
+                .await
+        });
+
+        connected_rx.await.unwrap();
+        let cancelled_at = Instant::now();
+        cancel_trigger.cancel();
+
+        let err = call.await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Cancelled);
+
+        // Both the blocking worker thread and the underlying TCP socket must shut down promptly.
+        tokio::time::timeout(Duration::from_secs(3), worker_done_wait).await.expect("blocking worker leaked instead of exiting on cancel");
+        tokio::time::timeout(Duration::from_secs(3), closed_rx).await.expect("TCP socket was not closed promptly on cancel").unwrap();
+        assert!(cancelled_at.elapsed() < Duration::from_secs(3), "{:?}", cancelled_at.elapsed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_stalled_sse_stream_closes_socket_and_exits_worker_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request_head(&mut sock).await;
+            let first = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5-5\",\"usage\":{}}}\n\n\
+                         event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                         event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{first}\r\n", first.len());
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            // Stall forever mid-stream until the client closes the socket.
+            let mut drain = [0u8; 64];
+            loop {
+                match sock.read(&mut drain).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+
+        let client = AiClient::new(stalled_cfg(&base, 900)).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_on_delta = cancel.clone();
+        let worker_done = Arc::new(Notify::new());
+        let guard = DropNotify(worker_done.clone());
+        let worker_done_wait = worker_done.notified();
+
+        let start = Instant::now();
+        let err = client
+            .chat_stream(
+                sample_req(),
+                move |_| {
+                    let _keep = &guard;
+                    cancel_on_delta.cancel();
+                },
+                cancel,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Cancelled);
+
+        tokio::time::timeout(Duration::from_secs(3), worker_done_wait).await.expect("blocking worker leaked mid-stream instead of exiting on cancel");
+        tokio::time::timeout(Duration::from_secs(3), closed_rx).await.expect("TCP socket was not closed promptly mid-stream on cancel").unwrap();
+        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_stream_beyond_poll_interval_succeeds_and_overall_timeout_still_fires() {
+        // 1) A quiet gap longer than READ_POLL_INTERVAL (600ms > 250ms) still succeeds.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request_head(&mut sock).await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5-5\",\"usage\":{}}}\n\n\
+                        event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                        event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"delayed\"}}\n\n\
+                        event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+                        event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let resp = AiClient::new(stalled_cfg(&base, 5)).unwrap().chat(sample_req(), CancellationToken::new()).await.unwrap();
+        assert_eq!(resp.text, "delayed");
+
+        // 2) Overall timeout_secs (1s) still fires as ErrorKind::Timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request_head(&mut sock).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let err = AiClient::new(stalled_cfg(&base, 1)).unwrap().chat(sample_req(), CancellationToken::new()).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Timeout, "{err}");
+    }
+}

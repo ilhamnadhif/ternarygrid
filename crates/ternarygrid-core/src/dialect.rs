@@ -104,7 +104,7 @@ impl SqlSyntax {
             plsql_blocks: false,
             newline_ends_statement: false,
             extra_ident_chars: "",
-            ident_case: IdentCase::Upper,
+            ident_case: IdentCase::Preserve,
             case_sensitive_names: false,
         }
     }
@@ -656,7 +656,7 @@ pub mod ansi {
             }
             match syntax.ident_case {
                 IdentCase::Lower if c.is_ascii_uppercase() => return true,
-                IdentCase::Upper if c.is_ascii_lowercase() => {}
+                IdentCase::Upper if c.is_ascii_lowercase() => return true,
                 _ => {}
             }
         }
@@ -1161,5 +1161,32 @@ mod tests {
         let d = GenericDialect::new();
         assert_eq!(d.limit_query("select 1;", 10, 0), "SELECT * FROM (select 1) ternarygrid_q LIMIT 10");
         assert_eq!(d.count_query("select 1"), "SELECT COUNT(*) FROM (select 1) ternarygrid_cnt");
+    }
+
+    #[test]
+    fn needs_quoting_respects_ident_case() {
+        let mut upper = SqlSyntax::ansi();
+        upper.ident_case = IdentCase::Upper;
+        assert!(!ansi::needs_quoting(&upper, "USERS"));
+        assert!(!ansi::needs_quoting(&upper, "USER_1"));
+        assert!(ansi::needs_quoting(&upper, "users"), "lowercase must be quoted under IdentCase::Upper");
+        assert!(ansi::needs_quoting(&upper, "Users"), "mixed case must be quoted under IdentCase::Upper");
+        assert!(ansi::needs_quoting(&upper, "SELECT"), "reserved words remain quoted under IdentCase::Upper");
+        let q = ansi::Quoter { syntax: &upper };
+        assert_eq!(q.ident("USERS"), "USERS");
+        assert_eq!(q.ident("users"), "\"users\"");
+
+        let mut lower = SqlSyntax::ansi();
+        lower.ident_case = IdentCase::Lower;
+        assert!(!ansi::needs_quoting(&lower, "users"));
+        assert!(ansi::needs_quoting(&lower, "USERS"));
+        assert!(ansi::needs_quoting(&lower, "Users"));
+
+        let preserve = SqlSyntax::ansi();
+        assert_eq!(preserve.ident_case, IdentCase::Preserve);
+        assert!(!ansi::needs_quoting(&preserve, "users"));
+        assert!(!ansi::needs_quoting(&preserve, "USERS"));
+        assert!(!ansi::needs_quoting(&preserve, "Users"));
+        assert!(ansi::needs_quoting(&preserve, "Order"));
     }
 }

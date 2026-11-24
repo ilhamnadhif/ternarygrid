@@ -94,11 +94,15 @@ impl Dictionary {
     }
 }
 
-/// Sort numeric keys numerically, others lexicographically.
+/// Sort finite numeric keys numerically before non-numeric keys (strict total order).
 fn natural_key_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    match (a.parse::<f64>(), b.parse::<f64>()) {
-        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-        _ => a.cmp(b),
+    let na = a.parse::<f64>().ok().filter(|x| x.is_finite());
+    let nb = b.parse::<f64>().ok().filter(|x| x.is_finite());
+    match (na, nb) {
+        (Some(x), Some(y)) => x.total_cmp(&y).then_with(|| a.cmp(b)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.cmp(b),
     }
 }
 
@@ -1155,12 +1159,19 @@ impl ResultModel {
         Ok(src)
     }
 
-    /// Validate `value` for column `col` (NULL constraint, maximum length).
+    /// Validate `value` for column `col` (NULL constraint, maximum length, safe expression).
     fn validate(&self, col: usize, value: &CellValue, inserted: bool) -> Result<(), String> {
         let meta = &self.columns[col];
         match value {
-            // The database knows the default and evaluates the expression; nothing to check.
-            CellValue::Default | CellValue::Expr(_) => Ok(()),
+            // The database knows the default; nothing to check.
+            CellValue::Default => Ok(()),
+            CellValue::Expr(e) => {
+                if ternarygrid_core::value::is_sql_expression(e) {
+                    Ok(())
+                } else {
+                    Err(trf("Invalid SQL expression for '{}'", &[&meta.name]))
+                }
+            }
             CellValue::Value(v) => {
                 if v.is_null() && meta.nullable == Some(false) && !(inserted && meta.auto_increment == Some(true)) {
                     return Err(trf("Column '{}' does not allow NULL", &[&meta.name]));
@@ -1188,6 +1199,17 @@ impl ResultModel {
     /// evaluate (`now()`, `CURRENT_TIMESTAMP`) where the text is no value of the
     /// column's type. Text columns always take the text.
     pub fn parse_cell_for_column(&self, col: usize, text: &str) -> Result<CellValue, String> {
+        self.parse_cell_inner(col, text, true)
+    }
+
+    /// Parse text for column `col` strictly as a typed literal (`CellValue::Value`).
+    /// Never promotes unparseable text into a raw SQL [`CellValue::Expr`]; used for
+    /// clipboard paste so untrusted clipboard content cannot inject SQL expressions.
+    pub fn parse_literal_for_column(&self, col: usize, text: &str) -> Result<CellValue, String> {
+        self.parse_cell_inner(col, text, false)
+    }
+
+    fn parse_cell_inner(&self, col: usize, text: &str, allow_expr: bool) -> Result<CellValue, String> {
         match self.parse_for_column(col, text) {
             // A database that gives this column's dates as text (SQLite): the edit stays the
             // checked text, shown and saved as its neighbours are (`2026-11-02 19:20:00`, not
@@ -1196,7 +1218,7 @@ impl ResultModel {
                 Ok(CellValue::Value(Value::text(text.trim())))
             }
             Ok(v) => Ok(CellValue::Value(v)),
-            Err(_) if ternarygrid_core::value::is_sql_expression(text) => Ok(CellValue::Expr(text.trim().to_string())),
+            Err(_) if allow_expr && ternarygrid_core::value::is_sql_expression(text) => Ok(CellValue::Expr(text.trim().to_string())),
             Err(e) => Err(e),
         }
     }
@@ -1481,7 +1503,7 @@ impl ResultModel {
                 let value = if nulls.and_then(|n| n.get(i)?.get(j).copied()).unwrap_or(false) {
                     CellValue::Value(Value::Null)
                 } else {
-                    self.parse_cell_for_column(c, text).map_err(|e| trf("Row {}: {}", &[&(row + i + 1), &e]))?
+                    self.parse_literal_for_column(c, text).map_err(|e| trf("Row {}: {}", &[&(row + i + 1), &e]))?
                 };
                 parsed.push((row + i, c, value));
             }

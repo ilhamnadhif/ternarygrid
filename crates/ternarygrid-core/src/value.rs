@@ -568,12 +568,13 @@ impl Value {
                 Null => 0,
                 Bool(_) => 1,
                 Int(_) | UInt(_) | Float(_) | Decimal(_) => 2,
-                Date(_) | DateTime(_) | DateTimeTz(_) => 3,
-                Time(_) => 4,
-                Uuid(_) => 5,
-                Text(_) | Json(_) => 6,
-                Bytes(_) => 7,
-                Array(_) => 8,
+                Date(_) | DateTime(_) => 3,
+                DateTimeTz(_) => 4,
+                Time(_) => 5,
+                Uuid(_) => 6,
+                Text(_) | Json(_) => 7,
+                Bytes(_) => 8,
+                Array(_) => 9,
             }
         }
         match (self, other) {
@@ -583,6 +584,18 @@ impl Value {
             (UInt(a), UInt(b)) => a.cmp(b),
             (Int(a), UInt(b)) => (*a as i128).cmp(&(*b as i128)),
             (UInt(a), Int(b)) => (*a as i128).cmp(&(*b as i128)),
+            (Float(a), Float(b)) => cmp_f64(*a, *b),
+            (Int(a), Float(b)) => cmp_i128_f64(*a as i128, *b),
+            (Float(a), Int(b)) => cmp_i128_f64(*b as i128, *a).reverse(),
+            (UInt(a), Float(b)) => cmp_i128_f64(*a as i128, *b),
+            (Float(a), UInt(b)) => cmp_i128_f64(*b as i128, *a).reverse(),
+            (Decimal(a), Decimal(b)) => ExactNum::parse_decimal(a).cmp(&ExactNum::parse_decimal(b)),
+            (Int(a), Decimal(b)) => ExactNum::Dec(ExactDec::from_i128(*a as i128)).cmp(&ExactNum::parse_decimal(b)),
+            (Decimal(a), Int(b)) => ExactNum::parse_decimal(a).cmp(&ExactNum::Dec(ExactDec::from_i128(*b as i128))),
+            (UInt(a), Decimal(b)) => ExactNum::Dec(ExactDec::from_i128(*a as i128)).cmp(&ExactNum::parse_decimal(b)),
+            (Decimal(a), UInt(b)) => ExactNum::parse_decimal(a).cmp(&ExactNum::Dec(ExactDec::from_i128(*b as i128))),
+            (Float(a), Decimal(b)) => cmp_f64_decimal(*a, b),
+            (Decimal(a), Float(b)) => cmp_f64_decimal(*b, a).reverse(),
             (Text(a), Text(b)) | (Json(a), Json(b)) => a.cmp(b),
             (Date(a), Date(b)) => a.cmp(b),
             (Time(a), Time(b)) => a.cmp(b),
@@ -600,10 +613,6 @@ impl Value {
                     }
                 }
                 a.len().cmp(&b.len())
-            }
-            (a, b) if rank(a) == 2 && rank(b) == 2 => {
-                let (x, y) = (a.as_f64().unwrap_or(f64::NAN), b.as_f64().unwrap_or(f64::NAN));
-                x.partial_cmp(&y).unwrap_or_else(|| x.is_nan().cmp(&y.is_nan()))
             }
             (a, b) => rank(a).cmp(&rank(b)).then_with(|| a.to_text().cmp(&b.to_text())),
         }
@@ -1018,34 +1027,427 @@ pub fn is_sql_expression(text: &str) -> bool {
     (call || keyword) && balanced(t)
 }
 
-/// Parentheses closed and quotes ended (outside of quotes), and no statement
-/// separator or comment outside of quotes: the text is inserted verbatim into
-/// `UPDATE … SET c = <text> WHERE …`, where `--`, `/*`, `#` or `;` would cut
-/// off the `WHERE` clause.
+/// Parentheses closed and quotes ended (outside of quotes), no statement
+/// separator, comment, top-level comma/assignment, SQL clause keywords, or
+/// dialect-ambiguous quoting (backslashes inside quotes, dollar-quotes,
+/// backticks, bracket identifiers, `E'...'` / `q'...'`): the text is inserted
+/// verbatim into `UPDATE … SET c = <text> WHERE …` or `INSERT … VALUES (…)`.
 fn balanced(t: &str) -> bool {
+    const FORBIDDEN_ANY_DEPTH: &[&str] = &[
+        "SELECT",
+        "DELETE",
+        "UPDATE",
+        "INSERT",
+        "DROP",
+        "ALTER",
+        "CREATE",
+        "TRUNCATE",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "INTO",
+        "WHERE",
+        "SET",
+        "RETURNING",
+        "EXEC",
+        "EXECUTE",
+        "PRAGMA",
+        "ATTACH",
+        "DETACH",
+        "COPY",
+        "OUTFILE",
+        "DUMPFILE",
+        "GRANT",
+        "REVOKE",
+        "MERGE",
+        "CALL",
+        "DO",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+    ];
+    const FORBIDDEN_TOP_LEVEL: &[&str] = &["FROM", "VALUES", "LIMIT", "OFFSET", "ORDER", "GROUP", "HAVING", "FOR", "WITH", "ON", "JOIN"];
+    let check_word = |word: &str, depth: i32| -> bool {
+        if word.is_empty() {
+            return true;
+        }
+        if FORBIDDEN_ANY_DEPTH.iter().any(|k| word.eq_ignore_ascii_case(k)) {
+            return false;
+        }
+        if depth == 0 && FORBIDDEN_TOP_LEVEL.iter().any(|k| word.eq_ignore_ascii_case(k)) {
+            return false;
+        }
+        true
+    };
+
     let (mut depth, mut quote) = (0i32, None);
+    let mut word = String::new();
     let mut chars = t.chars().peekable();
     while let Some(c) = chars.next() {
+        if c == '\0' {
+            return false;
+        }
         match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth < 0 {
-                        return false;
+            Some(q) => {
+                // Reject `\` inside quotes: MySQL treats `\'` as an escaped quote
+                // while standard SQL / PostgreSQL treats it as literal `\` followed
+                // by a closing quote, which would desync quote parity across dialects.
+                if c == '\\' {
+                    return false;
+                }
+                if c == q {
+                    if chars.peek() == Some(&q) {
+                        chars.next();
+                    } else {
+                        quote = None;
                     }
                 }
-                ';' | '#' => return false,
-                '-' if chars.peek() == Some(&'-') => return false,
-                '/' if chars.peek() == Some(&'*') => return false,
-                _ => {}
-            },
+            }
+            None => {
+                if c.is_alphanumeric() || c == '_' {
+                    word.push(c);
+                    continue;
+                }
+                // Reject dialect-specific quote prefixes (`E'...'`, `q'...'`, `nq'...'`).
+                if c == '\'' && (word.eq_ignore_ascii_case("q") || word.eq_ignore_ascii_case("nq") || word.eq_ignore_ascii_case("e")) {
+                    return false;
+                }
+                if !check_word(&word, depth) {
+                    return false;
+                }
+                word.clear();
+                match c {
+                    '\'' | '"' => quote = Some(c),
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth < 0 {
+                            return false;
+                        }
+                    }
+                    ',' | '=' if depth == 0 => return false,
+                    ';' | '#' | '$' | '`' | '[' | ']' | '\\' => return false,
+                    '-' if chars.peek() == Some(&'-') => return false,
+                    '/' if chars.peek() == Some(&'*') => return false,
+                    '*' if chars.peek() == Some(&'/') => return false,
+                    '&' if chars.peek() == Some(&'\'') => return false,
+                    _ => {}
+                }
+            }
         }
     }
+    if !check_word(&word, depth) {
+        return false;
+    }
     depth == 0 && quote.is_none()
+}
+
+/// Mathematical order on `f64`: `-Inf < finite (-0.0 == +0.0) < +Inf < NaN`.
+fn cmp_f64(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap(),
+    }
+}
+
+/// Exact comparison between an `i128` and an `f64` (`-Inf < finite < +Inf < NaN`).
+fn cmp_i128_f64(i: i128, f: f64) -> Ordering {
+    if f.is_nan() {
+        return Ordering::Less;
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { Ordering::Less } else { Ordering::Greater };
+    }
+    // 2^127 is exact in IEEE 754 f64; i128 spans [-2^127, 2^127 - 1].
+    const TWO_127: f64 = 170141183460469231731687303715884105728.0;
+    if f < -TWO_127 {
+        return Ordering::Greater;
+    }
+    if f >= TWO_127 {
+        return Ordering::Less;
+    }
+    let t = f.trunc();
+    let ti = t as i128;
+    match i.cmp(&ti) {
+        Ordering::Equal => {
+            let frac = f - t;
+            if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        o => o,
+    }
+}
+
+/// Normalized exact decimal `(-1)^neg * digits * 10^exp` with no leading or
+/// trailing `'0'` in `digits`. Zero is represented by empty `digits`, `neg = false`, `exp = 0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactDec {
+    neg: bool,
+    digits: Vec<u8>,
+    exp: i128,
+}
+
+impl ExactDec {
+    fn zero() -> Self {
+        ExactDec { neg: false, digits: Vec::new(), exp: 0 }
+    }
+
+    fn from_digits(neg: bool, mut digits: Vec<u8>, mut exp: i128) -> Self {
+        let lead = digits.iter().take_while(|&&b| b == b'0').count();
+        if lead > 0 {
+            digits.drain(..lead);
+        }
+        while digits.last() == Some(&b'0') {
+            digits.pop();
+            exp = exp.saturating_add(1);
+        }
+        if digits.is_empty() {
+            return ExactDec::zero();
+        }
+        ExactDec { neg, digits, exp }
+    }
+
+    fn from_i128(n: i128) -> Self {
+        if n == 0 {
+            return ExactDec::zero();
+        }
+        ExactDec::from_digits(n < 0, n.unsigned_abs().to_string().into_bytes(), 0)
+    }
+
+    /// Exact decimal expansion of any finite `f64` (`m * 2^e`).
+    fn from_finite_f64(f: f64) -> Self {
+        debug_assert!(f.is_finite());
+        let bits = f.to_bits();
+        let neg = (bits >> 63) != 0;
+        let raw_exp = ((bits >> 52) & 0x7ff) as i32;
+        let raw_mant = bits & ((1u64 << 52) - 1);
+        if raw_exp == 0 && raw_mant == 0 {
+            return ExactDec::zero();
+        }
+        let (mut mant, mut exp2) = if raw_exp == 0 { (raw_mant, -1074i32) } else { ((1u64 << 52) | raw_mant, raw_exp - 1075) };
+        let tz = mant.trailing_zeros();
+        mant >>= tz;
+        exp2 += tz as i32;
+
+        const BASE: u64 = 1_000_000_000;
+        let mut limbs = Vec::new();
+        let mut v = mant;
+        while v > 0 {
+            limbs.push((v % BASE) as u32);
+            v /= BASE;
+        }
+        let mul_small = |limbs: &mut Vec<u32>, factor: u64| {
+            let mut carry = 0u64;
+            for limb in limbs.iter_mut() {
+                let prod = u64::from(*limb) * factor + carry;
+                *limb = (prod % BASE) as u32;
+                carry = prod / BASE;
+            }
+            while carry > 0 {
+                limbs.push((carry % BASE) as u32);
+                carry /= BASE;
+            }
+        };
+        let exp10 = if exp2 >= 0 {
+            let mut rem = exp2 as u32;
+            while rem > 0 {
+                let step = rem.min(29);
+                mul_small(&mut limbs, 1u64 << step);
+                rem -= step;
+            }
+            0i128
+        } else {
+            let k = (-exp2) as u32;
+            let mut rem = k;
+            while rem > 0 {
+                let step = rem.min(13);
+                mul_small(&mut limbs, 5u64.pow(step));
+                rem -= step;
+            }
+            -i128::from(k)
+        };
+        let mut s = String::with_capacity(limbs.len() * 9);
+        if let Some((&top, rest)) = limbs.split_last() {
+            let _ = write!(s, "{top}");
+            for &limb in rest.iter().rev() {
+                let _ = write!(s, "{limb:09}");
+            }
+        }
+        ExactDec::from_digits(neg, s.into_bytes(), exp10)
+    }
+
+    fn cmp_magnitude(&self, other: &Self) -> Ordering {
+        match (self.digits.is_empty(), other.digits.is_empty()) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (false, false) => {}
+        }
+        let msd_a = self.exp.saturating_add(self.digits.len() as i128);
+        let msd_b = other.exp.saturating_add(other.digits.len() as i128);
+        msd_a.cmp(&msd_b).then_with(|| {
+            let n = self.digits.len().max(other.digits.len());
+            for i in 0..n {
+                let da = self.digits.get(i).copied().unwrap_or(b'0');
+                let db = other.digits.get(i).copied().unwrap_or(b'0');
+                let o = da.cmp(&db);
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            Ordering::Equal
+        })
+    }
+}
+
+impl Ord for ExactDec {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.neg, other.neg) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => self.cmp_magnitude(other),
+            (true, true) => other.cmp_magnitude(self),
+        }
+    }
+}
+
+impl PartialOrd for ExactDec {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactNum {
+    NegInf,
+    Dec(ExactDec),
+    PosInf,
+    NaN,
+}
+
+impl ExactNum {
+    fn parse_decimal(s: &str) -> Self {
+        let s = s.trim();
+        if s.is_empty() {
+            return ExactNum::NaN;
+        }
+        let (neg, rest) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        if rest.eq_ignore_ascii_case("nan") {
+            return ExactNum::NaN;
+        }
+        if rest.eq_ignore_ascii_case("inf") || rest.eq_ignore_ascii_case("infinity") {
+            return if neg { ExactNum::NegInf } else { ExactNum::PosInf };
+        }
+        let (mantissa, exp_opt) = match rest.find(['e', 'E']) {
+            Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+            None => (rest, None),
+        };
+        let (int_part, frac_part) = match mantissa.split_once('.') {
+            Some((a, b)) => (a, b),
+            None => (mantissa, ""),
+        };
+        if (int_part.is_empty() && frac_part.is_empty()) || !int_part.bytes().all(|b| b.is_ascii_digit()) || !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+            return ExactNum::NaN;
+        }
+        let mut digits = Vec::with_capacity(int_part.len() + frac_part.len());
+        digits.extend_from_slice(int_part.as_bytes());
+        digits.extend_from_slice(frac_part.as_bytes());
+        let exp_parsed: Result<i128, bool> = match exp_opt {
+            None => Ok(0),
+            Some(e) => {
+                let (eneg, edigits) = match e.strip_prefix('-') {
+                    Some(r) => (true, r),
+                    None => (false, e.strip_prefix('+').unwrap_or(e)),
+                };
+                if edigits.is_empty() || !edigits.bytes().all(|b| b.is_ascii_digit()) {
+                    return ExactNum::NaN;
+                }
+                e.parse::<i128>().map_err(|_| eneg)
+            }
+        };
+        if digits.iter().all(|&b| b == b'0') {
+            return ExactNum::Dec(ExactDec::zero());
+        }
+        let exp = match exp_parsed {
+            Ok(v) => match v.checked_sub(frac_part.len() as i128) {
+                Some(e) => e,
+                None => return ExactNum::Dec(ExactDec { neg, digits: vec![b'1'], exp: i128::MIN }),
+            },
+            Err(false) => return if neg { ExactNum::NegInf } else { ExactNum::PosInf },
+            Err(true) => return ExactNum::Dec(ExactDec { neg, digits: vec![b'1'], exp: i128::MIN }),
+        };
+        ExactNum::Dec(ExactDec::from_digits(neg, digits, exp))
+    }
+
+    fn rank(&self) -> u8 {
+        match self {
+            ExactNum::NegInf => 0,
+            ExactNum::Dec(_) => 1,
+            ExactNum::PosInf => 2,
+            ExactNum::NaN => 3,
+        }
+    }
+}
+
+impl Ord for ExactNum {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (ExactNum::Dec(a), ExactNum::Dec(b)) => a.cmp(b),
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+impl PartialOrd for ExactNum {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn cmp_f64_decimal(f: f64, s: &str) -> Ordering {
+    let dec = ExactNum::parse_decimal(s);
+    if f.is_nan() {
+        return ExactNum::NaN.cmp(&dec);
+    }
+    if f.is_infinite() {
+        let nf = if f > 0.0 { ExactNum::PosInf } else { ExactNum::NegInf };
+        return nf.cmp(&dec);
+    }
+    let ExactNum::Dec(ref b) = dec else {
+        return ExactNum::Dec(ExactDec::zero()).cmp(&dec);
+    };
+    if f == 0.0 {
+        return ExactDec::zero().cmp(b);
+    }
+    let f_neg = f.is_sign_negative();
+    if b.digits.is_empty() {
+        return if f_neg { Ordering::Less } else { Ordering::Greater };
+    }
+    match (f_neg, b.neg) {
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        _ => {}
+    }
+    let approx_msd = f.abs().log10().floor() as i128 + 1;
+    let b_msd = b.exp.saturating_add(b.digits.len() as i128);
+    if approx_msd.saturating_add(2) < b_msd {
+        return if f_neg { Ordering::Greater } else { Ordering::Less };
+    }
+    if approx_msd.saturating_sub(2) > b_msd {
+        return if f_neg { Ordering::Less } else { Ordering::Greater };
+    }
+    ExactDec::from_finite_f64(f).cmp(b)
 }
 
 pub fn parse_hex_bytes(t: &str) -> Option<Vec<u8>> {
@@ -1305,8 +1707,174 @@ mod tests {
             assert!(!is_sql_expression(t), "{t}");
         }
         // Inside quotes they are text.
-        for t in ["concat('a--b')", "concat('a;b', \"c/*d\")", "datetime('now', '#')"] {
+        for t in ["concat('a--b')", "concat('a;b', \"c/*d\")", "datetime('now', '#')", "concat('it''s')", "coalesce(a, b)", "extract(year from now())"] {
             assert!(is_sql_expression(t), "{t}");
+        }
+        // Regression tests: top-level comma/assignment, SQL clauses, backslash quote desync,
+        // dollar-quoting, backticks, bracket identifiers, and nested subqueries must be rejected.
+        for t in [
+            "now(), is_admin = true",
+            "f(1), role = 'admin'",
+            "now() = now()",
+            "now() WHERE 1=1",
+            "now() SET x = 1",
+            "now() UNION SELECT 1",
+            "now() INTO outfile",
+            "now()WHERE 1=1",
+            "f('a\\''), is_admin = 1 WHERE 1=1; -- '",
+            "f(\"a\\\"\"), is_admin = 1",
+            "f($$; DROP TABLE t; --$$)",
+            "f($tag$; DROP TABLE t; $tag$)",
+            "f(`a`)",
+            "f([a']), is_admin = 1 --'])",
+            "f(E'a\\''), is_admin = 1",
+            "f(q'[a']'), is_admin = 1",
+            "coalesce((SELECT secret FROM users LIMIT 1), 'x')",
+            "f('a\0b')",
+        ] {
+            assert!(!is_sql_expression(t), "expected rejection for: {t}");
+        }
+    }
+
+    #[test]
+    fn cmp_for_sort_is_a_strict_total_preorder() {
+        use chrono::TimeZone;
+        let d1 = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let dt_mid = d1.and_hms_opt(0, 0, 0).unwrap();
+        let dt_3 = d1.and_hms_opt(3, 0, 0).unwrap();
+        let tz_east = FixedOffset::east_opt(8 * 3600).unwrap().from_local_datetime(&d1.and_hms_opt(5, 0, 0).unwrap()).unwrap();
+        let tz_utc = FixedOffset::east_opt(0).unwrap().from_local_datetime(&d1.and_hms_opt(2, 0, 0).unwrap()).unwrap();
+        let big = 1i64 << 53;
+        let values = vec![
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Float(f64::NEG_INFINITY),
+            Value::decimal("-Infinity"),
+            Value::decimal("-1e400"),
+            Value::Int(i64::MIN),
+            Value::Float(-9223372036854775808.0),
+            Value::Int(-2),
+            Value::Float(-1.5),
+            Value::decimal("-1.5"),
+            Value::Int(-1),
+            Value::Float(-0.5),
+            Value::Float(-0.0),
+            Value::Int(0),
+            Value::UInt(0),
+            Value::Float(0.0),
+            Value::decimal("-0.00"),
+            Value::decimal("0"),
+            Value::Float(f64::from_bits(1)),
+            Value::decimal("0.1"),
+            Value::decimal("0.100000000000000003"),
+            Value::Float(0.1),
+            Value::Float(0.5),
+            Value::Int(1),
+            Value::Float(1.5),
+            Value::decimal("2"),
+            Value::Int(big),
+            Value::UInt(big as u64),
+            Value::Float(big as f64),
+            Value::decimal("9007199254740992"),
+            Value::Int(big + 1),
+            Value::UInt((big + 1) as u64),
+            Value::decimal("9007199254740993"),
+            Value::Float((big + 2) as f64),
+            Value::Int(i64::MAX),
+            Value::UInt(i64::MAX as u64),
+            Value::Float(9223372036854775808.0),
+            Value::UInt(u64::MAX),
+            Value::decimal("18446744073709551615"),
+            Value::Float(18446744073709551616.0),
+            Value::Float(f64::MAX),
+            Value::decimal("1e400"),
+            Value::Float(f64::INFINITY),
+            Value::decimal("Infinity"),
+            Value::Float(f64::NAN),
+            Value::decimal("NaN"),
+            Value::decimal("not-a-number"),
+            Value::Date(d1),
+            Value::DateTime(dt_mid),
+            Value::DateTime(dt_3),
+            Value::Date(d2),
+            Value::DateTimeTz(tz_east),
+            Value::DateTimeTz(tz_utc),
+            Value::Time(dt_3.time()),
+            Value::text("a"),
+            Value::json("{\"a\":1}"),
+            Value::bytes(vec![1, 2]),
+        ];
+
+        // Exact numeric precision checks.
+        assert_eq!(Value::Int(big).cmp_for_sort(&Value::Float(big as f64)), Ordering::Equal);
+        assert_eq!(Value::Int(big + 1).cmp_for_sort(&Value::Float(big as f64)), Ordering::Greater);
+        assert_eq!(Value::Float(big as f64).cmp_for_sort(&Value::Int(big + 1)), Ordering::Less);
+        assert_eq!(Value::Int(big + 1).cmp_for_sort(&Value::decimal("9007199254740993")), Ordering::Equal);
+        assert_eq!(Value::decimal("9007199254740993").cmp_for_sort(&Value::Float(big as f64)), Ordering::Greater);
+        assert_eq!(Value::Int(i64::MAX).cmp_for_sort(&Value::Float(9223372036854775808.0)), Ordering::Less);
+        assert_eq!(Value::Date(d1).cmp_for_sort(&Value::DateTime(dt_mid)), Ordering::Equal);
+
+        // Exhaustive reflexivity, antisymmetry, and transitivity across every triple.
+        for (i, a) in values.iter().enumerate() {
+            assert_eq!(a.cmp_for_sort(a), Ordering::Equal, "reflexivity failed for {a:?}");
+            for (j, b) in values.iter().enumerate() {
+                let ab = a.cmp_for_sort(b);
+                let ba = b.cmp_for_sort(a);
+                assert_eq!(ab, ba.reverse(), "antisymmetry failed for ({i}:{a:?}, {j}:{b:?})");
+                for (k, c) in values.iter().enumerate() {
+                    let bc = b.cmp_for_sort(c);
+                    let ac = a.cmp_for_sort(c);
+                    match (ab, bc) {
+                        (Ordering::Less, Ordering::Less | Ordering::Equal) | (Ordering::Equal, Ordering::Less) => {
+                            assert_eq!(ac, Ordering::Less, "transitivity failed: ({i}:{a:?}) <= ({j}:{b:?}) <= ({k}:{c:?})");
+                        }
+                        (Ordering::Greater, Ordering::Greater | Ordering::Equal) | (Ordering::Equal, Ordering::Greater) => {
+                            assert_eq!(ac, Ordering::Greater, "transitivity failed: ({i}:{a:?}) >= ({j}:{b:?}) >= ({k}:{c:?})");
+                        }
+                        (Ordering::Equal, Ordering::Equal) => {
+                            assert_eq!(ac, Ordering::Equal, "equivalence failed: ({i}:{a:?}) == ({j}:{b:?}) == ({k}:{c:?})");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Sorting reversed and shuffled copies never panics and produces a non-decreasing order.
+        let mut rev: Vec<Value> = values.iter().rev().cloned().collect();
+        rev.sort_by(|a, b| a.cmp_for_sort(b));
+        for w in rev.windows(2) {
+            assert_ne!(w[0].cmp_for_sort(&w[1]), Ordering::Greater, "out of order: {:?} > {:?}", w[0], w[1]);
+        }
+
+        // Verify fast cmp_i128_f64 agrees with ExactDec conversion on boundary pairs.
+        let ints: &[i128] = &[i128::from(i64::MIN), -100, -2, -1, 0, 1, 2, i128::from(big), i128::from(big + 1), i128::from(i64::MAX), i128::from(u64::MAX)];
+        let floats: &[f64] = &[
+            -9223372036854775808.0,
+            -2.5,
+            -1.5,
+            -1.0,
+            -0.5,
+            -0.0,
+            0.0,
+            f64::from_bits(1),
+            0.5,
+            1.0,
+            1.5,
+            big as f64,
+            (big + 2) as f64,
+            9223372036854775808.0,
+            18446744073709551616.0,
+            f64::MAX,
+        ];
+        for &i in ints {
+            let di = ExactDec::from_i128(i);
+            for &f in floats {
+                let df = ExactDec::from_finite_f64(f);
+                assert_eq!(cmp_i128_f64(i, f), di.cmp(&df), "mismatch for i={i}, f={f}");
+            }
         }
     }
 

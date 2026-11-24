@@ -998,6 +998,27 @@ mod liquibase {
         parse(&xml);
         assert!(!xml.contains('\u{1}'));
     }
+
+    #[test]
+    fn warning_comments_with_triple_hyphens_remain_valid_xml() {
+        // GenericDialect cannot drop custom types automatically, so a removed type
+        // containing `---` and a trailing `-` produces a Liquibase warning comment.
+        let src = SchemaSnapshot::default();
+        let mut tgt = SchemaSnapshot::default();
+        tgt.types.push(TypeDef {
+            schema: Some("public".into()),
+            name: "status---enum-".into(),
+            category: "enum".into(),
+            elements: vec!["a".into()],
+            definition: "CREATE TYPE public.\"status---enum-\" AS ENUM ('a')".into(),
+            comment: None,
+        });
+        let d = schema_diff(&src, &tgt, &CompareOptions::default());
+        let xml = liquibase_changelog(&d, &src, &tgt, &LiquibaseOptions { script: ScriptOptions::full_sync(), ..Default::default() });
+        assert!(xml.contains("<!-- WARNING:"), "expected a warning comment in:\n{xml}");
+        assert!(!xml.contains("---"), "XML comment must not contain `--` runs:\n{xml}");
+        parse(&xml);
+    }
 }
 
 /// `TERNARYGRID_SAMPLE_DIR=/some/dir cargo test -p ternarygrid-compare write_samples -- --ignored`

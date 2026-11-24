@@ -63,11 +63,14 @@ fn pct(s: &str) -> String {
 /// A connection string for `params`. A single host is reached directly
 /// (no replica set discovery, which fails behind Docker, NAT or a tunnel)
 /// unless `replicaSet` or `directConnection` says otherwise.
-pub(crate) fn uri(params: &ConnectParams) -> String {
+pub(crate) fn uri(params: &ConnectParams) -> DbResult<String> {
     let srv = params.property("srv") == Some("true");
     let hosts = match params.property("hosts").filter(|h| !h.trim().is_empty()) {
         Some(h) => h.to_string(),
         None if srv => params.host.clone(),
+        None if params.host.contains(':') && !params.host.starts_with('[') => {
+            format!("[{}]:{}", params.host, params.port)
+        }
         None => format!("{}:{}", params.host, params.port),
     };
     let mut s = String::from(if srv { "mongodb+srv://" } else { "mongodb://" });
@@ -100,21 +103,49 @@ pub(crate) fn uri(params: &ConnectParams) -> String {
             _ if !srv => q.push(("tlsAllowInvalidCertificates".into(), "true".into())),
             _ => {}
         }
-        // The connection's CA and client certificate (files): they were never used.
-        let file = |v: &Option<String>| {
-            v.as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && !s.contains("-----BEGIN"))
-                .map(str::to_string)
-        };
-        if let Some(ca) = file(&params.ssl.ca_cert) {
-            q.push(("tlsCAFile".into(), ca));
+        fn opt(v: &Option<String>) -> Option<&str> {
+            v.as_deref().map(str::trim).filter(|s| !s.is_empty())
         }
-        // MongoDB takes the certificate and its key in one PEM file.
-        if let Some(cert) = file(&params.ssl.client_cert)
-            && file(&params.ssl.client_key).is_none_or(|k| k == cert)
-        {
-            q.push(("tlsCertificateKeyFile".into(), cert));
+        let ca = opt(&params.ssl.ca_cert);
+        let cert = opt(&params.ssl.client_cert);
+        let key = opt(&params.ssl.client_key);
+        if let Some(ca) = ca {
+            if ca.contains("-----BEGIN") {
+                return Err(DbError::config(
+                    "MongoDB requires the CA certificate as a file path, not inline PEM",
+                ));
+            }
+            q.push(("tlsCAFile".into(), ca.to_string()));
+        }
+        // MongoDB takes the client certificate and private key in a single combined PEM file.
+        match (cert, key) {
+            (None, None) => {}
+            (Some(c), _) if c.contains("-----BEGIN") => {
+                return Err(DbError::config(
+                    "MongoDB requires the client certificate and key as a combined PEM file path, not inline PEM",
+                ));
+            }
+            (_, Some(k)) if k.contains("-----BEGIN") => {
+                return Err(DbError::config(
+                    "MongoDB requires the client certificate and key as a combined PEM file path, not inline PEM",
+                ));
+            }
+            (Some(c), None) => {
+                q.push(("tlsCertificateKeyFile".into(), c.to_string()));
+            }
+            (Some(c), Some(k)) if c == k => {
+                q.push(("tlsCertificateKeyFile".into(), c.to_string()));
+            }
+            (Some(_), Some(_)) => {
+                return Err(DbError::config(
+                    "MongoDB requires the client certificate and private key in a single combined PEM file; combine them into one PEM file and pass it as client_cert (with client_key empty or set to the same path)",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(DbError::config(
+                    "MongoDB client key set without a client certificate; supply a single combined PEM file containing both certificate and key",
+                ));
+            }
         }
     }
     if !srv
@@ -150,7 +181,7 @@ pub(crate) fn uri(params: &ConnectParams) -> String {
             .collect::<Vec<_>>()
             .join("&"),
     );
-    s
+    Ok(s)
 }
 
 // ------------------------------------------------------------- conversion
@@ -468,7 +499,7 @@ fn find_spec(first: &Call, rest: &[Call]) -> DbResult<(FindSpec, Vec<String>)> {
 
 impl MongoSession {
     pub async fn connect(params: &ConnectParams) -> DbResult<Self> {
-        let opts = ClientOptions::parse(uri(params)).await.map_err(err)?;
+        let opts = ClientOptions::parse(uri(params)?).await.map_err(err)?;
         let client = Client::with_options(opts).map_err(err)?;
         let db = params
             .database
@@ -1541,7 +1572,7 @@ mod tests {
         cfg.user = Some("app".into());
         cfg.ssl.mode = SslMode::Disable;
         let p = ConnectParams::from_config(&cfg, Some(ternarygrid_core::Secret::new("p@ss:w/rd")));
-        let u = uri(&p);
+        let u = uri(&p).unwrap();
         assert!(
             u.starts_with("mongodb://app:p%40ss%3Aw%2Frd@db.local:27017/?appName=TernaryGrid"),
             "{u}"
@@ -1553,7 +1584,7 @@ mod tests {
         // verify-ca checks the chain (not the host name); the CA file is used.
         cfg.ssl.mode = SslMode::VerifyCa;
         cfg.ssl.ca_cert = Some("/etc/ca.pem".into());
-        let u = uri(&ConnectParams::from_config(&cfg, None));
+        let u = uri(&ConnectParams::from_config(&cfg, None)).unwrap();
         assert!(
             u.contains("tlsAllowInvalidHostnames=true")
                 && !u.contains("tlsAllowInvalidCertificates")
@@ -1563,13 +1594,60 @@ mod tests {
         cfg.ssl.ca_cert = None;
         cfg.properties.insert("srv".into(), "true".into());
         cfg.ssl.mode = SslMode::Prefer;
-        let u = uri(&ConnectParams::from_config(&cfg, None));
+        let u = uri(&ConnectParams::from_config(&cfg, None)).unwrap();
         assert!(
             u.starts_with("mongodb+srv://app@db.local/?")
                 && u.contains("tls=true")
                 && !u.contains("directConnection"),
             "{u}"
         );
+    }
+
+    #[test]
+    fn ipv6_and_mtls_validation() {
+        let mut cfg = ConnectionConfig::new(DbKind::MongoDb, "x");
+        cfg.host = "::1".into();
+        cfg.ssl.mode = SslMode::Disable;
+        let u = uri(&ConnectParams::from_config(&cfg, None)).unwrap();
+        assert!(u.starts_with("mongodb://[::1]:27017/?"), "{u}");
+
+        // Already bracketed IPv6 stays single-bracketed.
+        cfg.host = "[::1]".into();
+        let u = uri(&ConnectParams::from_config(&cfg, None)).unwrap();
+        assert!(u.starts_with("mongodb://[::1]:27017/?"), "{u}");
+
+        // Combined PEM in client_cert (with empty or matching client_key) succeeds.
+        cfg.host = "db.local".into();
+        cfg.ssl.mode = SslMode::VerifyFull;
+        cfg.ssl.client_cert = Some("/etc/client.pem".into());
+        let u = uri(&ConnectParams::from_config(&cfg, None)).unwrap();
+        assert!(
+            u.contains("tlsCertificateKeyFile=%2Fetc%2Fclient.pem"),
+            "{u}"
+        );
+        cfg.ssl.client_key = Some("/etc/client.pem".into());
+        let u = uri(&ConnectParams::from_config(&cfg, None)).unwrap();
+        assert!(
+            u.contains("tlsCertificateKeyFile=%2Fetc%2Fclient.pem"),
+            "{u}"
+        );
+
+        // Separate client_cert and client_key files are rejected instead of silently dropped.
+        cfg.ssl.client_key = Some("/etc/client.key".into());
+        let e = uri(&ConnectParams::from_config(&cfg, None)).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Config);
+        assert!(e.message.contains("combined PEM"), "{e}");
+
+        // Only client_key without client_cert is rejected.
+        cfg.ssl.client_cert = None;
+        let e = uri(&ConnectParams::from_config(&cfg, None)).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Config);
+
+        // Inline PEM is rejected instead of silently ignored.
+        cfg.ssl.client_key = None;
+        cfg.ssl.ca_cert = Some("-----BEGIN CERTIFICATE-----\n...".into());
+        let e = uri(&ConnectParams::from_config(&cfg, None)).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Config);
     }
 
     #[test]

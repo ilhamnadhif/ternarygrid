@@ -532,7 +532,7 @@ fn parse_port(p: &str) -> DbResult<u16> {
 /// The URL with any password replaced by `***` (for messages).
 pub fn redact_url(url: &str) -> String {
     let mut out = url.to_string();
-    // user:password@host
+    // 1. Standard `scheme://user:password@host` (or `scheme://user:password` without `@`).
     if let Some(scheme_end) = out.find("://") {
         let auth_start = scheme_end + 3;
         let auth_end = out[auth_start..]
@@ -555,23 +555,82 @@ pub fn redact_url(url: &str) -> String {
                 out.replace_range(start..start + value.len(), "***");
             }
         }
+    } else if let Some(at) = out.rfind('@') {
+        // 2. Schemes without `://` such as Oracle `jdbc:oracle:thin:user/pass@//host:1521/orcl`
+        //    or `oracle:user/pass@host`. Skip file-path schemes that may contain `@` in paths.
+        let lower_prefix = out.to_ascii_lowercase();
+        let is_file_scheme = lower_prefix.starts_with("sqlite:")
+            || lower_prefix.starts_with("jdbc:sqlite:")
+            || lower_prefix.starts_with("file:");
+        if !is_file_scheme && let Some(slash) = out[..at].find('/') {
+            let user_start = out[..slash].rfind(':').map(|i| i + 1).unwrap_or(0);
+            let user = &out[user_start..slash];
+            if !user.is_empty() && slash + 1 < at {
+                out.replace_range(slash + 1..at, "***");
+            }
+        }
     }
-    // password=... in query / properties
-    let lower = out.to_ascii_lowercase();
-    let mut result = String::with_capacity(out.len());
+    // 3. `password=...`, `pwd=...`, `api_key=...` in query / semicolon properties,
+    //    including SQL Server JDBC braced values `{p;w}}x}` that may contain `;`, `&`, or `}}`.
+    redact_kv_secrets(&out)
+}
+
+/// Redact secret key-value parameters (`password=`, `pwd=`, `api_key=`) across query and
+/// semicolon property segments, preserving delimiters and respecting JDBC `{...}` values.
+fn redact_kv_secrets(s: &str) -> String {
+    const SECRET_KEYS: &[&str] = &["password=", "pwd=", "api_key="];
+    let lower = s.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut result = String::with_capacity(s.len());
     let mut i = 0;
-    while let Some(pos) = lower[i..].find("password=").map(|p| p + i) {
-        let value_start = pos + "password=".len();
-        result.push_str(&out[i..value_start]);
-        result.push_str("***");
-        let value_end = out[value_start..]
-            .find(['&', ';'])
-            .map(|e| e + value_start)
-            .unwrap_or(out.len());
-        i = value_end;
+    while i < s.len() {
+        let at_boundary = i == 0
+            || matches!(
+                bytes[i - 1],
+                b'?' | b'&' | b';' | b' ' | b'\t' | b'\r' | b'\n'
+            );
+        if at_boundary
+            && let Some(key_len) = SECRET_KEYS
+                .iter()
+                .find(|k| lower[i..].starts_with(*k))
+                .map(|k| k.len())
+        {
+            let value_start = i + key_len;
+            result.push_str(&s[i..value_start]);
+            result.push_str("***");
+            i = secret_value_end(s, value_start);
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
     }
-    result.push_str(&out[i..]);
     result
+}
+
+/// Byte index where a query/property secret value ends. Handles braced values
+/// `{...}` (with `}}` escaping a literal `}`) as parsed by `semi_properties`.
+fn secret_value_end(s: &str, value_start: usize) -> usize {
+    let tail = &s[value_start..];
+    let trimmed_offset = tail.len() - tail.trim_start().len();
+    if let Some(braced) = tail[trimmed_offset..].strip_prefix('{') {
+        let braced_start = value_start + trimmed_offset + 1;
+        let mut chars = braced.char_indices();
+        while let Some((idx, c)) = chars.next() {
+            if c == '}' {
+                if braced[idx + 1..].starts_with('}') {
+                    chars.next();
+                } else {
+                    return braced_start + idx + 1;
+                }
+            }
+        }
+        // Unterminated brace: mask through the end of the string.
+        return s.len();
+    }
+    tail.find(['&', ';'])
+        .map(|e| value_start + e)
+        .unwrap_or(s.len())
 }
 
 fn scheme_for(kind: DbKind) -> &'static str {
@@ -978,6 +1037,40 @@ mod tests {
         assert_eq!(redact_url("foo://[::1]:5432/db"), "foo://[::1]:5432/db");
         let e = parse_connection_url("foo://user:s3cret").unwrap_err();
         assert!(!e.message.contains("s3cret"), "{}", e.message);
+
+        // Oracle `user/pass@`, `pwd=`, and JDBC braced `{p;w}}x}` values are fully redacted.
+        assert_eq!(
+            redact_url("jdbc:oracle:thin:scott/tiger@//db:1521/orcl"),
+            "jdbc:oracle:thin:scott/***@//db:1521/orcl"
+        );
+        assert_eq!(
+            redact_url("jdbc:oracle:thin:scott/p:w@2@db:1521:XE"),
+            "jdbc:oracle:thin:scott/***@db:1521:XE"
+        );
+        assert_eq!(
+            redact_url("jdbc:sqlserver://h;uid=sa;pwd=s3cret;encrypt=true"),
+            "jdbc:sqlserver://h;uid=sa;pwd=***;encrypt=true"
+        );
+        assert_eq!(
+            redact_url("jdbc:sqlserver://h;user=sa;password={a;b}}c;d};x=1"),
+            "jdbc:sqlserver://h;user=sa;password=***;x=1"
+        );
+        assert_eq!(
+            redact_url("jdbc:sqlserver://h;user=sa;PWD={unterminated;s3cret"),
+            "jdbc:sqlserver://h;user=sa;PWD=***"
+        );
+        assert_eq!(
+            redact_url("postgres://h/db?user=a&pwd=secret&api_key=k123&sslmode=require"),
+            "postgres://h/db?user=a&pwd=***&api_key=***&sslmode=require"
+        );
+        // File schemes with `@` in paths are not mistakenly treated as `user/pass@`.
+        assert_eq!(
+            redact_url("sqlite:dir/user@host.db"),
+            "sqlite:dir/user@host.db"
+        );
+        let e = parse_connection_url("jdbc:unknown:scott/s3cret@host;pwd={x;y}}z}").unwrap_err();
+        assert!(!e.message.contains("s3cret"), "{}", e.message);
+        assert!(!e.message.contains("x;y"), "{}", e.message);
     }
 
     #[test]

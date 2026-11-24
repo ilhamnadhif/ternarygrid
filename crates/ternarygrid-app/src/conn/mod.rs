@@ -63,12 +63,16 @@ pub struct Credentials {
     pub properties: Vec<(String, Secret)>,
 }
 
-/// The secret properties of connection `id` kept in `secrets`.
-fn secret_properties(secrets: &dyn SecretSource, id: &str) -> Vec<(String, Secret)> {
-    ternarygrid_core::config::SECRET_PROPERTIES
-        .iter()
-        .filter_map(|n| secrets.get(&ternarygrid_core::config::property_secret_key(id, n)).ok().flatten().map(|v| (n.to_string(), v)))
-        .collect()
+/// The secret properties of connection `cfg` kept in `secrets`.
+/// Only reads from the secret store for database kinds that actually use
+/// secret driver properties (currently Elasticsearch's `api_key`), so
+/// file-based and secret-free connections never trigger an OS keychain lookup.
+fn secret_properties(secrets: &dyn SecretSource, cfg: &ConnectionConfig) -> Vec<(String, Secret)> {
+    let names: &[&str] = match cfg.kind {
+        DbKind::Elasticsearch => ternarygrid_core::config::SECRET_PROPERTIES,
+        _ => return Vec::new(),
+    };
+    names.iter().filter_map(|n| secrets.get(&ternarygrid_core::config::property_secret_key(&cfg.id, n)).ok().flatten().map(|v| (n.to_string(), v))).collect()
 }
 
 /// Something the user must enter before a connection can be opened.
@@ -522,7 +526,14 @@ impl LiveConnection {
         if database.is_some() {
             params.database = database.clone();
         }
-        let cfg = self.config.clone();
+        let mut cfg = self.config.clone();
+        if read_only {
+            // Forced read-only sessions (e.g. AI assistant queries) skip user `init_sql`:
+            // a read-write connection's init script could disable read-only mode, write
+            // data, or fail on a read-only session. `default_schema` and `time_zone`
+            // (already applied to `params`) still take effect.
+            cfg.init.init_sql.clear();
+        }
         let tab_sessions = self.tab_sessions.clone();
         let answered = self.revive.answered.clone();
         let closed = self.closed.clone();
@@ -604,6 +615,39 @@ async fn verify_sessions(main: SessionHandle, others: Vec<SessionHandle>, tunnel
     }
 }
 
+/// Split an initialization SQL script into statements using the dialect's
+/// quote-, comment-, and dollar-quote-aware splitter (never splitting on blank
+/// lines or treating `@...` as client commands).
+fn split_init_sql(sql: &str, dialect: &dyn Dialect) -> Vec<String> {
+    let opts = ternarygrid_sql::SplitOptions { delimiter: ";".into(), blank_line: ternarygrid_sql::BlankLineMode::Never, client_commands: false };
+    ternarygrid_sql::split_statements(sql, dialect.syntax(), &opts).into_iter().map(|span| span.text(sql).trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+/// Verify that initialization SQL on a read-only connection does not write
+/// data/schema or alter read-only session settings.
+fn check_read_only_init_sql(sql: &str, dialect: &dyn Dialect, conn_name: &str) -> DbResult<()> {
+    if sql.trim().is_empty() {
+        return Ok(());
+    }
+    let syntax = dialect.syntax();
+    let lang = dialect.kind().language();
+    let rejects = |stmt: &str| {
+        let info = ternarygrid_sql::classify_command(stmt, lang).unwrap_or_else(|| ternarygrid_sql::classify(stmt, syntax));
+        if info.is_write {
+            return true;
+        }
+        // Defense-in-depth for non-standard forms that touch read-only flags.
+        let lower = stmt.to_ascii_lowercase();
+        lower.contains("query_only")
+    };
+    for stmt in split_init_sql(sql, dialect) {
+        if rejects(&stmt) {
+            return Err(DbError::read_only(format!("Initialization SQL on read-only connection \"{conn_name}\" cannot modify data, schema, or read-only mode")));
+        }
+    }
+    Ok(())
+}
+
 /// Apply transaction mode, default schema and init SQL after connecting.
 pub async fn init_session(s: &mut dyn ternarygrid_core::Session, cfg: &ConnectionConfig, params: &ConnectParams) -> DbResult<()> {
     // A database without transactions (ClickHouse) stays in auto-commit: its session
@@ -621,44 +665,19 @@ pub async fn init_session(s: &mut dyn ternarygrid_core::Session, cfg: &Connectio
     {
         tracing::warn!("cannot set default schema: {e}");
     }
-    for stmt in split_simple(&cfg.init.init_sql) {
+    let dialect = s.dialect();
+    if params.read_only || cfg.read_only {
+        check_read_only_init_sql(&cfg.init.init_sql, dialect.as_ref(), &cfg.name)?;
+    }
+    for stmt in split_init_sql(&cfg.init.init_sql, dialect.as_ref()) {
         ternarygrid_core::driver::execute_update(s, &stmt, &[]).await.map_err(|e| e.with_context("Initialization SQL"))?;
     }
     Ok(())
 }
 
-/// Minimal `;` splitter for initialization scripts (quotes aware).
+/// Comment- and quote-aware `;` splitter for initialization scripts (ANSI SQL syntax).
 pub fn split_simple(sql: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quote: Option<char> = None;
-    for c in sql.chars() {
-        match quote {
-            Some(q) => {
-                cur.push(c);
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                '\'' | '"' | '`' => {
-                    quote = Some(c);
-                    cur.push(c);
-                }
-                ';' => {
-                    if !cur.trim().is_empty() {
-                        out.push(cur.trim().to_string());
-                    }
-                    cur.clear();
-                }
-                _ => cur.push(c),
-            },
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim().to_string());
-    }
-    out
+    split_init_sql(sql, &ternarygrid_core::dialect::GenericDialect::new())
 }
 
 /// Time zone set on new sessions (see [`TimeZoneChoice`]): a zone name for
@@ -864,7 +883,7 @@ pub async fn connect_saved(
         ssh_password: get(SecretSlot::SshPassword, net_cfg.ssh.is_some()),
         ssh_passphrase: get(SecretSlot::SshPassphrase, net_cfg.ssh.is_some()),
         proxy_password: get(SecretSlot::ProxyPassword, net_cfg.proxy.is_some()),
-        properties: secret_properties(secrets, &cfg.id),
+        properties: secret_properties(secrets, &cfg),
     };
     let mut eff = cfg.clone();
     eff.ssh = net_cfg.ssh;
@@ -1155,7 +1174,7 @@ impl ConnectionManager {
             ssh_password: prompted.ssh_password.clone().or_else(|| get(SecretSlot::SshPassword, net.ssh.is_some())),
             ssh_passphrase: prompted.ssh_passphrase.clone().or_else(|| get(SecretSlot::SshPassphrase, net.ssh.is_some())),
             proxy_password: prompted.proxy_password.clone().or_else(|| get(SecretSlot::ProxyPassword, net.proxy.is_some())),
-            properties: secret_properties(self.secrets.as_ref(), &cfg.id),
+            properties: secret_properties(self.secrets.as_ref(), cfg),
         }
     }
 
@@ -1543,6 +1562,31 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_connection_never_touches_secret_store() {
+        struct PanicSecrets;
+        impl SecretSource for PanicSecrets {
+            fn get(&self, key: &str) -> DbResult<Option<Secret>> {
+                panic!("unexpected secret store read for key {key}");
+            }
+            fn set(&self, key: &str, _value: &Secret) -> DbResult<()> {
+                panic!("unexpected secret store write for key {key}");
+            }
+            fn delete(&self, key: &str) -> DbResult<()> {
+                panic!("unexpected secret store delete for key {key}");
+            }
+        }
+        let mut cm = ConnectionManager::new(crate::driver_registry(), Arc::new(PanicSecrets), Arc::new(DirectNet));
+        let mut cfg = ConnectionConfig::new(DbKind::Sqlite, "local");
+        cfg.file_path = Some(":memory:".into());
+        cfg.auth = AuthMethod::None;
+        let id = cfg.id.clone();
+        cm.upsert(cfg);
+        let stored = cm.config(&id).unwrap().clone();
+        let creds = cm.credentials_for(&stored, &Credentials::default());
+        assert!(creds.password.is_none() && creds.properties.is_empty());
+    }
+
+    #[test]
     fn session_time_zones() {
         assert_eq!(format_offset(25_200), "+07:00");
         assert_eq!(format_offset(-19_800), "-05:30");
@@ -1781,5 +1825,102 @@ mod tests {
     fn simple_split() {
         assert_eq!(split_simple("set a=1; select ';'; \n"), vec!["set a=1".to_string(), "select ';'".to_string()]);
         assert!(split_simple("  ").is_empty());
+        // Comments containing quotes or semicolons do not corrupt statement splitting.
+        assert_eq!(split_simple("-- don't break; here\nSET a = 1; /* block ; ' comment */ SELECT 2;"), vec!["SET a = 1".to_string(), "SELECT 2".to_string()]);
+        assert!(split_simple("-- only a comment\n/* and a block comment */").is_empty());
+        // Blank lines inside a statement do not prematurely split init_sql.
+        assert_eq!(split_simple("SELECT\n\n1; SELECT 2;"), vec!["SELECT\n\n1".to_string(), "SELECT 2".to_string()]);
+    }
+
+    #[test]
+    fn read_only_init_sql_validation_blocks_writes_and_mode_toggles() {
+        let reg = crate::driver_registry();
+        let pg = reg.get(DbKind::Postgres).unwrap().dialect();
+        let mysql = reg.get(DbKind::MySql).unwrap().dialect();
+        let sqlite = reg.get(DbKind::Sqlite).unwrap().dialect();
+        let redis = reg.get(DbKind::Redis).unwrap().dialect();
+
+        // Safe session configuration is allowed.
+        assert!(check_read_only_init_sql("SET search_path TO analytics; SET timezone = 'UTC'", pg.as_ref(), "ro").is_ok());
+        assert!(check_read_only_init_sql("SELECT 1", sqlite.as_ref(), "ro").is_ok());
+        assert!(check_read_only_init_sql("PING", redis.as_ref(), "ro").is_ok());
+
+        // Attempting to disable read-only mode or write data/schema is refused.
+        for bad in [
+            "SET default_transaction_read_only = off",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+            "RESET default_transaction_read_only",
+            "RESET ALL",
+            "CREATE TEMP TABLE scratch (id int)",
+            "INSERT INTO t VALUES (1)",
+        ] {
+            let err = check_read_only_init_sql(bad, pg.as_ref(), "ro").unwrap_err();
+            assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly, "expected ReadOnly for {bad}: {err}");
+        }
+        for bad in ["SET SESSION transaction_read_only = 0", "SET TRANSACTION READ WRITE"] {
+            let err = check_read_only_init_sql(bad, mysql.as_ref(), "ro").unwrap_err();
+            assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly, "expected ReadOnly for {bad}: {err}");
+        }
+        for bad in ["PRAGMA query_only = 0", "PRAGMA query_only = OFF", "DELETE FROM t"] {
+            let err = check_read_only_init_sql(bad, sqlite.as_ref(), "ro").unwrap_err();
+            assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly, "expected ReadOnly for {bad}: {err}");
+        }
+        let err = check_read_only_init_sql("SET k v", redis.as_ref(), "ro").unwrap_err();
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly);
+    }
+
+    #[tokio::test]
+    async fn init_session_refuses_writing_init_sql_on_read_only_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ro.db");
+        let mut rw_cfg = ConnectionConfig::new(DbKind::Sqlite, "rw");
+        rw_cfg.file_path = Some(db_path.display().to_string());
+        let driver = ternarygrid_driver_sqlite::SqliteDriver::new();
+        let mut s = driver.connect(&ConnectParams::from_config(&rw_cfg, None)).await.unwrap();
+        ternarygrid_core::driver::execute_update(s.as_mut(), "CREATE TABLE t (id INTEGER)", &[]).await.unwrap();
+        s.close().await.unwrap();
+
+        let mut ro_cfg = ConnectionConfig::new(DbKind::Sqlite, "ro");
+        ro_cfg.file_path = Some(db_path.display().to_string());
+        ro_cfg.read_only = true;
+        ro_cfg.init.init_sql = "PRAGMA query_only = 0; INSERT INTO t VALUES (1)".into();
+        let params = ConnectParams::from_config(&ro_cfg, None);
+        let mut ro_s = driver.connect(&params).await.unwrap();
+        let err = init_session(ro_s.as_mut(), &ro_cfg, &params).await.unwrap_err();
+        assert_eq!(err.kind, ternarygrid_core::ErrorKind::ReadOnly);
+        let (_, rows) = ternarygrid_core::driver::query_all(ro_s.as_mut(), "SELECT COUNT(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rows[0][0].as_i64(), Some(0), "init_sql must not execute any statement when rejected");
+        ro_s.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_read_only_session_skips_connection_init_sql() {
+        let backend = Backend::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ai-ro.db");
+        let mut cfg = ConnectionConfig::new(DbKind::Sqlite, "dev");
+        cfg.file_path = Some(db_path.display().to_string());
+        cfg.init.init_sql = "CREATE TABLE IF NOT EXISTS init_log (id INTEGER); INSERT INTO init_log VALUES (1)".into();
+        let mut cm = ConnectionManager::new(crate::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
+        let id = cfg.id.clone();
+        cm.upsert(cfg);
+        cm.connect(&backend, &id, Credentials::default()).unwrap();
+        wait_for("connect", || {
+            cm.poll(&backend);
+            cm.is_connected(&id)
+        });
+        // Normal connect ran init_sql once.
+        let (_, rows) = backend.block_on(cm.live(&id).unwrap().main.query_all("SELECT COUNT(*) FROM init_log", &[])).unwrap();
+        assert_eq!(rows[0][0].as_i64(), Some(1));
+
+        // Forced read-only session (AI queries) opens cleanly without re-running init_sql
+        // and keeps SQLite's read-only enforcement intact.
+        let ai_session = backend.block_on(cm.live(&id).unwrap().open_read_only_session_future("ai".into(), None)).unwrap();
+        let (_, rows) = backend.block_on(ai_session.query_all("SELECT COUNT(*) FROM init_log", &[])).unwrap();
+        assert_eq!(rows[0][0].as_i64(), Some(1), "read-only session must skip init_sql");
+        let write_res = backend.block_on(ai_session.execute("INSERT INTO init_log VALUES (2)", &[], &ternarygrid_core::driver::ExecOptions::default()));
+        assert!(write_res.is_err(), "read-only session must reject writes");
+        cm.disconnect(&backend, &id);
     }
 }

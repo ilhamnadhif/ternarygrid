@@ -432,7 +432,11 @@ impl Engine<'_> {
 
     fn compare(&mut self, key: Vec<Value>, s: &Row, t: &Row) {
         let mut differing = Vec::new();
+        let mut seen = HashSet::new();
         for (i, (&si, &ti)) in self.lay.src_cols.iter().zip(&self.lay.tgt_cols).enumerate() {
+            if self.lay.tgt_keys.contains(&ti) || !seen.insert(ti) {
+                continue;
+            }
             if !values_equal(cell(s, si), cell(t, ti), &self.job.options) {
                 differing.push(i);
             }
@@ -462,11 +466,17 @@ impl Engine<'_> {
         if self.sync_room() {
             let mut cols = Vec::new();
             let mut vals = Vec::new();
+            let mut seen = HashSet::new();
             for (&sk, &tk) in self.lay.src_keys.iter().zip(&self.lay.tgt_keys) {
-                cols.push(self.dst.quote_ident(&self.tgt_meta[tk].name));
-                vals.push(self.lit(tk, cell(s, sk)));
+                if seen.insert(tk) {
+                    cols.push(self.dst.quote_ident(&self.tgt_meta[tk].name));
+                    vals.push(self.lit(tk, cell(s, sk)));
+                }
             }
             for (&sc, &tc) in self.lay.src_cols.iter().zip(&self.lay.tgt_cols) {
+                if self.lay.tgt_keys.contains(&tc) || !seen.insert(tc) {
+                    continue;
+                }
                 cols.push(self.dst.quote_ident(&self.tgt_meta[tc].name));
                 vals.push(self.lit(tc, cell(s, sc)));
             }
@@ -491,7 +501,9 @@ impl Engine<'_> {
         // SQL Server refuses explicit values for an identity column unless IDENTITY_INSERT is on.
         if self.dst.kind() == ternarygrid_core::DbKind::SqlServer && !self.inserts.is_empty() {
             let table = self.table();
-            let names: Vec<String> = self.lay.tgt_keys.iter().chain(&self.lay.tgt_cols).map(|&i| self.dst.string_literal(&self.tgt_meta[i].name)).collect();
+            let mut seen = HashSet::new();
+            let names: Vec<String> =
+                self.lay.tgt_keys.iter().chain(&self.lay.tgt_cols).copied().filter(|i| seen.insert(*i)).map(|i| self.dst.string_literal(&self.tgt_meta[i].name)).collect();
             let when =
                 format!("IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID({}) AND name IN ({}))", self.dst.string_literal(&table), names.join(", "));
             self.inserts.insert(0, format!("{when} SET IDENTITY_INSERT {table} ON"));

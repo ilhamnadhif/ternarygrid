@@ -333,6 +333,58 @@ pub fn schtasks_task_name(task_id: &str) -> String {
 }
 
 const WIN_DAYS: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+const WIN_XML_DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+fn validate_schtasks_inputs(task_id: &str, exe: &Path) -> DbResult<String> {
+    let exe_str = exe.to_string_lossy();
+    if exe_str.is_empty() {
+        return Err(DbError::config("The program path is empty"));
+    }
+    if task_id.chars().chain(exe_str.chars()).any(char::is_control) {
+        return Err(DbError::config("The task id or the program path contains a control character"));
+    }
+    if exe_str.contains('"') {
+        return Err(DbError::config("The program path must not contain double quotes"));
+    }
+    if exe_str.ends_with('\\') {
+        return Err(DbError::config("The program path must not end with a backslash"));
+    }
+    Ok(exe_str.into_owned())
+}
+
+/// Quotes an argument for Windows `CommandLineToArgvW` / `schtasks /TR`.
+fn windows_quote_arg(s: &str) -> String {
+    if !s.is_empty() && sanitize(s) == s {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in s.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..(backslashes * 2 + 1) {
+                    out.push('\\');
+                }
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
 
 fn schtasks_schedule(schedule: &Schedule) -> DbResult<Vec<String>> {
     schedule.validate().map_err(|e| DbError::config(e.to_string()))?;
@@ -361,9 +413,12 @@ fn schtasks_schedule(schedule: &Schedule) -> DbResult<Vec<String>> {
                 Ok(a(&["/SC", "WEEKLY", "/D", &d, "/ST", &st]))
             }
         }
-        Schedule::Once { at } => {
-            // /SD uses the locale's short date format; MM/DD/YYYY is the en-US one
-            Ok(a(&["/SC", "ONCE", "/SD", &at.format("%m/%d/%Y").to_string(), "/ST", &at.format("%H:%M").to_string()]))
+        Schedule::Once { .. } => {
+            // `/SD` parses dates according to the active Windows locale (MM/DD/YYYY vs
+            // DD/MM/YYYY vs YYYY/MM/DD), so a hardcoded date format silently schedules
+            // the wrong date or fails on non-US systems. Use `schtasks_xml` +
+            // `schtasks_create_from_xml` (ISO-8601 `<StartBoundary>`) instead.
+            Err(unsupported(tr("One-time schedules require XML registration in the Windows Task Scheduler (schtasks /XML) because /SD is locale-dependent").to_string()))
         }
         Schedule::Cron(expr) => {
             let f: Vec<&str> = expr.split_whitespace().collect();
@@ -393,13 +448,152 @@ fn schtasks_schedule(schedule: &Schedule) -> DbResult<Vec<String>> {
     }
 }
 
+fn schtasks_xml_trigger(schedule: &Schedule) -> DbResult<String> {
+    schedule.validate().map_err(|e| DbError::config(e.to_string()))?;
+    match schedule {
+        Schedule::Once { at } => {
+            Ok(format!("    <TimeTrigger>\n      <StartBoundary>{}</StartBoundary>\n      <Enabled>true</Enabled>\n    </TimeTrigger>\n", at.format("%Y-%m-%dT%H:%M:%S")))
+        }
+        Schedule::Interval { every_secs } => {
+            let s = *every_secs;
+            if s % 86_400 == 0 {
+                Ok(format!(
+                    "    <CalendarTrigger>\n      <StartBoundary>2000-01-01T00:00:00</StartBoundary>\n      <Enabled>true</Enabled>\n      <ScheduleByDay>\n        <DaysInterval>{}</DaysInterval>\n      </ScheduleByDay>\n    </CalendarTrigger>\n",
+                    s / 86_400
+                ))
+            } else if s % 3600 == 0 && s / 3600 <= 23 {
+                Ok(format!(
+                    "    <CalendarTrigger>\n      <Repetition>\n        <Interval>PT{}H</Interval>\n        <StopAtDurationEnd>false</StopAtDurationEnd>\n      </Repetition>\n      <StartBoundary>2000-01-01T00:00:00</StartBoundary>\n      <Enabled>true</Enabled>\n      <ScheduleByDay>\n        <DaysInterval>1</DaysInterval>\n      </ScheduleByDay>\n    </CalendarTrigger>\n",
+                    s / 3600
+                ))
+            } else if s % 60 == 0 && s / 60 <= 1439 {
+                Ok(format!(
+                    "    <CalendarTrigger>\n      <Repetition>\n        <Interval>PT{}M</Interval>\n        <StopAtDurationEnd>false</StopAtDurationEnd>\n      </Repetition>\n      <StartBoundary>2000-01-01T00:00:00</StartBoundary>\n      <Enabled>true</Enabled>\n      <ScheduleByDay>\n        <DaysInterval>1</DaysInterval>\n      </ScheduleByDay>\n    </CalendarTrigger>\n",
+                    s / 60
+                ))
+            } else {
+                Err(unsupported(trf("An interval of {} s cannot be expressed in the Windows Task Scheduler", &[&s])))
+            }
+        }
+        Schedule::Daily { at, weekdays } => {
+            let t = parse_time_of_day(at).map_err(|e| DbError::config(e.to_string()))?;
+            let start = format!("2000-01-01T{:02}:{:02}:00", t.hour(), t.minute());
+            let days: BTreeSet<usize> = weekdays.iter().map(|d| usize::from(*d) % 7).collect();
+            if days.is_empty() || days.len() == 7 {
+                Ok(format!(
+                    "    <CalendarTrigger>\n      <StartBoundary>{start}</StartBoundary>\n      <Enabled>true</Enabled>\n      <ScheduleByDay>\n        <DaysInterval>1</DaysInterval>\n      </ScheduleByDay>\n    </CalendarTrigger>\n"
+                ))
+            } else {
+                let mut d = String::new();
+                for day in days {
+                    d.push_str(&format!("          <{}/>\n", WIN_XML_DAYS[day]));
+                }
+                Ok(format!(
+                    "    <CalendarTrigger>\n      <StartBoundary>{start}</StartBoundary>\n      <Enabled>true</Enabled>\n      <ScheduleByWeek>\n        <WeeksInterval>1</WeeksInterval>\n        <DaysOfWeek>\n{d}        </DaysOfWeek>\n      </ScheduleByWeek>\n    </CalendarTrigger>\n"
+                ))
+            }
+        }
+        Schedule::Cron(expr) => {
+            let f: Vec<&str> = expr.split_whitespace().collect();
+            let num = |s: &str| s.parse::<u32>().ok();
+            match f.as_slice() {
+                [m, "*", "*", "*", "*"] if m.starts_with("*/") => {
+                    let n = num(&m[2..]).ok_or_else(|| unsupported(tr("This cron expression is too complex for the Windows Task Scheduler").to_string()))?;
+                    schtasks_xml_trigger(&Schedule::Interval { every_secs: u64::from(n) * 60 })
+                }
+                ["0", h, "*", "*", "*"] if h.starts_with("*/") => {
+                    let n = num(&h[2..]).ok_or_else(|| unsupported(tr("This cron expression is too complex for the Windows Task Scheduler").to_string()))?;
+                    schtasks_xml_trigger(&Schedule::Interval { every_secs: u64::from(n) * 3600 })
+                }
+                [m, h, "*", "*", dow] if num(m).is_some() && num(h).is_some() => {
+                    if *dow == "*" {
+                        schtasks_xml_trigger(&Schedule::Daily { at: format!("{h}:{m}"), weekdays: Vec::new() })
+                    } else {
+                        let c = compile_cron(expr).map_err(|e| DbError::config(e.to_string()))?;
+                        let days: Vec<u8> = c.primary.days_of_week().iter().map(|d| ((d + 6) % 7) as u8).collect();
+                        schtasks_xml_trigger(&Schedule::Daily { at: format!("{h}:{m}"), weekdays: days.into_iter().map(|d| if d == 0 { 7 } else { d }).collect() })
+                    }
+                }
+                _ => Err(unsupported(tr("This cron expression is too complex for the Windows Task Scheduler; use an interval or a daily schedule").to_string())),
+            }
+        }
+    }
+}
+
+/// Locale-independent Windows Task Scheduler 1.2 XML for registering `task`
+/// via `schtasks /Create /F /TN <name> /XML <file>` ([`schtasks_create_from_xml`]).
+///
+/// Uses ISO-8601 `<StartBoundary>YYYY-MM-DDTHH:MM:SS</StartBoundary>` and
+/// separate XML-escaped `<Command>` / `<Arguments>` elements.
+pub fn schtasks_xml(task: &TaskDef, exe: &Path) -> DbResult<String> {
+    let exe_str = validate_schtasks_inputs(&task.id, exe)?;
+    let trigger = schtasks_xml_trigger(require_schedule(task)?)?;
+    let args = format!("--run-task {}", windows_quote_arg(&task.id));
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+         \x20 <RegistrationInfo>\n\
+         \x20   <Description>{}</Description>\n\
+         \x20 </RegistrationInfo>\n\
+         \x20 <Triggers>\n\
+         {trigger}\
+         \x20 </Triggers>\n\
+         \x20 <Settings>\n\
+         \x20   <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
+         \x20   <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
+         \x20   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
+         \x20   <Enabled>true</Enabled>\n\
+         \x20 </Settings>\n\
+         \x20 <Actions Context=\"Author\">\n\
+         \x20   <Exec>\n\
+         \x20     <Command>{}</Command>\n\
+         \x20     <Arguments>{}</Arguments>\n\
+         \x20   </Exec>\n\
+         \x20 </Actions>\n\
+         </Task>\n",
+        xml(&task.name),
+        xml(&exe_str),
+        xml(&args),
+    ))
+}
+
+/// Path of a task's Windows Task Scheduler XML file inside `dir`.
+pub fn windows_task_xml_file(dir: &Path, task_id: &str) -> PathBuf {
+    dir.join(format!("task-{}.xml", sanitize(task_id)))
+}
+
+/// Write the task's Windows Task Scheduler XML into `dir` and return its path;
+/// register it with [`schtasks_create_from_xml`].
+pub fn install_windows_task_xml(task: &TaskDef, exe: &Path, dir: &Path) -> DbResult<PathBuf> {
+    let content = schtasks_xml(task, exe)?;
+    std::fs::create_dir_all(dir).map_err(|e| DbError::io(format!("{}: {e}", dir.display())))?;
+    let path = windows_task_xml_file(dir, &task.id);
+    std::fs::write(&path, content).map_err(|e| DbError::io(format!("{}: {e}", path.display())))?;
+    Ok(path)
+}
+
+/// `schtasks /Create /F /TN <name> /XML <xml_file>` command registering a task
+/// from a locale-independent XML definition produced by [`schtasks_xml`].
+pub fn schtasks_create_from_xml(task_id: &str, xml_file: &Path) -> OsCommand {
+    OsCommand {
+        program: "schtasks".into(),
+        args: vec!["/Create".into(), "/F".into(), "/TN".into(), schtasks_task_name(task_id), "/XML".into(), xml_file.to_string_lossy().to_string()],
+    }
+}
+
 /// `schtasks /Create` command registering the task.
+///
+/// Rejects unsafe characters in `exe` or `task.id` (`"`, control characters,
+/// or trailing `\`). One-time schedules (`Schedule::Once`) require
+/// [`schtasks_xml`] + [`schtasks_create_from_xml`] because `/SD` is
+/// locale-dependent on Windows.
 pub fn schtasks_create(task: &TaskDef, exe: &Path) -> DbResult<OsCommand> {
+    let exe_str = validate_schtasks_inputs(&task.id, exe)?;
     let sched = schtasks_schedule(require_schedule(task)?)?;
     let mut args = vec!["/Create".to_string(), "/F".to_string(), "/TN".to_string(), schtasks_task_name(&task.id), "/TR".to_string()];
     // The real id (quoted when needed): a sanitized one would not find the task.
-    let id = if sanitize(&task.id) == task.id { task.id.clone() } else { format!("\"{}\"", task.id.replace('"', "\\\"")) };
-    args.push(format!("\"{}\" --run-task {id}", exe.to_string_lossy()));
+    let id = windows_quote_arg(&task.id);
+    args.push(format!("\"{exe_str}\" --run-task {id}"));
     args.extend(sched);
     Ok(OsCommand { program: "schtasks".into(), args })
 }
@@ -534,5 +728,59 @@ mod tests {
         assert!(args(Schedule::Cron("0 0 1 * *".into())).is_err());
         assert!(args(Schedule::Interval { every_secs: 45 }).is_err());
         assert_eq!(schtasks_delete("1234-abcd").args, vec!["/Delete", "/F", "/TN", "TernaryGrid\\task-1234-abcd"]);
+    }
+
+    #[test]
+    fn schtasks_rejects_unsafe_exe_and_id_and_locale_dependent_once() {
+        let sched = Schedule::Daily { at: "08:00".into(), weekdays: Vec::new() };
+        let t = task(sched.clone());
+        // Quotes, control characters, trailing backslash or empty path in exe are rejected.
+        for bad_exe in ["", "C:\\Program Files\\bad\"quote\\ternarygrid.exe", "C:\\dir\\app.exe\r\n/SC MINUTE", "C:\\dir\\app.exe\0evil", "C:\\trailing\\backslash\\"] {
+            let err = schtasks_create(&t, Path::new(bad_exe)).unwrap_err();
+            assert_eq!(err.kind, ternarygrid_core::ErrorKind::Config, "{bad_exe:?}: {err}");
+            let xml_err = schtasks_xml(&t, Path::new(bad_exe)).unwrap_err();
+            assert_eq!(xml_err.kind, ternarygrid_core::ErrorKind::Config, "{bad_exe:?}: {xml_err}");
+        }
+        // Control characters in task id are rejected.
+        let mut evil = task(sched);
+        evil.id = "id\nwith-newline".into();
+        assert_eq!(schtasks_create(&evil, &exe()).unwrap_err().kind, ternarygrid_core::ErrorKind::Config);
+        assert_eq!(schtasks_xml(&evil, &exe()).unwrap_err().kind, ternarygrid_core::ErrorKind::Config);
+
+        // Schedule::Once is rejected by schtasks_create (/SD is locale-dependent).
+        let at = Local.with_ymd_and_hms(2030, 2, 13, 4, 5, 0).earliest().unwrap();
+        let once = task(Schedule::Once { at });
+        assert_eq!(schtasks_create(&once, &exe()).unwrap_err().kind, ternarygrid_core::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn schtasks_xml_is_locale_independent_and_escaped() {
+        let at = Local.with_ymd_and_hms(2030, 2, 13, 4, 5, 0).earliest().unwrap();
+        let mut t = task(Schedule::Once { at });
+        t.id = "a&b <c>".into();
+        let win_exe = Path::new("C:\\Program Files\\R&D <test>\\ternarygrid.exe");
+        let doc = schtasks_xml(&t, win_exe).unwrap();
+        assert!(doc.contains("<TimeTrigger>"), "{doc}");
+        assert!(doc.contains("<StartBoundary>2030-02-13T04:05:00</StartBoundary>"), "{doc}");
+        assert!(doc.contains("<Description>Nightly &lt;backup&gt;</Description>"), "{doc}");
+        assert!(doc.contains("<Command>C:\\Program Files\\R&amp;D &lt;test&gt;\\ternarygrid.exe</Command>"), "{doc}");
+        assert!(doc.contains("<Arguments>--run-task &quot;a&amp;b &lt;c&gt;&quot;</Arguments>"), "{doc}");
+
+        // Weekly & interval XML triggers.
+        let weekly = schtasks_xml(&task(Schedule::Daily { at: "22:00".into(), weekdays: vec![1, 7] }), win_exe).unwrap();
+        assert!(weekly.contains("<Sunday/>") && weekly.contains("<Monday/>"), "{weekly}");
+        assert!(weekly.contains("2000-01-01T22:00:00"), "{weekly}");
+
+        let interval = schtasks_xml(&task(Schedule::Interval { every_secs: 900 }), win_exe).unwrap();
+        assert!(interval.contains("<Interval>PT15M</Interval>"), "{interval}");
+
+        // Installing to a directory + creating the /XML command.
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = install_windows_task_xml(&t, win_exe, dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&xml_path).unwrap(), doc);
+        let cmd = schtasks_create_from_xml(&t.id, &xml_path);
+        assert_eq!(cmd.program, "schtasks");
+        assert_eq!(cmd.args[..5], ["/Create", "/F", "/TN", "TernaryGrid\\task-a_b__c_", "/XML"]);
+        assert_eq!(cmd.args[5], xml_path.to_string_lossy());
     }
 }

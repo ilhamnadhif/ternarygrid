@@ -22,22 +22,36 @@ use ternarygrid_core::plan::{PlanNode, QueryPlan};
 use ternarygrid_core::value::ColumnMeta;
 use ternarygrid_core::{
     CancelHandle, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions, QueryCursor,
-    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value,
+    ResultHeader, Row, ServerMessage, Session, TransactionMode, Value, trf,
 };
 
 /// Rows the server sends per round trip.
 const FETCH_ARRAY: u32 = 500;
 
+/// Reject characters that could break out of a TNS connect descriptor value.
+fn validate_tns_value(field: &str, value: &str) -> DbResult<()> {
+    if value
+        .chars()
+        .any(|c| matches!(c, '(' | ')' | '=' | '\r' | '\n' | '\0'))
+    {
+        return Err(DbError::config(format!(
+            "Invalid Oracle {field}: contains forbidden TNS descriptor characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Connect descriptor for `params`: a service name (the database field) or a
 /// `sid` property, over TCP or TCPS, or the `connect_descriptor` property as is.
-pub(crate) fn descriptor(params: &ConnectParams) -> String {
+pub(crate) fn descriptor(params: &ConnectParams) -> DbResult<String> {
     if let Some(d) = params
         .property("connect_descriptor")
         .map(str::trim)
         .filter(|d| !d.is_empty())
     {
-        return d.to_string();
+        return Ok(d.to_string());
     }
+    validate_tns_value("host", &params.host)?;
     // TCPS is a listener of its own: "prefer" cannot fall back, so it means TCP.
     let tls = matches!(
         params.ssl.mode,
@@ -49,16 +63,20 @@ pub(crate) fn descriptor(params: &ConnectParams) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(sid) => format!("(SID={sid})"),
-        None => format!(
-            "(SERVICE_NAME={})",
-            params
+        Some(sid) => {
+            validate_tns_value("SID", sid)?;
+            format!("(SID={sid})")
+        }
+        None => {
+            let service = params
                 .database
                 .as_deref()
                 .map(str::trim)
                 .filter(|d| !d.is_empty())
-                .unwrap_or("FREEPDB1")
-        ),
+                .unwrap_or("FREEPDB1");
+            validate_tns_value("service name", service)?;
+            format!("(SERVICE_NAME={service})")
+        }
     };
     let mut security = String::new();
     if tls {
@@ -69,10 +87,182 @@ pub(crate) fn descriptor(params: &ConnectParams) -> String {
         };
         security = format!("(SECURITY=(SSL_SERVER_DN_MATCH={verify}))");
     }
-    format!(
+    Ok(format!(
         "(DESCRIPTION=(ADDRESS=(PROTOCOL={protocol})(HOST={})(PORT={})){security}(CONNECT_DATA={target}))",
         params.host, params.port
-    )
+    ))
+}
+
+/// Token used for conservative Oracle read-only statement classification.
+#[derive(Debug, PartialEq, Eq)]
+enum OraTok {
+    Word(String),
+    Quoted(String),
+    Punct(char),
+    Literal,
+}
+
+/// Tokenize Oracle SQL, skipping comments, single-quoted strings, and Oracle
+/// `q'...'` alternative quote literals.
+fn oracle_tokens(sql: &str) -> Vec<OraTok> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '-' && chars.get(i + 1) == Some(&'-') {
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if (c == 'q' || c == 'Q') && chars.get(i + 1) == Some(&'\'') && i + 2 < chars.len() {
+            let open = chars[i + 2];
+            let close = match open {
+                '[' => ']',
+                '{' => '}',
+                '(' => ')',
+                '<' => '>',
+                other => other,
+            };
+            i += 3;
+            while i < chars.len() {
+                if chars[i] == close && chars.get(i + 1) == Some(&'\'') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            out.push(OraTok::Literal);
+        } else if c == '\'' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    i += 1;
+                    if chars.get(i) == Some(&'\'') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(OraTok::Literal);
+        } else if c == '"' {
+            i += 1;
+            let mut s = String::new();
+            while i < chars.len() {
+                if chars[i] == '"' {
+                    i += 1;
+                    if chars.get(i) == Some(&'"') {
+                        s.push('"');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    s.push(chars[i]);
+                    i += 1;
+                }
+            }
+            out.push(OraTok::Quoted(s));
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            i += 1;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '_' | '$' | '#'))
+            {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            out.push(OraTok::Word(word.to_ascii_uppercase()));
+        } else {
+            out.push(OraTok::Punct(c));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Conservative check for statements allowed on a read-only Oracle connection.
+fn is_read_only_sql(sql: &str) -> bool {
+    let toks = oracle_tokens(sql);
+    let mut start = 0;
+    while matches!(toks.get(start), Some(OraTok::Punct('('))) {
+        start += 1;
+    }
+    let Some(first) = toks.get(start) else {
+        return true;
+    };
+    let rest = &toks[start..];
+    let has_nextval = rest.windows(2).any(|w| {
+        matches!(
+            (&w[0], &w[1]),
+            (OraTok::Punct('.'), OraTok::Word(n)) if n == "NEXTVAL"
+        ) || matches!(
+            (&w[0], &w[1]),
+            (OraTok::Punct('.'), OraTok::Quoted(n)) if n == "NEXTVAL"
+        )
+    });
+    let has_for_update = rest.windows(2).any(|w| {
+        matches!(
+            (&w[0], &w[1]),
+            (OraTok::Word(a), OraTok::Word(b)) if a == "FOR" && b == "UPDATE"
+        )
+    });
+    match first {
+        OraTok::Word(w) if w == "SELECT" => !has_for_update && !has_nextval,
+        OraTok::Word(w) if w == "WITH" => {
+            if has_for_update || has_nextval {
+                return false;
+            }
+            // Reject inline PL/SQL declarations (`WITH FUNCTION`/`WITH PROCEDURE`) and DML/DDL keywords.
+            let forbidden = [
+                "FUNCTION",
+                "PROCEDURE",
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "MERGE",
+                "CREATE",
+                "ALTER",
+                "DROP",
+                "TRUNCATE",
+                "GRANT",
+                "REVOKE",
+                "BEGIN",
+                "DECLARE",
+                "CALL",
+                "EXEC",
+                "EXECUTE",
+                "LOCK",
+            ];
+            !rest
+                .iter()
+                .skip(1)
+                .any(|t| matches!(t, OraTok::Word(word) if forbidden.contains(&word.as_str())))
+        }
+        OraTok::Word(w) if w == "COMMIT" || w == "ROLLBACK" => true,
+        OraTok::Word(w) if w == "SET" => {
+            let words: Vec<&str> = rest
+                .iter()
+                .filter_map(|t| match t {
+                    OraTok::Word(w) => Some(w.as_str()),
+                    _ => None,
+                })
+                .collect();
+            words == ["SET", "TRANSACTION", "READ", "ONLY"]
+        }
+        _ => false,
+    }
 }
 
 /// Statement text as the server wants it: SQL without a trailing `;`, a
@@ -296,7 +486,7 @@ fn open(params: &ConnectParams) -> DbResult<Connection> {
     let password = params.password.as_ref().map(|p| p.expose()).unwrap_or("");
     let mut cfg = oracledb::Config::default()
         .set_credentials(user, password)
-        .set_connect_string(&descriptor(params))
+        .set_connect_string(&descriptor(params)?)
         .db()?
         .set_transport_connect_timeout(Some(params.connect_timeout))
         .set_program(&params.application_name)
@@ -395,6 +585,8 @@ pub struct OracleSession {
     /// The session zone's offset (seconds east of UTC), read at connect: TIMESTAMP WITH
     /// LOCAL TIME ZONE values arrive as its wall clock.
     ltz_offset: i32,
+    /// Only statements that read run on this session.
+    read_only: bool,
 }
 
 impl OracleSession {
@@ -455,6 +647,7 @@ impl OracleSession {
             cancel,
             service,
             ltz_offset,
+            read_only: params.read_only,
         })
     }
 
@@ -560,6 +753,7 @@ fn run(
     params: &[Value],
     opts: &ExecOptions,
     auto_commit: bool,
+    read_only: bool,
 ) -> DbResult<Outcome> {
     let binds: Vec<Box<dyn ToDbValue + Send + Sync>> = params.iter().map(convert::bind).collect();
     let refs: Vec<&dyn ToDbValue> = binds.iter().map(|b| b.as_ref() as &dyn ToDbValue).collect();
@@ -574,6 +768,12 @@ fn run(
             .build()
             .db()?;
         if stmt.is_query() {
+            if read_only {
+                if auto_commit {
+                    let _ = conn.rollback();
+                }
+                let _ = conn.execute("SET TRANSACTION READ ONLY", &[]);
+            }
             let cursor = stmt.query(&refs).db()?;
             let (columns, reads): (Vec<ColumnMeta>, Vec<Read>) =
                 cursor.columns().iter().map(convert::column).unzip();
@@ -584,6 +784,11 @@ fn run(
             });
         }
         let (dml, plsql, ddl) = (stmt.is_dml(), stmt.is_plsql(), stmt.is_ddl());
+        if read_only && (dml || plsql || ddl || stmt.is_dml_returning()) {
+            return Err(DbError::read_only(
+                "The connection is read-only: statement changes data",
+            ));
+        }
         let result = stmt.execute(&refs).db()?;
         let rows = result.rows_affected();
         // LOCK TABLE is none of these to oracledb: in auto mode its lock was held until some
@@ -777,16 +982,24 @@ impl Session for OracleSession {
                 commit_after: None,
             }));
         }
-        self.cancel.requested.store(false, Ordering::SeqCst);
         let words = leading_words(&sql, 1);
         let first = words.first().map(String::as_str).unwrap_or("");
+        if self.read_only && !is_read_only_sql(&sql) {
+            let label = if first.is_empty() { "statement" } else { first };
+            return Err(DbError::read_only(trf(
+                "The connection is read-only: {} changes data",
+                &[&label],
+            )));
+        }
+        self.cancel.requested.store(false, Ordering::SeqCst);
         let ends_tx = ends_transaction(&sql);
         let params = params.to_vec();
         let opts = opts.clone();
         let auto = self.mode == TransactionMode::Auto;
+        let read_only = self.read_only;
         let text = sql.clone();
         let outcome = match self
-            .blocking(move |c| run(c, &text, &params, &opts, auto))
+            .blocking(move |c| run(c, &text, &params, &opts, auto, read_only))
             .await
         {
             Ok(o) => o,
@@ -1277,16 +1490,86 @@ mod tests {
         cfg.database = Some("ORCLPDB1".into());
         let p = ConnectParams::from_config(&cfg, None);
         assert_eq!(
-            descriptor(&p),
+            descriptor(&p).unwrap(),
             "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=ORCLPDB1)))"
         );
         cfg.properties.insert("sid".into(), "ORCL".into());
         cfg.ssl.mode = SslMode::VerifyFull;
         let p = ConnectParams::from_config(&cfg, None);
         assert_eq!(
-            descriptor(&p),
+            descriptor(&p).unwrap(),
             "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db)(PORT=1521))(SECURITY=(SSL_SERVER_DN_MATCH=TRUE))(CONNECT_DATA=(SID=ORCL)))"
         );
+    }
+
+    #[test]
+    fn tns_descriptor_injection_is_rejected() {
+        for bad in [
+            "db)(ADDRESS=(HOST=evil)",
+            "db)",
+            "db(",
+            "db=evil",
+            "db\r\n(HOST=evil)",
+            "db\0evil",
+        ] {
+            let mut cfg = ConnectionConfig::new(DbKind::Oracle, "x");
+            cfg.host = bad.into();
+            cfg.database = Some("ORCLPDB1".into());
+            let e = descriptor(&ConnectParams::from_config(&cfg, None)).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::Config, "host {bad:?}");
+
+            let mut cfg = ConnectionConfig::new(DbKind::Oracle, "x");
+            cfg.host = "db".into();
+            cfg.database = Some(bad.into());
+            let e = descriptor(&ConnectParams::from_config(&cfg, None)).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::Config, "database {bad:?}");
+
+            let mut cfg = ConnectionConfig::new(DbKind::Oracle, "x");
+            cfg.host = "db".into();
+            cfg.properties.insert("sid".into(), bad.into());
+            let e = descriptor(&ConnectParams::from_config(&cfg, None)).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::Config, "sid {bad:?}");
+        }
+    }
+
+    #[test]
+    fn read_only_sql_classification() {
+        for r in [
+            "SELECT 1 FROM dual",
+            "  -- comment\n((SELECT * FROM users WHERE note = 'FOR UPDATE'))",
+            "SELECT q'[FOR UPDATE; DELETE FROM t]' FROM dual",
+            "SELECT nextval_note FROM t",
+            "WITH c AS (SELECT 1 AS a FROM dual) SELECT * FROM c",
+            "SET TRANSACTION READ ONLY",
+            "COMMIT",
+            "ROLLBACK",
+        ] {
+            assert!(is_read_only_sql(r), "expected read: {r}");
+        }
+        for w in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "MERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.a = s.a",
+            "CREATE TABLE t (a NUMBER)",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "ALTER TABLE t ADD (b NUMBER)",
+            "BEGIN DELETE FROM t; COMMIT; END;",
+            "DECLARE x NUMBER; BEGIN NULL; END;",
+            "CALL my_proc()",
+            "LOCK TABLE t IN EXCLUSIVE MODE",
+            "SELECT * FROM t FOR UPDATE",
+            "SELECT * FROM t FOR UPDATE NOWAIT",
+            "SELECT my_seq.NEXTVAL FROM dual",
+            "SELECT my_seq.\"NEXTVAL\" FROM dual",
+            "WITH FUNCTION f RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN DELETE FROM t; COMMIT; RETURN 1; END; SELECT f() FROM dual",
+            "SET TRANSACTION READ WRITE",
+            "/* SELECT 1 */ DELETE FROM t",
+            "-- SELECT 1\nDROP TABLE t",
+        ] {
+            assert!(!is_read_only_sql(w), "expected write: {w}");
+        }
     }
 
     #[test]

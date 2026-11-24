@@ -37,6 +37,26 @@ pub fn global_limit() -> usize {
 pub const DEFAULT_STORE_BUDGET: usize = 48 * 1024 * 1024;
 const DEFAULT_PAGE_ROWS: usize = 512;
 
+/// Atomically subtract `n` from `GLOBAL_RESIDENT`, saturating at zero.
+fn sub_global_resident(n: usize) {
+    if n == 0 {
+        return;
+    }
+    let mut cur = GLOBAL_RESIDENT.load(Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_sub(n);
+        match GLOBAL_RESIDENT.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Convert an encoded page byte length to `u32`, returning `None` if it exceeds 4 GiB.
+fn page_slot_len(buf_len: usize) -> Option<u32> {
+    u32::try_from(buf_len).ok()
+}
+
 fn row_bytes(row: &Row) -> usize {
     std::mem::size_of::<Row>() + row.capacity() * std::mem::size_of::<Value>() + row.iter().map(Value::heap_size).sum::<usize>()
 }
@@ -139,7 +159,7 @@ impl RowStore {
     fn sub_resident(&mut self, n: usize) {
         let n = n.min(self.resident);
         self.resident -= n;
-        GLOBAL_RESIDENT.fetch_sub(n, Ordering::Relaxed);
+        sub_global_resident(n);
     }
 
     pub fn push(&mut self, row: Row) {
@@ -237,13 +257,22 @@ impl RowStore {
                     }
                 }
             }
-            let buf = encode_page(self.pages[p].rows.as_ref().expect("resident"));
+            let Some(buf) = encode_page(self.pages[p].rows.as_ref().expect("resident")) else {
+                tracing::warn!("row store: page exceeds 4 GiB spill limit, keeping rows in memory");
+                self.spill_failed = true;
+                return false;
+            };
+            let Some(len) = page_slot_len(buf.len()) else {
+                tracing::warn!("row store: encoded page exceeds 4 GiB ({} bytes), keeping rows in memory", buf.len());
+                self.spill_failed = true;
+                return false;
+            };
             let spill = self.spill.as_mut().expect("spill file");
             // A page edited after it was spilled is written over its old copy
             // when it still fits, so repeated edits don't grow the file.
             let (offset, slot) = match self.pages[p].disk {
-                Some((old, _, slot)) if buf.len() <= slot as usize => (old, slot),
-                _ => (spill.end, buf.len() as u32),
+                Some((old, _, slot)) if len <= slot => (old, slot),
+                _ => (spill.end, len),
             };
             if let Err(e) = spill.file.seek(SeekFrom::Start(offset)).and_then(|_| spill.file.write_all(&buf)) {
                 tracing::warn!("row store: spill write failed, keeping rows in memory: {e}");
@@ -253,7 +282,7 @@ impl RowStore {
             if offset == spill.end {
                 spill.end += u64::from(slot);
             }
-            self.pages[p].disk = Some((offset, buf.len() as u32, slot));
+            self.pages[p].disk = Some((offset, len, slot));
             self.pages[p].dirty = false;
         }
         let bytes = self.pages[p].bytes;
@@ -387,20 +416,26 @@ impl RowStore {
 impl Drop for RowStore {
     fn drop(&mut self) {
         let r = self.resident;
-        GLOBAL_RESIDENT.fetch_sub(r.min(GLOBAL_RESIDENT.load(Ordering::Relaxed)), Ordering::Relaxed);
+        self.resident = 0;
+        sub_global_resident(r);
     }
 }
 
-fn encode_page(rows: &[Row]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(rows.len() * 64);
-    buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+fn encode_page(rows: &[Row]) -> Option<Vec<u8>> {
+    let n_rows = u32::try_from(rows.len()).ok()?;
+    let mut buf = Vec::with_capacity(rows.len().saturating_mul(64));
+    buf.extend_from_slice(&n_rows.to_le_bytes());
     for r in rows {
-        buf.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        let n_cols = u32::try_from(r.len()).ok()?;
+        buf.extend_from_slice(&n_cols.to_le_bytes());
         for v in r {
             v.encode(&mut buf);
         }
+        if buf.len() > u32::MAX as usize {
+            return None;
+        }
     }
-    buf
+    Some(buf)
 }
 
 fn decode_page(mut input: &[u8]) -> Option<Vec<Row>> {
@@ -491,5 +526,42 @@ mod tests {
         s.release_memory();
         assert!(s.resident_bytes() < before);
         assert_eq!(s.get(4_321).unwrap(), &row(4_321));
+    }
+
+    #[test]
+    fn concurrent_drops_and_saturating_sub_never_underflow_global_resident() {
+        use std::sync::Barrier;
+        let threads = 8;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for _ in 0..200 {
+                    let mut s = RowStore::new(64 * 1024).with_page_rows(32);
+                    for i in 0..128 {
+                        s.push(row(i));
+                    }
+                    // Simulate concurrent over-subtraction that used to race and wrap GLOBAL_RESIDENT.
+                    sub_global_resident(s.resident_bytes().saturating_add(1_000_000));
+                    drop(s);
+                    assert!(global_resident_bytes() < usize::MAX / 2, "GLOBAL_RESIDENT underflowed: {}", global_resident_bytes());
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(global_resident_bytes() < usize::MAX / 2);
+    }
+
+    #[test]
+    fn page_slot_len_rejects_over_4gib() {
+        assert_eq!(page_slot_len(0), Some(0));
+        assert_eq!(page_slot_len(u32::MAX as usize), Some(u32::MAX));
+        if usize::BITS > 32 {
+            assert_eq!(page_slot_len(u32::MAX as usize + 1), None);
+        }
     }
 }

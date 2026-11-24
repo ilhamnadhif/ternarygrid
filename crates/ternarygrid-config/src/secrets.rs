@@ -14,7 +14,7 @@
 //! ([`ternarygrid_core::config::secret_key`]), `profile:<id>:<slot>` for network
 //! profiles and `ai:<provider>:api-key` ([`ai_key`]).
 
-use crate::paths::{AppPaths, write_secure};
+use crate::paths::{AppPaths, ensure_private_dir, write_secure};
 use crate::settings::{SecretBackend, SecuritySettings};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -648,6 +648,71 @@ pub fn open_with_password(bytes: &[u8], password: &Secret) -> DbResult<BTreeMap<
         .ok_or_else(|| DbError::auth("Wrong password (or the file was modified)"))
 }
 
+/// Serializes read-modify-write operations on a vault file across threads and
+/// across TernaryGrid processes (e.g. GUI + `--run-task`) using a process-wide
+/// mutex plus an OS advisory lock on `<vault>.lock` (mode `0600` on Unix).
+struct VaultFileLock {
+    _process_guard: parking_lot::MutexGuard<'static, ()>,
+    _file: Option<std::fs::File>,
+}
+
+static VAULT_WRITE_MUTEX: Mutex<()> = Mutex::new(());
+
+fn vault_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+impl VaultFileLock {
+    fn acquire(path: &Path) -> DbResult<VaultFileLock> {
+        let guard = VAULT_WRITE_MUTEX.lock();
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            && !dir.exists()
+        {
+            ensure_private_dir(dir)?;
+        }
+        let lock_path = vault_lock_path(path);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&lock_path).map_err(|e| {
+            DbError::io(format!(
+                "Cannot open vault lock file {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+        let locked = loop {
+            #[allow(clippy::incompatible_msrv)]
+            match file.lock() {
+                Ok(()) => break Some(file),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    tracing::warn!(
+                        "Advisory file locks are unsupported on {}; falling back to in-process lock",
+                        lock_path.display()
+                    );
+                    break None;
+                }
+                Err(e) => {
+                    return Err(DbError::io(format!(
+                        "Cannot lock vault file {}: {e}",
+                        lock_path.display()
+                    )));
+                }
+            }
+        };
+        Ok(VaultFileLock {
+            _process_guard: guard,
+            _file: locked,
+        })
+    }
+}
+
 /// Encrypted file store protected by a master password.
 ///
 /// File format (`vault.bin`): `"TGRIDVLT"`, version byte, KDF id (1 =
@@ -706,18 +771,28 @@ impl VaultStore {
         if master.is_empty() {
             return Err(DbError::config("The master password must not be empty"));
         }
+        let mut guard = self.state.lock();
+        let _file_lock = VaultFileLock::acquire(&self.path)?;
+        if self.exists() {
+            return Err(DbError::config(format!(
+                "A vault already exists at {}",
+                self.path.display()
+            )));
+        }
         let mut salt = vec![0u8; SALT_LEN];
         random_bytes(&mut salt)?;
         let key = derive_key(master, &salt, params)?;
         let entries = BTreeMap::new();
         let bytes = seal(&key, params, &salt, &entries)?;
         write_secure(&self.path, &bytes)?;
-        *self.state.lock() = Some(Opened {
+        *guard = Some(Opened {
             key,
             params,
             salt,
             entries,
         });
+        drop(_file_lock);
+        drop(guard);
         self.touch();
         Ok(())
     }
@@ -765,8 +840,9 @@ impl VaultStore {
             return Err(DbError::config("The master password must not be empty"));
         }
         // Held from reading to writing the file: a concurrent `set` of this
-        // process must not write with the old key in between.
+        // or another process must not write with the old key in between.
         let mut guard = self.state.lock();
+        let _file_lock = VaultFileLock::acquire(&self.path)?;
         let bytes = self.read_file()?;
         let opened = open_vault(&bytes, old)?;
         let mut salt = vec![0u8; SALT_LEN];
@@ -780,6 +856,7 @@ impl VaultStore {
             salt,
             entries: opened.entries,
         });
+        drop(_file_lock);
         drop(guard);
         self.touch();
         Ok(())
@@ -829,6 +906,7 @@ impl VaultStore {
         let opened = guard
             .as_mut()
             .ok_or_else(|| DbError::auth("The secret vault is locked"))?;
+        let _file_lock = VaultFileLock::acquire(&self.path)?;
         let bytes = self.read_file()?;
         let mut entries = match reopen_with_key(&bytes, opened) {
             Ok(entries) => entries,
@@ -844,6 +922,7 @@ impl VaultStore {
             write_secure(&self.path, &sealed)?;
         }
         opened.entries = entries;
+        drop(_file_lock);
         drop(guard);
         self.touch();
         Ok(())
@@ -956,13 +1035,27 @@ impl std::fmt::Debug for SecretsManager {
 impl SecretsManager {
     /// Backend chosen in the settings: the OS keychain or `vault.bin`
     /// (initially locked; see [`SecretsManager::vault`]).
+    ///
+    /// On Windows, entries are stored directly per key in Windows Credential
+    /// Manager because each credential has a hard 2,560-byte
+    /// `CRED_MAX_CREDENTIAL_BLOB_SIZE` limit (which a single bundled JSON blob
+    /// quickly exceeds) and Windows does not display per-entry keychain
+    /// permission prompts. On macOS and other Unix platforms, secrets are
+    /// bundled into one keychain entry so macOS Keychain prompts at most once
+    /// per launch.
     pub fn new(paths: &AppPaths, security: &SecuritySettings) -> SecretsManager {
         match security.secret_backend {
-            SecretBackend::Keychain => SecretsManager {
-                backend: SecretBackend::Keychain,
-                store: Arc::new(BundledStore::new(KeychainStore::new())),
-                vault: None,
-            },
+            SecretBackend::Keychain => {
+                #[cfg(windows)]
+                let store: Arc<dyn SecretStore> = Arc::new(KeychainStore::new());
+                #[cfg(not(windows))]
+                let store: Arc<dyn SecretStore> = Arc::new(BundledStore::new(KeychainStore::new()));
+                SecretsManager {
+                    backend: SecretBackend::Keychain,
+                    store,
+                    vault: None,
+                }
+            }
             SecretBackend::EncryptedFile => {
                 let vault = Arc::new(VaultStore::new(paths.vault_file()));
                 SecretsManager {
@@ -1529,6 +1622,82 @@ mod tests {
     }
 
     #[test]
+    fn vault_concurrent_updates_preserve_all_keys() {
+        let (_d, v) = vault();
+        let master = Secret::new("concurrent-master");
+        v.create_with_params(&master, TEST_PARAMS).unwrap();
+        let path = v.path().to_path_buf();
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                let master = master.clone();
+                std::thread::spawn(move || {
+                    // Separate VaultStore instance per worker, matching independent processes.
+                    let worker = VaultStore::new(&path);
+                    worker.unlock(&master).unwrap();
+                    for k in 0..5 {
+                        worker
+                            .set(
+                                &format!("conn:t{t}-k{k}:password"),
+                                &Secret::new(format!("secret-{t}-{k}")),
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in threads {
+            handle.join().unwrap();
+        }
+        let check = VaultStore::new(&path);
+        check.unlock(&master).unwrap();
+        assert_eq!(check.list_keys().unwrap().len(), 40);
+        for t in 0..8 {
+            for k in 0..5 {
+                let key = format!("conn:t{t}-k{k}:password");
+                assert_eq!(
+                    check.get(&key).unwrap().unwrap().expose(),
+                    format!("secret-{t}-{k}"),
+                    "lost update for {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vault_file_lock_is_exclusive_across_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data").join("vault.bin");
+        let lock_path = vault_lock_path(&path);
+        let lock = VaultFileLock::acquire(&path).unwrap();
+        assert!(lock_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        #[allow(clippy::incompatible_msrv)]
+        let try_res = probe.try_lock();
+        assert!(
+            matches!(try_res, Err(std::fs::TryLockError::WouldBlock)),
+            "expected advisory lock contention, got {try_res:?}"
+        );
+        drop(lock);
+        #[allow(clippy::incompatible_msrv)]
+        probe
+            .try_lock()
+            .expect("lock must be released when VaultFileLock drops");
+    }
+
+    #[test]
     fn manager_from_settings() {
         let dir = tempfile::tempdir().unwrap();
         let paths = AppPaths::with_root(dir.path());
@@ -1543,7 +1712,9 @@ mod tests {
         assert!(vault_mgr.is_locked());
         assert_eq!(vault_mgr.vault().unwrap().path(), paths.vault_file());
         let kc = SecretsManager::new(&paths, &SecuritySettings::default());
+        assert_eq!(kc.backend(), SecretBackend::Keychain);
         assert_eq!(kc.store().backend_name(), "keychain");
+        assert!(!kc.is_locked());
         assert!(kc.vault().is_none());
     }
 

@@ -866,14 +866,13 @@ impl ResultPanel {
                 }
                 let Some(d) = self.dialect(cx) else { return };
                 let confirm = cx.conns.type_of(&self.conn).confirm_data_change;
-                if confirm {
-                    // Why the changes cannot be saved, instead of an empty preview.
-                    match self.model.checked_change_set() {
-                        Ok(cs) => self.save_preview = Some(cs.preview_sql(d.as_ref())),
-                        Err(e) => self.status = Some((e, true)),
-                    }
-                } else {
-                    self.start_save(cx);
+                // Why the changes cannot be saved, instead of an empty preview.
+                // Raw SQL expressions (`CellValue::Expr`) always open the preview so
+                // they are never executed silently without review.
+                match self.model.checked_change_set() {
+                    Ok(cs) if needs_save_preview(confirm, &cs) => self.save_preview = Some(cs.preview_sql(d.as_ref())),
+                    Ok(_) => self.start_save(cx),
+                    Err(e) => self.status = Some((e, true)),
                 }
             }
             GridAction::ChangesDiscarded
@@ -1573,6 +1572,15 @@ fn read_clipboard() -> Option<String> {
     None
 }
 
+/// Whether saving `cs` must show the SQL preview dialog first: whenever the
+/// connection type requires confirmation OR `cs` contains raw SQL expressions
+/// (`CellValue::Expr`), which must never execute silently without user review.
+fn needs_save_preview(confirm_data_change: bool, cs: &ternarygrid_grid::model::ChangeSet) -> bool {
+    confirm_data_change
+        || cs.updates.iter().any(|u| u.changes.iter().any(|c| matches!(c.value, CellValue::Expr(_))))
+        || cs.inserts.iter().any(|i| i.values.iter().any(|v| matches!(v.value, CellValue::Expr(_))))
+}
+
 /// Kind of object a data view can show.
 pub fn has_data(kind: ObjectKind) -> bool {
     kind.has_data()
@@ -1641,4 +1649,45 @@ fn confirm_dialog(
             }
         });
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ternarygrid_grid::model::{ChangeSet, ChangedValue, RowInsert, RowUpdate};
+
+    fn empty_cs() -> ChangeSet {
+        ChangeSet { table: ObjectRef::table(None, "t"), deletes: Vec::new(), updates: Vec::new(), inserts: Vec::new(), columns: Vec::new(), key_columns: Vec::new() }
+    }
+
+    #[test]
+    fn raw_sql_expressions_always_require_save_preview() {
+        let mut cs = empty_cs();
+        assert!(!needs_save_preview(false, &cs));
+        assert!(needs_save_preview(true, &cs));
+
+        // Concrete values and DEFAULT respect confirm_data_change = false.
+        cs.updates.push(RowUpdate {
+            row: 0,
+            key: Vec::new(),
+            changes: vec![
+                ChangedValue { column: 0, name: "a".into(), type_name: "text".into(), value: CellValue::Value(Value::Text("ok".into())) },
+                ChangedValue { column: 1, name: "b".into(), type_name: "int".into(), value: CellValue::Default },
+            ],
+        });
+        assert!(!needs_save_preview(false, &cs));
+
+        // A computed SQL expression in an UPDATE forces preview even on Dev connections.
+        let mut cs_upd = cs.clone();
+        cs_upd.updates[0].changes.push(ChangedValue { column: 2, name: "ts".into(), type_name: "timestamp".into(), value: CellValue::Expr("now()".into()) });
+        assert!(needs_save_preview(false, &cs_upd));
+
+        // A computed SQL expression in an INSERT also forces preview.
+        let mut cs_ins = cs;
+        cs_ins.inserts.push(RowInsert {
+            id: 1,
+            values: vec![ChangedValue { column: 2, name: "ts".into(), type_name: "timestamp".into(), value: CellValue::Expr("CURRENT_TIMESTAMP".into()) }],
+        });
+        assert!(needs_save_preview(false, &cs_ins));
+    }
 }

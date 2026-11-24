@@ -2145,11 +2145,7 @@ impl Navigator {
                     ui.close();
                 }
                 if kit::menu_item(ui, Some(icon::FILE_CODE), tr("Generate SELECT script"), "").clicked() {
-                    let text = if let Some(live) = cx.conns.live(&first_conn) {
-                        table_like.iter().map(|o| format!("{};", live.dialect.select_table(o, None, None, None, Some(100)))).collect::<Vec<_>>().join("\n\n")
-                    } else {
-                        table_like.iter().map(|o| format!("SELECT * FROM {};", o.display_path())).collect::<Vec<_>>().join("\n\n")
-                    };
+                    let text = generate_select_script(cx.conns, &first_conn, &table_like);
                     let schema = table_like.first().map(ObjectRef::schema_ref);
                     cx.push(AppCommand::NewSqlEditor { connection: Some(first_conn.clone()), schema, text: Some(text) });
                     ui.close();
@@ -3091,4 +3087,52 @@ mod tests {
         nav.rows = vec![rows[0].clone(), rows[1].clone(), rows[2].clone(), rows[4].clone()];
         assert_eq!(nav.selected_nodes().len(), 2);
     }
+
+    #[test]
+    fn generate_select_script_quotes_and_limits_when_disconnected() {
+        use crate::conn::{ConnectionManager, DirectNet, MemorySecrets};
+        use std::sync::Arc;
+        use ternarygrid_core::DbKind;
+        use ternarygrid_core::config::ConnectionConfig;
+
+        let mut cm = ConnectionManager::new(crate::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
+        let pg_cfg = ConnectionConfig::new(DbKind::Postgres, "pg");
+        let pg_id = pg_cfg.id.clone();
+        cm.upsert(pg_cfg);
+        let mysql_cfg = ConnectionConfig::new(DbKind::MySql, "my");
+        let mysql_id = mysql_cfg.id.clone();
+        cm.upsert(mysql_cfg);
+        let mssql_cfg = ConnectionConfig::new(DbKind::SqlServer, "ms");
+        let mssql_id = mssql_cfg.id.clone();
+        cm.upsert(mssql_cfg);
+
+        let objs = vec![ObjectRef::table(Some("public".into()), "order items"), ObjectRef::table(Some("public".into()), "select")];
+
+        let pg_sql = generate_select_script(&cm, &pg_id, &objs);
+        assert!(pg_sql.contains("\"order items\""), "{pg_sql}");
+        assert!(pg_sql.contains("\"select\""), "{pg_sql}");
+        assert!(pg_sql.contains("LIMIT 100;"), "{pg_sql}");
+
+        let my_sql = generate_select_script(&cm, &mysql_id, &objs);
+        assert!(my_sql.contains("`order items`"), "{my_sql}");
+        assert!(my_sql.contains("LIMIT 100;"), "{my_sql}");
+
+        let ms_sql = generate_select_script(&cm, &mssql_id, &objs);
+        assert!(ms_sql.contains("[order items]"), "{ms_sql}");
+        assert!(ms_sql.contains("[select]"), "{ms_sql}");
+        assert!(ms_sql.contains("TOP (100)"), "{ms_sql}");
+    }
+}
+
+/// Build dialect-aware `SELECT` statements (quoted identifiers + default 100-row
+/// limit) for multi-selected tables/views, even when the connection is disconnected.
+fn generate_select_script(conns: &crate::conn::ConnectionManager, conn_id: &str, objects: &[ObjectRef]) -> String {
+    let dialect: std::sync::Arc<dyn ternarygrid_core::Dialect> = if let Some(live) = conns.live(conn_id) {
+        live.dialect.clone()
+    } else if let Some(cfg) = conns.config(conn_id) {
+        conns.registry.dialect(cfg.kind)
+    } else {
+        std::sync::Arc::new(ternarygrid_core::dialect::GenericDialect::new())
+    };
+    objects.iter().map(|o| format!("{};", dialect.select_table(o, None, None, None, Some(100)))).collect::<Vec<_>>().join("\n\n")
 }

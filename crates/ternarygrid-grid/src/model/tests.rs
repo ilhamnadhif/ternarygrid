@@ -614,14 +614,19 @@ fn sql_functions_in_typed_columns_are_saved_as_typed() {
     assert_eq!(stmts[0].0, "UPDATE app.people SET at = now() WHERE id = $1");
     assert_eq!(stmts[1], ("UPDATE app.people SET note = $1 WHERE id = $2".to_string(), vec![Value::text("now()"), Value::Int(2)]));
     assert!(m.change_preview_sql(&d).contains("SET at = now() WHERE id = 1"));
-    // A new row with an expression; a pasted one; generated SQL keeps it.
+    // A new row with an expression; inline edit accepts expressions while paste rejects them.
     let r = m.add_row(None).unwrap();
     m.set_cell(r, 0, "3").unwrap();
     m.set_cell(r, 1, "CURRENT_TIMESTAMP").unwrap();
     let stmts = m.change_statements(&d);
     assert_eq!(stmts.last().unwrap(), &("INSERT INTO app.people (id, at) VALUES ($1, CURRENT_TIMESTAMP)".to_string(), vec![Value::Int(3)]));
     assert!(m.generate_rows_sql(crate::grid::SqlKind::Update, &[0], &d, "app.people").contains("at = now()"));
-    m.paste_block(1, &[vec!["now() - interval '1 day'".into()]], &[1], None).unwrap();
+    // Clipboard paste must never promote text into raw SQL expressions.
+    assert!(m.paste_block(1, &[vec!["now() - interval '1 day'".into()]], &[1], None).is_err());
+    assert!(m.paste_block(1, &[vec!["now()".into()]], &[0], None).is_err());
+    // Explicit inline edit still supports safe expressions, while rejecting SQL injection payloads.
+    assert!(m.set_cell(1, 1, "now(), note = 'pwned'").is_err());
+    m.set_cell(1, 1, "now() - interval '1 day'").unwrap();
     assert!(m.change_statements(&d)[1].0.contains("at = now() - interval '1 day'"));
     // Saved: the values the database gave are shown (read back), not NULL.
     let stamp = Value::parse_as("2026-10-27 10:00:00+07", DataKind::DateTimeTz).unwrap();
@@ -629,4 +634,85 @@ fn sql_functions_in_typed_columns_are_saved_as_typed() {
     assert!(!m.has_changes());
     assert_eq!(m.cell(0, 1), Some(stamp));
     assert_eq!(m.cell(0, 2), Some(Value::text("a")));
+}
+
+#[test]
+fn paste_block_never_promotes_sql_expressions() {
+    let mut m = timestamp_model();
+    let d = PgLike(GenericDialect::new());
+    // Pasting SQL expressions into typed columns (Int, DateTimeTz) must return a parse error.
+    assert!(m.paste_block(0, &[vec!["now()".into()]], &[0], None).is_err());
+    assert!(m.paste_block(0, &[vec!["now()".into()]], &[1], None).is_err());
+    assert!(m.paste_block(0, &[vec!["CURRENT_TIMESTAMP".into()]], &[1], None).is_err());
+    assert!(!m.has_changes());
+    // Pasting into a text column still stores it as a plain parameterized string literal.
+    assert_eq!(m.paste_block(0, &[vec!["now()".into()]], &[2], None).unwrap(), 1);
+    assert_eq!(m.change_statements(&d), vec![("UPDATE app.people SET note = $1 WHERE id = $2".to_string(), vec![Value::text("now()"), Value::Int(1)])]);
+    // Direct set_cells rejects invalid CellValue::Expr as well.
+    assert!(m.set_cells(vec![(0, 1, CellValue::Expr("now(), note = 'x'".into()))]).is_err());
+    // Defense in depth: even a manually constructed ChangeSet never emits raw unvalidated Expr SQL.
+    let manual = ChangeSet {
+        table: ObjectRef::table(Some("app".into()), "people"),
+        deletes: vec![],
+        updates: vec![RowUpdate {
+            row: 0,
+            key: vec![KeyValue { column: 0, name: "id".into(), type_name: "int4".into(), value: Value::Int(1) }],
+            changes: vec![ChangedValue { column: 1, name: "at".into(), type_name: "timestamptz".into(), value: CellValue::Expr("now(), is_admin = true".into()) }],
+        }],
+        inserts: vec![],
+        columns: vec![],
+        key_columns: vec![0],
+    };
+    let stmts = manual.statements(&d);
+    assert_eq!(stmts, vec![("UPDATE app.people SET at = $1 WHERE id = $2".to_string(), vec![Value::text("now(), is_admin = true"), Value::Int(1)])]);
+}
+
+#[test]
+fn dictionary_natural_key_cmp_is_a_strict_total_order() {
+    let tricky = ["10", "1a", "2", "NaN", "nan", "inf", "-inf", "Infinity", "-Infinity", "-0", "0", "0.0", "00", "-10", "2.5", "20", "100", "a", "0a", ""];
+    for (i, &a) in tricky.iter().enumerate() {
+        assert_eq!(natural_key_cmp(a, a), std::cmp::Ordering::Equal, "reflexivity: {a:?}");
+        for (j, &b) in tricky.iter().enumerate() {
+            let ab = natural_key_cmp(a, b);
+            assert_eq!(ab, natural_key_cmp(b, a).reverse(), "antisymmetry: ({i}:{a:?}, {j}:{b:?})");
+            for (k, &c) in tricky.iter().enumerate() {
+                let bc = natural_key_cmp(b, c);
+                let ac = natural_key_cmp(a, c);
+                if ab == std::cmp::Ordering::Less && bc != std::cmp::Ordering::Greater {
+                    assert_eq!(ac, std::cmp::Ordering::Less, "transitivity: ({i}:{a:?}) < ({j}:{b:?}) <= ({k}:{c:?})");
+                }
+            }
+        }
+    }
+    // Constructing Dictionary with mixed numeric, non-numeric, NaN, and inf keys never panics.
+    let map: HashMap<String, String> = tricky.iter().map(|&k| (k.to_string(), format!("desc:{k}"))).collect();
+    let dict = Dictionary::new(map);
+    assert_eq!(dict.len(), tricky.len());
+    let keys: Vec<&str> = dict.entries().iter().map(|(k, _)| k.as_str()).collect();
+    for w in keys.windows(2) {
+        assert_eq!(natural_key_cmp(w[0], w[1]), std::cmp::Ordering::Less, "not strictly sorted: {:?} vs {:?}", w[0], w[1]);
+    }
+    // Larger pseudo-random mixed set (stresses driftsort).
+    let mut big_map = HashMap::new();
+    let mut state: u64 = 0x1234_5678_9abc_def0;
+    for i in 0..500u32 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let k = match state % 6 {
+            0 => format!("{}", (state >> 16) % 1000),
+            1 => format!("{}a", (state >> 16) % 100),
+            2 => format!("-{}.{}", (state >> 16) % 50, i),
+            3 => format!("NaN{i}"),
+            4 => format!("00{}", i),
+            _ => format!("key_{i}_{}", state & 0xff),
+        };
+        big_map.insert(k, i.to_string());
+    }
+    big_map.insert("NaN".into(), "nan".into());
+    big_map.insert("inf".into(), "inf".into());
+    big_map.insert("-inf".into(), "-inf".into());
+    let big_dict = Dictionary::new(big_map);
+    let big_keys: Vec<&str> = big_dict.entries().iter().map(|(k, _)| k.as_str()).collect();
+    for w in big_keys.windows(2) {
+        assert_eq!(natural_key_cmp(w[0], w[1]), std::cmp::Ordering::Less);
+    }
 }

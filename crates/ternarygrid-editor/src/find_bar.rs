@@ -141,7 +141,9 @@ pub(crate) fn replace_one(st: &mut EditorState, lang: &dyn EditorLanguage) {
     let Some(searcher) = st.find.searcher.clone() else {
         return;
     };
-    if !sel.is_empty() && searcher.matches_exactly(&st.text, sel.clone(), |c| lang.is_word_char(c))
+    let at_current = st.find.current.and_then(|i| st.find.matches.get(i)) == Some(&sel);
+    if (!sel.is_empty() || at_current)
+        && searcher.matches_exactly(&st.text, sel.clone(), |c| lang.is_word_char(c))
     {
         let with = searcher.replacement_for(&st.text, sel.clone(), &st.find.replacement);
         let end = sel.start + with.len();
@@ -500,5 +502,34 @@ mod tests {
         assert!(st.find.error.is_some());
         assert!(st.find.matches.is_empty());
         assert_eq!(replace_all(&mut st, &PlainText), 0);
+    }
+
+    #[test]
+    fn replace_one_handles_zero_length_regex_matches() {
+        // Line-start anchor `^`
+        let mut st = EditorState::new(1, "alpha\nbeta".into());
+        st.find.open = true;
+        st.find.query = "^".into();
+        st.find.options.regex = true;
+        st.find.replacement = "> ".into();
+        st.set_selection(Selection::caret(0));
+        replace_one(&mut st, &PlainText);
+        assert_eq!(st.text(), "> alpha\nbeta");
+        assert_eq!(st.sel.range(), 8..8, "advanced to start of second line");
+        replace_one(&mut st, &PlainText);
+        assert_eq!(st.text(), "> alpha\n> beta");
+
+        // Line-end anchor `$`
+        let mut st = EditorState::new(2, "a\nb".into());
+        st.find.open = true;
+        st.find.query = "$".into();
+        st.find.options.regex = true;
+        st.find.replacement = ";".into();
+        st.set_selection(Selection::caret(1));
+        replace_one(&mut st, &PlainText);
+        assert_eq!(st.text(), "a;\nb");
+        assert_eq!(st.sel.range(), 4..4, "advanced to end of second line");
+        replace_one(&mut st, &PlainText);
+        assert_eq!(st.text(), "a;\nb;");
     }
 }

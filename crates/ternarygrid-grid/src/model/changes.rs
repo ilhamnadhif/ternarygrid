@@ -204,6 +204,13 @@ impl Builder<'_> {
         }
     }
 
+    /// Render a [`CellValue::Expr`] only when it still passes [`ternarygrid_core::value::is_sql_expression`];
+    /// otherwise fall back to binding/quoting it safely as a text value so manually
+    /// constructed [`ChangeSet`]s cannot emit arbitrary unvalidated SQL.
+    fn expr(&mut self, e: &str, type_name: &str) -> String {
+        if ternarygrid_core::value::is_sql_expression(e) { e.trim().to_string() } else { self.value(&Value::text(e), type_name) }
+    }
+
     /// `col = value` or `col IS NULL` (NULL-safe key comparison). Without a
     /// key (a change set built by hand) a condition no row meets: an `UPDATE`
     /// or `DELETE` never goes to every row of the table.
@@ -242,7 +249,10 @@ fn render_update(dialect: &dyn Dialect, table: &str, u: &RowUpdate, mode: Render
             let col = dialect.quote_ident(&c.name);
             match &c.value {
                 CellValue::Default => format!("{col} = DEFAULT"),
-                CellValue::Expr(e) => format!("{col} = {e}"),
+                CellValue::Expr(e) => {
+                    let rhs = b.expr(e, &c.type_name);
+                    format!("{col} = {rhs}")
+                }
                 CellValue::Value(v) => {
                     let p = b.value(v, &c.type_name);
                     format!("{col} = {p}")
@@ -265,7 +275,7 @@ fn render_insert(dialect: &dyn Dialect, table: &str, i: &RowInsert, mode: Render
     let vals: Vec<String> = specified
         .iter()
         .map(|c| match &c.value {
-            CellValue::Expr(e) => e.clone(),
+            CellValue::Expr(e) => b.expr(e, &c.type_name),
             v => b.value(v.value_or_null(), &c.type_name),
         })
         .collect();

@@ -439,3 +439,19 @@ fn job_serde_roundtrip() {
     let back: DataCompareJob = serde_json::from_str(&json).unwrap();
     assert_eq!(back, j);
 }
+
+#[tokio::test]
+async fn key_only_table_insert_does_not_duplicate_key_columns() {
+    // Mirrors UI "compare none" / key-only layout where `columns` lists the first key column
+    // because an empty `columns` means "compare every column".
+    let cols: &[(&str, DataKind)] = &[("a", DataKind::Int), ("b", DataKind::Int)];
+    let (src, tgt) = sessions();
+    let mut src = src.table("s.pairs", cols, vec![vec![int(1), int(10)], vec![int(2), int(20)]]);
+    let mut tgt = tgt.table("t.pairs", cols, vec![vec![int(1), int(10)], vec![int(3), int(30)]]);
+    let mut j = job("s.pairs", "t.pairs", &["a", "b"]);
+    j.source.columns = vec!["a".into()];
+    j.target.columns = vec!["a".into()];
+    let d = run(&j, &mut src, &mut tgt).await.unwrap();
+    assert_eq!((d.identical, d.different, d.only_in_source, d.only_in_target), (1, 0, 1, 1));
+    assert_eq!(d.sync_statements, vec!["DELETE FROM t.pairs WHERE a = 3 AND b = 30".to_string(), "INSERT INTO t.pairs (a, b) VALUES (2, 20)".to_string(),]);
+}

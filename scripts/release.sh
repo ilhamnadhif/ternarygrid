@@ -71,6 +71,17 @@ echo "==> Build"
 scripts/bundle-macos.sh --universal
 for f in "${FILES[@]}"; do [ -f "$f" ] || fail "missing $f"; done
 
+echo "==> Checksums"
+(
+    cd dist
+    BASENAMES=()
+    for f in "${FILES[@]}"; do
+        BASENAMES+=("$(basename "$f")")
+    done
+    shasum -a 256 "${BASENAMES[@]}" > SHA256SUMS.txt
+)
+FILES+=("dist/SHA256SUMS.txt")
+
 echo "==> Tag $TAG"
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git tag -a "$TAG" -m "TernaryGrid $VERSION"
 git push --quiet origin "$BRANCH"

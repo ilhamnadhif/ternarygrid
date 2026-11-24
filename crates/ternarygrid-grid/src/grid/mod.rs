@@ -586,7 +586,7 @@ pub(crate) fn paste_into(model: &mut ResultModel, state: &mut DataGridState, tex
                         let v = if nulls.as_ref().is_some_and(|n| n[0][0]) {
                             crate::model::CellValue::Value(Value::Null)
                         } else {
-                            model.parse_cell_for_column(visible[p], &block[0][0])?
+                            model.parse_literal_for_column(visible[p], &block[0][0])?
                         };
                         edits.push((r, visible[p], v));
                     }

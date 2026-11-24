@@ -1,6 +1,6 @@
 //! [`CassandraSession`] over the `scylla` driver (Cassandra and ScyllaDB).
 
-use crate::dialect::{CqlDialect, qualified, quote};
+use crate::dialect::{CqlDialect, needs_quoting, qualified, quote};
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
 use futures::StreamExt;
@@ -495,28 +495,155 @@ fn tls(params: &ConnectParams) -> DbResult<Option<Arc<rustls::ClientConfig>>> {
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| DbError::tls(e.to_string()))?;
-    let config = match params.ssl.mode {
-        SslMode::VerifyFull => builder
-            .with_root_certificates(root_store(&params.ssl)?)
-            .with_no_client_auth(),
+    let wants_auth = match params.ssl.mode {
+        SslMode::VerifyFull => {
+            let roots = Arc::new(root_store(&params.ssl)?);
+            if let Some(name) = params
+                .tls_server_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+            {
+                let server_name = rustls::pki_types::ServerName::try_from(name.to_string())
+                    .map_err(|e| {
+                        DbError::config(format!("Invalid TLS server name '{name}': {e}"))
+                    })?;
+                let inner =
+                    rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider)
+                        .build()
+                        .map_err(|e| DbError::tls(e.to_string()))?;
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NamedServerVerifier {
+                        inner,
+                        server_name,
+                    }))
+            } else {
+                builder.with_root_certificates(roots)
+            }
+        }
         // The chain must lead to a trusted root; the host name is not checked.
         SslMode::VerifyCa => builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(CertVerifier {
                 provider,
                 chain: Some(Arc::new(root_store(&params.ssl)?)),
-            }))
-            .with_no_client_auth(),
+            })),
         // Encrypted, any certificate.
         _ => builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(CertVerifier {
                 provider,
                 chain: None,
-            }))
-            .with_no_client_auth(),
+            })),
+    };
+    let config = match client_identity(&params.ssl)? {
+        Some((certs, key)) => wants_auth
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| DbError::config(format!("Invalid client certificate or key: {e}")))?,
+        None => wants_auth.with_no_client_auth(),
     };
     Ok(Some(Arc::new(config)))
+}
+
+/// Client certificate chain and private key for mTLS, if configured.
+fn client_identity(
+    ssl: &SslConfig,
+) -> DbResult<
+    Option<(
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    )>,
+> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    fn trim(v: &Option<String>) -> Option<&str> {
+        v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+    match (trim(&ssl.client_cert), trim(&ssl.client_key)) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(DbError::config(
+            "Both client certificate and client key must be provided for mTLS",
+        )),
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = std::fs::read(cert_path).map_err(|e| {
+                DbError::config(format!(
+                    "Cannot read the client certificate {cert_path}: {e}"
+                ))
+            })?;
+            let mut certs = Vec::new();
+            for c in CertificateDer::pem_slice_iter(&cert_pem) {
+                let c = c.map_err(|e| {
+                    DbError::config(format!(
+                        "Invalid PEM in client certificate {cert_path}: {e}"
+                    ))
+                })?;
+                certs.push(c);
+            }
+            if certs.is_empty() {
+                return Err(DbError::config(format!(
+                    "No certificate found in {cert_path}"
+                )));
+            }
+            let key_pem = std::fs::read(key_path).map_err(|e| {
+                DbError::config(format!("Cannot read the client key {key_path}: {e}"))
+            })?;
+            let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|e| {
+                DbError::config(format!("Invalid PEM in client key {key_path}: {e}"))
+            })?;
+            Ok(Some((certs, key)))
+        }
+    }
+}
+
+/// Verifies server certificates with `WebPkiServerVerifier` against an explicit
+/// `tls_server_name` (`scylla` always passes the node's resolved IP as
+/// `ServerName::IpAddress`, which breaks `VerifyFull` through tunnels/DNS).
+#[derive(Debug)]
+struct NamedServerVerifier {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    server_name: rustls::pki_types::ServerName<'static>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for NamedServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            &self.server_name,
+            ocsp_response,
+            now,
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
 }
 
 /// Trust anchors: the system's and the configured CA certificate (only the
@@ -649,7 +776,11 @@ pub struct CassandraSession {
 impl CassandraSession {
     pub async fn connect(params: &ConnectParams) -> DbResult<Self> {
         let mut b = SessionBuilder::new().connection_timeout(params.connect_timeout);
-        let first = format!("{}:{}", params.host, params.port);
+        let first = if params.host.contains(':') && !params.host.starts_with('[') {
+            format!("[{}]:{}", params.host, params.port)
+        } else {
+            format!("{}:{}", params.host, params.port)
+        };
         b = b.known_node(&first);
         // More contact points: `hosts` property `h1:9042,h2:9042` (from URLs).
         let several = params.property("hosts").is_some_and(|h| h.contains(','));
@@ -690,8 +821,13 @@ impl CassandraSession {
         if let Some(cfg) = tls(params)? {
             b = b.tls_context(Some(cfg));
         }
-        if let Some(ks) = params.database.as_deref().filter(|k| !k.trim().is_empty()) {
-            b = b.use_keyspace(ks.trim(), ks.chars().any(|c| c.is_ascii_uppercase()));
+        if let Some(ks) = params
+            .database
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            b = b.use_keyspace(ks, needs_quoting(ks));
         }
         let db = b.build().await.map_err(err)?;
         // ScyllaDB has system.versions; Cassandra does not.
@@ -1719,6 +1855,86 @@ mod tests {
         }
         let only = root_store(&params(SslMode::VerifyCa, Some(&ca), true).ssl).unwrap();
         assert_eq!(only.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const CLIENT_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIBcTCCARagAwIBAgIUXncsfltQcBJt91kTkYx4Z2FkT8swCgYIKoZIzj0EAwIw\nHTEbMBkGA1UEAwwSY2xpZW50LmV4YW1wbGUuY29tMCAXDTI2MTEyNDE2MzE1OVoY\nDzIxMjYxMDMxMTYzMTU5WjAdMRswGQYDVQQDDBJjbGllbnQuZXhhbXBsZS5jb20w\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATyCHaN3oOur6N6c+fXM7CRWFDL13cp\nVxPmNgJ4r9HyOIduEVReL0apn0oM6f+RNKMCKiZFs4CrgZINQ1GfMotAozIwMDAd\nBgNVHQ4EFgQU4xZGbCRxY4b2Ybn7aAT9hnYPnHkwDwYDVR0TAQH/BAUwAwEB/zAK\nBggqhkjOPQQDAgNJADBGAiEAm8i53aJ+BvKwGQxk6R766Bqd82wv2vx4Gh77m5Bh\n1IMCIQChRadsANIzaacUxr02qisAdchpDGcWRU0f3VBxidRV4A==\n-----END CERTIFICATE-----\n";
+    const CLIENT_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgMNh+jHt4yPcPfLAO\ngxYtUdM7oCaM1b13xSmifn1/sq+hRANCAATyCHaN3oOur6N6c+fXM7CRWFDL13cp\nVxPmNgJ4r9HyOIduEVReL0apn0oM6f+RNKMCKiZFs4CrgZINQ1GfMotA\n-----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn mtls_and_named_server_verification() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+
+        let dir = std::env::temp_dir().join(format!("ternarygrid-cql-mtls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        let cert = dir.join("client.crt");
+        let key = dir.join("client.key");
+        std::fs::write(&ca, TEST_CA).unwrap();
+        std::fs::write(&cert, CLIENT_CERT).unwrap();
+        std::fs::write(&key, CLIENT_KEY).unwrap();
+
+        let make = |mode, c: Option<&std::path::Path>, k: Option<&std::path::Path>| {
+            let mut cfg = ternarygrid_core::config::ConnectionConfig::new(DbKind::Cassandra, "t");
+            cfg.ssl.mode = mode;
+            cfg.ssl.ca_cert = Some(ca.display().to_string());
+            cfg.ssl.only_custom_ca = true;
+            cfg.ssl.client_cert = c.map(|p| p.display().to_string());
+            cfg.ssl.client_key = k.map(|p| p.display().to_string());
+            ConnectParams::from_config(&cfg, None)
+        };
+
+        // Valid mTLS cert+key succeeds across TLS modes.
+        for mode in [SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull] {
+            let mut p = make(mode, Some(&cert), Some(&key));
+            p.tls_server_name = Some("db.example.com".into());
+            assert!(tls(&p).unwrap().is_some(), "{mode:?}");
+        }
+
+        // Only cert or only key is rejected with Config error.
+        let e = tls(&make(SslMode::VerifyFull, Some(&cert), None)).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Config);
+        let e = tls(&make(SslMode::VerifyFull, None, Some(&key))).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Config);
+
+        // NamedServerVerifier substitutes `tls_server_name` even when scylla passes an IP.
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der(TEST_CA)).unwrap();
+        let inner =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .unwrap();
+        let ok_verifier = NamedServerVerifier {
+            inner: inner.clone(),
+            server_name: ServerName::try_from("db.example.com").unwrap().to_owned(),
+        };
+        let ip_from_scylla = ServerName::try_from("127.0.0.1").unwrap();
+        assert!(
+            ok_verifier
+                .verify_server_cert(&der(TEST_LEAF), &[], &ip_from_scylla, &[], UnixTime::now())
+                .is_ok()
+        );
+        let wrong_verifier = NamedServerVerifier {
+            inner,
+            server_name: ServerName::try_from("other.example.com")
+                .unwrap()
+                .to_owned(),
+        };
+        assert!(
+            wrong_verifier
+                .verify_server_cert(&der(TEST_LEAF), &[], &ip_from_scylla, &[], UnixTime::now())
+                .is_err()
+        );
+
+        // Keyspace quoting catches special chars, leading digits, uppercase, and keywords.
+        assert!(!needs_quoting("my_ks_1"));
+        assert!(needs_quoting("MyKs"));
+        assert!(needs_quoting("my-ks"));
+        assert!(needs_quoting("1ks"));
+        assert!(needs_quoting("select"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

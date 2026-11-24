@@ -8,8 +8,8 @@
 use crate::paths::{AppPaths, backup_corrupt_file, write_json};
 use serde::Serialize;
 use ternarygrid_core::config::{
-    AuthMethod, ConnectionConfig, ConnectionType, NetworkProfile, ProxyConfig, SecretSlot, SshAuth,
-    SshConfig, SslMode, secret_key,
+    AuthMethod, ConnectionConfig, ConnectionType, NetworkProfile, ProxyConfig, SECRET_PROPERTIES,
+    SecretSlot, SshAuth, SshConfig, SslMode, property_secret_key, secret_key,
 };
 use ternarygrid_core::{DbError, DbResult};
 
@@ -705,6 +705,11 @@ impl ConnectionStore {
         ]
         .into_iter()
         .map(|s| secret_key(connection_id, s))
+        .chain(
+            SECRET_PROPERTIES
+                .iter()
+                .map(|prop| property_secret_key(connection_id, prop)),
+        )
         .collect()
     }
 
@@ -1196,10 +1201,35 @@ mod tests {
             profile_secret_key("p1", SecretSlot::ProxyPassword),
             "profile:p1:proxy-password"
         );
-        assert_eq!(ConnectionStore::secret_keys_for("z").len(), 4);
+        assert_eq!(
+            ConnectionStore::secret_keys_for("z").len(),
+            4 + SECRET_PROPERTIES.len()
+        );
         assert_eq!(
             ConnectionStore::secret_key_pairs("a", "b")[0],
             ("conn:a:password".into(), "conn:b:password".into())
+        );
+    }
+
+    #[test]
+    fn secret_keys_include_secret_properties() {
+        let api_key = property_secret_key("c1", "api_key");
+        assert!(
+            ConnectionStore::secret_keys_for("c1").contains(&api_key),
+            "secret_keys_for must include api_key property"
+        );
+        let pair = (api_key.clone(), property_secret_key("c2", "api_key"));
+        assert!(
+            ConnectionStore::secret_key_pairs("c1", "c2").contains(&pair),
+            "secret_key_pairs must include api_key property"
+        );
+        let mut store = ConnectionStore::new();
+        let mut c = conn("Elastic", None);
+        c.id = "c1".into();
+        store.add(c).unwrap();
+        assert!(
+            store.all_secret_keys().contains(&api_key),
+            "all_secret_keys must include api_key property"
         );
     }
 }

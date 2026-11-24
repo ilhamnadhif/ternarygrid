@@ -437,10 +437,12 @@ impl TaskStore {
             for t in &tasks {
                 // Ids go into OS scheduler entries (a crontab line, a launchd label): one of
                 // a file someone sent is kept only when plain (no newline adding a cron line).
-                let plain = t.id.len() <= 64 && t.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                let plain = !t.id.is_empty() && t.id.len() <= 64 && t.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
                 let new_id = if !plain || used.contains(&t.id) { uuid::Uuid::new_v4().to_string() } else { t.id.clone() };
                 used.insert(new_id.clone());
-                map.entry(t.id.clone()).or_insert_with(|| new_id.clone());
+                if !t.id.is_empty() {
+                    map.entry(t.id.clone()).or_insert_with(|| new_id.clone());
+                }
                 ids.push(new_id);
             }
             let now = Utc::now();
@@ -635,6 +637,45 @@ mod tests {
         let imported = store.import_json(&arr).unwrap();
         assert!(imported[0].id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{:?}", imported[0].id);
         assert_eq!(imported[1].id, "nightly-backup_1");
+    }
+
+    #[test]
+    fn imported_tasks_with_empty_ids_get_fresh_uuids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+
+        // Single task with empty id.
+        let mut single = shell("single");
+        single.id = String::new();
+        let imported = store.import_json(&serde_json::to_string(&vec![single]).unwrap()).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert!(!imported[0].id.is_empty());
+        assert!(uuid::Uuid::parse_str(&imported[0].id).is_ok(), "{:?}", imported[0].id);
+        assert!(store.get(&imported[0].id).is_some());
+
+        // Multiple tasks with empty id in one import all receive distinct fresh UUIDs.
+        let mut first = shell("first");
+        first.id = String::new();
+        let mut second = shell("second");
+        second.id = String::new();
+        let export = serde_json::json!({
+            "format": FORMAT,
+            "version": VERSION,
+            "tasks": [first, second],
+        });
+        let imported = store.import_json(&export.to_string()).unwrap();
+        assert_eq!(imported.len(), 2);
+        assert_ne!(imported[0].id, imported[1].id);
+        assert!(uuid::Uuid::parse_str(&imported[0].id).is_ok());
+        assert!(uuid::Uuid::parse_str(&imported[1].id).is_ok());
+        assert_eq!(store.list().len(), 3);
+
+        // An empty id is never added to the remap table for composite steps.
+        let mut empty_step_target = shell("target");
+        empty_step_target.id = String::new();
+        let comp = TaskDef::new("bad-comp", TaskKind::Composite { steps: vec![String::new()], stop_on_error: true, parallel: false });
+        let arr = serde_json::to_string(&vec![empty_step_target, comp]).unwrap();
+        assert!(store.import_json(&arr).is_err(), "composite referencing empty step must not remap to empty-id task");
     }
 
     #[cfg(unix)]
