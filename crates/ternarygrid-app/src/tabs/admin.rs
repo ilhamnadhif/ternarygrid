@@ -89,6 +89,32 @@ impl AdminSession {
 }
 
 impl AdminSession {
+    /// True while a dedicated session is currently being opened.
+    pub fn is_loading(&self) -> bool {
+        self.session.is_loading()
+    }
+
+    /// Error text if opening the dedicated session failed.
+    pub fn error(&self) -> Option<String> {
+        match &self.session {
+            Loadable::Failed(e) => Some(e.full_text()),
+            _ => None,
+        }
+    }
+
+    /// The already-opened session handle, if open and not closed.
+    pub fn loaded(&self) -> Option<SessionHandle> {
+        match &self.session {
+            Loadable::Loaded(s) if !s.is_closed() => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Poll an in-flight session-opening job without starting a new one.
+    pub fn poll_only(&mut self) -> bool {
+        self.session.poll()
+    }
+
     /// Give the session up (closed in the background) and open a new one on the next
     /// use: after a cancel that the server may never answer, the next try does not
     /// wait on the same connection.
@@ -368,6 +394,21 @@ impl SessionManagerTab {
         self.selected = selected.map(str::to_string);
         self.kill = selected.filter(|_| kill).map(|s| (s.to_string(), KillMode::Terminate));
     }
+    /// Poll an in-flight kill/cancel job (explicit user action).
+    fn poll_kill_job(&mut self, cx: &mut AppContext) {
+        if let Some((j, mode, id)) = self.kill_job.as_mut()
+            && let Some(r) = j.poll()
+        {
+            let (mode, id) = (*mode, id.clone());
+            self.kill_job = None;
+            match r {
+                Ok(()) if mode == KillMode::Terminate => cx.toasts.success(trf("Session {} terminated", &[&id])),
+                Ok(()) => cx.toasts.success(trf("The query of session {} was cancelled", &[&id])),
+                Err(e) => cx.toasts.error(tr("Cannot end the session"), Some(e.full_text())),
+            }
+            self.refresh.last = None;
+        }
+    }
 }
 
 impl TabView for SessionManagerTab {
@@ -384,6 +425,24 @@ impl TabView for SessionManagerTab {
         Some(format!("sessions:{}", self.conn))
     }
 
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        if let Some((_, mode, id)) = &self.kill_job {
+            let detail = match mode {
+                KillMode::Terminate => trf("Terminating session {}…", &[id]),
+                KillMode::CancelQuery => trf("Cancelling query of session {}…", &[id]),
+            };
+            return crate::tabs::TabActivity::Running { detail: Some(detail), progress: None };
+        }
+        if self.kill.is_some() {
+            return crate::tabs::TabActivity::Attention { detail: tr("Waiting to confirm session action").to_string() };
+        }
+        crate::tabs::TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
+        self.poll_kill_job(cx);
+    }
+
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         let conn = self.conn.clone();
         // Asked by the lock list (a blocking session).
@@ -396,18 +455,7 @@ impl TabView for SessionManagerTab {
         {
             self.shown = Some(l.clone());
         }
-        if let Some((j, mode, id)) = self.kill_job.as_mut()
-            && let Some(r) = j.poll()
-        {
-            let (mode, id) = (*mode, id.clone());
-            self.kill_job = None;
-            match r {
-                Ok(()) if mode == KillMode::Terminate => cx.toasts.success(trf("Session {} terminated", &[&id])),
-                Ok(()) => cx.toasts.success(trf("The query of session {} was cancelled", &[&id])),
-                Err(e) => cx.toasts.error(tr("Cannot end the session"), Some(e.full_text())),
-            }
-            self.refresh.last = None;
-        }
+        self.poll_kill_job(cx);
         let p = style::pal(ui);
         let fmt = cx.settings.results.format.clone();
         // The visible rows of the last list.

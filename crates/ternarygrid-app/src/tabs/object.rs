@@ -742,6 +742,63 @@ impl TabView for ObjectEditorTab {
         self.data.as_ref().is_some_and(|d| d.is_dirty())
     }
 
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if let Some(d) = &self.data {
+            let act = d.tab_activity();
+            if !matches!(act, TabActivity::Idle) {
+                return act;
+            }
+        }
+        let check = |loading: bool, err: Option<&ternarygrid_core::DbError>, label: &str| -> Option<TabActivity> {
+            if loading {
+                Some(TabActivity::Running { detail: Some(label.to_string()), progress: None })
+            } else {
+                err.map(|e| TabActivity::Error { detail: first_line(&e.full_text()) })
+            }
+        };
+        let active = match self.page {
+            ObjectPage::Properties => check(self.table.is_loading(), self.table.error(), tr("Loading table definition…"))
+                .or_else(|| check(self.props.is_loading(), self.props.error(), tr("Loading properties…"))),
+            ObjectPage::Data => None,
+            ObjectPage::Ddl => check(self.ddl.is_loading(), self.ddl.error(), tr("Loading DDL…")),
+            ObjectPage::Dependencies => check(self.deps.is_loading(), self.deps.error(), tr("Loading dependencies…")),
+            ObjectPage::Statistics => check(self.stats.is_loading(), self.stats.error(), tr("Loading statistics…")),
+            ObjectPage::Diagram => self.diagram.as_ref().map(|er| er.tab_activity()).filter(|a| !matches!(a, TabActivity::Idle)),
+        };
+        if let Some(a) = active {
+            return a;
+        }
+        if self.props.is_loading() || self.table.is_loading() || self.ddl.is_loading() || self.deps.is_loading() || self.stats.is_loading() {
+            return TabActivity::Running { detail: Some(tr("Loading object metadata…").to_string()), progress: None };
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, ctx: &egui::Context, cx: &mut AppContext) {
+        if self.props.is_loading() {
+            self.props.poll();
+        }
+        if self.table.is_loading() {
+            self.table.poll();
+        }
+        if self.ddl.is_loading() {
+            self.ddl.poll();
+        }
+        if self.deps.is_loading() {
+            self.deps.poll();
+        }
+        if self.stats.is_loading() {
+            self.stats.poll();
+        }
+        if let Some(d) = &mut self.data {
+            d.poll_background(cx);
+        }
+        if let Some(er) = &mut self.diagram {
+            er.poll_background(ctx, cx);
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if !cx.conns.is_connected(&self.conn) {
             kit::empty_state(ui, icon::PLUGS, tr("The connection is closed."), tr("Reconnect to inspect this object or browse its data."), |ui| {

@@ -53,6 +53,8 @@ pub struct ResultSource {
     /// The store's length when the running fetch started: what it adds are server rows.
     fetch_store_len: usize,
     pub error: Option<DbError>,
+    /// True when the most recent fetch was explicitly cancelled by the user.
+    pub last_fetch_cancelled: bool,
     pub messages: Vec<ServerMessage>,
     pub executed_at: chrono::DateTime<chrono::Local>,
     pub exec_duration: Duration,
@@ -89,6 +91,7 @@ impl ResultSource {
             server_rows: 0,
             fetch_store_len: 0,
             error: None,
+            last_fetch_cancelled: false,
             messages: Vec::new(),
             executed_at: chrono::Local::now(),
             exec_duration: Duration::ZERO,
@@ -129,6 +132,19 @@ impl ResultSource {
         self.fetch_job.is_some()
     }
 
+    /// Determinate fraction (`0.0..=1.0`) while "fetch all" runs and the total row count is known.
+    pub fn fetch_progress(&self) -> Option<f32> {
+        if self.fetch_job.is_none() || self.fetch_want != usize::MAX {
+            return None;
+        }
+        if let Loadable::Loaded(total) = self.total_count
+            && total > 0
+        {
+            return Some((self.row_count() as f32 / total as f32).clamp(0.0, 1.0));
+        }
+        None
+    }
+
     pub fn has_more(&self) -> bool {
         !self.exhausted
     }
@@ -139,6 +155,7 @@ impl ResultSource {
             return;
         }
         self.error = None;
+        self.last_fetch_cancelled = false;
         self.fetch_started = Some(Instant::now());
         self.fetch_store_len = self.store.lock().len();
         self.fetch_op = op.clone();
@@ -218,6 +235,7 @@ impl ResultSource {
                         }
                         self.exhausted = b.exhausted;
                         self.token = b.token;
+                        self.last_fetch_cancelled = b.cancelled;
                         self.messages.extend(b.messages);
                         self.generation += 1;
                         self.fetch_op = None;
@@ -270,6 +288,7 @@ impl ResultSource {
             // connection that may have gone silent.
             let slow = self.fetch_started.is_some_and(|t| t.elapsed() >= STOP_WAIT);
             self.cancel_fetch();
+            self.last_fetch_cancelled = true;
             if slow {
                 let s = self.session.clone();
                 backend.spawn_detached(async move { s.settle_after_cancel(STOP_WAIT).await });

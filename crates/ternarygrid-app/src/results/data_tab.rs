@@ -22,6 +22,7 @@ pub struct TableDataView {
     exec: Option<Execution>,
     pub panel: Option<ResultPanel>,
     error: Option<String>,
+    cancelled: bool,
     started: bool,
     /// When the first query started (a slow one offers Cancel).
     started_at: Option<std::time::Instant>,
@@ -53,6 +54,7 @@ impl TableDataView {
             exec: None,
             panel: None,
             error: None,
+            cancelled: false,
             started: false,
             started_at: None,
             lost_on: None,
@@ -69,6 +71,7 @@ impl TableDataView {
     /// Load the data again after an error (Retry).
     pub fn retry(&mut self) {
         self.error = None;
+        self.cancelled = false;
         self.lost_on = None;
         self.auto_retries = 0;
         self.started = false;
@@ -77,6 +80,48 @@ impl TableDataView {
     /// The first page is still being read ("Reading data…").
     pub fn is_loading(&self) -> bool {
         self.exec.is_some()
+    }
+
+    /// Poll in-flight session opening, initial table query, or result panel jobs while hidden.
+    pub fn poll_background(&mut self, cx: &mut AppContext) {
+        if self.session.is_loading() {
+            self.session.poll_only();
+            if !self.started
+                && let Some(session) = self.session.loaded()
+            {
+                self.start(cx, session);
+            }
+        }
+        if self.exec.is_some() {
+            self.poll(cx);
+        }
+        if let Some(p) = self.panel.as_mut() {
+            p.poll_background(cx);
+        }
+    }
+
+    /// Live activity for the host tab's status icon.
+    pub fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if self.exec.is_some() {
+            return TabActivity::Running { detail: Some(tr("Reading data…").to_string()), progress: None };
+        }
+        if self.session.is_loading() {
+            return TabActivity::Running { detail: Some(tr("Opening a session…").to_string()), progress: None };
+        }
+        if self.cancelled {
+            return TabActivity::Cancelled { detail: tr("Query cancelled").to_string() };
+        }
+        if let Some(e) = &self.error {
+            return TabActivity::Error { detail: first_line(e) };
+        }
+        if let Some(e) = self.session.error() {
+            return TabActivity::Error { detail: first_line(&e) };
+        }
+        if let Some(p) = &self.panel {
+            return p.tab_activity();
+        }
+        TabActivity::Idle
     }
 
     fn start(&mut self, cx: &mut AppContext, session: crate::conn::session::SessionHandle) {
@@ -94,6 +139,7 @@ impl TableDataView {
         let opts = ExecOpts { fetch_size: cx.settings.results.effective_fetch_size() as usize, store_budget: cx.settings.results.store_budget_bytes(), ..Default::default() };
         self.exec = Some(Execution::start(cx.backend, session, vec![plan], opts, None));
         self.started_at = Some(std::time::Instant::now());
+        self.cancelled = false;
         self.started = true;
     }
 
@@ -123,6 +169,7 @@ impl TableDataView {
             self.exec = None;
             // Cancelled before the first rows: say so (with Retry) instead of "Reading data…".
             if self.panel.is_none() && self.error.is_none() {
+                self.cancelled = true;
                 self.error = Some(tr("The query was cancelled.").to_string());
             }
         }
@@ -240,6 +287,7 @@ impl TableDataView {
         if let Some(exec) = self.exec.take() {
             exec.cancel(backend);
             self.session.reset();
+            self.cancelled = true;
             self.error = Some(tr("The query was cancelled.").to_string());
         }
     }
@@ -332,6 +380,12 @@ impl TabView for TableDataTab {
     }
     fn is_dirty(&self) -> bool {
         EmbeddedView::is_dirty(&self.view)
+    }
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        self.view.tab_activity()
+    }
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
+        self.view.poll_background(cx);
     }
     /// A manual commit session's saved edits wait in its transaction: listed in Pending transactions.
     fn transaction_session(&self) -> Option<crate::conn::session::SessionHandle> {

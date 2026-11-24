@@ -3,6 +3,20 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.7 — 2026-11-24
+
+### Added
+- **Pure-logo process status icons in the tab bar.** Every tab's left icon slot now morphs cleanly into a crisp semantic vector icon reflecting its live or completed process state without shifting tab widths or adding text clutter:
+  - **Running**: animated teal arc spinner (with a 250 ms anti-flicker grace period for fast queries).
+  - **Progress**: determinate circular teal progress ring during "Fetch all" (when total row count is known) and multi-table Data Search.
+  - **Done (`✓`)**: green check-circle when a process finishes in an inactive background tab, clearing automatically back to the tab's normal icon as soon as you visit it (foreground runs never flash unread `✓`).
+  - **Error (`✕`)**: red error-circle when a query, fetch, save, migration, or metadata load fails.
+  - **Warning (`⚠`)**: amber warning triangle for server warnings, truncated scripts/AI responses, or partial search errors.
+  - **Attention (`!`)**: amber exclamation-circle when a tab is waiting on user input (query parameters, dangerous SQL confirmation, save preview, AI SQL approval, migration/sync confirmation).
+  - **Cancelled (`⊘`)**: muted slash-circle when an operation is cancelled by the user.
+- **Background tab polling.** Inactive tabs with already-started operations (SQL execution, EXPLAIN, commit/rollback, formatting, table data reading/fetching/saving/grouping/sorting, table designer, schema/data compare, metadata/data search, AI assistant, catalog editor, routine debugger, ER diagram snapshot loading, session terminate/cancel) now continue polling while hidden so background jobs finish promptly and update their tab status icon without needing to switch back first.
+- **Detailed status tooltips and amber dirty dot.** Hovering any tab shows its live status, progress percentage, elapsed time, completion summary, or concise error/confirmation reason; the unsaved-changes dot (`●`) is now styled in amber to stay visually distinct from green Done and red Error icons.
+
 ## 0.7.6 — 2026-11-24
 
 ### Added

@@ -199,6 +199,12 @@ pub struct SqlEditorTab {
     pub run_on_open: bool,
     /// Fetch every row of new results (benchmarks).
     pub fetch_all_results: bool,
+    /// Last terminal error / warning / cancel outcome reported on the tab badge.
+    last_outcome: Option<crate::tabs::TabActivity>,
+    /// First server WARNING seen during the current execution.
+    run_warning: Option<String>,
+    /// First statement error message seen during the current execution.
+    run_error: Option<String>,
 }
 
 #[allow(clippy::field_reassign_with_default)]
@@ -329,6 +335,9 @@ impl SqlEditorTab {
             auto_run: false,
             run_on_open: false,
             fetch_all_results: false,
+            last_outcome: None,
+            run_warning: None,
+            run_error: None,
         }
     }
 
@@ -669,6 +678,9 @@ impl SqlEditorTab {
             cx.toasts.info(tr("Preparing the session… run the statement again in a moment."));
             return;
         }
+        self.last_outcome = None;
+        self.run_warning = None;
+        self.run_error = None;
         let text = req.sql.clone().unwrap_or_else(|| self.editor.text().to_string());
         let prepared = {
             let cfg = self.prep_config(cx);
@@ -678,6 +690,7 @@ impl SqlEditorTab {
             self.log("ERROR", e.clone());
         }
         if !prepared.errors.is_empty() {
+            self.last_outcome = Some(crate::tabs::TabActivity::Error { detail: crate::tabs::first_line(&prepared.errors[0]) });
             self.bottom = Bottom::Output;
             self.show_results = true;
             return;
@@ -694,6 +707,7 @@ impl SqlEditorTab {
         let cfg = cx.conns.config(&conn).cloned();
         let ctype = cx.conns.type_of(&conn);
         if cfg.as_ref().is_some_and(|c| c.read_only) && prepared.has_writes {
+            self.last_outcome = Some(crate::tabs::TabActivity::Error { detail: tr("Read-only connection").to_string() });
             self.log("ERROR", tr("The connection is read-only; data and schema changes are blocked."));
             cx.toasts.error(tr("Read-only connection"), Some(tr("The script contains statements that change data or schema.").to_string()));
             return;
@@ -804,12 +818,15 @@ impl SqlEditorTab {
             self.explain_job = None;
             match r {
                 Ok(plan) => {
+                    self.last_outcome = None;
                     self.results.push(ResultItem::Plan { sql, plan: Box::new(plan), state: Default::default(), view: PlanView::Diagram });
                     self.bottom = Bottom::Result(self.results.len() - 1);
                     self.show_results = true;
                 }
                 Err(e) => {
-                    self.log("ERROR", e.full_text());
+                    let full = e.full_text();
+                    self.last_outcome = Some(crate::tabs::TabActivity::Error { detail: crate::tabs::first_line(&full) });
+                    self.log("ERROR", full);
                     self.bottom = Bottom::Output;
                 }
             }
@@ -895,9 +912,17 @@ impl SqlEditorTab {
                     }
                     self.log("INFO", msg);
                 }
-                ExecEvent::Message { severity, text, .. } => self.log(&severity, text),
+                ExecEvent::Message { severity, text, .. } => {
+                    if severity.eq_ignore_ascii_case("WARNING") && self.run_warning.is_none() {
+                        self.run_warning = Some(crate::tabs::first_line(&text));
+                    }
+                    self.log(&severity, text);
+                }
                 ExecEvent::Error { index, error } => {
                     let text = error.full_text();
+                    if self.run_error.is_none() {
+                        self.run_error = Some(crate::tabs::first_line(&error.message));
+                    }
                     self.log("ERROR", text.clone());
                     if let Some(st) = self.stats.iter_mut().find(|s| s.index == index) {
                         st.status = Some(false);
@@ -939,6 +964,18 @@ impl SqlEditorTab {
                 }
                 ExecEvent::Done { elapsed, cancelled, executed, failed } => {
                     self.last_run = Some((Instant::now(), elapsed));
+                    self.last_outcome = if cancelled {
+                        Some(crate::tabs::TabActivity::Cancelled { detail: trf("Cancelled after {}", &[&crate::widgets::format_duration(elapsed)]) })
+                    } else if failed > 0 {
+                        let detail = if failed == 1 {
+                            self.run_error.take().unwrap_or_else(|| tr("Statement failed").to_string())
+                        } else {
+                            trf("{} of {} statements failed", &[&failed, &executed])
+                        };
+                        Some(crate::tabs::TabActivity::Error { detail })
+                    } else {
+                        self.run_warning.take().map(|detail| crate::tabs::TabActivity::Warning { detail })
+                    };
                     let msg = if cancelled {
                         trf("Cancelled after {}", &[&crate::widgets::format_duration(elapsed)])
                     } else {
@@ -1311,8 +1348,46 @@ impl SqlEditorTab {
             }
             Err(e) => {
                 let title = if commit { trf("Commit failed: {}", &[&self.title]) } else { trf("Rollback failed: {}", &[&self.title]) };
-                self.log("ERROR", format!("{title}: {}", e.full_text()));
-                cx.toasts.error(title, Some(e.full_text()));
+                let full = e.full_text();
+                self.last_outcome = Some(crate::tabs::TabActivity::Error { detail: crate::tabs::first_line(&full) });
+                self.log("ERROR", format!("{title}: {full}"));
+                cx.toasts.error(title, Some(full));
+            }
+        }
+    }
+
+    fn poll_schema_job(&mut self, cx: &mut AppContext) {
+        if let Some((name, job)) = &mut self.schema_job
+            && let Some(r) = job.poll()
+        {
+            let name = name.clone();
+            self.schema_job = None;
+            if let Err(e) = r {
+                let title = trf("Cannot use schema {}", &[&name]);
+                let full = e.full_text();
+                self.last_outcome = Some(crate::tabs::TabActivity::Error { detail: crate::tabs::first_line(&full) });
+                self.log("ERROR", format!("{title}: {full}"));
+                cx.toasts.error(title, Some(full));
+            }
+        }
+    }
+
+    fn poll_format_job(&mut self, ctx: &egui::Context, cx: &mut AppContext) {
+        if let Some((range, version, job)) = &mut self.format_job
+            && let Some(res) = job.poll()
+        {
+            let (range, version) = (range.clone(), *version);
+            self.format_job = None;
+            match res {
+                Ok(text) if self.editor.version() == version && range.end <= self.editor.text().len() => {
+                    let text = text.trim_end_matches('\n').to_string();
+                    self.editor.replace_range(ctx, range, &text);
+                }
+                Ok(_) => cx.toasts.info(tr("The script changed while it was formatted; format again.")),
+                Err(e) => {
+                    self.last_outcome = Some(crate::tabs::TabActivity::Error { detail: crate::tabs::first_line(&e) });
+                    cx.toasts.error(tr("The external formatter failed"), Some(e));
+                }
             }
         }
     }
@@ -2231,6 +2306,97 @@ impl TabView for SqlEditorTab {
         (!self.console && self.editor.is_modified()) || self.results.iter().any(|r| matches!(r, ResultItem::Rows(p) if p.has_changes()))
     }
 
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if self.exec.is_some() {
+            return TabActivity::Running { detail: Some(tr("Executing SQL…").to_string()), progress: None };
+        }
+        if self.explain_job.is_some() {
+            return TabActivity::Running { detail: Some(tr("Explain…").to_string()), progress: None };
+        }
+        if let Some((commit, _)) = &self.tx_job {
+            let label = if *commit { tr("Committing transaction…") } else { tr("Rolling back transaction…") };
+            return TabActivity::Running { detail: Some(label.to_string()), progress: None };
+        }
+        if self.schema_job.is_some() {
+            return TabActivity::Running { detail: Some(tr("Switching schema…").to_string()), progress: None };
+        }
+        if self.format_job.is_some() {
+            return TabActivity::Running { detail: Some(tr("Formatting SQL…").to_string()), progress: None };
+        }
+        if matches!(self.session, SessionSlot::Opening(_)) {
+            return TabActivity::Running { detail: Some(tr("Opening a session…").to_string()), progress: None };
+        }
+        for r in &self.results {
+            if let ResultItem::Rows(p) = r {
+                let act = p.tab_activity();
+                if matches!(act, TabActivity::Running { .. }) {
+                    return act;
+                }
+            }
+        }
+        if self.params.is_some() {
+            return TabActivity::Attention { detail: tr("Waiting for query parameters").to_string() };
+        }
+        if self.confirm.is_some() {
+            return TabActivity::Attention { detail: tr("Waiting for execution confirmation").to_string() };
+        }
+        if self.close_prompt || self.close_tx_prompt {
+            return TabActivity::Attention { detail: tr("Waiting for close confirmation").to_string() };
+        }
+        for r in &self.results {
+            if let ResultItem::Rows(p) = r {
+                let act = p.tab_activity();
+                if matches!(act, TabActivity::Attention { .. }) {
+                    return act;
+                }
+            }
+        }
+        if let SessionSlot::Failed(e) = &self.session {
+            return TabActivity::Error { detail: first_line(e) };
+        }
+        for r in &self.results {
+            if let ResultItem::Rows(p) = r {
+                let act = p.tab_activity();
+                if matches!(act, TabActivity::Error { .. }) {
+                    return act;
+                }
+            }
+        }
+        if let Some(outcome) = &self.last_outcome {
+            return outcome.clone();
+        }
+        for r in &self.results {
+            if let ResultItem::Rows(p) = r {
+                let act = p.tab_activity();
+                if !matches!(act, TabActivity::Idle) {
+                    return act;
+                }
+            }
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, ctx: &egui::Context, cx: &mut AppContext) {
+        if let SessionSlot::Opening(j) = &mut self.session
+            && let Some(r) = j.poll()
+        {
+            self.session = match r {
+                Ok(s) => SessionSlot::Ready(s),
+                Err(e) => SessionSlot::Failed(e.full_text()),
+            };
+        }
+        self.poll_tx(cx);
+        self.poll_schema_job(cx);
+        self.poll_format_job(ctx, cx);
+        self.poll_exec(ctx, cx);
+        for r in &mut self.results {
+            if let ResultItem::Rows(p) = r {
+                p.poll_background(cx);
+            }
+        }
+    }
+
     fn focus_context(&self) -> ActionContext {
         if self.editor_focused && !(self.show_results && self.maximized) {
             ActionContext::SqlEditor
@@ -2374,35 +2540,12 @@ impl TabView for SqlEditorTab {
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll_tx(cx);
         // A schema that cannot be used (missing, no privilege): statements would run in the previous one.
-        if let Some((name, job)) = &mut self.schema_job
-            && let Some(r) = job.poll()
-        {
-            let name = name.clone();
-            self.schema_job = None;
-            if let Err(e) = r {
-                let title = trf("Cannot use schema {}", &[&name]);
-                self.log("ERROR", format!("{title}: {}", e.full_text()));
-                cx.toasts.error(title, Some(e.full_text()));
-            }
-        }
+        self.poll_schema_job(cx);
         self.poll_close_after_save(ui, cx);
         if self.tx_job.is_some() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
-        if let Some((range, version, job)) = &mut self.format_job
-            && let Some(res) = job.poll()
-        {
-            let (range, version) = (range.clone(), *version);
-            self.format_job = None;
-            match res {
-                Ok(text) if self.editor.version() == version && range.end <= self.editor.text().len() => {
-                    let text = text.trim_end_matches('\n').to_string();
-                    self.editor.replace_range(ui.ctx(), range, &text);
-                }
-                Ok(_) => cx.toasts.info(tr("The script changed while it was formatted; format again.")),
-                Err(e) => cx.toasts.error(tr("The external formatter failed"), Some(e)),
-            }
-        }
+        self.poll_format_job(ui.ctx(), cx);
         if self.format_job.is_some() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -2533,6 +2676,7 @@ impl TabView for SqlEditorTab {
         if self.editor.version() != self.last_version {
             self.last_version = self.editor.version();
             self.changed_at = Some(Instant::now());
+            self.last_outcome = None;
         }
         self.handle_events(resp.events, cx);
         self.analyse(cx);

@@ -935,6 +935,26 @@ impl TabView for DebuggerTab {
         Some(format!("debug:{}:{}", self.conn, self.routine.display_path()))
     }
 
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if self.is_busy() || self.def.is_loading() || !self.side_jobs.is_empty() {
+            return TabActivity::Running { detail: Some(tr("Debugging routine…").to_string()), progress: None };
+        }
+        if let Some(e) = &self.error {
+            return TabActivity::Error { detail: first_line(e) };
+        }
+        if let Some(e) = self.def.error() {
+            return TabActivity::Error { detail: first_line(&e.full_text()) };
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
+        if self.is_busy() || self.def.is_loading() || !self.side_jobs.is_empty() {
+            self.poll(cx);
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll(cx);
         let conn = self.conn.clone();

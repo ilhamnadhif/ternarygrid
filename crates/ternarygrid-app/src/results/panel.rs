@@ -102,6 +102,8 @@ pub struct ResultPanel {
     pub history_in_header: bool,
     /// Last status message (`true` = error).
     pub status: Option<(String, bool)>,
+    /// Error from the most recent failed save (shown on the tab badge until next save/discard).
+    last_save_error: Option<String>,
     executed: Instant,
     /// Dictionary lookups being loaded: (result column, job).
     dict_jobs: Vec<(usize, Job<DbResult<HashMap<String, String>>>)>,
@@ -228,6 +230,7 @@ impl ResultPanel {
             next_layout: None,
             history_in_header: false,
             status: None,
+            last_save_error: None,
             executed: Instant::now(),
             dict_jobs: Vec::new(),
             settings_applied: false,
@@ -256,6 +259,78 @@ impl ResultPanel {
 
     pub fn sql(&self) -> &str {
         &self.src.sql
+    }
+
+    /// Poll in-flight result jobs while the host tab is inactive.
+    pub fn poll_background(&mut self, cx: &mut AppContext) {
+        if self.src.is_fetching()
+            || self.src.total_count.is_loading()
+            || self.save_job.is_some()
+            || self.column_stats.is_some()
+            || !self.dict_jobs.is_empty()
+            || self.refs_job.is_some()
+            || self.saved_in_tx.is_some()
+        {
+            self.poll(cx);
+        }
+        let _ = self.model.poll_view_job();
+        let _ = self.view.grouping.poll();
+    }
+
+    /// Live activity for the host tab's status icon.
+    pub fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if self.save_job.is_some() {
+            return TabActivity::Running { detail: Some(tr("Saving changes…").to_string()), progress: None };
+        }
+        if self.src.is_fetching() {
+            let progress = self.src.fetch_progress();
+            let detail = if progress.is_some() { tr("Fetching rows…") } else { tr("Fetching data…") };
+            return TabActivity::Running { detail: Some(detail.to_string()), progress };
+        }
+        if self.src.total_count.is_loading() {
+            return TabActivity::Running { detail: Some(tr("Counting rows…").to_string()), progress: None };
+        }
+        if let Some((name, _)) = &self.column_stats {
+            return TabActivity::Running { detail: Some(trf("Statistics of {}…", &[name])), progress: None };
+        }
+        if self.refs_job.is_some() {
+            return TabActivity::Running { detail: Some(tr("Loading related rows…").to_string()), progress: None };
+        }
+        if self.model.is_view_job_running() {
+            return TabActivity::Running { detail: Some(tr("Sorting / filtering rows…").to_string()), progress: None };
+        }
+        if self.view.grouping.is_running() {
+            return TabActivity::Running { detail: Some(tr("Grouping rows…").to_string()), progress: None };
+        }
+        if self.save_preview.is_some() {
+            return TabActivity::Attention { detail: tr("Waiting to confirm save").to_string() };
+        }
+        if self.confirm_discard.is_some() {
+            return TabActivity::Attention { detail: tr("Waiting to confirm discarding changes").to_string() };
+        }
+        if self.confirm_rerun.is_some() {
+            return TabActivity::Attention { detail: tr("Waiting to confirm re-running statement").to_string() };
+        }
+        if self.confirm_fetch_all {
+            return TabActivity::Attention { detail: tr("Waiting to confirm Fetch all").to_string() };
+        }
+        if let Some(e) = &self.last_save_error {
+            return TabActivity::Error { detail: first_line(e) };
+        }
+        if let Some(e) = &self.src.error {
+            return TabActivity::Error { detail: first_line(&e.full_text()) };
+        }
+        if let Some((msg, true)) = &self.status {
+            return TabActivity::Error { detail: first_line(msg) };
+        }
+        if let Some((msg, true)) = &self.view.toolbar.notice {
+            return TabActivity::Error { detail: first_line(msg) };
+        }
+        if self.src.last_fetch_cancelled {
+            return TabActivity::Cancelled { detail: tr("Fetch cancelled").to_string() };
+        }
+        TabActivity::Idle
     }
 
     fn dialect(&self, cx: &AppContext) -> Option<Arc<dyn Dialect>> {
@@ -353,6 +428,7 @@ impl ResultPanel {
             self.model.set_saving(false);
             match r {
                 Ok((n, committed, inserted, updated)) => {
+                    self.last_save_error = None;
                     // Rows a fetch appended meanwhile are synced first: the saved order is built
                     // over all of them (they stayed hidden until a refresh).
                     self.model.sync();
@@ -380,7 +456,9 @@ impl ResultPanel {
                 }
                 Err(e) => {
                     self.after_save = None;
-                    cx.toasts.error(tr("Cannot save the changes"), Some(e.full_text()));
+                    let text = e.full_text();
+                    self.last_save_error = Some(text.clone());
+                    cx.toasts.error(tr("Cannot save the changes"), Some(text));
                 }
             }
         }
@@ -908,6 +986,7 @@ impl ResultPanel {
     }
 
     fn start_save(&mut self, cx: &mut AppContext) {
+        self.last_save_error = None;
         let Some(d) = self.dialect(cx) else { return };
         let cs = match self.model.checked_change_set() {
             Ok(cs) => cs,
@@ -1140,6 +1219,7 @@ impl ResultPanel {
     }
 
     pub fn discard(&mut self) {
+        self.last_save_error = None;
         self.model.discard_changes();
     }
 

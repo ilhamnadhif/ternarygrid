@@ -2138,8 +2138,18 @@ impl eframe::App for TernaryGridApp {
                 crate::tabs::welcome::show(ui, &mut cx);
                 return;
             }
-            let leaf_open =
+            let leaf_open: std::collections::HashMap<u64, u64> =
                 self.dock.iter_leaves().filter_map(|(_, l)| Some((l, l.tabs.get(l.active.0)?.id))).flat_map(|(l, open)| l.tabs.iter().map(move |t| (t.id, open))).collect();
+            // Poll inactive tabs that have in-flight work so processes finish in the background
+            // and immediately surface Done / Error / Attention icons on the tab bar.
+            let now = std::time::Instant::now();
+            for (_, tab) in self.dock.iter_all_tabs_mut() {
+                let is_open = leaf_open.get(&tab.id) == Some(&tab.id);
+                if !is_open {
+                    tab.view.poll_background(ui.ctx(), &mut cx);
+                }
+                tab.sync_status(is_open, now);
+            }
             let mut viewer = DockViewer {
                 cx: &mut cx,
                 close_vetoed: Vec::new(),

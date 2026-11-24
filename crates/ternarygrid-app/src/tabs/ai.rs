@@ -2317,6 +2317,41 @@ impl TabView for AiAssistantTab {
         self.dedupe.then(|| "ai-assistant".to_string())
     }
 
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if let Some(p) = &self.pending {
+            if p.approval.is_some() {
+                return TabActivity::Attention { detail: tr("Waiting for SQL approval").to_string() };
+            }
+            return TabActivity::Running { detail: Some(tr("AI assistant working…").to_string()), progress: None };
+        }
+        if self.confirm_clear.is_some() {
+            return TabActivity::Attention { detail: tr("Waiting for confirmation").to_string() };
+        }
+        if let Some(last) = self.turns.last() {
+            match &last.state {
+                TurnState::Failed(e) => return TabActivity::Error { detail: first_line(e) },
+                TurnState::Refused(e) => return TabActivity::Warning { detail: first_line(e) },
+                TurnState::Stopped => return TabActivity::Cancelled { detail: tr("Response stopped").to_string() },
+                TurnState::Done if last.truncated => return TabActivity::Warning { detail: tr("Response truncated").to_string() },
+                _ => {}
+            }
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
+        if self.pending.is_some() && self.poll() {
+            self.unsaved = false;
+            self.save(cx);
+        }
+        if std::mem::take(&mut self.schema_changed)
+            && let Some(connection) = self.conn.clone()
+        {
+            cx.push(AppCommand::RefreshMetadata { connection, object: None, schema: self.scope.clone() });
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if self.poll() || self.unsaved {
             self.unsaved = false;

@@ -43,6 +43,26 @@ impl GroupingPanelState {
     pub fn is_running(&self) -> bool {
         self.task.is_some()
     }
+
+    /// Poll any in-flight background grouping task. Returns `true` when it finishes.
+    pub fn poll(&mut self) -> bool {
+        let Some(task) = &self.task else { return false };
+        match task.poll() {
+            TaskPoll::Running => false,
+            TaskPoll::Done(mut r) => {
+                GroupingPanel::clamp_sort(self);
+                sort_groups(&mut r.groups, self.sort);
+                self.result = Some(r);
+                self.result_key = self.pending_key.take();
+                self.task = None;
+                true
+            }
+            TaskPoll::Failed => {
+                self.task = None;
+                true
+            }
+        }
+    }
 }
 
 /// What the panel asks the caller to do.
@@ -142,21 +162,7 @@ impl<'a> GroupingPanel<'a> {
         let GroupingPanel { model, state } = self;
         let mut action = None;
         // Poll the background task.
-        if let Some(task) = &state.task {
-            match task.poll() {
-                TaskPoll::Running => {}
-                TaskPoll::Done(mut r) => {
-                    Self::clamp_sort(state);
-                    sort_groups(&mut r.groups, state.sort);
-                    state.result = Some(r);
-                    state.result_key = state.pending_key.take();
-                    state.task = None;
-                }
-                TaskPoll::Failed => {
-                    state.task = None;
-                }
-            }
-        }
+        state.poll();
         let names = model.column_names();
         let col_count = names.len();
         state.spec.columns.retain(|&c| c < col_count);

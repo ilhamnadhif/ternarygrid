@@ -533,20 +533,8 @@ impl SchemaCompareTab {
     pub fn ask_apply(&mut self) {
         self.confirm_apply = true;
     }
-}
 
-impl TabView for SchemaCompareTab {
-    fn title(&self) -> String {
-        tr("Schema compare").to_string()
-    }
-    fn icon(&self) -> &'static str {
-        icon::ARROWS_DOWN_UP
-    }
-    fn connection_id(&self) -> Option<&str> {
-        self.target.conn.as_deref()
-    }
-
-    fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+    fn poll(&mut self, cx: &mut AppContext) {
         if let Some(j) = self.job.as_mut()
             && let Some(r) = j.poll()
         {
@@ -577,6 +565,45 @@ impl TabView for SchemaCompareTab {
                 Err(e) => self.error = Some(e.full_text()),
             }
         }
+    }
+}
+
+impl TabView for SchemaCompareTab {
+    fn title(&self) -> String {
+        tr("Schema compare").to_string()
+    }
+    fn icon(&self) -> &'static str {
+        icon::ARROWS_DOWN_UP
+    }
+    fn connection_id(&self) -> Option<&str> {
+        self.target.conn.as_deref()
+    }
+
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if self.apply_job.is_some() {
+            return TabActivity::Running { detail: Some(tr("Applying migration script…").to_string()), progress: None };
+        }
+        if self.job.is_some() {
+            return TabActivity::Running { detail: Some(tr("Reading both schemas…").to_string()), progress: None };
+        }
+        if self.confirm_apply {
+            return TabActivity::Attention { detail: tr("Waiting to confirm migration").to_string() };
+        }
+        if let Some(e) = &self.error {
+            return TabActivity::Error { detail: first_line(e) };
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
+        if self.job.is_some() || self.apply_job.is_some() {
+            self.poll(cx);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
+        self.poll(cx);
         let p = style::pal(ui);
         ui.spacing_mut().item_spacing.y = 0.0;
         // Source and target (28 px pickers), straight above the toolbar.

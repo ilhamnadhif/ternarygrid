@@ -118,6 +118,23 @@ impl TabView for CatalogObjectTab {
         Some(Self::key(&self.conn, self.folder_id, &self.ctx))
     }
 
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if self.row.is_loading() || self.ddl.is_loading() || self.children.iter().any(|(_, l)| l.is_loading()) {
+            return TabActivity::Running { detail: Some(tr("Loading…").to_string()), progress: None };
+        }
+        if let Some(e) = self.row.error().or_else(|| self.ddl.error()).or_else(|| self.children.iter().find_map(|(_, l)| l.error())) {
+            return TabActivity::Error { detail: first_line(&e.full_text()) };
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, _cx: &mut AppContext) {
+        if self.started {
+            let _ = self.poll();
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if !self.started {
             if !cx.conns.is_connected(&self.conn) {

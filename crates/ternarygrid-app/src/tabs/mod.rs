@@ -25,7 +25,163 @@ pub mod welcome;
 use crate::cx::AppContext;
 use egui::{Id, Ui, WidgetText};
 use std::any::Any;
+use std::time::{Duration, Instant};
 use ternarygrid_core::SchemaRef;
+
+/// Live background or foreground process activity reported by a [`TabView`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum TabActivity {
+    /// No active process, pending prompt, or unacknowledged error.
+    #[default]
+    Idle,
+    /// A process is running (`progress` is `Some(0.0..=1.0)` when determinate).
+    Running { detail: Option<String>, progress: Option<f32> },
+    /// Waiting on user action (parameter prompt, dangerous SQL confirm, AI approval).
+    Attention { detail: String },
+    /// Most recent operation failed (stays visible until resolved or re-run).
+    Error { detail: String },
+    /// Most recent operation finished with warnings or partial/truncated results.
+    Warning { detail: String },
+    /// Most recent operation was cancelled by the user.
+    Cancelled { detail: String },
+}
+
+/// Visual icon painted in the tab's 14×14 left icon slot (Opsi A — Pure Logo Only).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum TabBadge {
+    /// Normal object icon.
+    #[default]
+    None,
+    /// Animated teal arc spinner (indeterminate running).
+    Running,
+    /// Determinate circular progress ring (`0.0..=1.0`).
+    Progress(f32),
+    /// Green check-circle: finished in the background (auto-clears on visit).
+    Done,
+    /// Red error-circle: failed / error.
+    Error,
+    /// Amber warning triangle: warning / partial / truncated.
+    Warning,
+    /// Amber exclamation-circle: waiting for confirmation / parameters / approval.
+    Attention,
+    /// Muted slash-circle: cancelled by user.
+    Cancelled,
+}
+
+/// Grace period before an indeterminate spinner shows (prevents micro-flicker on sub-250 ms queries).
+const SPINNER_DELAY: Duration = Duration::from_millis(250);
+
+/// Single-line compact summary of an error or status message for tab hover tooltips.
+pub(crate) fn first_line(text: &str) -> String {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let mut chars = line.chars();
+    let short: String = chars.by_ref().take(96).collect();
+    if chars.next().is_some() { format!("{short}…") } else { short }
+}
+
+/// Tracks a tab's live activity, background completion ("unread ✓"), anti-flicker grace period,
+/// and hover tooltip detail.
+#[derive(Debug, Default)]
+pub struct TabStatusTracker {
+    activity: TabActivity,
+    running_since: Option<Instant>,
+    last_running_detail: Option<String>,
+    /// Unread background outcome (`Done`, `Warning`, `Cancelled`) + tooltip detail,
+    /// cleared automatically as soon as the tab becomes open/active.
+    unread: Option<(TabBadge, String)>,
+}
+
+impl TabStatusTracker {
+    /// Update state from the tab's live [`TabActivity`] and whether the tab is currently open.
+    pub fn update(&mut self, activity: TabActivity, is_open: bool, now: Instant) {
+        if is_open {
+            self.unread = None;
+        }
+        match &activity {
+            TabActivity::Running { detail, .. } => {
+                self.running_since.get_or_insert(now);
+                if detail.is_some() {
+                    self.last_running_detail = detail.clone();
+                }
+                self.unread = None;
+            }
+            other => {
+                if let Some(started) = self.running_since.take() {
+                    let elapsed = now.saturating_duration_since(started);
+                    let running_label = self.last_running_detail.take();
+                    if !is_open {
+                        match other {
+                            TabActivity::Idle => {
+                                let dur = crate::widgets::format_duration(elapsed);
+                                let tip = match running_label {
+                                    Some(d) => ternarygrid_core::trf("Completed ({}) · {}", &[&dur, &d.trim_end_matches('…')]),
+                                    None => ternarygrid_core::trf("Completed in {}", &[&dur]),
+                                };
+                                self.unread = Some((TabBadge::Done, tip));
+                            }
+                            TabActivity::Warning { detail } => {
+                                self.unread = Some((TabBadge::Warning, detail.clone()));
+                            }
+                            TabActivity::Cancelled { detail } => {
+                                self.unread = Some((TabBadge::Cancelled, detail.clone()));
+                            }
+                            TabActivity::Error { .. } | TabActivity::Attention { .. } | TabActivity::Running { .. } => {}
+                        }
+                    }
+                }
+            }
+        }
+        self.activity = activity;
+    }
+
+    /// Current icon badge to render in the tab's left icon slot.
+    pub fn badge(&self, now: Instant) -> TabBadge {
+        match &self.activity {
+            TabActivity::Running { progress: Some(p), .. } => TabBadge::Progress(p.clamp(0.0, 1.0)),
+            TabActivity::Running { progress: None, .. } => {
+                let elapsed = self.running_since.map(|t| now.saturating_duration_since(t)).unwrap_or_default();
+                if elapsed >= SPINNER_DELAY { TabBadge::Running } else { TabBadge::None }
+            }
+            TabActivity::Attention { .. } => TabBadge::Attention,
+            TabActivity::Error { .. } => TabBadge::Error,
+            TabActivity::Warning { .. } => TabBadge::Warning,
+            TabActivity::Cancelled { .. } => TabBadge::Cancelled,
+            TabActivity::Idle => self.unread.as_ref().map_or(TabBadge::None, |(b, _)| *b),
+        }
+    }
+
+    /// Optional status summary appended to the tab's hover tooltip.
+    pub fn tooltip_line(&self, now: Instant) -> Option<String> {
+        match &self.activity {
+            TabActivity::Running { detail, progress } => {
+                let elapsed = self.running_since.map(|t| now.saturating_duration_since(t)).unwrap_or_default();
+                let label = detail.as_deref().unwrap_or_else(|| ternarygrid_core::tr("Running…"));
+                if let Some(p) = progress {
+                    let pct = (p.clamp(0.0, 1.0) * 100.0).round() as u32;
+                    Some(format!("{label} ({pct}%)"))
+                } else if elapsed >= Duration::from_secs(1) {
+                    Some(format!("{label} ({})", crate::widgets::format_duration(elapsed)))
+                } else {
+                    Some(label.to_string())
+                }
+            }
+            TabActivity::Attention { detail } | TabActivity::Error { detail } | TabActivity::Warning { detail } | TabActivity::Cancelled { detail } => Some(detail.clone()),
+            TabActivity::Idle => self.unread.as_ref().map(|(_, tip)| tip.clone()),
+        }
+    }
+
+    /// Repaint delay needed by the tab status icon (`None` when completely static/idle).
+    pub fn repaint_after(&self, now: Instant) -> Option<Duration> {
+        match &self.activity {
+            TabActivity::Running { progress: Some(_), .. } => Some(Duration::from_millis(80)),
+            TabActivity::Running { progress: None, .. } => {
+                let elapsed = self.running_since.map(|t| now.saturating_duration_since(t)).unwrap_or_default();
+                if elapsed >= SPINNER_DELAY { Some(Duration::from_millis(33)) } else { Some(SPINNER_DELAY - elapsed) }
+            }
+            _ => None,
+        }
+    }
+}
 
 /// Behaviour shared by every tab kind.
 pub trait TabView: Any {
@@ -85,6 +241,15 @@ pub trait TabView: Any {
     fn is_dirty(&self) -> bool {
         false
     }
+
+    /// Live process / attention / error state shown in the tab's icon slot.
+    fn tab_activity(&self) -> TabActivity {
+        TabActivity::Idle
+    }
+
+    /// Poll already-started background jobs while the tab is inactive so processes finish
+    /// and update the tab's status icon without requiring the user to switch back.
+    fn poll_background(&mut self, _ctx: &egui::Context, _cx: &mut AppContext) {}
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext);
 
@@ -148,11 +313,19 @@ pub struct Tab {
     pub view: Box<dyn TabView>,
     /// The user chose to discard its unsaved changes: close without asking.
     pub force_close: bool,
+    /// Process / background-completion status rendered in the tab's left icon slot.
+    pub status: TabStatusTracker,
 }
 
 impl Tab {
     pub fn new(id: u64, view: Box<dyn TabView>) -> Self {
-        Tab { id, view, force_close: false }
+        Tab { id, view, force_close: false, status: TabStatusTracker::default() }
+    }
+
+    /// Sync [`Self::status`] from the view's live activity.
+    pub fn sync_status(&mut self, is_open: bool, now: Instant) {
+        let activity = self.view.tab_activity();
+        self.status.update(activity, is_open, now);
     }
 
     /// Closing it would lose unsaved changes the tab does not ask about itself.
@@ -280,16 +453,23 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
     /// the database, so that the same table of two databases can be told apart. Tabs of no
     /// connection have the first line only. Every tab keeps room for its × at the right.
     fn title(&mut self, tab: &mut Tab) -> WidgetText {
-        let dirty = if tab.view.is_dirty() { "● " } else { "" };
-        let title = format!("{dirty}{}", tab.view.title());
+        let dirty = tab.view.is_dirty();
+        let title = tab.view.title();
         let p = ternarygrid_ui::palette(self.style.visuals.dark_mode);
         let open = self.is_open(tab.id);
+        let badge = tab.status.badge(Instant::now());
         let size = self.style.text_styles.get(&egui::TextStyle::Body).map_or(13.0, |f| f.size);
         let format = |font: egui::FontId, color: egui::Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
         let location = tab_location(tab.view.as_ref(), self.cx.conns);
         // An object's icon in its hue on the tab's background; other tabs stay quiet.
+        // When a process status badge is active, keep the exact glyph slot transparent so
+        // `on_tab_button` can paint the vector logo in place with zero tab-width jump.
         let quiet = if open { p.text_muted } else { p.text_faint };
-        let icon_color = location.as_ref().and_then(|_| crate::theme::object_icon_color(tab.view.icon(), if open { p.canvas } else { p.chrome })).unwrap_or(quiet);
+        let icon_color = if badge != TabBadge::None {
+            egui::Color32::TRANSPARENT
+        } else {
+            location.as_ref().and_then(|_| crate::theme::object_icon_color(tab.view.icon(), if open { p.canvas } else { p.chrome })).unwrap_or(quiet)
+        };
         let mut job = egui::text::LayoutJob::default();
         // egui_dock pads the title by 8 points: 6 more on the left (7 inside the open tab's
         // hairline), the icon in a 14-point slot, 8 points, the title, then the × room.
@@ -297,7 +477,14 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         let end = "\u{200b}";
         job.append(tab.view.icon(), lead, format(ternarygrid_ui::style::icon_font(14.0), icon_color));
         let font = if open { egui::FontId::new(size, egui::FontFamily::Name(ternarygrid_ui::style::MEDIUM.into())) } else { egui::FontId::proportional(size) };
-        job.append(&title, TAB_ICON_ROOM - 14.0 * ternarygrid_ui::style::ICON_SCALE, format(font, egui::Color32::PLACEHOLDER));
+        let after_icon = TAB_ICON_ROOM - 14.0 * ternarygrid_ui::style::ICON_SCALE;
+        if dirty {
+            let dot_font = egui::FontId::proportional((size - 2.5).max(9.0));
+            job.append("● ", after_icon, format(dot_font, p.warn));
+            job.append(&title, 0.0, format(font, egui::Color32::PLACEHOLDER));
+        } else {
+            job.append(&title, after_icon, format(font, egui::Color32::PLACEHOLDER));
+        }
         let close_room = TAB_CLOSE_ROOM + 1.0;
         job.append(end, close_room, format(egui::FontId::proportional(size), egui::Color32::PLACEHOLDER));
         if let Some(place) = location.and_then(|l| l.place) {
@@ -316,6 +503,8 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         self.cx.current_tab = Some(tab.id);
         tab.view.ui(ui, self.cx);
         self.cx.current_tab = None;
+        // Sync immediately after UI so processes started on this frame are tracked right away.
+        tab.sync_status(true, Instant::now());
     }
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
@@ -324,12 +513,15 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         if response.hovered() && response.ctx.dragged_id().is_none() {
             response.ctx.set_cursor_icon(egui::CursorIcon::Default);
         }
-        // The tab's own text, then its connection and schema@database.
-        let location = tab_location(tab.view.as_ref(), self.cx.conns).map(|l| match l.place {
+        let now = Instant::now();
+        let loc_info = tab_location(tab.view.as_ref(), self.cx.conns);
+        let has_place = loc_info.as_ref().is_some_and(|l| l.place.is_some());
+        // The tab's own text, its connection/schema, then any live/unread process detail.
+        let location = loc_info.map(|l| match l.place {
             Some(p) => format!("{} · {p}", l.name),
             None => l.name,
         });
-        let tip: Vec<String> = tab.view.tooltip().into_iter().chain(location).collect();
+        let tip: Vec<String> = tab.view.tooltip().into_iter().chain(location).chain(tab.status.tooltip_line(now)).collect();
         if !tip.is_empty() {
             response.clone().on_hover_text(tip.join("\n"));
         }
@@ -338,10 +530,25 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         }
         self.tab_rects.insert(tab.id, response.rect);
         let p = ternarygrid_ui::palette(self.style.visuals.dark_mode);
+        let icons = ternarygrid_ui::style::icon_palette(self.style.visuals.dark_mode);
         let r = response.rect;
         // The tab reaches up to the top bar's hairline: what it paints starts a point below. Only
         // the part of the tab inside the bar: a tab scrolled away paints nothing over the panels.
         let painter = response.ctx.layer_painter(response.layer_id).with_clip_rect(response.interact_rect.with_min_y(r.top() + 1.0));
+        // Paint the Opsi A pure-logo status icon in the exact 14×14 left icon slot.
+        let badge = tab.status.badge(now);
+        if badge != TabBadge::None {
+            let open = self.is_open(tab.id);
+            let lead = if open { 7.0 } else { 6.0 };
+            let size = self.style.text_styles.get(&egui::TextStyle::Body).map_or(13.0, |f| f.size);
+            let cx = r.left() + 8.0 + lead + 6.5;
+            let cy = if has_place { r.center().y - (size - 2.0) * 0.54 } else { r.center().y };
+            let time = response.ctx.input(|i| i.time);
+            paint_tab_status_icon(&painter, egui::pos2(cx, cy), badge, &p, &icons, time);
+        }
+        if let Some(delay) = tab.status.repaint_after(now) {
+            response.ctx.request_repaint_after(delay);
+        }
         // Every tab's ×: 20 points, 10 from its right edge.
         let x = egui::Rect::from_center_size(egui::pos2(r.right() - 21.0, r.center().y + 0.5), egui::vec2(20.0, 20.0));
         let hover = response.ctx.input(|i| i.pointer.hover_pos()).is_some_and(|q| x.contains(q)) && response.hovered();
@@ -392,6 +599,63 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
 
     fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
         [false, false]
+    }
+}
+
+/// Paint the pure-logo status glyph in the tab's 14×14 left icon slot.
+fn paint_tab_status_icon(painter: &egui::Painter, c: egui::Pos2, badge: TabBadge, p: &ternarygrid_ui::style::Palette, icons: &ternarygrid_ui::style::IconPalette, time: f64) {
+    use egui::{Stroke, pos2, vec2};
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let r = 5.6_f32;
+    let arc_points =
+        |start: f32, sweep: f32, steps: usize| -> Vec<egui::Pos2> { (0..=steps).map(|k| c + r * egui::Vec2::angled(start + sweep * (k as f32 / steps as f32))).collect() };
+    match badge {
+        TabBadge::None => {}
+        TabBadge::Running => {
+            painter.circle_stroke(c, r, Stroke::new(1.45, p.border_strong));
+            let angle = (time * 5.2) as f32;
+            painter.add(egui::epaint::PathShape::line(arc_points(angle, TAU * 0.65, 20), Stroke::new(1.75, icons.teal)));
+        }
+        TabBadge::Progress(frac) => {
+            painter.circle_stroke(c, r, Stroke::new(1.5, p.border_strong));
+            let sweep = frac.clamp(0.05, 1.0) * TAU;
+            painter.add(egui::epaint::PathShape::line(arc_points(-FRAC_PI_2, sweep, 24), Stroke::new(1.8, icons.teal)));
+        }
+        TabBadge::Done => {
+            painter.circle_filled(c, r, ternarygrid_ui::soft(p.ok, 0.16));
+            painter.circle_stroke(c, r, Stroke::new(1.3, p.ok));
+            let s = Stroke::new(1.55, p.ok);
+            let a = c + vec2(-2.4, 0.2);
+            let m = c + vec2(-0.5, 2.1);
+            let z = c + vec2(2.8, -1.8);
+            painter.line_segment([a, m], s);
+            painter.line_segment([m, z], s);
+        }
+        TabBadge::Error => {
+            painter.circle_filled(c, r, ternarygrid_ui::soft(p.err, 0.16));
+            painter.circle_stroke(c, r, Stroke::new(1.3, p.err));
+            let s = Stroke::new(1.5, p.err);
+            let d = 2.15;
+            painter.line_segment([c + vec2(-d, -d), c + vec2(d, d)], s);
+            painter.line_segment([c + vec2(d, -d), c + vec2(-d, d)], s);
+        }
+        TabBadge::Warning => {
+            let pts = vec![pos2(c.x, c.y - 5.3), pos2(c.x + 5.6, c.y + 4.4), pos2(c.x - 5.6, c.y + 4.4)];
+            painter.add(egui::epaint::PathShape::convex_polygon(pts, ternarygrid_ui::soft(p.warn, 0.16), Stroke::new(1.25, p.warn)));
+            painter.line_segment([c + vec2(0.0, -1.9), c + vec2(0.0, 1.1)], Stroke::new(1.4, p.warn));
+            painter.circle_filled(c + vec2(0.0, 2.8), 0.8, p.warn);
+        }
+        TabBadge::Attention => {
+            painter.circle_filled(c, r, ternarygrid_ui::soft(p.warn, 0.16));
+            painter.circle_stroke(c, r, Stroke::new(1.3, p.warn));
+            painter.line_segment([c + vec2(0.0, -2.8), c + vec2(0.0, 0.7)], Stroke::new(1.5, p.warn));
+            painter.circle_filled(c + vec2(0.0, 2.55), 0.85, p.warn);
+        }
+        TabBadge::Cancelled => {
+            painter.circle_stroke(c, r, Stroke::new(1.3, p.text_faint));
+            let d = r * 0.68;
+            painter.line_segment([c + vec2(-d, -d), c + vec2(d, d)], Stroke::new(1.3, p.text_faint));
+        }
     }
 }
 
@@ -453,7 +717,8 @@ pub fn code(ui: &mut Ui, cx: &mut AppContext, conn: &str, id: impl std::hash::Ha
 
 #[cfg(test)]
 mod tests {
-    use super::{place_label, tab_reveal_delta};
+    use super::{SPINNER_DELAY, TabActivity, TabBadge, TabStatusTracker, first_line, place_label, tab_reveal_delta};
+    use std::time::{Duration, Instant};
     use ternarygrid_core::SchemaRef;
 
     #[test]
@@ -482,5 +747,99 @@ mod tests {
         assert_eq!(place_label(at(None, Some("crm")), &mysql, false).as_deref(), Some("crm"));
         assert_eq!(place_label(SchemaRef::default(), &mysql, false).as_deref(), Some("shop"));
         assert_eq!(place_label(at(None, Some("main")), &at(None, None), false).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn tab_status_anti_flicker_and_determinate_progress() {
+        let t0 = Instant::now();
+        let mut tr = TabStatusTracker::default();
+        assert_eq!(tr.badge(t0), TabBadge::None);
+        assert_eq!(tr.repaint_after(t0), None);
+
+        // Indeterminate run stays hidden during the 250 ms anti-flicker grace period.
+        tr.update(TabActivity::Running { detail: Some("Executing SQL…".into()), progress: None }, true, t0);
+        assert_eq!(tr.badge(t0 + Duration::from_millis(100)), TabBadge::None);
+        assert!(tr.repaint_after(t0 + Duration::from_millis(100)).is_some());
+
+        // After 250 ms it morphs into the animated spinner.
+        let t_spin = t0 + SPINNER_DELAY;
+        assert_eq!(tr.badge(t_spin), TabBadge::Running);
+        assert_eq!(tr.repaint_after(t_spin), Some(Duration::from_millis(33)));
+
+        // Determinate progress appears immediately without waiting 250 ms.
+        let mut tr_prog = TabStatusTracker::default();
+        tr_prog.update(TabActivity::Running { detail: Some("Fetching rows…".into()), progress: Some(0.64) }, false, t0);
+        assert_eq!(tr_prog.badge(t0), TabBadge::Progress(0.64));
+        assert_eq!(tr_prog.tooltip_line(t0).as_deref(), Some("Fetching rows… (64%)"));
+    }
+
+    #[test]
+    fn tab_status_background_done_clears_on_visit_while_foreground_stays_clean() {
+        let t0 = Instant::now();
+        // Foreground run: active the entire time -> never shows unread Done badge.
+        let mut fg = TabStatusTracker::default();
+        fg.update(TabActivity::Running { detail: Some("Reading data…".into()), progress: None }, true, t0);
+        fg.update(TabActivity::Idle, true, t0 + Duration::from_secs(2));
+        assert_eq!(fg.badge(t0 + Duration::from_secs(2)), TabBadge::None);
+        assert_eq!(fg.tooltip_line(t0 + Duration::from_secs(2)), None);
+
+        // Background run: started active, user switches away, job completes while inactive -> green Done ✓.
+        let mut bg = TabStatusTracker::default();
+        bg.update(TabActivity::Running { detail: Some("Reading data…".into()), progress: None }, true, t0);
+        bg.update(TabActivity::Running { detail: Some("Reading data…".into()), progress: None }, false, t0 + Duration::from_millis(400));
+        assert_eq!(bg.badge(t0 + Duration::from_millis(400)), TabBadge::Running);
+
+        let t_done = t0 + Duration::from_secs(3);
+        bg.update(TabActivity::Idle, false, t_done);
+        assert_eq!(bg.badge(t_done), TabBadge::Done);
+        assert_eq!(bg.repaint_after(t_done), None, "Done badge is static and uses 0 idle CPU");
+        let tip = bg.tooltip_line(t_done).expect("Done tooltip");
+        assert!(tip.contains("Completed") && tip.contains("Reading data"), "unexpected tip: {tip}");
+
+        // Switching back to the tab auto-clears the unread Done badge immediately.
+        bg.update(TabActivity::Idle, true, t_done + Duration::from_millis(10));
+        assert_eq!(bg.badge(t_done + Duration::from_millis(10)), TabBadge::None);
+        assert_eq!(bg.tooltip_line(t_done + Duration::from_millis(10)), None);
+    }
+
+    #[test]
+    fn tab_status_error_warning_attention_cancelled_and_restart() {
+        let t0 = Instant::now();
+        let mut tr = TabStatusTracker::default();
+
+        // Background error stays visible until cleared by a new run or edit.
+        tr.update(TabActivity::Running { detail: Some("Executing SQL…".into()), progress: None }, false, t0);
+        tr.update(TabActivity::Error { detail: "syntax error at or near FROM".into() }, false, t0 + Duration::from_secs(1));
+        assert_eq!(tr.badge(t0 + Duration::from_secs(1)), TabBadge::Error);
+        assert_eq!(tr.tooltip_line(t0 + Duration::from_secs(1)).as_deref(), Some("syntax error at or near FROM"));
+        assert_eq!(tr.repaint_after(t0 + Duration::from_secs(1)), None);
+
+        // Attention (confirm / parameter prompt / AI approval).
+        tr.update(TabActivity::Attention { detail: "Waiting for query parameters".into() }, false, t0 + Duration::from_secs(2));
+        assert_eq!(tr.badge(t0 + Duration::from_secs(2)), TabBadge::Attention);
+
+        // Warning.
+        tr.update(TabActivity::Warning { detail: "Sync script was truncated".into() }, false, t0 + Duration::from_secs(3));
+        assert_eq!(tr.badge(t0 + Duration::from_secs(3)), TabBadge::Warning);
+
+        // Cancelled.
+        tr.update(TabActivity::Cancelled { detail: "Cancelled after 1.2 s".into() }, false, t0 + Duration::from_secs(4));
+        assert_eq!(tr.badge(t0 + Duration::from_secs(4)), TabBadge::Cancelled);
+
+        // Starting a new run clears any previous unread Done badge.
+        tr.update(TabActivity::Running { detail: Some("Fetching…".into()), progress: None }, false, t0 + Duration::from_secs(5));
+        tr.update(TabActivity::Idle, false, t0 + Duration::from_secs(6));
+        assert_eq!(tr.badge(t0 + Duration::from_secs(6)), TabBadge::Done);
+        tr.update(TabActivity::Running { detail: Some("Fetching…".into()), progress: None }, false, t0 + Duration::from_secs(7));
+        assert_eq!(tr.badge(t0 + Duration::from_secs(7)), TabBadge::None, "new run resets grace period and clears stale Done");
+        assert_eq!(tr.badge(t0 + Duration::from_secs(7) + SPINNER_DELAY), TabBadge::Running);
+    }
+
+    #[test]
+    fn first_line_compacts_multiline_and_long_messages() {
+        assert_eq!(first_line("\n  ERROR: relation missing\nDETAIL: more info"), "ERROR: relation missing");
+        let long = "x".repeat(120);
+        let s = first_line(&long);
+        assert!(s.ends_with('…') && s.chars().count() == 97);
     }
 }

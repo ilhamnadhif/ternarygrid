@@ -32,6 +32,8 @@ pub struct ErTab {
     /// The Diagram page of a table: the table and its related ones, without the
     /// name / Save / Refresh row (the page's header refreshes it).
     embedded: bool,
+    loading_snapshot: bool,
+    snapshot_error: Option<String>,
 }
 
 impl ErTab {
@@ -54,6 +56,8 @@ impl ErTab {
             refresh_pending: false,
             curated: false,
             embedded: false,
+            loading_snapshot: false,
+            snapshot_error: None,
         }
     }
 
@@ -286,6 +290,59 @@ impl TabView for ErTab {
         self.dirty && self.saved_name.is_some()
     }
 
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if self.loading_snapshot {
+            return TabActivity::Running { detail: Some(tr("Reading the schema…").to_string()), progress: None };
+        }
+        if let Some(e) = &self.snapshot_error {
+            return TabActivity::Error { detail: first_line(e) };
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
+        if !self.loading_snapshot && !self.refresh_pending {
+            return;
+        }
+        let Some(live) = cx.conns.live(&self.conn) else {
+            self.loading_snapshot = false;
+            return;
+        };
+        match live.meta.snapshots.get(&self.schema) {
+            Some(crate::backend::Loadable::Loaded(snap)) => {
+                let snap = snap.clone();
+                if self.diagram.is_none() {
+                    let model = self.build_model(&snap);
+                    self.diagram = Some(ErDiagram::new(self.name_edit.clone(), model));
+                } else if self.refresh_pending {
+                    let curated = (!self.tables.is_empty() && !self.embedded) || self.curated;
+                    let model = match &self.diagram {
+                        Some(d) if curated => {
+                            let keys: Vec<String> = d.model.tables.iter().map(|t| t.key.clone()).collect();
+                            ErModel::from_snapshot(&snap, Some(&keys))
+                        }
+                        _ => self.build_model(&snap),
+                    };
+                    if let Some(d) = self.diagram.as_mut() {
+                        d.refresh_model(model);
+                    }
+                    self.refresh_pending = false;
+                }
+                self.snapshot = Some(snap);
+                self.loading_snapshot = false;
+                self.snapshot_error = None;
+            }
+            Some(crate::backend::Loadable::Failed(e)) => {
+                self.loading_snapshot = false;
+                self.snapshot_error = Some(e.full_text());
+            }
+            _ => {
+                self.loading_snapshot = self.diagram.is_none() || self.refresh_pending;
+            }
+        }
+    }
+
     fn session_state(&self) -> Option<serde_json::Value> {
         let path = self.saved_name.as_ref().map(|n| std::path::PathBuf::from(format!("{n}.json")));
         let tab = ternarygrid_config::SessionTab {
@@ -319,6 +376,8 @@ impl TabView for ErTab {
         match entry {
             Some(crate::backend::Loadable::Loaded(snap)) => {
                 let snap = snap.clone();
+                self.loading_snapshot = false;
+                self.snapshot_error = None;
                 if self.diagram.is_none() {
                     let model = self.build_model(&snap);
                     self.diagram = Some(ErDiagram::new(self.name_edit.clone(), model));
@@ -343,15 +402,20 @@ impl TabView for ErTab {
             }
             Some(crate::backend::Loadable::Failed(e)) => {
                 let text = e.full_text();
+                self.loading_snapshot = false;
+                self.snapshot_error = Some(text.clone());
                 egui::Frame::new().inner_margin(egui::Margin::same(16)).show(ui, |ui| {
                     crate::widgets::error_box(ui, &text);
                     if kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), tr("Retry")).clicked() {
                         live.meta.clear_schema(&self.schema);
+                        self.snapshot_error = None;
                     }
                 });
                 return;
             }
             _ => {
+                self.loading_snapshot = self.diagram.is_none() || self.refresh_pending;
+                self.snapshot_error = None;
                 if self.diagram.is_none() {
                     egui::Frame::new().inner_margin(egui::Margin::same(16)).show(ui, |ui| ternarygrid_ui::parts::spinner_label(ui, tr("Reading the schema…")));
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));

@@ -452,6 +452,7 @@ pub struct DataCompareTab {
     run: Option<Running>,
     result: Option<Outcome>,
     error: Option<String>,
+    cancelled: bool,
     view: ResultView,
     filter: Option<RowDiffKind>,
     confirm_apply: bool,
@@ -505,6 +506,7 @@ impl DataCompareTab {
             run: None,
             result: None,
             error: None,
+            cancelled: false,
             view: ResultView::Rows,
             filter: None,
             confirm_apply: false,
@@ -777,6 +779,7 @@ impl DataCompareTab {
             }
         };
         self.error = None;
+        self.cancelled = false;
         self.result = None;
         let progress = Arc::new(Mutex::new(DataCompareProgress::default()));
         let cancel = CancellationToken::new();
@@ -829,8 +832,14 @@ impl DataCompareTab {
                         lang: SqlLanguage::new(dialect),
                     });
                 }
-                Err(e) if e.kind == ErrorKind::Cancelled => self.error = Some(tr("The comparison was cancelled.").to_string()),
-                Err(e) => self.error = Some(e.full_text()),
+                Err(e) if e.kind == ErrorKind::Cancelled => {
+                    self.cancelled = true;
+                    self.error = Some(tr("The comparison was cancelled.").to_string());
+                }
+                Err(e) => {
+                    self.cancelled = false;
+                    self.error = Some(e.full_text());
+                }
             }
         }
         if let Some(j) = self.apply_job.as_mut()
@@ -1200,6 +1209,40 @@ impl TabView for DataCompareTab {
 
     fn connection_id(&self) -> Option<&str> {
         self.target.conn.as_deref().or(self.source.conn.as_deref())
+    }
+
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if self.apply_job.is_some() {
+            return TabActivity::Running { detail: Some(tr("Applying sync script…").to_string()), progress: None };
+        }
+        if self.run.is_some() || self.start_requested {
+            return TabActivity::Running { detail: Some(tr("Comparing table data…").to_string()), progress: None };
+        }
+        if self.confirm_apply {
+            return TabActivity::Attention { detail: tr("Waiting to confirm sync script").to_string() };
+        }
+        if self.cancelled {
+            return TabActivity::Cancelled { detail: tr("Comparison cancelled").to_string() };
+        }
+        if let Some(e) = &self.error {
+            return TabActivity::Error { detail: first_line(e) };
+        }
+        if let Some(o) = &self.result {
+            if o.diff.sync_truncated {
+                return TabActivity::Warning { detail: tr("Sync script was truncated").to_string() };
+            }
+            if let Some(w) = o.diff.warnings.first() {
+                return TabActivity::Warning { detail: first_line(w) };
+            }
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
+        if self.run.is_some() || self.apply_job.is_some() {
+            self.poll(cx);
+        }
     }
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {

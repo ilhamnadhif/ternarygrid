@@ -2498,6 +2498,29 @@ impl TabView for TableDesignerTab {
         self.model != self.baseline
     }
 
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if self.exec.is_some() {
+            return TabActivity::Running { detail: Some(tr("Applying table changes…").to_string()), progress: None };
+        }
+        if self.load.is_some() {
+            return TabActivity::Running { detail: Some(tr("Reading the table definition…").to_string()), progress: None };
+        }
+        if self.confirm || self.close_prompt {
+            return TabActivity::Attention { detail: tr("Waiting for confirmation").to_string() };
+        }
+        if let Some(e) = self.exec_error.as_ref().or(self.load_error.as_ref()) {
+            return TabActivity::Error { detail: first_line(e) };
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
+        if self.load.is_some() || self.exec.is_some() {
+            self.poll(cx);
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.tab_id = cx.current_tab;
         self.poll(cx);

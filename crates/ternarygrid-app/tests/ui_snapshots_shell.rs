@@ -693,3 +693,83 @@ fn bars(s: &mut Shots, conn: &str) {
     wheel(s, tree, -60.0);
     s.shot_at("nav_sticky_next", Some(egui::pos2(1439.0, 519.0)));
 }
+
+struct StatusSampleTab {
+    title: String,
+    icon: &'static str,
+    conn: String,
+    dirty: bool,
+    activity: ternarygrid_app::tabs::TabActivity,
+}
+
+impl ternarygrid_app::tabs::TabView for StatusSampleTab {
+    fn title(&self) -> String {
+        self.title.clone()
+    }
+    fn icon(&self) -> &'static str {
+        self.icon
+    }
+    fn connection_id(&self) -> Option<&str> {
+        Some(&self.conn)
+    }
+    fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+    fn tab_activity(&self) -> ternarygrid_app::tabs::TabActivity {
+        self.activity.clone()
+    }
+    fn ui(&mut self, _ui: &mut egui::Ui, _cx: &mut ternarygrid_app::cx::AppContext) {}
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+#[test]
+#[ignore = "writes tab-status screenshots for visual review; run with --ignored"]
+fn tab_status_badges() {
+    use egui_phosphor::regular as icon;
+    use ternarygrid_app::tabs::TabActivity;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots/tab-status");
+    std::fs::create_dir_all(&root).unwrap();
+    for theme in [Theme::Dark, Theme::Light] {
+        let home = std::env::temp_dir().join(format!("ternarygrid-tab-status-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut s = Shots::new(&home, root.clone(), theme, Vec::new());
+        s.click("Create sample database");
+        s.wait("sample connected", |h| h.state().conns.configs().iter().any(|c| h.state().conns.is_connected(&c.id)));
+        let conn = s.h.state().conns.configs().first().unwrap().id.clone();
+
+        let make = |title: &str, ic: &'static str, dirty: bool, activity: TabActivity| {
+            Box::new(StatusSampleTab { title: title.into(), icon: ic, conn: conn.clone(), dirty, activity }) as Box<dyn ternarygrid_app::tabs::TabView>
+        };
+
+        let active_id = s.h.state_mut().open_tab(make("ratios", icon::TABLE, false, TabActivity::Idle));
+        let done_id = s.h.state_mut().open_tab(make("pixels", icon::TABLE, false, TabActivity::Idle));
+        let _run_id = s.h.state_mut().open_tab(make("subscriptions", icon::TABLE, false, TabActivity::Running { detail: Some("Fetching data…".into()), progress: None }));
+        let _prog_id = s.h.state_mut().open_tab(make("events", icon::TABLE, false, TabActivity::Running { detail: Some("Fetching rows…".into()), progress: Some(0.64) }));
+        let _err_id = s.h.state_mut().open_tab(make("audit_log", icon::FILE_CODE, false, TabActivity::Error { detail: "syntax error".into() }));
+        let _warn_id = s.h.state_mut().open_tab(make("billing", icon::FILE_CODE, false, TabActivity::Warning { detail: "Partial results".into() }));
+        let _attn_id = s.h.state_mut().open_tab(make("delete.sql", icon::FILE_CODE, false, TabActivity::Attention { detail: "Confirm execution".into() }));
+        let _cancel_id = s.h.state_mut().open_tab(make("export_job", icon::TABLE, false, TabActivity::Cancelled { detail: "Cancelled".into() }));
+        let dirty_done_id = s.h.state_mut().open_tab(make("users", icon::TABLE, true, TabActivity::Idle));
+
+        s.command(AppCommand::FocusTab(active_id));
+        // Seed Done ✓ on two background tabs and advance >250 ms so the indeterminate spinner shows.
+        let past = Instant::now() - Duration::from_secs(3);
+        for (_, tab) in s.h.state_mut().dock.iter_all_tabs_mut() {
+            if tab.id == done_id || tab.id == dirty_done_id {
+                tab.status.update(TabActivity::Running { detail: Some("Reading data…".into()), progress: None }, false, past);
+                tab.status.update(TabActivity::Idle, false, Instant::now());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(280));
+        s.frames(6);
+        s.shot("tab_status_all");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}

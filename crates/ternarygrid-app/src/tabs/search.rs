@@ -1030,6 +1030,41 @@ impl TabView for SearchTab {
         self.conn.as_deref()
     }
 
+    fn tab_activity(&self) -> crate::tabs::TabActivity {
+        use crate::tabs::{TabActivity, first_line};
+        if let Some(r) = &self.data_run {
+            let p = r.state.lock();
+            let progress = (p.total > 0).then(|| (p.done as f32 / p.total as f32).clamp(0.0, 1.0));
+            let detail = if p.total > 0 { trf("Searching table {} of {}", &[&(p.done + 1).min(p.total), &p.total]) } else { tr("Searching data…").to_string() };
+            return TabActivity::Running { detail: Some(detail), progress };
+        }
+        if self.meta_job.is_some() {
+            return TabActivity::Running { detail: Some(tr("Searching metadata…").to_string()), progress: None };
+        }
+        if self.data_requested {
+            return TabActivity::Running { detail: Some(tr("Opening a session…").to_string()), progress: None };
+        }
+        if let Some((_, _, true)) = self.data_done {
+            return TabActivity::Cancelled { detail: tr("Search stopped").to_string() };
+        }
+        if let Some(e) = self.meta_errors.first() {
+            return TabActivity::Error { detail: first_line(e) };
+        }
+        if self.data_hits.iter().any(|h| h.error.is_some()) {
+            return TabActivity::Warning { detail: tr("Some tables failed during search").to_string() };
+        }
+        TabActivity::Idle
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, _cx: &mut AppContext) {
+        if self.meta_job.is_some() {
+            self.poll_metadata();
+        }
+        if self.data_run.is_some() {
+            self.poll_data();
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         self.poll_metadata();
         self.poll_data();

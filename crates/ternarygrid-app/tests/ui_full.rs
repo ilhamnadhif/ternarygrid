@@ -2780,3 +2780,98 @@ fn the_side_panel_still_resizes_by_hand() {
     frames(&mut h, 20);
     assert_eq!(h.state().chrome.nav.unwrap().width(), narrower, "it stays where it was left");
 }
+
+#[test]
+fn tab_process_status_background_completion_error_attention_and_stable_width() {
+    use ternarygrid_app::tabs::TabBadge;
+
+    let (_dir, mut h, conn) = setup();
+
+    // Open a SQL editor tab (Tab A) and a second table tab (Tab B).
+    let tab_a = h.state_mut().open_tab(Box::new(SqlEditorTab::new(
+        Some(conn.clone()),
+        None,
+        "with recursive n(i) as (select 1 union all select i + 1 from n where i < 2000000) select count(*) from n;".into(),
+        None,
+        false,
+        "report.sql".into(),
+    )));
+    wait(&mut h, "sql editor session ready", |h| {
+        h.state().dock.iter_all_tabs().find(|(_, t)| t.id == tab_a).and_then(|(_, t)| t.view.as_any().downcast_ref::<SqlEditorTab>()).is_some_and(|e| e.session_ready())
+    });
+    let badge_of = |h: &H, id: u64| -> TabBadge { h.state().dock.iter_all_tabs().find(|(_, t)| t.id == id).map(|(_, t)| t.status.badge(Instant::now())).expect("tab exists") };
+    let tip_of = |h: &H, id: u64| -> Option<String> { h.state().dock.iter_all_tabs().find(|(_, t)| t.id == id).and_then(|(_, t)| t.status.tooltip_line(Instant::now())) };
+
+    let tab_b = h.state_mut().open_tab(Box::new(SqlEditorTab::new(Some(conn.clone()), None, "select 1;".into(), None, false, "scratch.sql".into())));
+    // Measure Tab A's width while inactive and idle (same font/padding as background Done/Error).
+    frames(&mut h, 6);
+    assert_eq!(badge_of(&h, tab_a), TabBadge::None);
+    let idle_width = h.state().tab_rect(tab_a).expect("tab A rect").width();
+
+    h.state_mut().push_command(AppCommand::FocusTab(tab_a));
+    frames(&mut h, 4);
+
+    // 1. Start query in Tab A, immediately switch to Tab B, and verify background polling
+    //    finishes the query and shows Done ✓ without switching back.
+    let ctx = h.ctx.clone();
+    h.state_mut().dispatch_action(&ctx, Action::ExecuteStatement);
+    h.step();
+    h.state_mut().push_command(AppCommand::FocusTab(tab_b));
+    frames(&mut h, 3);
+
+    wait(&mut h, "background query finishes with Done badge", |h| badge_of(h, tab_a) == TabBadge::Done);
+    let done_width = h.state().tab_rect(tab_a).expect("tab A rect when Done").width();
+    assert!((done_width - idle_width).abs() <= 0.5, "tab width must not jump on Done: idle={idle_width}, done={done_width}");
+    let done_tip = tip_of(&h, tab_a).expect("Done tooltip");
+    assert!(done_tip.contains("Completed"), "unexpected Done tooltip: {done_tip}");
+
+    // Switching back to Tab A immediately clears the unread Done badge.
+    h.state_mut().push_command(AppCommand::FocusTab(tab_a));
+    frames(&mut h, 4);
+    assert_eq!(badge_of(&h, tab_a), TabBadge::None, "visiting Tab A clears Done badge");
+    assert_eq!(tip_of(&h, tab_a), None);
+
+    // 2. Failing query in background surfaces Error badge on Tab A while Tab B stays active.
+    if let Some((_, t)) = h.state_mut().dock.iter_all_tabs_mut().find(|(_, t)| t.id == tab_a)
+        && let Some(ed) = t.view.as_any_mut().downcast_mut::<SqlEditorTab>()
+    {
+        ed.set_text(&ctx, "select * from nonexistent_table_for_tab_status;");
+    }
+    frames(&mut h, 2);
+    h.state_mut().dispatch_action(&ctx, Action::ExecuteStatement);
+    h.step();
+    h.state_mut().push_command(AppCommand::FocusTab(tab_b));
+    wait(&mut h, "background query fails with Error badge", |h| badge_of(h, tab_a) == TabBadge::Error);
+    frames(&mut h, 3);
+    let err_width = h.state().tab_rect(tab_a).expect("tab A rect when Error").width();
+    assert!((err_width - idle_width).abs() <= 0.5, "tab width must not jump on Error: idle={idle_width}, err={err_width}");
+
+    // 3. Query needing parameters triggers Attention badge.
+    h.state_mut().push_command(AppCommand::FocusTab(tab_a));
+    frames(&mut h, 3);
+    if let Some((_, t)) = h.state_mut().dock.iter_all_tabs_mut().find(|(_, t)| t.id == tab_a)
+        && let Some(ed) = t.view.as_any_mut().downcast_mut::<SqlEditorTab>()
+    {
+        ed.set_text(&ctx, "select :user_id as id;");
+    }
+    frames(&mut h, 2);
+    h.state_mut().dispatch_action(&ctx, Action::ExecuteStatement);
+    frames(&mut h, 4);
+    assert_eq!(badge_of(&h, tab_a), TabBadge::Attention, "parameter prompt shows Attention badge");
+
+    // 4. Foreground completion stays clean (never triggers unread Done).
+    h.key_press(Key::Escape);
+    frames(&mut h, 3);
+    if let Some((_, t)) = h.state_mut().dock.iter_all_tabs_mut().find(|(_, t)| t.id == tab_a)
+        && let Some(ed) = t.view.as_any_mut().downcast_mut::<SqlEditorTab>()
+    {
+        ed.set_text(&ctx, "select 42 as answer;");
+    }
+    frames(&mut h, 2);
+    h.state_mut().dispatch_action(&ctx, Action::ExecuteStatement);
+    wait(&mut h, "foreground query completes", |h| {
+        h.state().dock.iter_all_tabs().find(|(_, t)| t.id == tab_a).and_then(|(_, t)| t.view.as_any().downcast_ref::<SqlEditorTab>()).is_some_and(|e| !e.is_running())
+    });
+    frames(&mut h, 4);
+    assert_eq!(badge_of(&h, tab_a), TabBadge::None, "foreground run must not leave unread Done badge");
+}
