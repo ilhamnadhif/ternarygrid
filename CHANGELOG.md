@@ -3,6 +3,18 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.8 — 2026-11-25
+
+### Security
+- **Grid paste and SQL expression hardening.** Clipboard pastes into editable grids now always parse as typed literals and never promote pasted text into raw SQL expressions; `is_sql_expression` rejects multi-column assignments, SQL clauses, `TABLE`/`WITH` subqueries, dialect quote prefixes, and comments, and unvalidated expressions always require SQL preview confirmation before saving.
+- **Comprehensive read-only enforcement across all engines and workflows.** Hardened read-only mode across Redis (strict subcommand allowlists, `TOUCH` blocked), Elasticsearch/OpenSearch (percent-decoded paths and query keys, blocked write endpoints, full OpenSearch PPL read support), SQL Server (`ApplicationIntent=ReadOnly` plus T-SQL write guards on `execute` and `EXPLAIN ANALYZE`), Oracle (`SET TRANSACTION READ ONLY`, `nq'...'` literal scanning, automatic transaction cleanup in auto-commit mode), scheduled SQL/NoSQL tasks, forced read-only AI sessions (skipping `init_sql`), and read-only `init_sql` validation.
+- **Network, URL, and driver hardening.** Added HTTP CONNECT proxy target/credential CRLF validation, Oracle TNS descriptor injection validation, Elasticsearch 64 MiB response cap with URL path percent-encoding and JSON escaping, explicit TLS/mTLS & IPv6 handling across MongoDB, Cassandra (`tls_server_name` + mTLS), and ClickHouse, and expanded `redact_url` masking for Oracle `user/pass@`, `pwd=`, `api_key=`, and SQL Server `{...}` braced passwords.
+- **Packaging and supply-chain hardening.** Pinned `appimagetool` SHA-256 digests, hardened `install.sh` (fail-closed checksum verification + argv-safe AppleScript) and `release.sh`/`ci-publish.sh` (`SHA256SUMS.txt` publication), pinned CI workflow actions to commit SHAs with minimal permissions, updated 3 yanked crates, and migrated PostgreSQL TLS from unmaintained `rustls-pemfile` to `rustls-pki-types::pem`.
+
+### Fixed
+- **Windows secrets and Task Scheduler reliability.** Windows now stores credentials per-key in Windows Credential Manager (avoiding the 2,560-byte `CredWriteW` bundle limit) with automatic one-time migration of existing bundled secrets; `VaultStore` uses an exclusive advisory lock file (`vault.bin.lock`) to prevent lost updates across concurrent windows/tasks; Windows OS-scheduled tasks now register via locale-independent Task Scheduler 1.2 XML (`schtasks /XML`) supporting `Schedule::Once` on all locales.
+- **Connections, sorting, compare, transfer, and editor fixes.** SQLite and secret-free connections no longer trigger OS Keychain lookups; fixed `RowStore` atomic counter underflow and `u32` page-size checks; enforced strict total ordering across all `Value` types and natural grid sorting; deduplicated key columns in Data Compare `INSERT`s; honored `inline_value` in `BatchWriter` replace-mode `DELETE`; added MSSQL `SHOWPLAN_XML` recovery guard on cancellation; added prompt socket cancellation for AI SSE streams; fixed `ansi::needs_quoting` for `IdentCase::Upper`; fixed Liquibase XML comment escaping for `---` and trailing `-`; added dialect-aware quoting/limits for disconnected multi-select `SELECT` generation; switched `init_sql` splitting to comment-aware parsing; enabled single-step Find & Replace for zero-length regexes (`^`, `$`); added process-group termination + reaping on external SQL formatter timeouts, runtime log rotation (`ternarygrid.log` → `ternarygrid.1.log`), cancellation cleanup for stale macOS self-updates, and quoting of non-finite floats (`NaN`, `inf`) in `morph_to_delimited`.
+
 ## 0.7.7 — 2026-11-24
 
 ### Added
