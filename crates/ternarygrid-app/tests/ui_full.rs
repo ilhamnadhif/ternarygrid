@@ -924,12 +924,9 @@ fn settings_grid_menu_and_editor_helpers() {
     h.key_press(Key::Tab);
     frames(&mut h, 3);
     wait(&mut h, "rows side by side", |h| has(h, "Record view, 3 rows"));
-    assert!(has(&h, "3 selected rows"), "{:?}", labels(&h));
-    // "Hide empty" is remembered.
-    click(&mut h, "Hide empty");
-    assert!(h.state().settings.results.record_hide_empty);
-    click(&mut h, "Hide empty");
-    assert!(!h.state().settings.results.record_hide_empty);
+    // The record view renders directly without its former top filter/row-navigation bar.
+    assert!(!has(&h, "Hide empty"), "record view top bar removed");
+    assert!(!has(&h, "Filter columns"), "record view top bar removed");
     // Drag a column border: wider; double-click it: fitted to the values.
     let handle = |h: &H| h.query_all_by_label_contains("Resize Row #").next().map(|n| n.rect()).unwrap_or_else(|| panic!("{:?}", labels(h)));
     let start = handle(&h).center();

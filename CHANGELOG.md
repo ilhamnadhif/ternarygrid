@@ -3,6 +3,17 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.3 — 2026-11-24
+
+### Changed
+- **Left icon rail removed; Database navigator sits flush against the left edge.** The sidebar switches (Database navigator, Projects and scripts) moved to the left of the top bar, and Query history, Tasks, Background operations and Settings are grouped on the right of the top bar (with the Operations pop-up anchored directly beneath its button).
+- **Tab and navigator accent stripes removed.** Focused tabs stand out with a crisp outline and surface contrast, and selected navigator rows use a clean soft-accent outline and fill without top or side colour bars.
+- **Record view top bar removed.** Single-row and multi-row record views display the transposed card directly beneath the filter bar while keeping full keyboard navigation (`Tab`, `←`/`→`, `↑`/`↓`, `PageUp`/`PageDown`, `⌘C`, `⌘A`).
+- **Result footer actions surfaced and grouped by function.** Refresh & Fetch (`Refresh`, `Auto refresh`, `Fetch all rows`, `Calculate total row count`), Row editing (`Add row`, `Add row before`, `Duplicate`, `Copy from row above`, `Copy from row below`, `Delete`, `Undo`), Views & Visuals (`Grid`, `Text`, `Record`, `JSON`, `XML`, `Chart`, `Spatial view`), `Export`, and Side panels (`Value`, `Metadata`, `Grouping`, `Calc`, `References`, panel toggle) now appear directly on the bottom toolbar with vertical group dividers, gracefully collapsing into `⋯` only in narrow panes.
+
+### Fixed
+- **Pop-up menus with section captions no longer shift vertically on their first frame** (`kit::menu_caption` now has a consistent height across sizing and layout passes).
+
 ## 0.7.2 — 2026-11-16
 
 ### Fixed

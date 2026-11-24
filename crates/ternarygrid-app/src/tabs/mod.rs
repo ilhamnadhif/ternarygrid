@@ -338,20 +338,10 @@ impl egui_dock::TabViewer for DockViewer<'_, '_> {
         }
         self.tab_rects.insert(tab.id, response.rect);
         let p = ternarygrid_ui::palette(self.style.visuals.dark_mode);
-        let open = self.is_open(tab.id);
         let r = response.rect;
         // The tab reaches up to the top bar's hairline: what it paints starts a point below. Only
         // the part of the tab inside the bar: a tab scrolled away paints nothing over the panels.
         let painter = response.ctx.layer_painter(response.layer_id).with_clip_rect(response.interact_rect.with_min_y(r.top() + 1.0));
-        // A line along the top: the connection type's colour on every tab of a marked
-        // connection (Production stays visible), else the accent on the focused tab.
-        let marker = tab.view.connection_id().and_then(|c| self.cx.conns.color_of(c)).and_then(|c| crate::theme::marker(c, self.style.visuals.dark_mode));
-        let focused = self.active_tab == Some(tab.id);
-        if let Some(color) = marker.or_else(|| focused.then_some(p.accent)) {
-            let (top, thick) = if open { (r.top() + 1.0, 3.0) } else { (r.top() + 2.0, 2.0) };
-            let line = egui::Rect::from_min_max(egui::pos2(r.left() + 8.0, top), egui::pos2(r.right() - 8.0, top + thick));
-            painter.rect_filled(line, egui::CornerRadius { nw: 0, ne: 0, sw: 2, se: 2 }, color);
-        }
         // Every tab's ×: 20 points, 10 from its right edge.
         let x = egui::Rect::from_center_size(egui::pos2(r.right() - 21.0, r.center().y + 0.5), egui::vec2(20.0, 20.0));
         let hover = response.ctx.input(|i| i.pointer.hover_pos()).is_some_and(|q| x.contains(q)) && response.hovered();

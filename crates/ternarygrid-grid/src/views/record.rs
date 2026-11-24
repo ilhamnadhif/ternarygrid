@@ -3,7 +3,7 @@
 use crate::format::PreparedFormat;
 use crate::grid::state::Dropdown;
 use crate::grid::{DataGridState, GridAction, GridOptions, ListChoice, ResultViewKind};
-use crate::model::{CellRef, ResultModel, RowAnchor, RowState};
+use crate::model::{CellRef, ResultModel, RowAnchor};
 use crate::theme::GridTheme;
 use egui::text::{CCursor, CCursorRange};
 use egui::{Key, RichText, ScrollArea, TextEdit, Ui};
@@ -138,35 +138,6 @@ fn is_empty_value(v: &Value) -> bool {
     v.is_null() || matches!(v, Value::Text(s) if s.is_empty())
 }
 
-/// The keyboard keys at the right of the toolbar: an ⓘ whose tooltip lists them.
-fn keys_hint(ui: &mut Ui, text: &str, more: &str) {
-    if ui.available_width() < 30.0 {
-        return;
-    }
-    let tip = format!("{}\n\n{more}", text.replace(" · ", "\n"));
-    let faint = ternarygrid_ui::pal(ui).text_faint;
-    ui.add(egui::Label::new(RichText::new(icon::INFO).font(ternarygrid_ui::style::icon_font(15.0)).color(faint)).sense(egui::Sense::hover())).on_hover_text(tip);
-}
-
-/// The "Hide empty" toggle; true when it changed.
-fn hide_empty_toggle(ui: &mut Ui, state: &mut RecordViewState, options: &GridOptions, tip: &str) -> bool {
-    let mut hide = state.hide_empty.unwrap_or(options.record_hide_empty);
-    let changed = ternarygrid_ui::kit::checkbox(ui, &mut hide, tr("Hide empty")).on_hover_text(tip).changed();
-    if changed {
-        state.hide_empty = Some(hide);
-    }
-    if hide && state.hidden_empty > 0 {
-        ui.label(RichText::new(trf("{} hidden", &[&state.hidden_empty])).size(12.0).color(ternarygrid_ui::pal(ui).text_faint));
-    }
-    changed
-}
-
-impl RecordViewState {
-    fn prefs(&self, options: &GridOptions) -> GridAction {
-        GridAction::RecordPrefs { hide_empty: self.hide_empty.unwrap_or(options.record_hide_empty) }
-    }
-}
-
 impl RecordViewState {
     /// Take the keyboard focus on the next frame: Tab goes back to the
     /// grid, ← / → show the previous / next row.
@@ -241,67 +212,6 @@ impl<'a> RecordView<'a> {
             });
         }
         focus.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, trf("Record view, row {} of {}", &[&(row + 1), &nrows])));
-        let total_columns = grid.visible_columns().len();
-        let bar = egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                use ternarygrid_ui::kit;
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let pal = ternarygrid_ui::pal(ui);
-                let nav = |ui: &mut Ui, on: bool, glyph: &str, tip: &str| ui.add_enabled_ui(on, |ui| kit::icon_button_ex(ui, glyph, tip, false, 26.0).clicked()).inner;
-                if nav(ui, row > 0, icon::CARET_LINE_LEFT, tr("First row")) {
-                    go_to = Some(0);
-                }
-                if nav(ui, row > 0, icon::CARET_LEFT, tr("Previous row (←)")) {
-                    go_to = Some(row - 1);
-                }
-                ui.label(RichText::new(tr("Row")).size(12.5).color(pal.text_muted));
-                let mut n = row + 1;
-                let typed = ui
-                    .scope(|ui| {
-                        ui.spacing_mut().interact_size = egui::vec2(64.0, 26.0);
-                        ui.add_sized([64.0, 26.0], egui::DragValue::new(&mut n).range(1..=nrows).speed(0.25)).on_hover_text(tr("Type or drag to go to a row"))
-                    })
-                    .inner;
-                if typed.changed() {
-                    go_to = Some(n.clamp(1, nrows) - 1);
-                }
-                ui.label(RichText::new(trf("of {}", &[&crate::format::group_thousands(&nrows.to_string())])).size(12.5).color(pal.text_muted));
-                if nav(ui, row + 1 < nrows, icon::CARET_RIGHT, tr("Next row (→)")) {
-                    go_to = Some(row + 1);
-                }
-                if nav(ui, row + 1 < nrows, icon::CARET_LINE_RIGHT, tr("Last row")) {
-                    go_to = Some(nrows - 1);
-                }
-                let state_label = match model.row_state(row) {
-                    RowState::Inserted => Some(tr("new row")),
-                    RowState::Deleted => Some(tr("marked for deletion")),
-                    RowState::Modified => Some(tr("modified")),
-                    RowState::Unchanged => None,
-                };
-                if let Some(s) = state_label {
-                    kit::pill(ui, s, pal.warn);
-                }
-                kit::vdivider(ui, 18.0);
-                kit::search_field(ui, ui.id().with("record_column_filter"), &mut state.column_filter, tr("Filter columns"), 200.0);
-                if hide_empty_toggle(ui, state, options, tr("Hide the columns that are NULL or empty in this row")) {
-                    actions.push(state.prefs(options));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !state.column_filter.trim().is_empty() {
-                        let needle = state.column_filter.to_lowercase();
-                        let shown = grid.visible_columns().into_iter().filter(|&c| model.column_name(c).to_lowercase().contains(&needle)).count();
-                        ui.label(RichText::new(trf("{} of {} columns", &[&shown, &total_columns])).small().weak());
-                    }
-                    keys_hint(
-                        ui,
-                        tr("Tab: grid · ← →: rows · ↑ ↓: fields · type, Enter: edit · ⌘C: copy"),
-                        tr("Tab: back to the grid · ← →: previous / next row. Click a value or a column name to select it, ⇧-click or ⌘-click to select more; ⌘C copies the selection. Right-click for the grid's menu (Set NULL, rows, filters…); its keys work here too."),
-                    );
-                });
-            });
-        });
-        let line = egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border);
-        ui.painter().hline(ui.max_rect().x_range(), bar.response.rect.bottom() + 0.5, line);
         // Keyboard: Page Up / Page Down move between rows when no field is edited.
         if state.editing.is_none() && go_to.is_none() && ui.ui_contains_pointer() {
             ui.input(|i| {
@@ -362,11 +272,9 @@ fn keep_arrows(ui: &Ui, id: egui::Id) {
     });
 }
 
-/// Selected rows side by side: the header ("3 selected rows", the column
-/// filter, Hide empty) above the table of [`rows_table`].
+/// Selected rows side by side in [`rows_table`].
 fn show_rows(model: &mut ResultModel, grid: &mut DataGridState, options: &GridOptions, state: &mut RecordViewState, ui: &mut Ui, mut rows: Vec<usize>) -> Vec<GridAction> {
     let mut actions = Vec::new();
-    let more = rows.len() > MAX_ROWS;
     rows.truncate(MAX_ROWS);
     // Keyboard: Tab back to the grid (⌘C: see the table).
     let focus = ui.interact(ui.max_rect(), ui.id().with("record_focus"), egui::Sense::click());
@@ -380,37 +288,6 @@ fn show_rows(model: &mut ResultModel, grid: &mut DataGridState, options: &GridOp
             actions.push(GridAction::SwitchView(ResultViewKind::Grid));
         }
     }
-    let total_columns = grid.visible_columns().len();
-    let bar = egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            use ternarygrid_ui::kit;
-            ui.spacing_mut().item_spacing.x = 8.0;
-            let pal = ternarygrid_ui::pal(ui);
-            ui.label(RichText::new(icon::LIST_DASHES).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.text_muted));
-            ui.label(RichText::new(trf("{} selected rows", &[&rows.len()])).font(ternarygrid_ui::style::semibold(ui.ctx(), 13.0)).color(pal.text));
-            if more {
-                ui.label(RichText::new(trf("(the first {})", &[&MAX_ROWS])).color(pal.text_faint));
-            }
-            kit::vdivider(ui, 18.0);
-            kit::search_field(ui, ui.id().with("record_column_filter"), &mut state.column_filter, tr("Filter columns"), 200.0);
-            if hide_empty_toggle(ui, state, options, tr("Hide the columns that are NULL or empty in every row")) {
-                actions.push(state.prefs(options));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let needle = state.column_filter.trim().to_lowercase();
-                if !needle.is_empty() {
-                    let shown = grid.visible_columns().into_iter().filter(|&c| model.column_name(c).to_lowercase().contains(&needle)).count();
-                    ui.label(RichText::new(trf("{} of {} columns", &[&shown, &total_columns])).small().weak());
-                }
-                keys_hint(
-                    ui,
-                    tr("Tab: grid · ↑ ↓: fields · type, Enter: edit · ⌘C: copy"),
-                    tr("Click a value or a column name to select it, ⇧-click or ⌘-click to select more; ⌘C copies the selection. Right-click for the grid's menu (Set NULL, rows, filters…); its keys work here too."),
-                );
-            });
-        });
-    });
-    ui.painter().hline(ui.max_rect().x_range(), bar.response.rect.bottom() + 0.5, egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border));
     rows_table(model, grid, options, state, ui, &rows, &focus, &mut actions);
     actions
 }

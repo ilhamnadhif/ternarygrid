@@ -157,7 +157,7 @@ impl Operations {
         }
     }
 
-    /// The operations window beside the rail's button (`at`: its bottom-left
+    /// The operations window below the top bar's button (`at`: its top-right
     /// corner); clears [`Operations::panel_open`] when it is closed.
     pub fn window(&mut self, ctx: &egui::Context, at: egui::Pos2) {
         if !self.panel_open {
@@ -170,7 +170,7 @@ impl Operations {
             .resizable(false)
             .collapsible(false)
             .frame(crate::dialogs::window_frame(ctx))
-            .pivot(egui::Align2::LEFT_BOTTOM)
+            .pivot(egui::Align2::RIGHT_TOP)
             .default_pos(at)
             .show(ctx, |ui| Dialog::new(title).icon(icon::ACTIVITY).width(crate::dialogs::WIDTH_S).body_padding(egui::Margin::ZERO).contents(ui, |ui| self.ui(ui), None).0);
         let closed = shown.as_ref().and_then(|s| s.inner).unwrap_or(false);

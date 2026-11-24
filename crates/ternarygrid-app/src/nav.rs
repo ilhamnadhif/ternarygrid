@@ -100,8 +100,6 @@ struct Row {
     badge: Option<Color32>,
     /// The database's logo instead of `icon` (connections).
     logo: Option<DbKind>,
-    /// Background of the row: the connection type's colour (DBeaver-like).
-    tint: Option<Color32>,
     /// A table's size right-aligned (as in DBeaver: "2.4M") and its hover text.
     size: Option<(String, String)>,
     expandable: bool,
@@ -436,7 +434,6 @@ impl Navigator {
                 icon_color: None,
                 badge: None,
                 logo: None,
-                tint: None,
                 size: None,
                 expandable: true,
                 expanded,
@@ -470,7 +467,6 @@ impl Navigator {
             ConnStatus::Failed(_) | ConnStatus::Lost => Some(crate::theme::error_color(dark)),
             ConnStatus::Disconnected => None,
         };
-        let marker = cx.conns.color_of(&cfg.id).and_then(|c| crate::theme::marker(c, dark));
         let start = rows.len();
         rows.push(Row {
             node: node.clone(),
@@ -481,7 +477,6 @@ impl Navigator {
             icon_color: Some(crate::theme::logo_color(cfg.kind, dark)),
             badge: color,
             logo: Some(cfg.kind),
-            tint: marker,
             size: None,
             expandable: true,
             expanded: expanded || pending.is_some(),
@@ -556,7 +551,6 @@ impl Navigator {
             icon_color: None,
             badge: None,
             logo: None,
-            tint: None,
             size: None,
             expandable: true,
             expanded,
@@ -577,7 +571,6 @@ impl Navigator {
                     icon_color: None,
                     badge: None,
                     logo: None,
-                    tint: None,
                     size: None,
                     expandable: true,
                     expanded: ext_expanded,
@@ -632,7 +625,6 @@ impl Navigator {
                 icon_color: None,
                 badge: None,
                 logo: None,
-                tint: None,
                 size: None,
                 expandable: true,
                 expanded,
@@ -667,7 +659,6 @@ impl Navigator {
                 icon_color: None,
                 badge: None,
                 logo: None,
-                tint: None,
                 size: None,
                 expandable: !f.table_only,
                 expanded,
@@ -703,7 +694,6 @@ impl Navigator {
                     icon_color: None,
                     badge: None,
                     logo: None,
-                    tint: None,
                     size: None,
                     expandable: has_children,
                     expanded: item_expanded,
@@ -777,7 +767,6 @@ impl Navigator {
                 icon_color: None,
                 badge: None,
                 logo: None,
-                tint: None,
                 size: None,
                 expandable: true,
                 expanded,
@@ -825,7 +814,6 @@ impl Navigator {
                 icon_color: None,
                 badge: None,
                 logo: None,
-                tint: None,
                 size: None,
                 expandable: true,
                 expanded,
@@ -913,7 +901,6 @@ impl Navigator {
                 icon_color: None,
                 badge: None,
                 logo: None,
-                tint: None,
                 size: size_badge(o),
                 expandable: has_children,
                 expanded,
@@ -947,7 +934,6 @@ impl Navigator {
                 icon_color: None,
                 badge: None,
                 logo: None,
-                tint: None,
                 size: None,
                 expandable: true,
                 expanded,
@@ -970,7 +956,6 @@ impl Navigator {
                                 icon_color: None,
                                 badge: None,
                                 logo: None,
-                                tint: None,
                                 size: size_badge(c),
                                 expandable: false,
                                 expanded: false,
@@ -1526,10 +1511,9 @@ impl Navigator {
         if let Some(fill) = fill {
             ui.painter().rect_filled(inner, ternarygrid_ui::style::RADIUS, fill);
         }
-        // A marked connection type (Production): a stripe on the row's left edge.
-        if let Some(t) = r.tint {
-            let stripe = egui::Rect::from_min_max(egui::pos2(inner.left(), inner.top() + 4.0), egui::pos2(inner.left() + 3.0, inner.bottom() - 4.0));
-            ui.painter().rect_filled(stripe, 2.0, t);
+        if selected {
+            let outline = ternarygrid_ui::soft(p.accent, if ui.visuals().dark_mode { 0.45 } else { 0.30 });
+            ui.painter().rect_stroke(inner, ternarygrid_ui::style::RADIUS, egui::Stroke::new(1.0, outline), egui::StrokeKind::Inside);
         }
         let row_bg = fill.unwrap_or(p.canvas);
         let mut x = inner.left() + 8.0 + r.depth as f32 * 14.0;
@@ -2096,7 +2080,6 @@ fn placeholder(depth: usize, kind: RowKind) -> Row {
         icon_color: None,
         badge: None,
         logo: None,
-        tint: None,
         size: None,
         expandable: false,
         expanded: false,

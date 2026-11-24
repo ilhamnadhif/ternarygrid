@@ -1,16 +1,14 @@
 //! The window's chrome: the top bar (menus where there is no system menu
-//! bar, New, where the active tab works, the search / command box, the AI
-//! assistant, theme and settings), the icon rail at the left and the status
-//! bar. Every action that used to have a toolbar button is in one of these,
-//! the menus, the context menus or the command palette.
+//! bar, sidebar switches, New, where the active tab works, the search /
+//! command box, workspace views, operations, AI assistant, theme and settings)
+//! and the status bar. Every action that used to have a toolbar button is in
+//! one of these, the menus, the context menus or the command palette.
 
 use super::*;
 use ternarygrid_ui::kit;
 
 /// Height of the top bar: 44 points and the hairline under it.
 pub const TOP_BAR_H: f32 = 45.0;
-/// Width of the icon rail, its hairline included.
-pub const RAIL_W: f32 = 48.0;
 /// Height of the status bar: the hairline over it and 26 points.
 pub const STATUS_H: f32 = 27.0;
 
@@ -78,10 +76,13 @@ fn bar_button(ui: &mut Ui, lead: Lead, text: &str, tip: &str, framed: bool) -> e
 }
 
 impl TernaryGridApp {
-    /// The top bar, as in the design: [window buttons] [menus] + New ▾ │ connection ▾ ›
-    /// database ▾ › schema ▾ PRODUCTION, the search box in the middle, the AI assistant,
-    /// theme and settings at the right. `inset`: space for the window buttons at its left.
-    pub(super) fn top_bar(&mut self, ui: &mut Ui, inset: f32, menus: bool) {
+    /// The top bar: [window buttons] [menus] [Navigator | Projects] │ + New ▾
+    /// connection ▾ › database ▾ › schema ▾ PRODUCTION, the search box in the middle,
+    /// and [History | Tasks] │ [Operations | AI | Theme | Settings] at the right.
+    /// `inset`: space for the window buttons at its left. Returns the Background
+    /// operations button rect so its pop-up anchors cleanly beneath it.
+    pub(super) fn top_bar(&mut self, ui: &mut Ui, inset: f32, menus: bool) -> egui::Rect {
+        use crate::keys::Action;
         let rect = ui.max_rect();
         // An empty spot of the bar moves the window (its title bar is hidden on macOS);
         // registered first, so the widgets on the bar take their clicks.
@@ -96,24 +97,58 @@ impl TernaryGridApp {
             }
         }
         let p = ternarygrid_ui::pal(ui);
+        #[derive(PartialEq)]
+        enum Place {
+            History,
+            Tasks,
+            Settings,
+        }
+        let place = match self.dock.find_active_focused().map(|(_, t)| t.view.as_any()) {
+            Some(v) if v.is::<crate::tabs::history::HistoryTab>() => Some(Place::History),
+            Some(v) if v.is::<crate::tabs::tasks::TasksTab>() => Some(Place::Tasks),
+            Some(v) if v.is::<crate::tabs::settings::SettingsTab>() => Some(Place::Settings),
+            _ => None,
+        };
 
-        // Right: update, AI, theme (laid out first: the search box goes between). The settings
-        // are on the rail, which shows when they are open.
+        // Right (laid out right-to-left so the search box centres between left & right):
+        // [Updates] [History] [Tasks] │ [Operations] [AI] [Theme] [Settings]
         let mut right = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::right_to_left(egui::Align::Center)));
         right.spacing_mut().item_spacing.x = 2.0;
+        if kit::icon_button_sized(&mut right, icon::GEAR_SIX, tr("Settings"), place == Some(Place::Settings), 30.0, 16.0).clicked() {
+            self.commands.push(AppCommand::OpenSettings);
+        }
         let dark = right.visuals().dark_mode;
         let (theme_icon, theme_tip) = if dark { (icon::SUN, tr("Switch to the light theme")) } else { (icon::MOON, tr("Switch to the dark theme")) };
         if kit::icon_button_sized(&mut right, theme_icon, theme_tip, false, 30.0, 16.0).clicked() {
             self.toggle_theme(right.ctx());
         }
         if kit::icon_button_sized(&mut right, icon::SPARKLE, tr("AI assistant"), self.ai_open, 30.0, 16.0).clicked() {
-            self.commands.push(AppCommand::Action(crate::keys::Action::AiAssistant));
+            self.commands.push(AppCommand::Action(Action::AiAssistant));
         }
-        right.add_space(6.0);
+        let running = self.ops.running();
+        let ops_tip = if running > 0 { ternarygrid_core::trf("Background operations ({} running)", &[&running]) } else { tr("Background operations").to_string() };
+        let ops_resp = kit::icon_button_sized(&mut right, icon::ACTIVITY, &ops_tip, self.ops.panel_open, 30.0, 16.0);
+        if running > 0 {
+            right.painter().circle_filled(ops_resp.rect.right_top() + egui::vec2(-7.5, 7.5), 3.0, p.accent_text);
+        }
+        if ops_resp.clicked() {
+            self.ops.panel_open = !self.ops.panel_open;
+        }
+        right.add_space(2.0);
+        kit::vdivider(&mut right, 16.0);
+        right.add_space(2.0);
+        if kit::icon_button_sized(&mut right, icon::LIST_CHECKS, tr("Tasks"), place == Some(Place::Tasks), 30.0, 16.0).clicked() {
+            self.commands.push(AppCommand::Action(Action::OpenTasks));
+        }
+        if kit::icon_button_sized(&mut right, icon::CLOCK_COUNTER_CLOCKWISE, tr("Query history"), place == Some(Place::History), 30.0, 16.0).clicked() {
+            self.commands.push(AppCommand::Action(Action::OpenHistory));
+        }
+        right.add_space(4.0);
         self.updates.toolbar_button(&mut right);
         let right_start = right.min_rect().left();
 
-        // Left: menus (no system menu bar), New, where the active tab works.
+        // Left: menus (no system menu bar), side panel switches (Database navigator, Projects),
+        // New, and where the active tab works.
         let mut left = ui.new_child(egui::UiBuilder::new().max_rect(rect.with_min_x(rect.left() + inset)).layout(egui::Layout::left_to_right(egui::Align::Center)));
         left.spacing_mut().item_spacing.x = 4.0;
         if menus {
@@ -122,9 +157,30 @@ impl TernaryGridApp {
             left.allocate_ui_with_layout(egui::vec2(0.0, h), egui::Layout::left_to_right(egui::Align::Center), |ui| self.menu_bar(ui));
             kit::vdivider(&mut left, 18.0);
         }
+        left.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let nav_on = self.show_nav && !self.show_project;
+            if kit::icon_button_sized(ui, icon::DATABASE, tr("Database navigator"), nav_on, 30.0, 16.0).clicked() {
+                if nav_on {
+                    self.show_nav = false;
+                } else {
+                    self.show_nav = true;
+                    self.show_project = false;
+                }
+            }
+            let projects_on = self.show_nav && self.show_project;
+            if kit::icon_button_sized(ui, icon::FILE_TEXT, tr("Projects and scripts"), projects_on, 30.0, 16.0).clicked() {
+                if projects_on {
+                    self.show_nav = false;
+                } else {
+                    self.show_nav = true;
+                    self.show_project = true;
+                }
+            }
+        });
+        kit::vdivider(&mut left, 16.0);
         self.new_menu(&mut left);
-        // The design's divider after New: 6 points, a hairline, 6 points and the 4-point gap (drawn as a gap).
-        left.add_space(17.0);
+        left.add_space(10.0);
         // The connection type's pill only where it does not run under the search box.
         let pill_limit = rect.center().x - 210.0 - 16.0;
         self.location_crumbs(&mut left, &p, pill_limit);
@@ -138,6 +194,7 @@ impl TernaryGridApp {
             let r = egui::Rect::from_min_size(egui::pos2(x, rect.center().y - 15.0), egui::vec2(width, 30.0));
             self.search_box(ui, r, &p);
         }
+        ops_resp.rect
     }
 
     /// "+ New ▾": what can be created.
@@ -285,76 +342,6 @@ impl TernaryGridApp {
         if hovered {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-    }
-
-    /// The icon rail: two groups with a selection each, the side panel that is open (the
-    /// navigator, projects) and the workspace tab that is active (history, tasks); background
-    /// operations and settings at the bottom (34-point buttons 4 apart, 8 points from the ends).
-    pub(super) fn rail(&mut self, ui: &mut Ui) {
-        use crate::keys::Action;
-        let (side, glyph) = (34.0, 20.0);
-        #[derive(PartialEq)]
-        enum Place {
-            History,
-            Tasks,
-            Settings,
-        }
-        let place = match self.dock.find_active_focused().map(|(_, t)| t.view.as_any()) {
-            Some(v) if v.is::<crate::tabs::history::HistoryTab>() => Some(Place::History),
-            Some(v) if v.is::<crate::tabs::tasks::TasksTab>() => Some(Place::Tasks),
-            Some(v) if v.is::<crate::tabs::settings::SettingsTab>() => Some(Place::Settings),
-            _ => None,
-        };
-        ui.vertical_centered(|ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.add_space(8.0);
-            let nav_on = self.show_nav && !self.show_project;
-            if kit::icon_button_sized(ui, icon::DATABASE, tr("Database navigator"), nav_on, side, glyph).clicked() {
-                if nav_on {
-                    self.show_nav = false;
-                } else {
-                    self.show_nav = true;
-                    self.show_project = false;
-                }
-            }
-            let projects_on = self.show_nav && self.show_project;
-            if kit::icon_button_sized(ui, icon::FILE_TEXT, tr("Projects and scripts"), projects_on, side, glyph).clicked() {
-                if projects_on {
-                    self.show_nav = false;
-                } else {
-                    self.show_nav = true;
-                    self.show_project = true;
-                }
-            }
-            // A hairline between the groups, 6 points clear of the buttons.
-            ui.add_space(2.0);
-            let (line, _) = ui.allocate_exact_size(egui::vec2(20.0, 1.0), egui::Sense::hover());
-            ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border_strong));
-            ui.add_space(2.0);
-            if kit::icon_button_sized(ui, icon::CLOCK_COUNTER_CLOCKWISE, tr("Query history"), place == Some(Place::History), side, glyph).clicked() {
-                self.commands.push(AppCommand::Action(Action::OpenHistory));
-            }
-            if kit::icon_button_sized(ui, icon::LIST_CHECKS, tr("Tasks"), place == Some(Place::Tasks), side, glyph).clicked() {
-                self.commands.push(AppCommand::Action(Action::OpenTasks));
-            }
-        });
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.add_space(8.0);
-            if kit::icon_button_sized(ui, icon::GEAR_SIX, tr("Settings"), place == Some(Place::Settings), side, glyph).clicked() {
-                self.commands.push(AppCommand::OpenSettings);
-            }
-            let running = self.ops.running();
-            let tip = if running > 0 { ternarygrid_core::trf("Background operations ({} running)", &[&running]) } else { tr("Background operations").to_string() };
-            let ops = kit::icon_button_sized(ui, icon::ACTIVITY, &tip, self.ops.panel_open, side, glyph);
-            if running > 0 {
-                let p = ternarygrid_ui::pal(ui);
-                ui.painter().circle_filled(ops.rect.right_top() + egui::vec2(-9.5, 9.5), 3.5, p.accent_text);
-            }
-            if ops.clicked() {
-                self.ops.panel_open = !self.ops.panel_open;
-            }
-        });
     }
 
     /// The status bar: the state of the connection the active tab works on (the top bar names

@@ -795,13 +795,36 @@ fn the_footer_moves_what_does_not_fit_into_its_menu() {
     v.frame(vec![]);
     let all = vec!["Refresh", "Add row", "Duplicate", "Delete", "Undo", "Export"];
     assert_eq!(on_footer(&v), all, "wide");
-    let wide = v.find_all_exact("Duplicate")[0];
-    // Medium: every button stays, as icons, so the group gets shorter.
-    sized(&mut v, 800.0);
+    // Wide: every functional group is directly on the footer bar (no overflow menu needed).
+    for item in [
+        "Auto refresh",
+        "Fetch all rows",
+        "Calculate total row count",
+        "Add row before",
+        "Copy from row above",
+        "Copy from row below",
+        "Grid",
+        "Text",
+        "Record",
+        "JSON",
+        "XML",
+        "Chart",
+        "Spatial view",
+        "Value",
+        "Metadata",
+        "Grouping",
+        "Calc",
+        "References",
+    ] {
+        assert!(!v.find_all_exact(item).is_empty(), "{item} on the wide footer");
+    }
+    assert!(v.find_all_exact("More result actions").is_empty(), "nothing overflowed");
+    // Medium: core groups stay on the bar, extra actions move into ⋯.
+    sized(&mut v, 700.0);
     assert_eq!(on_footer(&v), all, "medium");
-    assert!(v.find_all_exact("Duplicate")[0].x > wide.x - 400.0);
+    assert!(!v.find_all_exact("More result actions").is_empty(), "overflow menu appears");
     // Narrow: Refresh and Add row stay; the others are one click away in ⋯.
-    sized(&mut v, 520.0);
+    sized(&mut v, 440.0);
     assert_eq!(on_footer(&v), vec!["Refresh", "Add row"], "narrow");
     let more = v.find_all_exact("More result actions")[0];
     v.click(more);
@@ -815,11 +838,12 @@ fn the_footer_moves_what_does_not_fit_into_its_menu() {
 #[test]
 fn the_more_menu_has_only_what_the_bar_does_not() {
     let mut v = Viewer::new(editable_model(5));
-    v.frame(vec![]);
+    // At medium width, Core groups stay on the bar while secondary groups move into ⋯.
+    sized(&mut v, 700.0);
     let more = v.find_all_exact("More result actions")[0];
     v.click(more);
     v.frame(vec![]);
-    for item in ["Add row before", "Copy from row above", "Auto refresh", "Calculate total row count", "Chart"] {
+    for item in ["Add row before", "Copy from row above", "Auto refresh", "Calculate total row count", "Chart", "Spatial view", "Panels"] {
         assert!(v.find(item).is_some(), "{item} in ⋯");
     }
     for item in ["Duplicate selected rows", "Delete selected rows", "Export…"] {

@@ -1965,20 +1965,12 @@ impl eframe::App for TernaryGridApp {
         // inner edge) left out of the content: the top bar 16 / 10 points from the sides.
         let bar = |style: &egui::Style, m: egui::Margin| egui::Frame::new().fill(crate::theme::chrome(&style.visuals)).inner_margin(m);
         let top_margin = egui::Margin { left: 16, right: 10, top: 0, bottom: 1 };
-        chrome.toolbar = Some(
-            egui::Panel::top("ternarygrid_topbar")
-                .exact_size(shell::TOP_BAR_H)
-                .frame(bar(ui.style(), top_margin))
-                .show(ui, |ui| self.top_bar(ui, inset, !native_menu))
-                .response
-                .rect,
-        );
+        let top_bar = egui::Panel::top("ternarygrid_topbar").exact_size(shell::TOP_BAR_H).frame(bar(ui.style(), top_margin)).show(ui, |ui| self.top_bar(ui, inset, !native_menu));
+        chrome.toolbar = Some(top_bar.response.rect);
+        let ops_button = top_bar.inner;
         let status_margin = egui::Margin { left: 12, right: 12, top: 1, bottom: 0 };
         chrome.status =
             Some(egui::Panel::bottom("ternarygrid_status").exact_size(shell::STATUS_H).frame(bar(ui.style(), status_margin)).show(ui, |ui| self.status_bar(ui)).response.rect);
-        let rail_margin = egui::Margin { left: 0, right: 1, top: 0, bottom: 0 };
-        chrome.rail =
-            Some(egui::Panel::left("ternarygrid_rail").exact_size(shell::RAIL_W).resizable(false).frame(bar(ui.style(), rail_margin)).show(ui, |ui| self.rail(ui)).response.rect);
 
         let mut cx = AppContext {
             backend: &self.backend,
@@ -2245,8 +2237,8 @@ impl eframe::App for TernaryGridApp {
         }
 
         self.dialogs.show(&ctx, &mut cx);
-        // Beside its button at the bottom of the rail, where the design has it.
-        let at = egui::pos2(shell::RAIL_W + 10.0, ctx.content_rect().bottom() - shell::STATUS_H - 66.0);
+        // Right below the Background operations button on the top bar.
+        let at = egui::pos2(ops_button.right(), shell::TOP_BAR_H + 6.0);
         self.ops.window(&ctx, at);
         if self.updates.ui(&ctx, &self.backend, &mut self.settings, &mut self.toasts) {
             self.save_settings();

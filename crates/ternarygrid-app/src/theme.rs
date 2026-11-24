@@ -237,10 +237,9 @@ pub fn chrome_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::side_top_panel(style).fill(chrome(&style.visuals))
 }
 
-/// The tab area's style, as in TernaryWire and TernaryShell: the tab bar in
-/// [`chrome`], the active tab in the content's colour (it opens onto it, with
-/// rounded top corners), inactive tabs muted. The focused tab's accent line is
-/// painted by the tab viewer (`tabs::DockViewer::on_tab_button`).
+/// The tab area's style: the tab bar in [`chrome`], the focused tab in the
+/// content's colour with a crisp outline (it opens onto the canvas, with rounded
+/// top corners) and bright medium text, inactive tabs muted.
 pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     use egui::CornerRadius;
     let mut s = egui_dock::Style::from_egui(style);
@@ -264,9 +263,15 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     s.tab.spacing = 2.0;
     s.tab.minimum_width = None;
     s.tab.hline_below_active_tab_name = false;
-    for t in [&mut s.tab.active, &mut s.tab.focused, &mut s.tab.active_with_kb_focus, &mut s.tab.focused_with_kb_focus] {
+    for t in [&mut s.tab.active, &mut s.tab.active_with_kb_focus] {
         t.bg_fill = p.canvas;
         t.outline_color = p.border;
+        t.text_color = p.text_muted;
+        t.corner_radius = top;
+    }
+    for t in [&mut s.tab.focused, &mut s.tab.focused_with_kb_focus] {
+        t.bg_fill = p.canvas;
+        t.outline_color = p.border_strong;
         t.text_color = p.text;
         t.corner_radius = top;
     }

@@ -957,10 +957,9 @@ pub fn menu_separator(ui: &mut Ui) {
 pub fn menu_caption(ui: &mut Ui, text: &str) {
     let p = style::pal(ui);
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        ui.label(RichText::new(text).font(style::medium(ui.ctx(), style::SMALL)).color(p.text_faint));
-    });
+    let galley = ui.painter().layout_no_wrap(text.to_string(), style::medium(ui.ctx(), style::SMALL), p.text_faint);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(galley.size().x + 20.0), galley.size().y + 4.0), Sense::hover());
+    ui.painter().galley(egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0), galley, p.text_faint);
     ui.add_space(2.0);
 }
 

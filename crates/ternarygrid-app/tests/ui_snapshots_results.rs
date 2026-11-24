@@ -564,7 +564,6 @@ fn main_screens(s: &mut Shots, conn: &str) {
     s.shot("main");
     s.data().model.discard_changes();
     // Fetch all, without a known total.
-    s.click("More result actions");
     s.click_contains("Fetch all rows");
     s.frames(20);
     s.shot("res_fetch_all");
@@ -802,7 +801,6 @@ fn result_screens(s: &mut Shots, conn: &str) {
     s.frames(20);
 
     // Chart and spatial view.
-    s.click("More result actions");
     s.click_contains("Chart");
     s.frames(20);
     s.park();
@@ -976,7 +974,6 @@ fn more_result_screens(s: &mut Shots, conn: &str) {
     s.close_tabs();
     // The chart as a donut.
     orders(s, conn);
-    s.click("More result actions");
     s.click_contains("Chart");
     s.frames(10);
     s.click_contains("Pie");
@@ -987,7 +984,6 @@ fn more_result_screens(s: &mut Shots, conn: &str) {
     // The spatial view.
     s.open(conn, "delivery_area", ObjectPage::Data);
     s.frames(10);
-    s.click("More result actions");
     s.click_contains("Spatial view");
     s.frames(20);
     s.park();

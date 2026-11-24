@@ -1362,9 +1362,8 @@ impl SqlEditorTab {
                 ui.set_min_height(40.0);
                 // Connection selector.
                 let conn_name = short(self.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.name.clone()).unwrap_or_else(|| tr("No connection").to_string()), 14);
-                let marker = self.conn.as_ref().and_then(|c| cx.conns.color_of(c)).and_then(|c| crate::theme::marker(c, ui.visuals().dark_mode));
                 let kind = self.conn.as_ref().and_then(|c| cx.conns.config(c)).map(|c| c.kind);
-                let r = connection_chip(ui, kind, marker, &conn_name, &format!("{} ({})", tr("Active connection"), crate::keys::label(cx.keymap, Action::SelectConnection)));
+                let r = connection_chip(ui, kind, &conn_name, &format!("{} ({})", tr("Active connection"), crate::keys::label(cx.keymap, Action::SelectConnection)));
                 if r.clicked() {
                     self.select_conn_open = !self.select_conn_open;
                 }
@@ -2787,14 +2786,13 @@ fn run_split_button(ui: &mut Ui, id: egui::Id, tip: &str) -> (egui::Response, eg
     (main, more)
 }
 
-/// The editor's connection, as the top bar's crumb: the connection type's stripe (Production)
-/// at its left edge, the database's logo, the name and a faint chevron; 28 points high, framed
-/// only when hovered.
-fn connection_chip(ui: &mut Ui, kind: Option<ternarygrid_core::DbKind>, marker: Option<egui::Color32>, name: &str, tip: &str) -> egui::Response {
+/// The editor's connection, as the top bar's crumb: the database's logo, the
+/// name and a faint chevron; 28 points high, framed only when hovered.
+fn connection_chip(ui: &mut Ui, kind: Option<ternarygrid_core::DbKind>, name: &str, tip: &str) -> egui::Response {
     let p = ternarygrid_ui::pal(ui);
     let galley = ui.painter().layout_no_wrap(name.to_string(), egui::FontId::proportional(13.0), p.text);
     let caret = ui.painter().layout_no_wrap(icon::CARET_DOWN.to_string(), ternarygrid_ui::style::icon_font(11.0), p.text_faint);
-    let (pad, lead, gap) = (if marker.is_some() { 11.0 } else { 8.0 }, 16.0, 6.0);
+    let (pad, lead, gap) = (8.0, 16.0, 6.0);
     let width = pad + lead + gap + galley.size().x + gap + caret.size().x + 8.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
@@ -2808,10 +2806,6 @@ fn connection_chip(ui: &mut Ui, kind: Option<ternarygrid_core::DbKind>, marker: 
             painter.rect_stroke(rect, ternarygrid_ui::style::RADIUS, egui::Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
         }
         let cy = rect.center().y;
-        if let Some(m) = marker {
-            let stripe = egui::Rect::from_min_size(egui::pos2(rect.left() + 3.0, cy - 8.0), egui::vec2(3.0, 16.0));
-            painter.rect_filled(stripe, 2.0, m);
-        }
         let logo = egui::Rect::from_min_size(egui::pos2(rect.left() + pad, cy - 8.0), egui::vec2(lead, lead));
         let dark = ui.visuals().dark_mode;
         let drawn = kind.is_some_and(|k| crate::dblogo::paint(ui, k, logo, crate::theme::legible_on(crate::theme::logo_color(k, dark), p.surface)));
