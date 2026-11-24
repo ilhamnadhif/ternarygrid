@@ -3,7 +3,7 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
-## 0.7.4 — 2026-11-24
+## 0.7.5 — 2026-11-24
 
 ### Changed
 - **Single-row native pro toolbar for result sets (icon + micro-label).** Every action on the result footer now pairs a semantic coloured icon on top with a concise text label directly underneath (`Refresh`, `Auto`, `All`, `Count` | `Add`, `Before`, `Dup`, `Above`, `Below`, `Del`, `Undo` | `Grid`, `Text`, `Rec`, `JSON`, `XML`, `Chart`, `Map` | `Export` | `Value`, `Meta`, `Group`, `Calc`, `Refs`, `Panel`), with stacked two-line status (`rows · elapsed` over `Fetch next …`) on the left and clean responsive degradation into `More` in narrow panes.
@@ -11,6 +11,7 @@ notes of a new version once after it was updated (Help → What's new).
 - **Semantic coloured icons across all toolbars and menus.** Added a WCAG AA calibrated light/dark semantic icon palette (`ternarygrid-ui`) and enabled coloured icons app-wide: Database navigator (`+` green, Refresh blue, **Disconnect red** / Connect green, New folder amber), Top bar, Projects panel, SQL editor toolbar, Object editor, Welcome screen, and context/popup menus.
 
 ### Fixed — connections & reliability
+- **SQL Server: `PRINT` and `RAISERROR` (severity ≤ 10) messages could be silently dropped for the rest of the session** when no global `tracing` subscriber was installed and another connection read login `INFO` tokens before the first statement captured one (`infomsg` now keeps a companion ambient dispatcher so `tracing-core` never falls back to its single-dispatcher fast path and caches `Interest::never()`).
 - **Failed SQL statements and rolled-back savepoints no longer permanently inflate pending transaction write counts** (`tx.writes` only increments on successful writes and restores cleanly after `ROLLBACK TO SAVEPOINT`).
 - **Disconnect and app exit now track and await in-flight auto-revive and background close jobs** instead of abandoning them, preventing leaked sessions/tunnels or truncated `shell_after_disconnect` hooks.
 - **Tunnel reconnection (`ReviveJob::Connection`) now marks replaced main, per-database, and tab sessions closed** so open tabs and result panels rehome cleanly instead of hanging on dead handles.

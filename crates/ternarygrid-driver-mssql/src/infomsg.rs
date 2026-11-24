@@ -47,14 +47,68 @@ pub(crate) fn take() -> Vec<String> {
 
 /// One for the process: creating a dispatcher re-evaluates every callsite.
 fn dispatch() -> Dispatch {
-    static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
+    static DISPATCH: OnceLock<(Dispatch, Dispatch)> = OnceLock::new();
     DISPATCH
         .get_or_init(|| {
             // The app's dispatcher (this runs outside any task's scoped one).
             let inner = tracing::dispatcher::get_default(Dispatch::clone);
-            Dispatch::new(Capture { inner })
+            // Keep a second live dispatcher registered so `tracing-core` stays out
+            // of its single-dispatcher (`has_just_one`) fast path when no global
+            // subscriber is installed (e.g. tests or library callers). Without it,
+            // a callsite first encountered outside `collecting` (such as a concurrent
+            // `connect()` reading login INFO tokens) evaluates only the calling
+            // thread's default (`NoSubscriber`) and permanently caches
+            // `Interest::never()`, silencing later `PRINT` / `RAISERROR` messages.
+            let ambient = Dispatch::new(Ambient(inner.clone()));
+            let capture = Dispatch::new(Capture { inner });
+            (capture, ambient)
         })
+        .0
         .clone()
+}
+
+/// Sentinel kept alongside [`Capture`] so `tracing-core`'s callsite registry
+/// always combines interest across every registered dispatcher.
+struct Ambient(Dispatch);
+
+impl Subscriber for Ambient {
+    fn register_callsite(&self, meta: &'static Metadata<'static>) -> Interest {
+        self.0.register_callsite(meta)
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        // Never raise the global max level beyond what the app's own dispatcher
+        // and `Capture` already request.
+        Some(tracing::level_filters::LevelFilter::OFF)
+    }
+
+    fn enabled(&self, meta: &Metadata<'_>) -> bool {
+        self.0.enabled(meta)
+    }
+
+    fn new_span(&self, span: &Attributes<'_>) -> Id {
+        self.0.new_span(span)
+    }
+
+    fn record(&self, span: &Id, values: &Record<'_>) {
+        self.0.record(span, values)
+    }
+
+    fn record_follows_from(&self, span: &Id, follows: &Id) {
+        self.0.record_follows_from(span, follows)
+    }
+
+    fn event(&self, event: &Event<'_>) {
+        self.0.event(event)
+    }
+
+    fn enter(&self, span: &Id) {
+        self.0.enter(span)
+    }
+
+    fn exit(&self, span: &Id) {
+        self.0.exit(span)
+    }
 }
 
 fn is_token_event(meta: &Metadata<'_>) -> bool {
@@ -166,5 +220,44 @@ mod tests {
         // Outside a statement task nothing is kept.
         tracing::event!(target: "tiberius::tds::stream::token", Level::DEBUG, "{}", "elsewhere");
         assert!(take().is_empty());
+    }
+
+    /// A token callsite first hit outside `collecting` (e.g. a concurrent `connect()`
+    /// reading login INFO tokens after another query raised `MAX_LEVEL`) must still
+    /// be captured when later hit inside `collecting`.
+    #[tokio::test]
+    async fn callsite_first_hit_outside_collecting_is_still_captured() {
+        fn emit_token(msg: &str) {
+            tracing::event!(target: "tiberius::tds::stream::token", Level::DEBUG, "{}", msg);
+        }
+
+        // Initialise the capture dispatcher first, raising MAX_LEVEL to DEBUG.
+        collecting(async {}).await;
+        // Register `emit_token`'s callsite while no scoped subscriber is active.
+        emit_token("Changed database context to 'master'");
+        // Later invocations inside `collecting` must still capture the message.
+        let got = collecting(async {
+            emit_token("step one");
+            take()
+        })
+        .await;
+        assert_eq!(got, vec!["step one".to_string()]);
+
+        // Dropping another scoped dispatcher triggers `tracing-core`'s live-dispatcher
+        // pruning; a brand-new callsite hit outside `collecting` afterwards must still
+        // be captured.
+        fn emit_token_after_prune(msg: &str) {
+            tracing::event!(target: "tiberius::tds::stream::token", Level::DEBUG, "{}", msg);
+        }
+        {
+            let _temp = Dispatch::new(tracing::subscriber::NoSubscriber::new());
+        }
+        emit_token_after_prune("Changed language setting to us_english.");
+        let got2 = collecting(async {
+            emit_token_after_prune("step two");
+            take()
+        })
+        .await;
+        assert_eq!(got2, vec!["step two".to_string()]);
     }
 }
