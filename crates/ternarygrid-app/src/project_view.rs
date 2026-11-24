@@ -76,16 +76,17 @@ impl ProjectView {
     pub fn toolbar_ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            let ic = ternarygrid_ui::style::icons(ui);
             let folder_tip = if crate::keys::IS_MAC { tr("Show in Finder") } else { tr("Open the project's folder") };
             if let Some(p) = cx.services.projects.as_ref().and_then(|m| m.default_project().ok())
-                && kit::icon_button_sized(ui, icon::FOLDER_OPEN, folder_tip, false, 26.0, 15.0).clicked()
+                && kit::icon_button_colored(ui, icon::FOLDER_OPEN, folder_tip, false, 26.0, 15.0, Some(ic.amber)).clicked()
             {
                 let _ = open::that(p.path());
             }
-            if kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 15.0).clicked() {
+            if kit::icon_button_colored(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 15.0, Some(ic.blue)).clicked() {
                 self.reload(cx);
             }
-            if kit::icon_button_sized(ui, icon::FILE_PLUS, tr("New SQL editor"), false, 26.0, 15.0).clicked() {
+            if kit::icon_button_colored(ui, icon::FILE_PLUS, tr("New SQL editor"), false, 26.0, 15.0, Some(ic.green)).clicked() {
                 cx.push(AppCommand::NewSqlEditor { connection: None, schema: None, text: None });
             }
         });

@@ -1406,11 +1406,12 @@ impl SqlEditorTab {
                     self.select_schema_open = !self.select_schema_open;
                 }
                 let mut chosen_schema: Option<SchemaRef> = None;
-                if self.select_schema_open
-                    && let Some(conn) = self.conn.clone()
-                {
-                    let backend = cx.backend;
-                    if let Some(live) = cx.conns.live_mut(&conn) {
+                let mut active_db_now: Option<String> = None;
+                if self.select_schema_open {
+                    if let Some(conn) = self.conn.clone()
+                        && let Some(live) = cx.conns.live_mut(&conn)
+                    {
+                        let backend = cx.backend;
                         let main = live.main.clone();
                         let multi = live.driver.info().capabilities.multiple_databases;
                         if multi {
@@ -1425,6 +1426,8 @@ impl SqlEditorTab {
                         let schemas: Vec<String> =
                             live.meta.schemas_of(editor_db.as_deref()).get().map(|v| v.iter().filter(|s| !s.is_system).map(|s| s.name.clone()).collect()).unwrap_or_default();
                         let cur_db = editor_db.clone().or_else(|| live.current_database.clone());
+                        let cur_schema = self.schema.as_ref().and_then(|s| s.schema.clone()).or_else(|| live.current_schema.clone());
+                        active_db_now = cur_db.clone();
                         egui::Popup::from_response(&r).open_bool(&mut self.select_schema_open).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                             ui.set_min_width(200.0);
                             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
@@ -1439,17 +1442,19 @@ impl SqlEditorTab {
                                 }
                                 ui.weak(tr("Schemas"));
                                 for s in &schemas {
-                                    if ui.selectable_label(false, format!("{} {s}", icon::TREE_STRUCTURE)).clicked() {
+                                    if ui.selectable_label(cur_schema.as_deref() == Some(s.as_str()), format!("{} {s}", icon::TREE_STRUCTURE)).clicked() {
                                         chosen_schema = Some(SchemaRef::new(editor_db.clone(), Some(s.clone())));
                                     }
                                 }
                             });
                         });
+                    } else {
+                        self.select_schema_open = false;
                     }
                 }
                 if let Some(s) = chosen_schema {
                     self.select_schema_open = false;
-                    let db_changed = s.database.is_some() && s.database != self.schema.as_ref().and_then(|x| x.database.clone());
+                    let db_changed = s.database.is_some() && s.database != active_db_now;
                     // Another database closes the session: not over a transaction or pending edits.
                     // Nor while a script runs: the statements after the switch ran in the new schema.
                     let blocked = if self.exec.is_some() {
@@ -1511,8 +1516,9 @@ impl SqlEditorTab {
                     _ => {}
                 }
                 // Format SQL; in a narrow editor it moves into "⋯" first.
+                let ic = ternarygrid_ui::style::icons(ui);
                 let sql = self.is_sql(cx);
-                if sql && !narrow && kit::icon_button_sized(ui, icon::TEXT_INDENT, &tip(Action::FormatSql), false, 26.0, 14.0).clicked() {
+                if sql && !narrow && kit::icon_button_colored(ui, icon::TEXT_INDENT, &tip(Action::FormatSql), false, 26.0, 14.0, Some(ic.purple)).clicked() {
                     self.format(cx);
                 }
                 let more = kit::icon_button_sized(ui, icon::DOTS_THREE, tr("More editor commands"), false, 26.0, 14.0);
@@ -1601,13 +1607,13 @@ impl SqlEditorTab {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    if kit::icon_button_sized(ui, icon::LIST_BULLETS, tr("Outline"), self.show_outline, 28.0, 15.0).clicked() {
+                    if kit::icon_button_colored(ui, icon::LIST_BULLETS, tr("Outline"), self.show_outline, 28.0, 15.0, Some(ic.cyan)).clicked() {
                         self.show_outline = !self.show_outline;
                     }
-                    if kit::icon_button_sized(ui, icon::TERMINAL, tr("Terminal mode: print results as text"), self.terminal, 28.0, 15.0).clicked() {
+                    if kit::icon_button_colored(ui, icon::TERMINAL, tr("Terminal mode: print results as text"), self.terminal, 28.0, 15.0, Some(ic.teal)).clicked() {
                         self.terminal = !self.terminal;
                     }
-                    if kit::icon_button_sized(ui, icon::ROWS, &tip(Action::ToggleResultsPanel), self.show_results, 28.0, 15.0).clicked() {
+                    if kit::icon_button_colored(ui, icon::ROWS, &tip(Action::ToggleResultsPanel), self.show_results, 28.0, 15.0, Some(ic.blue)).clicked() {
                         self.show_results = !self.show_results;
                     }
                     // The running time; the banner over the results has it when they show.
@@ -1662,58 +1668,71 @@ impl SqlEditorTab {
             }
         }
         let tabs = ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.add_space(4.0);
-            for i in 0..self.results.len() {
-                let (ic, label, dirty) = match &self.results[i] {
-                    ResultItem::Rows(p) => (icon::TABLE, p.title.clone(), p.has_changes()),
-                    ResultItem::Plan { .. } => (icon::TREE_VIEW, tr("Plan").to_string(), false),
-                    ResultItem::Error { .. } => (icon::WARNING_CIRCLE, tr("Error").to_string(), false),
-                };
-                let label = if dirty { format!("● {label}") } else { label };
-                let rows = self.result_rows(i).map(|n| ternarygrid_grid::format::group_thousands(&n.to_string()));
-                let r = kit::underline_tab(ui, Some(ic), &label, rows.as_deref(), self.bottom == Bottom::Result(i), TAB_H);
-                // An error's icon in the error colour, selected or not (the kit paints a tab's
-                // icon in the accent or faint): painted over, where the kit put it.
-                if matches!(self.results[i], ResultItem::Error { .. }) {
-                    let size = ternarygrid_ui::style::body_size(ui.ctx());
-                    let g = ui.painter().layout_no_wrap(ic.to_string(), ternarygrid_ui::style::icon_font(size + 1.0), ternarygrid_ui::pal(ui).err);
-                    let pos = egui::pos2(r.rect.left() + 6.0, r.rect.center().y - g.size().y / 2.0);
-                    ui.painter().galley(pos, g, ternarygrid_ui::pal(ui).err);
-                }
-                if r.clicked() {
-                    self.bottom = Bottom::Result(i);
-                }
-                if r.middle_clicked() {
-                    close = Some(i);
-                }
-                r.context_menu(|ui| {
-                    kit::menu_look(ui, 160.0);
-                    if kit::menu_item(ui, Some(icon::X), tr("Close"), "").clicked() {
-                        close = Some(i);
-                        ui.close();
-                    }
-                });
-            }
-            if !self.stats.is_empty() && kit::underline_tab(ui, Some(icon::LIST_NUMBERS), tr("Statistics"), None, self.bottom == Bottom::Statistics, TAB_H).clicked() {
-                self.bottom = Bottom::Statistics;
-            }
-            if kit::underline_tab(ui, Some(icon::SCROLL), tr("Output"), None, self.bottom == Bottom::Output, TAB_H).clicked() {
-                self.bottom = Bottom::Output;
-            }
-            // The statements a manual transaction holds, as a count on its tab.
-            let pending = match &self.session {
-                SessionSlot::Ready(s) => s.tx_state().log.len(),
-                _ => 0,
-            };
-            let pending = (pending > 0).then(|| pending.to_string());
-            if kit::underline_tab(ui, Some(icon::LIST_DASHES), tr("Transaction log"), pending.as_deref(), self.bottom == Bottom::Transaction, TAB_H).clicked() {
-                self.bottom = Bottom::Transaction;
-            }
-            let vars = (!self.variables.is_empty()).then(|| self.variables.len().to_string());
-            if kit::underline_tab(ui, Some(icon::BRACKETS_CURLY), tr("Variables"), vars.as_deref(), self.bottom == Bottom::Variables, TAB_H).clicked() {
-                self.bottom = Bottom::Variables;
-            }
+            ui.set_min_height(TAB_H);
+            let strip_w = (ui.available_width() - 40.0).max(40.0);
+            ui.allocate_ui_with_layout(egui::vec2(strip_w, TAB_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                egui::ScrollArea::horizontal().id_salt(("sql_res_tabs", self.editor.id())).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(
+                    ui,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.add_space(4.0);
+                            for i in 0..self.results.len() {
+                                let (ic, label, dirty) = match &self.results[i] {
+                                    ResultItem::Rows(p) => (icon::TABLE, p.title.clone(), p.has_changes()),
+                                    ResultItem::Plan { .. } => (icon::TREE_VIEW, tr("Plan").to_string(), false),
+                                    ResultItem::Error { .. } => (icon::WARNING_CIRCLE, tr("Error").to_string(), false),
+                                };
+                                let label = if dirty { format!("● {label}") } else { label };
+                                let rows = self.result_rows(i).map(|n| ternarygrid_grid::format::group_thousands(&n.to_string()));
+                                let r = kit::underline_tab(ui, Some(ic), &label, rows.as_deref(), self.bottom == Bottom::Result(i), TAB_H);
+                                // An error's icon in the error colour, selected or not (the kit paints a tab's
+                                // icon in the accent or faint): painted over, where the kit put it.
+                                if matches!(self.results[i], ResultItem::Error { .. }) {
+                                    let size = ternarygrid_ui::style::body_size(ui.ctx());
+                                    let g = ui.painter().layout_no_wrap(ic.to_string(), ternarygrid_ui::style::icon_font(size + 1.0), ternarygrid_ui::pal(ui).err);
+                                    let pos = egui::pos2(r.rect.left() + 6.0, r.rect.center().y - g.size().y / 2.0);
+                                    ui.painter().galley(pos, g, ternarygrid_ui::pal(ui).err);
+                                }
+                                if r.clicked() {
+                                    self.bottom = Bottom::Result(i);
+                                }
+                                if r.middle_clicked() {
+                                    close = Some(i);
+                                }
+                                r.context_menu(|ui| {
+                                    kit::menu_look(ui, 160.0);
+                                    if kit::menu_item(ui, Some(icon::X), tr("Close"), "").clicked() {
+                                        close = Some(i);
+                                        ui.close();
+                                    }
+                                });
+                            }
+                            if !self.stats.is_empty()
+                                && kit::underline_tab(ui, Some(icon::LIST_NUMBERS), tr("Statistics"), None, self.bottom == Bottom::Statistics, TAB_H).clicked()
+                            {
+                                self.bottom = Bottom::Statistics;
+                            }
+                            if kit::underline_tab(ui, Some(icon::SCROLL), tr("Output"), None, self.bottom == Bottom::Output, TAB_H).clicked() {
+                                self.bottom = Bottom::Output;
+                            }
+                            // The statements a manual transaction holds, as a count on its tab.
+                            let pending = match &self.session {
+                                SessionSlot::Ready(s) => s.tx_state().log.len(),
+                                _ => 0,
+                            };
+                            let pending = (pending > 0).then(|| pending.to_string());
+                            if kit::underline_tab(ui, Some(icon::LIST_DASHES), tr("Transaction log"), pending.as_deref(), self.bottom == Bottom::Transaction, TAB_H).clicked() {
+                                self.bottom = Bottom::Transaction;
+                            }
+                            let vars = (!self.variables.is_empty()).then(|| self.variables.len().to_string());
+                            if kit::underline_tab(ui, Some(icon::BRACKETS_CURLY), tr("Variables"), vars.as_deref(), self.bottom == Bottom::Variables, TAB_H).clicked() {
+                                self.bottom = Bottom::Variables;
+                            }
+                        });
+                    },
+                );
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(10.0);
                 let (ic, on) = if self.maximized { (icon::CORNERS_IN, true) } else { (icon::CORNERS_OUT, false) };
@@ -2213,7 +2232,7 @@ impl TabView for SqlEditorTab {
     }
 
     fn focus_context(&self) -> ActionContext {
-        if self.editor_focused {
+        if self.editor_focused && !(self.show_results && self.maximized) {
             ActionContext::SqlEditor
         } else if matches!(self.bottom, Bottom::Result(_)) {
             ActionContext::ResultsGrid
@@ -2453,6 +2472,7 @@ impl TabView for SqlEditorTab {
         let pal = ternarygrid_ui::pal(ui);
         let results_visible = self.show_results;
         if results_visible && self.maximized {
+            self.editor_focused = false;
             self.results_ui(ui, cx);
             self.dialogs(ui, cx);
             return;

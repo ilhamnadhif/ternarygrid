@@ -127,6 +127,115 @@ impl Palette {
     }
 }
 
+/// Semantic icon colours calibrated per theme so every toolbar and menu icon
+/// has at least 4.5:1 contrast against `canvas`, `chrome`, `surface` and `hover`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IconPalette {
+    pub blue: Color32,
+    pub cyan: Color32,
+    pub teal: Color32,
+    pub green: Color32,
+    pub amber: Color32,
+    pub orange: Color32,
+    pub red: Color32,
+    pub purple: Color32,
+    pub slate: Color32,
+}
+
+pub const ICONS_LIGHT: IconPalette = IconPalette {
+    blue: rgb(0x1d4ed8),
+    cyan: rgb(0x0369a1),
+    teal: rgb(0x0f766e),
+    green: rgb(0x157337),
+    amber: rgb(0xa15307),
+    orange: rgb(0xc2410c),
+    red: rgb(0xc81e1e),
+    purple: rgb(0x7e22ce),
+    slate: rgb(0x52525b),
+};
+
+pub const ICONS_DARK: IconPalette = IconPalette {
+    blue: rgb(0x60a5fa),
+    cyan: rgb(0x38bdf8),
+    teal: rgb(0x2dd4bf),
+    green: rgb(0x4ade80),
+    amber: rgb(0xfbbf24),
+    orange: rgb(0xfb923c),
+    red: rgb(0xf87171),
+    purple: rgb(0xc084fc),
+    slate: rgb(0xa6a8b3),
+};
+
+/// The semantic icon palette for the light or dark theme.
+pub fn icon_palette(dark: bool) -> IconPalette {
+    if dark { ICONS_DARK } else { ICONS_LIGHT }
+}
+
+/// The semantic icon palette for the theme `ui` is drawn with.
+pub fn icons(ui: &Ui) -> IconPalette {
+    icon_palette(ui.visuals().dark_mode)
+}
+
+/// Semantic colour for a Phosphor glyph in toolbars and menus (`None` keeps the
+/// neutral muted colour for chrome controls such as `⋯`, `×`, and carets).
+pub fn icon_color(glyph: &str, dark: bool) -> Option<Color32> {
+    use egui_phosphor::regular as i;
+    let c = icon_palette(dark);
+    Some(match glyph {
+        i::PLUGS | i::TRASH | i::STOP | i::STOP_CIRCLE | i::X_CIRCLE | i::MINUS_CIRCLE | i::WARNING_OCTAGON => c.red,
+        i::PLUG
+        | i::PLUGS_CONNECTED
+        | i::PLUS
+        | i::PLUS_CIRCLE
+        | i::FILE_PLUS
+        | i::PLAY
+        | i::PLAY_CIRCLE
+        | i::CHECK
+        | i::CHECK_CIRCLE
+        | i::LIST_CHECKS
+        | i::CHART_BAR
+        | i::TREE_STRUCTURE
+        | i::ARROW_CIRCLE_UP => c.green,
+        i::ARROW_CLOCKWISE | i::ARROWS_CLOCKWISE | i::TABLE | i::ROWS | i::EYE | i::FLOPPY_DISK | i::LIST_BULLETS => c.blue,
+        i::COPY | i::DATABASE | i::INFO | i::FILE_CODE | i::FILE_SQL => c.cyan,
+        i::EXPORT
+        | i::UPLOAD_SIMPLE
+        | i::DOWNLOAD
+        | i::DOWNLOAD_SIMPLE
+        | i::ROWS_PLUS_TOP
+        | i::LIST_DASHES
+        | i::ACTIVITY
+        | i::TERMINAL
+        | i::TERMINAL_WINDOW
+        | i::ARROW_LINE_DOWN => c.teal,
+        i::FOLDER
+        | i::FOLDER_OPEN
+        | i::FOLDER_SIMPLE
+        | i::FOLDERS
+        | i::FOLDER_PLUS
+        | i::TIMER
+        | i::CLOCK
+        | i::CLOCK_COUNTER_CLOCKWISE
+        | i::HOURGLASS
+        | i::ARROW_FAT_LINE_DOWN
+        | i::ARROW_FAT_LINE_UP
+        | i::ARROW_U_UP_LEFT
+        | i::BRACKETS_CURLY
+        | i::CALCULATOR
+        | i::KEY
+        | i::PENCIL
+        | i::PENCIL_SIMPLE
+        | i::NOTE_PENCIL
+        | i::SUN
+        | i::PUSH_PIN
+        | i::FILE_TEXT
+        | i::WARNING => c.amber,
+        i::GIT_DIFF | i::ARROWS_LEFT_RIGHT => c.orange,
+        i::HASH | i::MAP_TRIFOLD | i::STACK | i::SPARKLE | i::ROBOT | i::MAGIC_WAND | i::TEXT_INDENT | i::FUNNEL | i::FUNNEL_SIMPLE | i::MOON | i::FLASK => c.purple,
+        _ => return None,
+    })
+}
+
 /// The palette of the light or the dark theme.
 pub fn palette(dark: bool) -> Palette {
     if dark { DARK } else { LIGHT }
@@ -310,6 +419,23 @@ mod tests {
             }
             let c = contrast(p.accent, p.canvas);
             assert!(c >= 3.0, "{name}: the accent fill against the canvas is {c:.2}:1");
+            let ic = icon_palette(name == "dark");
+            for (ic_name, fg) in [
+                ("blue", ic.blue),
+                ("cyan", ic.cyan),
+                ("teal", ic.teal),
+                ("green", ic.green),
+                ("amber", ic.amber),
+                ("orange", ic.orange),
+                ("red", ic.red),
+                ("purple", ic.purple),
+                ("slate", ic.slate),
+            ] {
+                for (bg_name, bg) in [("canvas", p.canvas), ("chrome", p.chrome), ("surface", p.surface), ("hover", p.hover)] {
+                    let c = contrast(fg, bg);
+                    assert!(c >= 4.5, "{name}: icon {ic_name} on {bg_name} is {c:.2}:1");
+                }
+            }
         }
     }
 

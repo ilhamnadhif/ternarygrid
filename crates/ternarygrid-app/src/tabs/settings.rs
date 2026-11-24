@@ -1224,14 +1224,10 @@ impl SettingsTab {
                     cx.conns.store.set_connection_type(t.clone());
                     cx.conns.dirty = true;
                 }
-                // How the type marks its connections: the navigator row, the tab, the top bar
-                // (as they draw it: the production red, the pill on its soft tint).
+                // How the type marks its connections: the top-bar badge and save-confirmation
+                // marker pill (as they draw it: the production red, the pill on its soft tint).
                 let marker = crate::theme::marker(t.color, dark);
-                let sample = cx.conns.configs().iter().find(|c| c.connection_type == t.id).map(|c| (c.name.clone(), c.kind));
-                let sample_kind = sample.as_ref().map(|s| s.1);
                 group(ui, tr("How it looks"), |ui| {
-                    preview_row(ui, sample.as_ref().map_or(tr("connection"), |s| s.0.as_str()), sample_kind, marker);
-                    preview_tab(ui, "report.sql", marker);
                     match marker {
                         Some(m) => {
                             crate::theme::marker_pill(ui, &t.name.to_uppercase(), m);
@@ -1935,40 +1931,6 @@ fn profile_proxy_form(ui: &mut Ui, proxy: &mut ternarygrid_core::config::ProxyCo
     });
     commit |= check(ui, &mut proxy.save_credentials, tr("Save credentials"));
     commit
-}
-
-/// A navigator row as it looks for a connection of the type (its stripe).
-fn preview_row(ui: &mut Ui, name: &str, kind: Option<ternarygrid_core::DbKind>, marker: Option<egui::Color32>) {
-    let p = ternarygrid_ui::pal(ui);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(280.0, 26.0), egui::Sense::hover());
-    let painter = ui.painter();
-    if let Some(m) = marker {
-        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + 4.0), egui::pos2(rect.left() + 3.0, rect.bottom() - 4.0)), 2, m);
-    }
-    let cy = rect.center().y;
-    painter.text(egui::pos2(rect.left() + 14.0, cy), egui::Align2::CENTER_CENTER, icon::CARET_RIGHT, ternarygrid_ui::style::icon_font(11.0), p.text_faint);
-    let logo = egui::Rect::from_center_size(egui::pos2(rect.left() + 32.0, cy), egui::vec2(16.0, 16.0));
-    let kind = kind.unwrap_or(ternarygrid_core::DbKind::Postgres);
-    if !crate::dblogo::paint(ui, kind, logo, crate::theme::logo_color(kind, ui.visuals().dark_mode)) {
-        ui.painter().text(logo.center(), egui::Align2::CENTER_CENTER, crate::nav::db_icon(kind), ternarygrid_ui::style::icon_font(15.0), p.text_muted);
-    }
-    let font = ternarygrid_ui::style::medium(ui.ctx(), ternarygrid_ui::style::body_size(ui.ctx()));
-    let r = ui.painter().text(egui::pos2(rect.left() + 46.0, cy), egui::Align2::LEFT_CENTER, name, font, p.text);
-    ui.painter().circle_filled(egui::pos2(r.right() + 9.0, cy), 3.5, p.ok);
-}
-
-/// A tab as it looks for a connection of the type (the line along its top).
-fn preview_tab(ui: &mut Ui, label: &str, marker: Option<egui::Color32>) {
-    let p = ternarygrid_ui::pal(ui);
-    let font = egui::FontId::proportional(ternarygrid_ui::style::body_size(ui.ctx()));
-    let g = ui.painter().layout_no_wrap(label.to_string(), font, p.text);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(g.size().x + 50.0, 34.0), egui::Sense::hover());
-    let top = egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
-    ui.painter().rect(rect, top, p.canvas, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-    let line = marker.unwrap_or(p.accent);
-    ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left() + 8.0, rect.top()), egui::pos2(rect.right() - 8.0, rect.top() + 3.0)), 1, line);
-    ui.painter().text(egui::pos2(rect.left() + 21.0, rect.center().y), egui::Align2::CENTER_CENTER, icon::FILE_CODE, ternarygrid_ui::style::icon_font(14.0), p.text_muted);
-    ui.painter().galley(egui::pos2(rect.left() + 36.0, rect.center().y - g.size().y / 2.0), g, p.text);
 }
 
 impl TabView for SettingsTab {

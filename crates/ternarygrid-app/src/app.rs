@@ -222,8 +222,9 @@ impl TernaryGridApp {
     /// What the tab bars have besides the tabs: the hairline under the bar (1 point, open under
     /// the open tab), "+" (a new SQL editor) after the last tab, at the bar's end when the tabs
     /// do not fit, and then the list of all the tabs.
-    fn tab_bar_extras(ui: &mut Ui, dock: &DockState<Tab>, tab_rects: &std::collections::HashMap<u64, egui::Rect>, cx: &mut AppContext) {
+    fn tab_bar_extras(ui: &mut Ui, dock: &mut DockState<Tab>, tab_rects: &std::collections::HashMap<u64, egui::Rect>, cx: &mut AppContext) {
         let p = ternarygrid_ui::pal(ui);
+        let mut focus_leaf = None;
         for (path, leaf) in dock.iter_leaves() {
             if leaf.tabs.is_empty() || !leaf.rect.is_positive() {
                 continue;
@@ -234,9 +235,15 @@ impl TernaryGridApp {
             let open = leaf.tabs.get(leaf.active.0).and_then(|t| tab_rects.get(&t.id)).copied();
             let stroke = egui::Stroke::new(1.0, p.border);
             match open {
-                Some(r) if r.left() > bar.left() => {
-                    painter.hline(bar.left()..=r.left() + 1.0, y, stroke);
-                    painter.hline(r.right() - 1.0..=bar.right(), y, stroke);
+                Some(r) if r.right() > bar.left() && r.left() < bar.right() => {
+                    let gap_left = (r.left() + 1.0).clamp(bar.left(), bar.right());
+                    let gap_right = (r.right() - 1.0).clamp(bar.left(), bar.right());
+                    if gap_left > bar.left() {
+                        painter.hline(bar.left()..=gap_left, y, stroke);
+                    }
+                    if gap_right < bar.right() {
+                        painter.hline(gap_right..=bar.right(), y, stroke);
+                    }
                 }
                 _ => {
                     painter.hline(bar.x_range(), y, stroke);
@@ -253,7 +260,9 @@ impl TernaryGridApp {
             let button = |x: f32| egui::Rect::from_min_size(egui::pos2(x, bar.top() + (crate::tabs::TAB_BAR_H - 27.0) / 2.0), egui::vec2(26.0, 26.0));
             let plus = button((last + 2.0).min(strip_right + 2.0));
             let mut b = ui.new_child(egui::UiBuilder::new().max_rect(plus).id_salt(("tab_bar_new", path.node)));
-            if kit::icon_button_sized(&mut b, icon::PLUS, tr("New SQL editor"), false, 26.0, 14.0).clicked() {
+            let ic = ternarygrid_ui::style::icons(&b);
+            if kit::icon_button_colored(&mut b, icon::PLUS, tr("New SQL editor"), false, 26.0, 14.0, Some(ic.green)).clicked() {
+                focus_leaf = Some(path);
                 cx.commands.push(AppCommand::Action(crate::keys::Action::NewSqlEditor));
             }
             // Tabs that do not fit: all of them in a list.
@@ -275,6 +284,9 @@ impl TernaryGridApp {
                     });
                 });
             }
+        }
+        if let Some(node) = focus_leaf {
+            dock.set_focused_node_and_surface(node);
         }
     }
 
@@ -380,21 +392,21 @@ impl TernaryGridApp {
     }
 
     /// Close a tab or pop-up (it may veto, e.g. to ask about unsaved changes).
-    /// A vetoing tab stays where it is.
-    pub fn close_tab(&mut self, id: u64) {
+    /// Returns `true` if the tab was closed, `false` if it vetoed and stayed open.
+    pub fn close_tab(&mut self, id: u64) -> bool {
         let popup = self.popups.iter().position(|t| t.id == id);
         let tab = match popup {
             Some(i) => self.popups.get_mut(i),
             None => self.dock.iter_all_tabs_mut().find(|(_, t)| t.id == id).map(|(_, t)| t),
         };
-        let Some(tab) = tab else { return };
+        let Some(tab) = tab else { return true };
         if tab.needs_close_confirm() || tab.close_rolls_back(&self.conns) {
             if !self.close_confirm.contains(&id) {
                 self.close_confirm.push(id);
             }
-            return;
+            return false;
         }
-        {
+        let vetoed = {
             let mut cx = AppContext {
                 backend: &self.backend,
                 conns: &mut self.conns,
@@ -408,9 +420,14 @@ impl TernaryGridApp {
                 current_tab: None,
                 popup: false,
             };
-            if !tab.view.on_close(&mut cx) {
-                return;
+            !tab.view.on_close(&mut cx)
+        };
+        if vetoed {
+            // Focus a dock tab that armed its own close prompt so the confirmation dialog is shown immediately.
+            if popup.is_none() {
+                self.focus_tab(id);
             }
+            return false;
         }
         match popup {
             Some(i) => {
@@ -422,6 +439,7 @@ impl TernaryGridApp {
                 }
             }
         }
+        true
     }
 
     /// Ask before closing the tab `id` (screenshots of the question).
@@ -627,12 +645,16 @@ impl TernaryGridApp {
             AppCommand::OpenTab(view) => {
                 self.open_tab(view);
             }
-            AppCommand::CloseTab(id) => self.close_tab(id),
-            AppCommand::CloseBackgroundTab { id, keep_open, keep_focused } => {
+            AppCommand::CloseTab(id) => {
                 self.close_tab(id);
-                // The open tab of the leaf first, then the focus (it may be in another leaf).
-                for keep in std::iter::once(keep_open).chain(keep_focused) {
-                    self.focus_tab(keep);
+            }
+            AppCommand::CloseBackgroundTab { id, keep_open, keep_focused } => {
+                // Only restore focus to the previous tab if the background tab actually closed
+                // (a vetoing tab needs focus so its unsaved-changes prompt renders immediately).
+                if self.close_tab(id) {
+                    for keep in std::iter::once(keep_open).chain(keep_focused) {
+                        self.focus_tab(keep);
+                    }
                 }
             }
             AppCommand::FocusTab(id) => self.focus_tab(id),
@@ -820,7 +842,7 @@ impl TernaryGridApp {
                 if self.conns.is_connected(&connection) {
                     self.dialogs.create_db = Some(crate::dialogs::create_db::CreateDatabaseDialog::schema(connection, database));
                 } else {
-                    self.toasts.info(tr("Connect first, then create the database."));
+                    self.toasts.info(tr("Connect first, then create the schema."));
                 }
             }
             AppCommand::OpenFdwConfigurator { connection } => {
@@ -896,13 +918,22 @@ impl TernaryGridApp {
         }
     }
 
-    /// Keyboard shortcuts of the focused context (active tab) and global ones.
+    /// True while a modal dialog or confirmation prompt owns keyboard input.
+    fn modal_open(&self) -> bool {
+        self.dialogs.captures_keyboard() || self.confirm_quit || self.confirm_disconnect.is_some() || !self.close_confirm.is_empty()
+    }
+
+    /// Keyboard shortcuts of the focused context (focused pop-up or active tab) and global ones.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         // Modal questions take the keyboard.
-        if self.dialogs.captures_keyboard() || self.confirm_quit || self.confirm_disconnect.is_some() || !self.close_confirm.is_empty() {
+        if self.modal_open() {
             return;
         }
-        let context = self.dock.find_active_focused().map(|(_, t)| t.view.focus_context()).unwrap_or(crate::keys::ActionContext::Global);
+        let in_popup = self.popup_focus.filter(|id| self.popups.iter().any(|t| t.id == *id));
+        let context = match in_popup {
+            Some(id) => self.popups.iter().find(|t| t.id == id).map(|t| t.view.focus_context()).unwrap_or(crate::keys::ActionContext::Global),
+            None => self.dock.find_active_focused().map(|(_, t)| t.view.focus_context()).unwrap_or(crate::keys::ActionContext::Global),
+        };
         for action in crate::keys::take_actions(ctx, &self.keymap, context) {
             self.dispatch_action(ctx, action);
         }
@@ -944,13 +975,35 @@ impl TernaryGridApp {
             self.nav.refresh_node(&node, &mut self.commands);
             return;
         }
-        // Working in a pop-up: Close closes it, and the tab behind gets no shortcut.
+        // Working in a pop-up: route shortcuts to the focused pop-up, Close closes it,
+        // and background dock tabs do not receive actions meant for the pop-up.
         let in_popup = self.popup_focus.filter(|id| self.popups.iter().any(|t| t.id == *id));
-        if let Some(id) = in_popup
-            && action == A::CloseTab
-        {
-            self.close_tab(id);
-            return;
+        if let Some(id) = in_popup {
+            if action == A::CloseTab {
+                self.close_tab(id);
+                return;
+            }
+            if let Some(tab) = self.popups.iter_mut().find(|t| t.id == id) {
+                let mut cx = AppContext {
+                    backend: &self.backend,
+                    conns: &mut self.conns,
+                    services: &self.services,
+                    settings: &mut self.settings,
+                    commands: &mut self.commands,
+                    toasts: &mut self.toasts,
+                    ops: &mut self.ops,
+                    keymap: &self.keymap,
+                    tab_active: true,
+                    current_tab: Some(id),
+                    popup: true,
+                };
+                if tab.view.on_action(action, &mut cx) {
+                    return;
+                }
+            }
+            if !matches!(action, A::Quit | A::ToggleTheme | A::ShowShortcuts) {
+                return;
+            }
         }
         let handled = match self.dock.find_active_focused().filter(|_| in_popup.is_none()) {
             Some((_, tab)) => {
@@ -1584,7 +1637,7 @@ impl TernaryGridApp {
     pub(crate) fn run_menu_action(&mut self, ctx: &egui::Context, action: crate::menu::MenuAction) {
         use crate::menu::MenuAction as M;
         let cmd = match action {
-            M::NewSqlEditor => Some(AppCommand::NewSqlEditor { connection: None, schema: None, text: None }),
+            M::NewSqlEditor => Some(AppCommand::Action(crate::keys::Action::NewSqlEditor)),
             M::OpenScript => rfd::FileDialog::new().add_filter("SQL", &["sql"]).pick_file().map(AppCommand::OpenScript),
             M::Settings => Some(AppCommand::OpenSettings),
             M::Quit => Some(AppCommand::Quit),
@@ -2016,6 +2069,8 @@ impl eframe::App for TernaryGridApp {
                     self.project.ui(ui, &mut cx);
                     self.nav.has_focus = false;
                 } else {
+                    self.nav.keyboard_blocked =
+                        self.dialogs.captures_keyboard() || self.confirm_quit || self.confirm_disconnect.is_some() || !self.close_confirm.is_empty() || self.popup_focus.is_some();
                     self.nav.ui(ui, &mut cx);
                     self.nav.track_focus(ui);
                 }
@@ -2102,11 +2157,14 @@ impl eframe::App for TernaryGridApp {
                 .show_leaf_close_all_buttons(false)
                 .show_inside(ui, &mut viewer);
             self.tab_rects = std::mem::take(&mut viewer.tab_rects);
-            Self::tab_bar_extras(ui, &self.dock, &self.tab_rects, viewer.cx);
+            Self::tab_bar_extras(ui, &mut self.dock, &self.tab_rects, viewer.cx);
             for id in viewer.close_confirm {
                 if !self.close_confirm.contains(&id) {
                     self.close_confirm.push(id);
                 }
+            }
+            for id in viewer.close_vetoed {
+                viewer.cx.commands.push(AppCommand::FocusTab(id));
             }
         });
         // Wizards and actions in pop-up windows over the tabs.
@@ -2227,8 +2285,18 @@ impl eframe::App for TernaryGridApp {
                 cx.commands.push(AppCommand::CloseTab(tab.id));
             }
         }
-        if pressed.is_some() {
-            self.popup_focus = clicked_popup;
+        if let Some(p) = pressed {
+            // Do not drop pop-up focus when clicking a ComboBox / popup menu option rendered
+            // on a Foreground/Tooltip overlay layer that extends beyond the tool window rect.
+            let in_overlay = ctx.layer_id_at(p).is_some_and(|l| l.order >= egui::Order::Foreground);
+            if clicked_popup.is_some() || !in_overlay {
+                self.popup_focus = clicked_popup;
+            }
+        }
+        if let Some(id) = focus
+            && crate::widgets::escape_closes(&ctx, focused_layer)
+        {
+            cx.commands.push(AppCommand::CloseTab(id));
         }
         // The dimming over the other windows, the focused one right above it.
         if let (Some(scrim), Some(window)) = (scrim_layer, focused_layer) {

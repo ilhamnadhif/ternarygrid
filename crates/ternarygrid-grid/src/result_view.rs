@@ -170,11 +170,11 @@ fn fetch_error_bar(ui: &mut Ui, message: &str) -> bool {
 }
 
 fn panel_icon(p: PanelKind) -> &'static str {
-    crate::toolbar::PANELS.iter().find(|(k, ..)| *k == p).map_or("", |(_, icon, _)| icon)
+    crate::toolbar::PANELS.iter().find(|(k, ..)| *k == p).map_or("", |(_, icon, _, _)| icon)
 }
 
 fn panel_name(p: PanelKind) -> &'static str {
-    crate::toolbar::PANELS.iter().find(|(k, ..)| *k == p).map_or("", |(.., name)| tr(name))
+    crate::toolbar::PANELS.iter().find(|(k, ..)| *k == p).map_or("", |(_, _, name, _)| tr(name))
 }
 
 /// A panel's tab in the panel strip: the shown one with its name, the others their icon (the
@@ -182,6 +182,7 @@ fn panel_name(p: PanelKind) -> &'static str {
 fn panel_tab(ui: &mut Ui, p: PanelKind, selected: bool) -> egui::Response {
     use egui::{Align2, Sense, vec2};
     let pal = ternarygrid_ui::pal(ui);
+    let ic_color = crate::toolbar::panel_color(ui, p);
     let name = panel_name(p);
     let galley = selected.then(|| ui.painter().layout_no_wrap(name.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.5), egui::Color32::PLACEHOLDER));
     // 8 | icon 14 | 6 name | 10 (named), 6 | icon 14 | 6 (icon only).
@@ -193,22 +194,16 @@ fn panel_tab(ui: &mut Ui, p: PanelKind, selected: bool) -> egui::Response {
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, name));
     let resp = if selected { resp } else { resp.on_hover_text(name) };
     let painter = ui.painter();
+    let dark = ui.visuals().dark_mode;
     if selected {
-        painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, pal.accent_soft);
+        painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, ternarygrid_ui::style::soft(ic_color, if dark { 0.18 } else { 0.12 }));
     } else if resp.hovered() {
         painter.rect_filled(rect, ternarygrid_ui::style::RADIUS, pal.hover);
     }
-    let icon_color = if selected {
-        pal.accent_text
-    } else if resp.hovered() {
-        pal.text
-    } else {
-        pal.text_muted
-    };
     let icon_x = if selected { rect.left() + 8.0 + 7.0 } else { rect.center().x };
-    painter.text(egui::pos2(icon_x, rect.center().y), Align2::CENTER_CENTER, panel_icon(p), ternarygrid_ui::style::icon_font(14.0), icon_color);
+    painter.text(egui::pos2(icon_x, rect.center().y), Align2::CENTER_CENTER, panel_icon(p), ternarygrid_ui::style::icon_font(14.0), ic_color);
     if let Some(g) = galley {
-        painter.galley(egui::pos2(rect.left() + 8.0 + 14.0 + 6.0, rect.center().y - g.size().y / 2.0), g, pal.accent_text);
+        painter.galley(egui::pos2(rect.left() + 8.0 + 14.0 + 6.0, rect.center().y - g.size().y / 2.0), g, pal.text);
     }
     resp
 }
@@ -248,9 +243,9 @@ impl<'a> ResultViewer<'a> {
         let mut grid_response = None;
         let pal = ternarygrid_ui::pal(ui);
         // The filter bar: 46 high, 16 / 12 at the sides, a line under it; the footer a line
-        // and 42 under it, 16 / 10 at the sides.
+        // and 48 under it (single-row icon + micro-label toolbar), 14 / 10 at the sides.
         let filter_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 12, top: 8, bottom: 9 }).fill(pal.canvas);
-        let footer_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 10, top: 7, bottom: 6 }).fill(pal.canvas);
+        let footer_frame = Frame::new().inner_margin(egui::Margin { left: 14, right: 10, top: 5, bottom: 5 }).fill(pal.canvas);
         let line = egui::Stroke::new(1.0, pal.border);
         let bar = Panel::top(id.with("filter_bar")).frame(filter_frame).show_separator_line(false).show(ui, |ui| {
             actions.extend(FilterBar::new(model, &mut state.grid, &mut state.toolbar).dialect(options.dialect.clone()).show(ui));
@@ -258,8 +253,15 @@ impl<'a> ResultViewer<'a> {
         ui.painter().hline(bar.response.rect.x_range(), bar.response.rect.bottom() - 0.5, line);
         // "Filter by value" in server mode adds to the WHERE the filter box shows.
         state.grid.set_server_filter(&state.toolbar.filter_text);
+        let record_editing = state.record.is_editing();
         let footer = Panel::bottom(id.with("toolbar")).frame(footer_frame).show_separator_line(false).show(ui, |ui| {
-            actions.extend(ResultToolbar::new(model, &mut state.grid, &mut state.toolbar).fetch_size(options.fetch_more_threshold).can_edit(options.allow_editing).show(ui));
+            actions.extend(
+                ResultToolbar::new(model, &mut state.grid, &mut state.toolbar)
+                    .fetch_size(options.fetch_more_threshold)
+                    .can_edit(options.allow_editing)
+                    .editing(record_editing)
+                    .show(ui),
+            );
         });
         ui.painter().hline(footer.response.rect.x_range(), footer.response.rect.top() + 0.5, line);
         // Errors in a pop-up: a refused edit or a failed save each time, a failed fetch once.

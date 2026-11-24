@@ -95,7 +95,8 @@ impl<'a> Dialog<'a> {
     // The frame code is not generic so it is compiled once, not once per dialog.
     fn contents_dyn(&self, ui: &mut Ui, body: &mut dyn FnMut(&mut Ui), footer: Option<&mut dyn FnMut(&mut Ui)>) -> bool {
         let p = style::pal(ui);
-        ui.set_width(self.width);
+        let max_w = (ui.ctx().content_rect().width() - 32.0).max(280.0);
+        ui.set_width(self.width.min(max_w));
         ui.spacing_mut().item_spacing.y = 0.0;
         let mut close = false;
         // Header.

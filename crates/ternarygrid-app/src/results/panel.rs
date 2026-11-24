@@ -30,13 +30,14 @@ struct ChartView {
     config: ternarygrid_visual::chart::ChartConfig,
     data: ternarygrid_visual::chart::ChartData,
     state: ternarygrid_visual::chart::ChartState,
-    generation: u64,
+    generation: (u64, u64),
 }
 
 struct SpatialView {
     layers: Vec<ternarygrid_visual::spatial::SpatialLayer>,
     state: ternarygrid_visual::spatial::SpatialState,
     column: usize,
+    generation: (u64, u64),
 }
 
 /// Something that reloads the rows, waiting for "discard the pending changes?".
@@ -107,11 +108,20 @@ pub struct ResultPanel {
     confirm_fetch_all: bool,
 }
 
-/// Collect the rows of a store (bounded) for charts / maps.
+/// Collect visible rows through [`ResultModel`] (respecting filters, sorting,
+/// pending edits/inserts, and saved deletions) for charts and maps.
 fn rows_of(model: &ResultModel, limit: usize) -> Vec<Row> {
-    let mut s = model.store().lock();
-    let n = s.len().min(limit);
-    (0..n).filter_map(|i| s.get(i).cloned()).collect()
+    let nrows = model.row_count().min(limit);
+    let ncols = model.columns().len();
+    let mut out = Vec::with_capacity(nrows);
+    model.visit_rows(0..nrows, |_, cells| {
+        let mut row = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            row.push(cells.value_of(c).unwrap_or(Value::Null));
+        }
+        out.push(row);
+    });
+    out
 }
 
 /// Virtual model entry of a table; the schema may be missing on either side
@@ -1118,16 +1128,17 @@ impl ResultPanel {
     }
 
     fn chart_ui(&mut self, ui: &mut Ui) {
-        let generation = self.src.generation;
+        self.model.try_sync();
+        let generation = (self.src.generation, self.model.content_generation());
         let cv = self.chart.get_or_insert_with(|| {
             let config = ternarygrid_visual::chart::ChartConfig::suggest_with(self.model.columns(), |c| ternarygrid_grid::format::is_identifier_column(&self.model, c));
-            ChartView { data: ternarygrid_visual::chart::ChartData::default(), config, state: Default::default(), generation: u64::MAX }
+            ChartView { data: ternarygrid_visual::chart::ChartData::default(), config, state: Default::default(), generation: (u64::MAX, u64::MAX) }
         });
         let mut rebuild = cv.generation != generation;
         let pal = ternarygrid_ui::pal(ui);
         // The settings at the left (Back to grid and Export at their top), the chart beside them.
         let (mut back, mut export) = (false, false);
-        let side = egui::Panel::left("chart_cfg")
+        let side = egui::Panel::left(ui.id().with(("chart_cfg", &self.conn, &self.title)))
             .resizable(true)
             .default_size(250.0)
             .show_separator_line(false)
@@ -1165,49 +1176,69 @@ impl ResultPanel {
             cv.generation = generation;
             cv.state.reset_view = true;
         }
+        if let Some((msg, err)) = self.status.clone() {
+            egui::Panel::bottom(ui.id().with(("chart_status", &self.conn, &self.title)))
+                .frame(egui::Frame::new().fill(pal.canvas).inner_margin(egui::Margin::symmetric(14, 6)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let color = if err { crate::theme::error_color(ui.visuals().dark_mode) } else { pal.text_muted };
+                        ui.label(RichText::new(&msg).size(12.0).color(color));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ternarygrid_ui::kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 20.0).clicked() {
+                                self.status = None;
+                            }
+                        });
+                    });
+                });
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.surface).inner_margin(egui::Margin::symmetric(24, 18))).show(ui, |ui| {
             ternarygrid_visual::chart::show_chart(ui, &cv.data, &cv.config, &mut cv.state);
         });
     }
 
     fn spatial_ui(&mut self, ui: &mut Ui) {
+        self.model.try_sync();
         let cols = ternarygrid_visual::spatial::geometry_columns(self.model.columns());
         let Some(&first) = cols.first() else {
             self.mode = Mode::Grid;
             return;
         };
-        let generation = self.src.generation;
+        let generation = (self.src.generation, self.model.content_generation());
         let need = self.spatial.as_ref().is_none_or(|s| !cols.contains(&s.column));
         if need {
-            self.spatial = Some(SpatialView { layers: Vec::new(), state: Default::default(), column: first });
+            self.spatial = Some(SpatialView { layers: Vec::new(), state: Default::default(), column: first, generation: (u64::MAX, u64::MAX) });
         }
         let names: Vec<String> = self.model.columns().iter().map(|c| c.name.clone()).collect();
         let sv = self.spatial.as_mut().expect("set above");
-        let mut rebuild = need || sv.layers.is_empty();
+        let mut rebuild = need || sv.layers.is_empty() || sv.generation != generation;
         ternarygrid_ui::parts::toolbar(ui, |ui| {
             use ternarygrid_ui::kit;
+            let ic = ternarygrid_ui::style::icons(ui);
             if kit::button_full(ui, kit::Kind::Ghost, Some(icon::TABLE), tr("Back to grid"), true, false).clicked() {
                 self.mode = Mode::Grid;
             }
             // As tall as the bar's buttons.
             ui.spacing_mut().interact_size.y = ternarygrid_ui::style::SMALL_H;
-            egui::ComboBox::from_id_salt("spatial_col").icon(ternarygrid_ui::kit::combo_caret).selected_text(names.get(sv.column).cloned().unwrap_or_default()).show_ui(ui, |ui| {
-                kit::menu_look(ui, 180.0);
-                for c in &cols {
-                    if kit::menu_check(ui, &mut (sv.column == *c), names.get(*c).map_or("", String::as_str)).clicked() {
-                        sv.column = *c;
-                        rebuild = true;
+            egui::ComboBox::from_id_salt(ui.id().with(("spatial_col", &self.conn, &self.title)))
+                .icon(ternarygrid_ui::kit::combo_caret)
+                .selected_text(names.get(sv.column).cloned().unwrap_or_default())
+                .show_ui(ui, |ui| {
+                    kit::menu_look(ui, 180.0);
+                    for c in &cols {
+                        if kit::menu_check(ui, &mut (sv.column == *c), names.get(*c).map_or("", String::as_str)).clicked() {
+                            sv.column = *c;
+                            rebuild = true;
+                        }
                     }
-                }
-            });
-            if kit::icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0).clicked() {
+                });
+            if kit::icon_button_colored(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 26.0, 14.0, Some(ic.blue)).clicked() {
                 rebuild = true;
             }
         });
-        let _ = generation;
         if rebuild {
             let rows = rows_of(&self.model, 200_000);
             sv.layers = vec![ternarygrid_visual::spatial::SpatialLayer::from_column(names.get(sv.column).cloned().unwrap_or_default(), &rows, sv.column, None)];
+            sv.generation = generation;
         }
         let r = ternarygrid_visual::spatial::show_spatial(ui, &sv.layers, &mut sv.state);
         if let Some(row) = r.clicked_row {
@@ -1417,9 +1448,16 @@ impl ResultPanel {
                 }
             }
         }
-        if let Some((msg, err)) = &self.status {
-            let color = if *err { crate::theme::error_color(ui.visuals().dark_mode) } else { ui.visuals().weak_text_color() };
-            ui.label(RichText::new(msg).small().color(color));
+        if self.mode != Mode::Chart
+            && let Some((msg, err)) = self.status.clone()
+        {
+            ui.horizontal(|ui| {
+                let color = if err { crate::theme::error_color(ui.visuals().dark_mode) } else { ui.visuals().weak_text_color() };
+                ui.label(RichText::new(&msg).small().color(color));
+                if ternarygrid_ui::kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 18.0).clicked() {
+                    self.status = None;
+                }
+            });
         }
         self.dialogs(ui, cx);
         if self.src.is_fetching() || self.save_job.is_some() || self.refs_job.is_some() {

@@ -3,6 +3,38 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.4 — 2026-11-24
+
+### Changed
+- **Single-row native pro toolbar for result sets (icon + micro-label).** Every action on the result footer now pairs a semantic coloured icon on top with a concise text label directly underneath (`Refresh`, `Auto`, `All`, `Count` | `Add`, `Before`, `Dup`, `Above`, `Below`, `Del`, `Undo` | `Grid`, `Text`, `Rec`, `JSON`, `XML`, `Chart`, `Map` | `Export` | `Value`, `Meta`, `Group`, `Calc`, `Refs`, `Panel`), with stacked two-line status (`rows · elapsed` over `Fetch next …`) on the left and clean responsive degradation into `More` in narrow panes.
+- **Clearer Duplicate icon.** Replaced the ambiguous row-plus-bottom glyph with the overlapping-sheets copy glyph (`Dup`) across the result footer, overflow menu, and grid context menu.
+- **Semantic coloured icons across all toolbars and menus.** Added a WCAG AA calibrated light/dark semantic icon palette (`ternarygrid-ui`) and enabled coloured icons app-wide: Database navigator (`+` green, Refresh blue, **Disconnect red** / Connect green, New folder amber), Top bar, Projects panel, SQL editor toolbar, Object editor, Welcome screen, and context/popup menus.
+
+### Fixed — connections & reliability
+- **Failed SQL statements and rolled-back savepoints no longer permanently inflate pending transaction write counts** (`tx.writes` only increments on successful writes and restores cleanly after `ROLLBACK TO SAVEPOINT`).
+- **Disconnect and app exit now track and await in-flight auto-revive and background close jobs** instead of abandoning them, preventing leaked sessions/tunnels or truncated `shell_after_disconnect` hooks.
+- **Tunnel reconnection (`ReviveJob::Connection`) now marks replaced main, per-database, and tab sessions closed** so open tabs and result panels rehome cleanly instead of hanging on dead handles.
+- **Per-database `ensure_session` now checks connection closure after connecting/initializing**, preventing leaked sessions and keep-alive loops when disconnecting mid-open.
+- **`SessionHandle::ping` is now cancelable on `abandon`/`close`**, preventing hung half-open keep-alive pings from stalling disconnect.
+- **Prompted credentials are cleared from memory when a connection attempt fails.**
+
+### Fixed — result grid, views & visualizations
+- **Row mutations (`Add row before`, `Copy from row above`, `Copy from row below`) now execute immediately in Record view and all other views** instead of queueing until switching back to Grid view.
+- **Keyboard navigation (`←`/`→`/`PageUp`/`PageDown`) in Record view now updates active cell selection**, keeping the active outline visible and ensuring `⌘C`/`Ctrl+C` copies the newly shown row's field.
+- **Chart and Spatial views now read visible rows through `ResultModel`** (respecting filters, sorting, pending edits/inserts, and saved deletions), track data generation so streaming/fetched rows refresh maps automatically, use unique panel IDs across split tabs, and show dismissible status messages.
+- **Auto-refresh now pauses while editing or using dropdowns in Record view and Grid view**, and no longer duplicates its interval chip alongside the footer `Auto` button at full width.
+- **Pending changes pill (`Discard` / `Save`) is disabled while a save is running**, respects platform shortcut text (`Ctrl+S` on Windows/Linux), and overflow menu `Copy from row above/below` disables properly when nothing is selected.
+- **Hiding columns clamps selection to visible columns**, and clicking the vertical scrollbar track no longer double-pages on slight mouse drag.
+
+### Fixed — shell, editor & security
+- **Top bar breadcrumbs clip cleanly before the right-side icons** so long connection/schema names never overlap toolbar buttons at narrow widths.
+- **Maximizing SQL editor results updates `focus_context`** so `⌘S`/`⌘F` target the visible result grid instead of the hidden editor.
+- **Closing a background dirty SQL editor or Table designer tab now focuses it** so its unsaved-changes confirmation prompt is shown immediately instead of staying hidden.
+- **Tool pop-ups now route keyboard shortcuts to the focused pop-up, close on `Escape`, and keep focus when clicking `ComboBox`/menu dropdowns.**
+- **Clicking the top bar search box resets and focuses the Command Palette**, and `File › New SQL editor` / Command Palette inherit the active connection and schema just like the shortcut.
+- **Background operations pop-up tracks window resize and stays inside the viewport**; dialogs and the Command Palette clamp to narrow windows; navigator keyboard navigation is blocked while modal dialogs are open; split tab bar `+` opens in the clicked leaf and its bottom hairline handles scrolled active tabs; SQL editor results tab strip scrolls horizontally and highlights the active schema accurately; Settings › Connection types preview matches the current marker pill UI.
+- **Updated dependencies (`cookie` 0.18.3, `url` 2.5.9, `parquet` 60.2.0, `rustix` 1.1.6)** to resolve all `cargo audit` advisories.
+
 ## 0.7.3 — 2026-11-24
 
 ### Changed

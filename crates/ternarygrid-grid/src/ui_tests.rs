@@ -961,3 +961,35 @@ fn record_view_keeps_its_values_while_the_store_is_busy() {
     holder.join().unwrap();
     assert_eq!(busy.as_deref(), Some("true"), "the values read before, not NULL, while the fetch task holds the store");
 }
+
+#[test]
+fn row_footer_actions_work_in_record_view_and_keyboard_nav_preserves_copy() {
+    let mut v = Viewer::new(editable_model(5));
+    v.state.grid.select_cell(1, 1);
+    v.state.toolbar.view = ResultViewKind::Record;
+    v.frame(vec![]);
+    v.frame(vec![]);
+    // Add row before works immediately from Record view (no need to switch back to Grid).
+    let before = v.find_all_exact("Add row before")[0];
+    v.click(before);
+    v.frame(vec![]);
+    assert_eq!(v.model.row_count(), 6, "Add row before inserted immediately in Record view");
+    // Copy from row below works immediately from Record view.
+    v.state.grid.select_cell(2, 1);
+    v.frame(vec![]);
+    let copy_below = v.find_all_exact("Copy from row below")[0];
+    v.click(copy_below);
+    v.frame(vec![]);
+    assert_eq!(v.model.cell(2, 1), v.model.cell(3, 1), "Copy from row below ran immediately in Record view");
+    // Navigating to the next row via ArrowRight updates picked so Cmd+C copies the new row's value.
+    v.state.record.request_focus();
+    v.frame(vec![]);
+    v.frame(vec![crate::test_support::key(egui::Key::ArrowRight, Modifiers::NONE)]);
+    v.frame(vec![]);
+    v.frame(vec![Event::Copy]);
+    let copied = v.output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    });
+    assert_eq!(copied.as_deref(), Some("name 2"), "Cmd+C copies active field after ArrowRight navigation");
+}

@@ -164,6 +164,9 @@ impl Operations {
             return;
         }
         let title = tr("Background operations");
+        let screen = ctx.content_rect();
+        let w = crate::dialogs::WIDTH_S.min((screen.width() - 16.0).max(260.0));
+        let pos = egui::pos2(at.x.clamp(screen.left() + w + 8.0, screen.right() - 8.0), at.y.clamp(screen.top() + 8.0, (screen.bottom() - 80.0).max(screen.top() + 8.0)));
         let shown = egui::Window::new(title)
             .id(egui::Id::new("ternarygrid_operations"))
             .title_bar(false)
@@ -171,8 +174,8 @@ impl Operations {
             .collapsible(false)
             .frame(crate::dialogs::window_frame(ctx))
             .pivot(egui::Align2::RIGHT_TOP)
-            .default_pos(at)
-            .show(ctx, |ui| Dialog::new(title).icon(icon::ACTIVITY).width(crate::dialogs::WIDTH_S).body_padding(egui::Margin::ZERO).contents(ui, |ui| self.ui(ui), None).0);
+            .current_pos(pos)
+            .show(ctx, |ui| Dialog::new(title).icon(icon::ACTIVITY).width(w).body_padding(egui::Margin::ZERO).contents(ui, |ui| self.ui(ui), None).0);
         let closed = shown.as_ref().and_then(|s| s.inner).unwrap_or(false);
         if closed || crate::widgets::escape_closes(ctx, shown.map(|s| s.response.layer_id)) {
             self.panel_open = false;

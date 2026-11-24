@@ -279,9 +279,18 @@ impl LiveConnection {
             params.database = Some(db.clone());
             let cfg = self.config.clone();
             let label = format!("{} / {db}", cfg.name);
+            let closed = self.closed.clone();
             *entry = Loadable::Loading(backend.spawn(async move {
                 let mut s = driver.connect(&params).await?;
+                if closed.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = s.close().await;
+                    return Err(DbError::connection("Connection was closed"));
+                }
                 init_session(s.as_mut(), &cfg, &params).await?;
+                if closed.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = s.close().await;
+                    return Err(DbError::connection("Connection was closed"));
+                }
                 let handle = SessionHandle::new(s, label, Some(db));
                 // Kept alive like the main session; it ends with the session.
                 if cfg.init.keep_alive_secs > 0 {
@@ -337,8 +346,20 @@ impl LiveConnection {
             match r {
                 Ok((s, connection)) => {
                     tracing::info!("{}: connected again", self.config.name);
+                    // Mark old sessions closed so tabs/panels holding clones rehome promptly.
+                    self.main.abandon(true);
                     if let Some((tunnel, params, server)) = connection {
-                        // The other databases' sessions went through the old tunnel.
+                        // The other databases' and tabs' sessions went through the old tunnel.
+                        for db in self.db_sessions.values() {
+                            if let Some(old) = db.get() {
+                                old.abandon(true);
+                            }
+                        }
+                        for w in self.tab_sessions.lock().drain(..) {
+                            if let Some(old) = w.upgrade() {
+                                old.abandon(true);
+                            }
+                        }
                         self.db_sessions.clear();
                         self.tunnel = tunnel;
                         self.params = params;
@@ -1255,6 +1276,7 @@ impl ConnectionManager {
                         self.just_connected.push(id);
                     }
                     Err(e) => {
+                        self.prompted.remove(&id);
                         self.failed_shown.remove(&id);
                         self.failed.insert(id, e.full_text());
                     }
@@ -1308,13 +1330,38 @@ impl ConnectionManager {
     /// Disconnect, closing all sessions in the background.
     pub fn disconnect(&mut self, backend: &Backend, id: &str) {
         self.prompted.remove(id);
-        if let Some(live) = self.live.remove(id) {
+        if let Some(mut live) = self.live.remove(id) {
             // Closed for its tabs at once: they open new sessions (after a reconnect)
             // instead of waiting on these, which may never answer again.
             for s in live.sessions() {
                 s.mark_closed_here();
             }
             live.closed.store(true, std::sync::atomic::Ordering::Release);
+            // Track any in-flight auto-revive job so it closes cleanly instead of leaking.
+            match live.revive.job.take() {
+                Some(ReviveJob::Connection(job)) => {
+                    let after = live.config.init.shell_after_disconnect.clone();
+                    self.abandoned.push((id.to_string(), job, after));
+                }
+                Some(ReviveJob::Session(mut job)) => {
+                    backend.spawn_detached(async move {
+                        let deadline = Instant::now() + Duration::from_secs(30);
+                        loop {
+                            if let Some(res) = job.poll() {
+                                if let Ok(s) = res {
+                                    s.cancel_and_close().await;
+                                }
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    });
+                }
+                None => {}
+            }
             self.close_in_background(backend, id, close_live(live));
         }
         // A connect still running: its session and tunnel are closed once it finishes.
@@ -1339,14 +1386,19 @@ impl ConnectionManager {
     /// detached task would not finish (sessions, tunnels, the after-disconnect commands).
     pub fn disconnect_all_and_wait(&mut self, backend: &Backend, timeout: Duration) {
         let lives: Vec<LiveConnection> = self.live_ids().iter().filter_map(|id| self.live.remove(id)).collect();
+        let closing: Vec<tokio::sync::watch::Receiver<bool>> = self.closing.drain().map(|(_, rx)| rx).filter(|rx| !*rx.borrow()).collect();
         self.connecting.clear();
-        if lives.is_empty() {
+        if lives.is_empty() && closing.is_empty() {
             return;
         }
         backend.block_on(async move {
             // Together: one connection whose session does not answer used the whole time,
             // and the ones after it never ran their after-disconnect commands.
-            let _ = tokio::time::timeout(timeout, futures::future::join_all(lives.into_iter().map(close_live))).await;
+            let close_lives = futures::future::join_all(lives.into_iter().map(close_live));
+            let wait_closing = futures::future::join_all(closing.into_iter().map(|mut rx| async move {
+                let _ = rx.wait_for(|done| *done).await;
+            }));
+            let _ = tokio::time::timeout(timeout, futures::future::join(close_lives, wait_closing)).await;
         });
     }
 }

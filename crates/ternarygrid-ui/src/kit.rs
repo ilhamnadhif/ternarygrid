@@ -192,7 +192,20 @@ pub fn icon_button_sized(ui: &mut Ui, icon: &str, tooltip: &str, on: bool, side:
 /// [`icon_button_sized`] whose tooltip says more than its accessible `name` (its keys, what it
 /// acts on).
 pub fn icon_button_tip(ui: &mut Ui, icon: &str, name: &str, tooltip: &str, on: bool, side: f32, glyph: f32) -> Response {
+    icon_button_tip_colored(ui, icon, name, tooltip, on, side, glyph, None, false)
+}
+
+/// [`icon_button_sized`] with an explicit semantic icon colour (`None` uses the neutral muted tone).
+pub fn icon_button_colored(ui: &mut Ui, icon: &str, tooltip: &str, on: bool, side: f32, glyph: f32, color: Option<Color32>) -> Response {
+    let danger_hover = color.is_some_and(|c| c == style::icons(ui).red);
+    icon_button_tip_colored(ui, icon, tooltip, tooltip, on, side, glyph, color, danger_hover)
+}
+
+/// [`icon_button_tip`] with an optional semantic icon colour and optional red hover tint.
+#[allow(clippy::too_many_arguments)]
+pub fn icon_button_tip_colored(ui: &mut Ui, icon: &str, name: &str, tooltip: &str, on: bool, side: f32, glyph: f32, color: Option<Color32>, danger_hover: bool) -> Response {
     let p = style::pal(ui);
+    let dark = ui.visuals().dark_mode;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
     let resp = if tooltip.is_empty() { resp } else { resp.on_hover_text(tooltip) };
     let enabled = ui.is_enabled();
@@ -202,24 +215,108 @@ pub fn icon_button_tip(ui: &mut Ui, icon: &str, name: &str, tooltip: &str, on: b
         let painter = ui.painter();
         let radius = CornerRadius::same(RADIUS);
         if on {
-            painter.rect_filled(rect, radius, p.accent_soft);
+            let (fill, stroke) = match color {
+                Some(c) => (style::soft(c, if dark { 0.18 } else { 0.12 }), Some(style::soft(c, if dark { 0.36 } else { 0.25 }))),
+                None => (p.accent_soft, None),
+            };
+            painter.rect_filled(rect, radius, fill);
+            if let Some(s) = stroke {
+                painter.rect_stroke(rect, radius, Stroke::new(1.0, s), StrokeKind::Inside);
+            }
         } else if enabled && resp.is_pointer_button_down_on() {
             painter.rect_filled(rect, radius, p.subtle);
         } else if hovered {
-            painter.rect_filled(rect, radius, p.hover);
+            let hover_fill = if danger_hover { style::soft(color.unwrap_or(p.err), if dark { 0.17 } else { 0.11 }) } else { p.hover };
+            painter.rect_filled(rect, radius, hover_fill);
         }
         if resp.has_focus() {
             painter.rect_stroke(rect, radius, Stroke::new(1.5, p.accent), StrokeKind::Inside);
         }
-        let color = if on {
-            p.accent_text
+        let icon_color = match color {
+            Some(c) => c,
+            None if on => p.accent_text,
+            None if hovered => p.text,
+            None => p.text_muted,
+        };
+        let icon_color = if enabled { icon_color } else { icon_color.gamma_multiply(0.38) };
+        painter.text(rect.center(), Align2::CENTER_CENTER, icon, style::icon_font(glyph), icon_color);
+    }
+    resp
+}
+
+/// Micro-label font size used by [`labeled_icon_button`] (native pro toolbar style: icon over label).
+const LABELED_ICON_FONT: f32 = 9.5;
+
+/// Width [`labeled_icon_button`] allocates for `short_label`.
+pub fn labeled_icon_width(ui: &Ui, short_label: &str) -> f32 {
+    let w = ui.painter().layout_no_wrap(short_label.to_string(), style::medium(ui.ctx(), LABELED_ICON_FONT), Color32::PLACEHOLDER).size().x;
+    (w + 8.0).ceil().max(28.0)
+}
+
+/// A compact toolbar button with a coloured icon on top and a crisp micro-label underneath
+/// (macOS pro toolbar / Opsi 1 style). `name` is the full accessible label; `short_label` is
+/// the concise caption shown directly under the icon.
+#[allow(clippy::too_many_arguments)]
+pub fn labeled_icon_button(
+    ui: &mut Ui,
+    icon: &str,
+    short_label: &str,
+    name: &str,
+    tooltip: &str,
+    on: bool,
+    width: f32,
+    height: f32,
+    color: Option<Color32>,
+    danger_hover: bool,
+) -> Response {
+    let p = style::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    let resp = if tooltip.is_empty() { resp } else { resp.on_hover_text(tooltip) };
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, enabled, on, name));
+    if ui.is_rect_visible(rect) {
+        let hovered = enabled && resp.hovered();
+        let pressed = enabled && resp.is_pointer_button_down_on();
+        let painter = ui.painter();
+        let radius = CornerRadius::same(RADIUS);
+        if on {
+            let tint = color.unwrap_or(p.accent_text);
+            let fill = if color.is_some() { style::soft(tint, if dark { 0.18 } else { 0.12 }) } else { p.accent_soft };
+            painter.rect_filled(rect, radius, fill);
+            painter.rect_stroke(rect, radius, Stroke::new(1.0, style::soft(tint, if dark { 0.36 } else { 0.25 })), StrokeKind::Inside);
+        } else if pressed {
+            painter.rect_filled(rect, radius, p.subtle);
+        } else if hovered {
+            let hover_fill = if danger_hover { style::soft(color.unwrap_or(p.err), if dark { 0.17 } else { 0.11 }) } else { p.hover };
+            painter.rect_filled(rect, radius, hover_fill);
+        }
+        if resp.has_focus() {
+            painter.rect_stroke(rect, radius, Stroke::new(1.5, p.accent), StrokeKind::Inside);
+        }
+        let icon_color = match color {
+            Some(c) => c,
+            None if on => p.accent_text,
+            None if hovered => p.text,
+            None => p.text_muted,
+        };
+        let label_color = if on {
+            color.unwrap_or(p.accent_text)
+        } else if hovered && danger_hover {
+            color.unwrap_or(p.err)
         } else if hovered {
             p.text
         } else {
             p.text_muted
         };
-        let color = if enabled { color } else { color.gamma_multiply(0.45) };
-        painter.text(rect.center(), Align2::CENTER_CENTER, icon, style::icon_font(glyph), color);
+        let icon_alpha = if dark { 0.38 } else { 0.44 };
+        let label_alpha = if dark { 0.60 } else { 0.70 };
+        let icon_color = if enabled { icon_color } else { icon_color.gamma_multiply(icon_alpha) };
+        let label_color = if enabled { label_color } else { p.text_faint.gamma_multiply(label_alpha) };
+        let icon_y = rect.top() + (height * 0.34).round();
+        let label_y = rect.bottom() - 8.0;
+        painter.text(egui::pos2(rect.center().x, icon_y), Align2::CENTER_CENTER, icon, style::icon_font(14.5), icon_color);
+        painter.text(egui::pos2(rect.center().x, label_y), Align2::CENTER_CENTER, short_label, style::medium(ui.ctx(), LABELED_ICON_FONT), label_color);
     }
     resp
 }
@@ -901,7 +998,13 @@ pub fn menu_item_danger(ui: &mut Ui, icon: Option<&str>, text: &str, keys: &str)
 fn menu_item_ex(ui: &mut Ui, icon: Option<&str>, text: &str, keys: &str, danger: bool) -> Response {
     let p = style::pal(ui);
     let size = style::body_size(ui.ctx());
-    let (icon_color, text_color) = if danger { (p.err, p.err) } else { (p.text_muted, p.text) };
+    let dark = ui.visuals().dark_mode;
+    let (icon_color, text_color) = if danger {
+        (p.err, p.err)
+    } else {
+        let ic = icon.and_then(|g| style::icon_color(g, dark)).unwrap_or(p.text_muted);
+        (ic, p.text)
+    };
     let lead = menu_icon(icon.unwrap_or(egui_phosphor::regular::SQUARE), size, if icon.is_some() { icon_color } else { Color32::TRANSPARENT });
     let mut b = egui::Button::new((lead, RichText::new(text).color(text_color)));
     if !keys.is_empty() {
@@ -935,7 +1038,8 @@ pub fn menu_check(ui: &mut Ui, on: &mut bool, text: &str) -> Response {
 pub fn submenu(ui: &mut Ui, icon: Option<&str>, text: &str, width: f32, add: &mut dyn FnMut(&mut Ui)) -> Response {
     let p = style::pal(ui);
     let size = style::body_size(ui.ctx());
-    let lead = menu_icon(icon.unwrap_or(egui_phosphor::regular::SQUARE), size, if icon.is_some() { p.text_muted } else { Color32::TRANSPARENT });
+    let ic = icon.and_then(|g| style::icon_color(g, ui.visuals().dark_mode)).unwrap_or(p.text_muted);
+    let lead = menu_icon(icon.unwrap_or(egui_phosphor::regular::SQUARE), size, if icon.is_some() { ic } else { Color32::TRANSPARENT });
     let chevron = RichText::new(egui_phosphor::regular::CARET_RIGHT).font(style::icon_font(size - 1.0)).color(p.text_faint);
     let button = egui::Button::new((lead, RichText::new(text).color(p.text))).right_text(chevron);
     egui::containers::menu::SubMenuButton::from_button(button)

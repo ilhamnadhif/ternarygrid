@@ -169,6 +169,8 @@ pub struct Navigator {
     prefs: ternarygrid_config::settings::NavigatorSettings,
     /// The last click was in the navigator: Refresh (F5) is its own, not the active tab's.
     pub has_focus: bool,
+    /// True while a modal dialog or tool pop-up owns keyboard input (blocks navigator shortcuts).
+    pub keyboard_blocked: bool,
 }
 
 /// Text next to a connection: `user@host:port/db`, or for a database file
@@ -1225,23 +1227,27 @@ impl Navigator {
                     cx.push(AppCommand::SettingsChanged);
                 }
             });
-            if show_collapse && kit::icon_button_sized(ui, icon::ARROWS_IN_SIMPLE, tr("Collapse all"), false, 26.0, 15.0).clicked() {
+            let ic = ternarygrid_ui::style::icons(ui);
+            let plug_color = if connected { ic.red } else { ic.green };
+            if show_collapse && kit::icon_button_colored(ui, icon::ARROWS_IN_SIMPLE, tr("Collapse all"), false, 26.0, 15.0, Some(ic.slate)).clicked() {
                 self.collapse_all();
             }
             // In place without a connection selected: the buttons do not move with the selection.
             if show_plug
-                && ui.add_enabled_ui(sel_conn.is_some(), |ui| kit::icon_button_sized(ui, plug, &plug_label, false, 26.0, 15.0)).inner.clicked()
+                && ui.add_enabled_ui(sel_conn.is_some(), |ui| kit::icon_button_colored(ui, plug, &plug_label, false, 26.0, 15.0, Some(plug_color))).inner.clicked()
                 && let Some(c) = &sel_conn
             {
                 cx.push(plug_command(c));
             }
-            if show_refresh && ui.add_enabled_ui(can_refresh, |ui| kit::icon_button_sized(ui, icon::ARROW_CLOCKWISE, refresh_tip, false, 26.0, 15.0)).inner.clicked() {
+            if show_refresh
+                && ui.add_enabled_ui(can_refresh, |ui| kit::icon_button_colored(ui, icon::ARROW_CLOCKWISE, refresh_tip, false, 26.0, 15.0, Some(ic.blue))).inner.clicked()
+            {
                 self.refresh_or_reconnect(failed, sel_conn.as_deref(), cx);
             }
-            if show_folder && kit::icon_button_sized(ui, icon::FOLDER_PLUS, tr("New folder…"), false, 26.0, 15.0).clicked() {
+            if show_folder && kit::icon_button_colored(ui, icon::FOLDER_PLUS, tr("New folder…"), false, 26.0, 15.0, Some(ic.amber)).clicked() {
                 self.new_folder(cx);
             }
-            if kit::icon_button_sized(ui, icon::PLUS, tr("New connection"), false, 26.0, 15.0).clicked() {
+            if kit::icon_button_colored(ui, icon::PLUS, tr("New connection"), false, 26.0, 15.0, Some(ic.green)).clicked() {
                 cx.push(AppCommand::Action(crate::keys::Action::NewConnection));
             }
         });
@@ -1678,9 +1684,9 @@ impl Navigator {
     }
 
     fn keyboard(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        // Only while the user works in the navigator (clicked it last): keys typed in a
-        // grid or another view, which may not take egui's focus, are theirs.
-        if !self.has_focus {
+        // Only while the user works in the navigator (clicked it last) and no modal owns keys:
+        // keys typed in a grid or dialog are theirs.
+        if !self.has_focus || self.keyboard_blocked {
             return;
         }
         let nodes: Vec<usize> = self.rows.iter().enumerate().filter(|(_, r)| r.kind == RowKind::Node).map(|(i, _)| i).collect();

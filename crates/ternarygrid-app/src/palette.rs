@@ -187,7 +187,7 @@ fn collect(cx: &AppContext) -> Vec<Item> {
     };
     let mut items = vec![
         command(icon::PLUS, "New connection…", C::Connections, || AppCommand::NewConnection { kind: None, folder: None }),
-        command(icon::FILE_CODE, "New SQL editor", C::Sql, || AppCommand::NewSqlEditor { connection: None, schema: None, text: None }),
+        command(icon::FILE_CODE, "New SQL editor", C::Sql, || AppCommand::Action(crate::keys::Action::NewSqlEditor)),
         command(icon::GEAR_SIX, "Settings", C::Application, || AppCommand::OpenSettings),
         command(icon::CLOCK_COUNTER_CLOCKWISE, "Query history", C::Tools, || AppCommand::OpenHistory),
         command(icon::LIST_CHECKS, "Tasks", C::Tools, || AppCommand::OpenTasks),
@@ -356,7 +356,8 @@ pub fn show(ctx: &egui::Context, cx: &mut AppContext, open: &mut bool) {
         let frame =
             egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(ternarygrid_ui::style::RADIUS_LG + 2).shadow(ui.visuals().window_shadow);
         frame.show(ui, |ui| {
-            ui.set_width(620.0);
+            let max_w = (ctx.content_rect().width() - 32.0).max(280.0);
+            ui.set_width(620.0_f32.min(max_w));
             ui.spacing_mut().item_spacing.y = 0.0;
             let line = egui::Stroke::new(1.0, p.border);
             // The search: a large frameless field with a magnifier painted in its margin.

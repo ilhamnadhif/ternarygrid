@@ -360,7 +360,7 @@ impl SessionHandle {
         let mut tx = self.inner.tx.lock();
         if tx.in_transaction || tx.mode == TransactionMode::Manual {
             let sql: String = sql.chars().take(4000).collect();
-            if ternarygrid_sql::classify(&sql, self.inner.dialect.syntax()).is_write {
+            if ok && ternarygrid_sql::classify(&sql, self.inner.dialect.syntax()).is_write {
                 tx.writes += 1;
             }
             tx.log.push(TxLogEntry { sql, at: chrono::Local::now(), duration: started.elapsed(), rows, ok });
@@ -667,6 +667,7 @@ impl SessionHandle {
         let mut total = 0u64;
         let mut failure = None;
         let mut results = Vec::with_capacity(stmts.len());
+        let writes_before = self.inner.tx.lock().writes;
         // How far the driver's row count can be trusted: SQL Server reports none with
         // NOCOUNT and adds a trigger's; MySQL counts changed rows (an unchanged value is 0).
         let (zero_means_missing, many_means_ambiguous) = match self.kind() {
@@ -702,6 +703,7 @@ impl SessionHandle {
         if let Some((_, rollback, release)) = savepoint {
             if failure.is_some() {
                 let _ = ternarygrid_core::driver::execute_update(guard.as_mut(), rollback, &[]).await;
+                self.inner.tx.lock().writes = writes_before;
             }
             if let Some(release) = release {
                 let _ = ternarygrid_core::driver::execute_update(guard.as_mut(), release, &[]).await;
@@ -795,11 +797,16 @@ impl SessionHandle {
         if self.inner.cursor.try_lock().map(|c| c.is_some()).unwrap_or(true) {
             return Ok(());
         }
-        // A connection silently dropped by the network may never answer: bounded.
-        let r = match tokio::time::timeout(Duration::from_secs(20), guard.ping()).await {
-            Ok(r) => r,
-            Err(_) => Err(DbError::connection("The server did not answer the ping within 20 s")),
-        };
+        // A connection silently dropped by the network may never answer: bounded, and
+        // cancelable on abandon/close so disconnect does not stall behind a hung ping.
+        let r = self
+            .killable(async {
+                match tokio::time::timeout(Duration::from_secs(20), guard.ping()).await {
+                    Ok(r) => r,
+                    Err(_) => Err(DbError::connection("The server did not answer the ping within 20 s")),
+                }
+            })
+            .await;
         drop(guard);
         if let Err(e) = &r {
             self.note_error(e);

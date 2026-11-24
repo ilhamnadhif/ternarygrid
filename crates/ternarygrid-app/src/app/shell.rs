@@ -63,7 +63,7 @@ fn bar_button(ui: &mut Ui, lead: Lead, text: &str, tip: &str, framed: bool) -> e
             }
         }
         Lead::Icon(glyph) => {
-            let color = if framed { p.text } else { p.text_muted };
+            let color = ternarygrid_ui::style::icon_color(glyph, ui.visuals().dark_mode).unwrap_or(if framed { p.text } else { p.text_muted });
             painter.text(egui::pos2(x + 7.0, cy), egui::Align2::CENTER_CENTER, glyph, ternarygrid_ui::style::icon_font(14.0), color);
         }
     }
@@ -112,22 +112,24 @@ impl TernaryGridApp {
 
         // Right (laid out right-to-left so the search box centres between left & right):
         // [Updates] [History] [Tasks] │ [Operations] [AI] [Theme] [Settings]
+        let ic = ternarygrid_ui::style::icons(ui);
         let mut right = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::right_to_left(egui::Align::Center)));
         right.spacing_mut().item_spacing.x = 2.0;
-        if kit::icon_button_sized(&mut right, icon::GEAR_SIX, tr("Settings"), place == Some(Place::Settings), 30.0, 16.0).clicked() {
+        if kit::icon_button_colored(&mut right, icon::GEAR_SIX, tr("Settings"), place == Some(Place::Settings), 30.0, 16.0, Some(ic.slate)).clicked() {
             self.commands.push(AppCommand::OpenSettings);
         }
         let dark = right.visuals().dark_mode;
-        let (theme_icon, theme_tip) = if dark { (icon::SUN, tr("Switch to the light theme")) } else { (icon::MOON, tr("Switch to the dark theme")) };
-        if kit::icon_button_sized(&mut right, theme_icon, theme_tip, false, 30.0, 16.0).clicked() {
+        let (theme_icon, theme_tip, theme_color) =
+            if dark { (icon::SUN, tr("Switch to the light theme"), ic.amber) } else { (icon::MOON, tr("Switch to the dark theme"), ic.purple) };
+        if kit::icon_button_colored(&mut right, theme_icon, theme_tip, false, 30.0, 16.0, Some(theme_color)).clicked() {
             self.toggle_theme(right.ctx());
         }
-        if kit::icon_button_sized(&mut right, icon::SPARKLE, tr("AI assistant"), self.ai_open, 30.0, 16.0).clicked() {
+        if kit::icon_button_colored(&mut right, icon::SPARKLE, tr("AI assistant"), self.ai_open, 30.0, 16.0, Some(ic.purple)).clicked() {
             self.commands.push(AppCommand::Action(Action::AiAssistant));
         }
         let running = self.ops.running();
         let ops_tip = if running > 0 { ternarygrid_core::trf("Background operations ({} running)", &[&running]) } else { tr("Background operations").to_string() };
-        let ops_resp = kit::icon_button_sized(&mut right, icon::ACTIVITY, &ops_tip, self.ops.panel_open, 30.0, 16.0);
+        let ops_resp = kit::icon_button_colored(&mut right, icon::ACTIVITY, &ops_tip, self.ops.panel_open, 30.0, 16.0, Some(ic.teal));
         if running > 0 {
             right.painter().circle_filled(ops_resp.rect.right_top() + egui::vec2(-7.5, 7.5), 3.0, p.accent_text);
         }
@@ -137,10 +139,10 @@ impl TernaryGridApp {
         right.add_space(2.0);
         kit::vdivider(&mut right, 16.0);
         right.add_space(2.0);
-        if kit::icon_button_sized(&mut right, icon::LIST_CHECKS, tr("Tasks"), place == Some(Place::Tasks), 30.0, 16.0).clicked() {
+        if kit::icon_button_colored(&mut right, icon::LIST_CHECKS, tr("Tasks"), place == Some(Place::Tasks), 30.0, 16.0, Some(ic.green)).clicked() {
             self.commands.push(AppCommand::Action(Action::OpenTasks));
         }
-        if kit::icon_button_sized(&mut right, icon::CLOCK_COUNTER_CLOCKWISE, tr("Query history"), place == Some(Place::History), 30.0, 16.0).clicked() {
+        if kit::icon_button_colored(&mut right, icon::CLOCK_COUNTER_CLOCKWISE, tr("Query history"), place == Some(Place::History), 30.0, 16.0, Some(ic.amber)).clicked() {
             self.commands.push(AppCommand::Action(Action::OpenHistory));
         }
         right.add_space(4.0);
@@ -148,8 +150,12 @@ impl TernaryGridApp {
         let right_start = right.min_rect().left();
 
         // Left: menus (no system menu bar), side panel switches (Database navigator, Projects),
-        // New, and where the active tab works.
-        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(rect.with_min_x(rect.left() + inset)).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        // New, and where the active tab works — clipped before `right_start` so breadcrumbs
+        // never collide with the right toolbar icons at narrow window widths.
+        let left_max = (right_start - 8.0).max(rect.left() + inset);
+        let left_rect = rect.with_min_x(rect.left() + inset).with_max_x(left_max);
+        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(left_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        left.set_clip_rect(left.clip_rect().intersect(left_rect));
         left.spacing_mut().item_spacing.x = 4.0;
         if menus {
             // egui's menu bar takes the whole width: give it none, it grows to its menus.
@@ -160,7 +166,7 @@ impl TernaryGridApp {
         left.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let nav_on = self.show_nav && !self.show_project;
-            if kit::icon_button_sized(ui, icon::DATABASE, tr("Database navigator"), nav_on, 30.0, 16.0).clicked() {
+            if kit::icon_button_colored(ui, icon::DATABASE, tr("Database navigator"), nav_on, 30.0, 16.0, Some(ic.cyan)).clicked() {
                 if nav_on {
                     self.show_nav = false;
                 } else {
@@ -169,7 +175,7 @@ impl TernaryGridApp {
                 }
             }
             let projects_on = self.show_nav && self.show_project;
-            if kit::icon_button_sized(ui, icon::FILE_TEXT, tr("Projects and scripts"), projects_on, 30.0, 16.0).clicked() {
+            if kit::icon_button_colored(ui, icon::FILE_TEXT, tr("Projects and scripts"), projects_on, 30.0, 16.0, Some(ic.amber)).clicked() {
                 if projects_on {
                     self.show_nav = false;
                 } else {
@@ -337,7 +343,7 @@ impl TernaryGridApp {
         );
         painter.galley(egui::pos2(r.left() + 32.0, r.center().y - hint.size().y / 2.0), hint, p.text_faint);
         if resp.clicked() {
-            self.dialogs.palette_open = true;
+            self.commands.push(AppCommand::ShowPalette);
         }
         if hovered {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

@@ -368,7 +368,7 @@ impl DataGridState {
     pub fn set_column_visible(&mut self, col: usize, visible: bool) {
         if let Some(c) = self.columns.get_mut(col) {
             c.visible = visible;
-            self.rt.selection.clamp(usize::MAX, self.order.len());
+            self.rt.selection.clamp(usize::MAX, self.visible_columns().len());
         }
     }
 
@@ -491,9 +491,9 @@ impl DataGridState {
         self.rt.scroll_y = y.max(0.0);
     }
 
-    /// True while a cell editor is open.
+    /// True while a cell editor or dropdown list is open.
     pub fn is_editing(&self) -> bool {
-        self.rt.editing.is_some()
+        self.rt.editing.is_some() || self.rt.dropdown.is_some()
     }
 
     /// Show a transient status message inside the grid.

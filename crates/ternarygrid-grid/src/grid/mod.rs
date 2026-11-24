@@ -415,6 +415,50 @@ pub fn add_row(model: &mut ResultModel, state: &mut DataGridState) -> Result<usi
     Ok(row)
 }
 
+/// Insert a new row before the active row (or at row 0) and select its first cell to fill in.
+/// Works from any result view (grid, record, text, JSON, XML). Returns the display row.
+pub fn add_row_before(model: &mut ResultModel, state: &mut DataGridState) -> Result<usize, String> {
+    let before = state.active_cell().map(|(r, _)| r).unwrap_or(0);
+    let current = state.active_cell().map_or(0, |(_, c)| c);
+    let row = model.add_row_before(before)?;
+    let col = state.visible_columns().iter().copied().find(|&c| model.can_edit_cell(row, c).is_ok() && model.column_meta(c).is_some_and(|m| m.auto_increment != Some(true)));
+    state.select_cell(row, col.unwrap_or(current));
+    Ok(row)
+}
+
+/// Copy into the selected cells the value of the same column in the row above (`above`) or
+/// below. Works from any result view (grid, record, text, JSON, XML). Returns the number of
+/// cells edited.
+pub fn copy_from_adjacent(model: &mut ResultModel, state: &mut DataGridState, above: bool) -> Result<usize, String> {
+    const MAX_CELL_EDITS: usize = 100_000;
+    let visible = state.visible_columns();
+    let nrows = model.row_count();
+    let sel = state.selection();
+    let mut cells = Vec::new();
+    for r in sel.rows(nrows, MAX_CELL_EDITS + 1) {
+        for p in sel.columns(visible.len()) {
+            if sel.contains(r, p) && !model.is_virtual_column(visible[p]) {
+                cells.push((r, visible[p]));
+                if cells.len() > MAX_CELL_EDITS {
+                    return Err(trf("Select at most {} cells to change at once", &[&MAX_CELL_EDITS]));
+                }
+            }
+        }
+    }
+    let mut edits = Vec::with_capacity(cells.len());
+    for (r, c) in cells {
+        let src = if above { r.checked_sub(1) } else { Some(r + 1).filter(|&x| x < nrows) };
+        let Some(src) = src else { continue };
+        let v = model.cell(src, c).unwrap_or(ternarygrid_core::Value::Null);
+        edits.push((r, c, crate::model::CellValue::Value(v)));
+    }
+    let count = edits.len();
+    if count > 0 {
+        model.set_cells(edits)?;
+    }
+    Ok(count)
+}
+
 /// Duplicate the selected rows; selects the first copy.
 pub fn duplicate_selected(model: &mut ResultModel, state: &mut DataGridState) -> Result<usize, String> {
     let rows = state.selected_rows(model.row_count(), 10_000);

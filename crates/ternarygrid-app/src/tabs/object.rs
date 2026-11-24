@@ -422,7 +422,8 @@ impl ObjectEditorTab {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             ui.add_sized([name_w, h], field(&mut c.name, "", false, faint));
                             ui.add_sized([expr_w, h], field(&mut c.expression, "", true, faint));
-                            if kit::icon_button_ex(ui, icon::TRASH, tr("Remove"), false, h).clicked() {
+                            let ic = ternarygrid_ui::style::icons(ui);
+                            if kit::icon_button_colored(ui, icon::TRASH, tr("Remove"), false, h, (h * 0.54).round(), Some(ic.red)).clicked() {
                                 remove = Some(i);
                             }
                         });
@@ -624,7 +625,8 @@ impl ObjectEditorTab {
                 let more = kit::icon_button_ex(ui, icon::DOTS_THREE, tr("More actions"), false, 28.0);
                 egui::Popup::menu(&more).show(|ui| crate::nav::object_menu(ui, cx, &self.conn.clone(), &self.obj.clone(), false));
                 // The data page has Refresh in its footer, with the other actions on the rows.
-                if self.page != ObjectPage::Data && kit::icon_button_ex(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 28.0).clicked() {
+                let ic = ternarygrid_ui::style::icons(ui);
+                if self.page != ObjectPage::Data && kit::icon_button_colored(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), false, 28.0, 15.0, Some(ic.blue)).clicked() {
                     self.refresh();
                     if let (ObjectPage::Diagram, Some(d)) = (self.page, self.diagram.as_mut()) {
                         d.reload(cx);
@@ -733,10 +735,8 @@ impl TabView for ObjectEditorTab {
 
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
         if !cx.conns.is_connected(&self.conn) {
-            ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-                ui.label(tr("The connection is closed."));
-                if ui.button(tr("Connect")).clicked() {
+            kit::empty_state(ui, icon::PLUGS, tr("The connection is closed."), tr("Reconnect to inspect this object or browse its data."), |ui| {
+                if kit::primary_icon(ui, icon::PLUGS_CONNECTED, tr("Connect")).clicked() {
                     cx.push(AppCommand::Connect(self.conn.clone()));
                 }
             });

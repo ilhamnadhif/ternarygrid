@@ -97,8 +97,8 @@ impl GridFrame<'_> {
             {
                 if thumb.contains(p) {
                     self.state.rt.drag = Drag::VThumb { grab: p.y - thumb.top() };
-                } else if resp.drag_started() || ui.input(|i| i.pointer.primary_pressed()) {
-                    // Page towards the pointer.
+                } else if ui.input(|i| i.pointer.primary_pressed()) {
+                    // Page towards the pointer once per press (avoid double-paging on drag_started).
                     let page = self.geo.body.height() as f64;
                     let dir = if p.y < thumb.top() { -1.0 } else { 1.0 };
                     self.state.rt.scroll_y = (self.state.rt.scroll_y + dir * page).clamp(0.0, self.geo.max_scroll_y());
@@ -989,32 +989,15 @@ impl GridFrame<'_> {
 
     /// Add a new row before the active row.
     pub fn add_row_before_active(&mut self) {
-        let before = self.active().map(|(r, _)| r).unwrap_or(0);
-        match self.model.add_row_before(before) {
-            Ok(row) => {
-                let col = self.state.rt.selection.active().col;
-                self.state.rt.selection.select_cell(CellPos::new(row, col));
-                self.state.rt.scroll_to_active = true;
-            }
-            Err(e) => self.notify(e, true),
+        if let Err(e) = super::add_row_before(self.model, self.state) {
+            self.notify(e, true);
         }
     }
 
     /// Copy into the selected cells the value of the same column in the row
     /// above (`above`) or below.
     pub fn copy_from_adjacent(&mut self, above: bool) {
-        let Some(cells) = self.cells_to_change() else { return };
-        let mut edits = Vec::with_capacity(cells.len());
-        for (r, c) in cells {
-            let src = if above { r.checked_sub(1) } else { Some(r + 1).filter(|&x| x < self.geo.nrows) };
-            let Some(src) = src else { continue };
-            let v = self.model.cell(src, c).unwrap_or(Value::Null);
-            edits.push((r, c, crate::model::CellValue::Value(v)));
-        }
-        if edits.is_empty() {
-            return;
-        }
-        if let Err(e) = self.model.set_cells(edits) {
+        if let Err(e) = super::copy_from_adjacent(self.model, self.state, above) {
             self.notify(e, true);
         }
     }

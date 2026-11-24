@@ -292,7 +292,7 @@ impl GridFrame<'_> {
                 self.add_row_after_active();
                 ui.close();
             }
-            if item(ui, Some(icon::ROWS_PLUS_BOTTOM), &rows_label(selected_rows, tr("Duplicate row"), tr("Duplicate {} rows")), Some(keys("⌘D", "Ctrl+D"))).clicked() {
+            if item(ui, Some(icon::COPY), &rows_label(selected_rows, tr("Duplicate row"), tr("Duplicate {} rows")), Some(keys("⌘D", "Ctrl+D"))).clicked() {
                 self.duplicate_selected();
                 ui.close();
             }

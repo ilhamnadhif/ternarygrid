@@ -92,7 +92,8 @@ fn action_row(ui: &mut Ui, ic: &str, label: &str, keys: &str) -> egui::Response 
             painter.rect_stroke(rect, ternarygrid_ui::style::RADIUS, egui::Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
         }
         let cy = rect.center().y;
-        painter.text(egui::pos2(rect.left() + 20.0, cy), egui::Align2::CENTER_CENTER, ic, ternarygrid_ui::style::icon_font(16.0), p.text_muted);
+        let icon_color = ternarygrid_ui::style::icon_color(ic, ui.visuals().dark_mode).unwrap_or(p.text_muted);
+        painter.text(egui::pos2(rect.left() + 20.0, cy), egui::Align2::CENTER_CENTER, ic, ternarygrid_ui::style::icon_font(16.0), icon_color);
         let size = ternarygrid_ui::style::body_size(ui.ctx()) + 0.5;
         painter.text(egui::pos2(rect.left() + 40.0, cy), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(size), p.text);
         if !keys.is_empty() {

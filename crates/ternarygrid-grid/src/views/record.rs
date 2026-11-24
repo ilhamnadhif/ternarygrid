@@ -139,6 +139,11 @@ fn is_empty_value(v: &Value) -> bool {
 }
 
 impl RecordViewState {
+    /// True while a field editor or value dropdown is open in record view.
+    pub fn is_editing(&self) -> bool {
+        self.editing.is_some() || self.dropdown.is_some()
+    }
+
     /// Take the keyboard focus on the next frame: Tab goes back to the
     /// grid, ← / → show the previous / next row.
     pub fn request_focus(&mut self) {
@@ -224,6 +229,8 @@ impl<'a> RecordView<'a> {
         }
         if let Some(r) = go_to {
             grid.select_cell(r, active_col);
+            state.picked = vec![(r, active_col)];
+            state.pick_anchor = Some((r, active_col));
             state.editing = None;
             state.dropdown = None;
             state.error = None;
