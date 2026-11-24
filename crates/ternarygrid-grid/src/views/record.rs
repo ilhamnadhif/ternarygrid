@@ -3,7 +3,7 @@
 use crate::format::PreparedFormat;
 use crate::grid::state::Dropdown;
 use crate::grid::{DataGridState, GridAction, GridOptions, ListChoice, ResultViewKind};
-use crate::model::{CellRef, ResultModel, RowAnchor};
+use crate::model::{CellRef, DefaultDisplay, ResultModel, RowAnchor};
 use crate::theme::GridTheme;
 use egui::text::{CCursor, CCursorRange};
 use egui::{Key, RichText, ScrollArea, TextEdit, Ui};
@@ -11,18 +11,38 @@ use egui_phosphor::regular as icon;
 use ternarygrid_core::value::single_line;
 use ternarygrid_core::{Value, tr, trf};
 
-/// A value styled by kind: NULL / DEFAULT in italics, booleans with a
-/// check box, JSON in monospace, modified values highlighted.
-fn value_text(v: &Value, is_default: bool, modified: bool, fmt: &PreparedFormat, options: &GridOptions, theme: &GridTheme) -> RichText {
-    let rt = if is_default {
-        RichText::new(tr("[DEFAULT]")).italics().color(theme.weak)
+/// A value styled by kind: NULL / DEFAULT in italics (showing the column's real
+/// SQL default or NULL when nullable), booleans with a check box (including
+/// default and NULL states), JSON in monospace, modified values highlighted.
+#[allow(clippy::too_many_arguments)]
+fn value_text(model: &ResultModel, col: usize, v: &Value, is_default: bool, modified: bool, fmt: &PreparedFormat, options: &GridOptions, theme: &GridTheme) -> RichText {
+    let rt = if is_bool_column(model, col, v) {
+        if is_default {
+            match model.default_bool(col) {
+                Some(true) => RichText::new(icon::CHECK_SQUARE).size(17.0).color(theme.bool_true.gamma_multiply(0.75)),
+                Some(false) => RichText::new(icon::SQUARE).size(17.0).color(theme.weak),
+                None => RichText::new(icon::MINUS_SQUARE).size(17.0).color(theme.weak),
+            }
+        } else if v.is_null() {
+            RichText::new(icon::MINUS_SQUARE).size(17.0).color(theme.weak)
+        } else {
+            match v {
+                Value::Bool(true) => RichText::new(icon::CHECK_SQUARE).size(17.0).color(theme.bool_true),
+                Value::Bool(false) => RichText::new(icon::SQUARE).size(17.0).color(theme.weak),
+                other => RichText::new(clip(&fmt.format(other))).color(theme.text),
+            }
+        }
+    } else if is_default {
+        match model.default_display(col) {
+            DefaultDisplay::Expr(e) => RichText::new(clip(e)).italics().color(theme.weak),
+            DefaultDisplay::Null => RichText::new(options.format.null_text.clone()).italics().color(theme.weak),
+            DefaultDisplay::Auto => RichText::new(tr("[AUTO]")).italics().color(theme.weak),
+            DefaultDisplay::Generic => RichText::new(tr("[DEFAULT]")).italics().color(theme.weak),
+        }
     } else if v.is_null() {
         RichText::new(options.format.null_text.clone()).italics().color(theme.weak)
     } else {
         match v {
-            // A check box only (its state is the value).
-            Value::Bool(true) => RichText::new(icon::CHECK_SQUARE).size(17.0).color(theme.bool_true),
-            Value::Bool(false) => RichText::new(icon::SQUARE).size(17.0).color(theme.weak),
             Value::Json(s) => RichText::new(clip(&single_line(s))).monospace().color(theme.text),
             Value::Text(s) => RichText::new(clip(&single_line(s))).color(theme.text),
             other => RichText::new(clip(&fmt.format(other))).color(theme.text),
@@ -30,6 +50,26 @@ fn value_text(v: &Value, is_default: bool, modified: bool, fmt: &PreparedFormat,
     };
     let _ = modified;
     rt
+}
+
+/// Optional muted hint painted beside a boolean checkbox for default or NULL cells.
+fn bool_hint(model: &ResultModel, col: usize, v: &Value, is_default: bool, options: &GridOptions) -> Option<String> {
+    if is_default {
+        match model.default_bool(col) {
+            Some(true) => Some(format!("{} (true)", tr("default"))),
+            Some(false) => Some(format!("{} (false)", tr("default"))),
+            None => match model.default_display(col) {
+                DefaultDisplay::Expr(e) => Some(clip(e)),
+                DefaultDisplay::Null => Some(options.format.null_text.clone()),
+                DefaultDisplay::Auto => Some(tr("[AUTO]").to_string()),
+                DefaultDisplay::Generic => Some(tr("[DEFAULT]").to_string()),
+            },
+        }
+    } else if v.is_null() {
+        Some(options.format.null_text.clone())
+    } else {
+        None
+    }
 }
 
 /// The draggable right border of a header cell: drag to resize, double-click
@@ -378,7 +418,7 @@ fn rows_table(
         for (i, &c) in columns.iter().enumerate() {
             if let Some((v, is_default, modified)) = values.get(j).and_then(|vs| vs.get(i)) {
                 let fmt = PreparedFormat::new(&options.format, crate::format::cell_format(model, c, grid.column_format(c)));
-                let rt = value_text(v, *is_default, *modified, &fmt, options, &theme);
+                let rt = value_text(model, c, v, *is_default, *modified, &fmt, options, &theme);
                 let g = egui::WidgetText::from(rt).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
                 w = w.max(g.size().x);
             }
@@ -596,13 +636,21 @@ fn rows_table(
                                 let inner = rect.shrink2(egui::vec2(12.0, 0.0));
                                 let Some((v, is_default, modified)) = values.get(j).and_then(|vs| vs.get(i)) else { continue };
                                 let fmt = PreparedFormat::new(&options.format, crate::format::cell_format(model, c, grid.column_format(c)));
-                                let rt = value_text(v, *is_default, *modified, &fmt, options, &theme);
+                                let boolean = is_bool_column(model, c, v);
+                                let rt = value_text(model, c, v, *is_default, *modified, &fmt, options, &theme);
                                 let mut text_rect = inner;
                                 let fk = model.foreign_key_for_column(c).filter(|_| !v.is_null() && !*is_default && inner.width() > 40.0);
                                 if fk.is_some() {
                                     text_rect.max.x -= 22.0;
                                 }
                                 let text_w = paint_text(ui, text_rect, rt, theme.text);
+                                if boolean
+                                    && let Some(hint) = bool_hint(model, c, v, *is_default, options)
+                                    && text_rect.left() + text_w + 16.0 < text_rect.right()
+                                {
+                                    let hint_rect = egui::Rect::from_min_max(egui::pos2(text_rect.left() + text_w + 6.0, text_rect.top()), text_rect.max);
+                                    paint_text(ui, hint_rect, RichText::new(hint).size(12.0).italics().color(theme.weak), theme.weak);
+                                }
                                 // As in the grid: a foreign key value has a button (↗, after it) that opens the row it references.
                                 if let Some(i) = fk {
                                     let b =
@@ -623,12 +671,18 @@ fn rows_table(
                                         follow = Some((r, c));
                                     }
                                 }
-                                let boolean = is_bool_column(model, c, v) && !*is_default;
                                 let can_edit = editable && model.can_edit_cell(r, c).is_ok();
-                                // Booleans: the box is a check box of its own (a click elsewhere picks the cell).
+                                // Booleans: the box is a check box of its own (including default and NULL cells).
                                 if boolean {
-                                    let on = v.as_bool().unwrap_or(false);
-                                    let label = if v.is_null() {
+                                    let current_bool = if *is_default { model.default_bool(c) } else { v.as_bool() };
+                                    let on = current_bool.unwrap_or(false);
+                                    let label = if *is_default {
+                                        match current_bool {
+                                            Some(true) => format!("true ({})", tr("default")),
+                                            Some(false) => format!("false ({})", tr("default")),
+                                            None => options.format.null_text.clone(),
+                                        }
+                                    } else if v.is_null() {
                                         options.format.null_text.clone()
                                     } else if on {
                                         "true".into()
@@ -638,7 +692,11 @@ fn rows_table(
                                     let box_rect = egui::Rect::from_min_size(egui::pos2(inner.left() - 2.0, rect.top()), egui::vec2(24.0, rect.height()));
                                     let box_resp = ui.interact(box_rect, ui.id().with(("record_bool", r, c)), egui::Sense::click());
                                     box_resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, can_edit, on, &label));
-                                    let box_resp = if can_edit { box_resp.on_hover_text(tr("Click the box to change the value")) } else { box_resp };
+                                    let box_resp = if can_edit {
+                                        box_resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tr("Click the box to change the value"))
+                                    } else {
+                                        box_resp
+                                    };
                                     if box_resp.clicked() {
                                         clicked_cell = Some((r, c, egui::Modifiers::NONE));
                                         focus.request_focus();
@@ -647,9 +705,16 @@ fn rows_table(
                                         }
                                     }
                                 }
+                                let default_tip = (*is_default)
+                                    .then(|| match model.default_display(c) {
+                                        DefaultDisplay::Expr(e) => Some(trf("Default: {}", &[&e])),
+                                        DefaultDisplay::Auto => Some(tr("Generated automatically on save").to_string()),
+                                        _ => None,
+                                    })
+                                    .flatten();
                                 let full = if v.is_null() { None } else { Some(v.to_text().into_owned()) };
-                                let resp = match full.filter(|t| t.chars().count() > 40 || t.contains('\n')) {
-                                    Some(t) => resp.on_hover_text(clip(&t)),
+                                let resp = match default_tip.or_else(|| full.filter(|t| t.chars().count() > 40 || t.contains('\n')).map(|t| clip(&t))) {
+                                    Some(t) => resp.on_hover_text(t),
                                     None => resp,
                                 };
                                 let resp = if can_edit && !boolean { resp.on_hover_text(tr("Type, Enter or double-click to edit")) } else { resp };

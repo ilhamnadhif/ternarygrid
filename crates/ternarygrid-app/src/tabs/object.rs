@@ -141,17 +141,26 @@ impl ObjectEditorTab {
             (TablePage::VirtualModel, tr("Virtual model"), None),
         ];
         ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (page, label, n) in sub_pages {
-                if pill_tab(ui, label, n.as_deref(), self.table_page == page).clicked() {
-                    self.table_page = page;
-                }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if self.obj.kind.is_table_like() && kit::button_full(ui, kit::Kind::Secondary, Some(icon::PENCIL), tr("Edit table"), true, false).clicked() {
+                cx.push(AppCommand::EditTable { connection: self.conn.clone(), table: self.obj.clone() });
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.obj.kind.is_table_like() && kit::button_full(ui, kit::Kind::Secondary, Some(icon::PENCIL), tr("Edit table"), true, false).clicked() {
-                    cx.push(AppCommand::EditTable { connection: self.conn.clone(), table: self.obj.clone() });
-                }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt(("object_sub_pages", &self.obj))
+                    .auto_shrink([false, true])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            for (page, label, n) in sub_pages {
+                                if pill_tab(ui, label, n.as_deref(), self.table_page == page).clicked() {
+                                    self.table_page = page;
+                                }
+                            }
+                        });
+                    });
             });
         });
         ui.add_space(10.0 - gap);

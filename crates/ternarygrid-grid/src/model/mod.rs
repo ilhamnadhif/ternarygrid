@@ -182,6 +182,19 @@ impl PendingCounts {
     }
 }
 
+/// How an untouched [`CellRef::Default`] cell is displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultDisplay<'a> {
+    /// Column has an explicit SQL default expression (`nextval(...)`, `0`, `false`, `now()`).
+    Expr(&'a str),
+    /// Column has no explicit default and allows NULL (the database inserts NULL).
+    Null,
+    /// Auto-increment / identity column without an explicit default expression.
+    Auto,
+    /// Unknown or NOT NULL without a known default (generic `[DEFAULT]`).
+    Generic,
+}
+
 /// A cell value as seen through the pending edit overlay.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CellRef<'a> {
@@ -330,7 +343,7 @@ impl ResultModel {
         let fetch = std::mem::take(&mut self.fetch);
         let editability = std::mem::replace(&mut self.editability, Err(ReadOnlyReason::NoSourceTable));
         let same_columns = columns.len() == self.columns.len() && columns.iter().zip(&self.columns).all(|(a, b)| a.name == b.name);
-        let old_sources: Vec<Option<ternarygrid_core::value::ColumnSource>> = self.columns.iter().map(|c| c.source.clone()).collect();
+        let old_cols: Vec<ColumnMeta> = self.columns.clone();
         let client_spec = match &self.view_kind {
             ViewKind::Client(spec) => Some(spec.clone()),
             _ => None,
@@ -343,9 +356,20 @@ impl ResultModel {
         if same_columns {
             self.dictionaries = dictionaries;
             // Same names from another table (navigating a foreign key) must not save into the old one.
-            let same_sources = self.columns.iter().zip(&old_sources).all(|(a, b)| &a.source == b);
+            let same_sources = self.columns.iter().zip(&old_cols).all(|(a, b)| a.source == b.source);
             if same_sources {
                 self.editability = editability;
+                for (col, old) in self.columns.iter_mut().zip(old_cols) {
+                    if col.default_value.is_none() {
+                        col.default_value = old.default_value;
+                    }
+                    if col.nullable.is_none() {
+                        col.nullable = old.nullable;
+                    }
+                    if col.auto_increment.is_none() {
+                        col.auto_increment = old.auto_increment;
+                    }
+                }
             }
             for v in virtuals {
                 let _ = self.add_virtual_column(&v.name, v.expression.source());
@@ -399,6 +423,87 @@ impl ResultModel {
     /// Logical kind of a column (`Other` for virtual columns).
     pub fn column_kind(&self, col: usize) -> DataKind {
         self.columns.get(col).map_or(DataKind::Other, |c| c.kind)
+    }
+
+    /// Enrich column metadata (defaults, nullability, auto-increment) from a
+    /// base table's schema definition, and mark generated columns read-only.
+    pub fn apply_table_def(&mut self, def: &ternarygrid_core::ddl::TableDef) {
+        let mut changed = false;
+        for (i, col) in self.columns.iter_mut().enumerate() {
+            if let Some(src) = &col.source
+                && !src.table.eq_ignore_ascii_case(&def.name)
+            {
+                continue;
+            }
+            let target_name = col.source.as_ref().map_or(col.name.as_str(), |s| s.column.as_str());
+            let Some(cd) = def.columns.iter().find(|d| d.name == target_name).or_else(|| def.columns.iter().find(|d| d.name.eq_ignore_ascii_case(target_name))) else {
+                continue;
+            };
+            if col.default_value != cd.default {
+                col.default_value = cd.default.clone();
+                changed = true;
+            }
+            if col.nullable != Some(cd.nullable) {
+                col.nullable = Some(cd.nullable);
+                changed = true;
+            }
+            let auto = if cd.auto_increment { Some(true) } else { col.auto_increment.or(Some(false)) };
+            if col.auto_increment != auto {
+                col.auto_increment = auto;
+                changed = true;
+            }
+            if cd.generated.is_some()
+                && let Ok(target) = &mut self.editability
+                && !target.is_key_column(i)
+                && target.column_names.get(i).is_some_and(Option::is_some)
+            {
+                target.column_names[i] = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation += 1;
+        }
+    }
+
+    /// How an untouched `CellRef::Default` cell in `col` should be shown.
+    pub fn default_display(&self, col: usize) -> DefaultDisplay<'_> {
+        let Some(m) = self.columns.get(col) else { return DefaultDisplay::Generic };
+        if let Some(expr) = m.default_value.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            DefaultDisplay::Expr(ternarygrid_core::value::display_default(expr))
+        } else if m.auto_increment == Some(true) {
+            DefaultDisplay::Auto
+        } else if m.nullable == Some(true) {
+            DefaultDisplay::Null
+        } else {
+            DefaultDisplay::Generic
+        }
+    }
+
+    /// Boolean literal default of `col`, if its schema default evaluates to `true` or `false`.
+    pub fn default_bool(&self, col: usize) -> Option<bool> {
+        self.columns.get(col)?.default_value.as_deref().and_then(ternarygrid_core::value::parse_default_bool)
+    }
+
+    /// True when the cell currently holds an untouched column default.
+    pub fn cell_is_default(&self, row: usize, col: usize) -> bool {
+        let mut out = false;
+        self.visit_rows(row..row + 1, |_, cells| out = matches!(cells.get(col), CellRef::Default));
+        out
+    }
+
+    /// Effective boolean state of a cell: explicit `Bool`, else schema boolean default
+    /// for `CellRef::Default`, else `None` (NULL / unknown).
+    pub fn effective_bool(&self, row: usize, col: usize) -> Option<bool> {
+        let mut out = None;
+        self.visit_rows(row..row + 1, |_, cells| {
+            out = match cells.get(col) {
+                CellRef::Value(Value::Bool(b)) => Some(*b),
+                CellRef::Default => self.default_bool(col),
+                _ => None,
+            };
+        });
+        out
     }
 
     /// Virtual columns.

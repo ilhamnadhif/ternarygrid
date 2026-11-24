@@ -21,6 +21,12 @@ pub(super) fn fk_button_rect(inner: Rect) -> Option<Rect> {
     (inner.width() >= FK_BUTTON + 24.0).then(|| Rect::from_min_max(pos2(inner.right() - FK_BUTTON, inner.top()), inner.max))
 }
 
+/// Centered checkbox rectangle inside a boolean cell whose padded rect is `inner`.
+pub(super) fn bool_checkbox_rect(inner: Rect, row_h: f32) -> Rect {
+    let side = (row_h - 8.0).clamp(8.0, 14.0);
+    Rect::from_center_size(inner.center(), vec2(side, side))
+}
+
 /// Geometry of one frame.
 #[derive(Debug, Clone)]
 pub(super) struct Geo {

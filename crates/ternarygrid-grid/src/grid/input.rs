@@ -466,11 +466,16 @@ impl GridFrame<'_> {
                 } else {
                     let col = self.geo.cols[pos];
                     let fk = self.model.foreign_key_for_column(col);
+                    let already_active = !self.state.rt.selection.is_empty() && self.state.rt.selection.active() == cell;
+                    let is_new_row = self.model.row_state(row) == crate::model::RowState::Inserted;
                     if mods.command && !mods.shift && fk.is_some() {
                         self.navigate_fk(row, col);
                     } else if !mods.any() && self.fk_button_at(p).is_some() {
                         self.state.rt.selection.select_cell(cell);
                         self.navigate_fk(row, col);
+                    } else if !mods.any() && (already_active || is_new_row) && self.bool_checkbox_at(p).is_some() {
+                        self.state.rt.selection.select_cell(cell);
+                        self.toggle_bool(row, col);
                     } else if mods.shift {
                         self.state.rt.selection.extend_to(cell);
                         self.state.rt.drag = Drag::Cells;
@@ -502,20 +507,39 @@ impl GridFrame<'_> {
         }
         if body.double_clicked()
             && !mods.command
+            && !body.interact_pointer_pos().is_some_and(|p| self.bool_checkbox_at(p).is_some())
             && let Some((row, col)) = self.active()
         {
             self.start_edit(row, col, None);
         }
-        // FK link cursor: Cmd over a foreign key value, or over its button.
+        // FK link cursor: Cmd over a foreign key value, or over its button; checkbox cursor over editable booleans.
         if let Some(c) = self.hover_cell
             && mods.command
             && self.geo.cols.get(c.col).and_then(|&col| self.model.foreign_key_for_column(col)).is_some()
         {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        if body.hover_pos().and_then(|p| self.fk_button_at(p)).is_some() {
+        if body.hover_pos().is_some_and(|p| self.fk_button_at(p).is_some() || self.bool_checkbox_at(p).is_some()) {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
+    }
+
+    /// Editable boolean checkbox under `p` (single click toggles it).
+    fn bool_checkbox_at(&self, p: egui::Pos2) -> Option<(usize, usize)> {
+        if self.options.format.bool_style != ternarygrid_core::value::BoolStyle::Checkbox || !self.options.allow_editing || !self.model.is_editable() {
+            return None;
+        }
+        let (sx, sy) = (self.state.rt.scroll_x, self.state.rt.scroll_y);
+        let (row, pos) = (self.geo.row_at(p.y, sy, false)?, self.geo.col_at(p.x, sx, false)?);
+        let col = *self.geo.cols.get(pos)?;
+        if self.model.column_kind(col) != DataKind::Bool || self.model.can_edit_cell(row, col).is_err() {
+            return None;
+        }
+        let inner = self.geo.cell_rect(row, pos, sx, sy).shrink2(egui::vec2(super::frame::PAD, 0.0));
+        if inner.width() <= 2.0 {
+            return None;
+        }
+        super::frame::bool_checkbox_rect(inner, self.geo.row_h).expand(3.0).contains(p).then_some((row, col))
     }
 
     /// The foreign key button under `p`: (display row, column) of its cell, when the value is not NULL.
@@ -867,14 +891,13 @@ impl GridFrame<'_> {
         true
     }
 
-    /// Toggle a boolean cell (NULL → true → false → true ...).
+    /// Toggle a boolean cell (respecting column boolean defaults: DEFAULT true → false, NULL / false → true).
     pub fn toggle_bool(&mut self, row: usize, col: usize) {
         if let Err(e) = self.model.can_edit_cell(row, col) {
             self.notify(e, true);
             return;
         }
-        let v = self.model.cell(row, col).unwrap_or_default();
-        let next = !v.as_bool().unwrap_or(false);
+        let next = !self.model.effective_bool(row, col).unwrap_or(false);
         if let Err(e) = self.model.set_value(row, col, Value::Bool(next)) {
             self.notify(e, true);
         }

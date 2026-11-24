@@ -675,7 +675,7 @@ fn result_screens(s: &mut Shots, conn: &str) {
     s.shot("res_meta");
     {
         let p = s.data();
-        p.view.grouping.spec = ternarygrid_grid::grouping::GroupSpec { columns: vec![2], measure: Some(3) };
+        p.view.grouping.spec = ternarygrid_grid::grouping::GroupSpec { columns: vec![2], measures: vec![3] };
         p.view.active_panel = Some(PanelKind::Grouping);
     }
     s.frames(10);

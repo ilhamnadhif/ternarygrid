@@ -45,6 +45,7 @@ pub struct ReferencesPanelState {
     selected: Option<usize>,
     requested: Option<(usize, Vec<Value>)>,
     related: Option<(usize, Related)>,
+    error: Option<(usize, Vec<Value>, String)>,
     /// The key last read: ((content generation, row, relation), values), for
     /// frames where the row store is busy.
     key: Option<((u64, usize, usize), Vec<Value>)>,
@@ -65,6 +66,7 @@ impl ReferencesPanelState {
             self.selected = (!self.relations.is_empty()).then_some(0);
             self.related = None;
             self.requested = None;
+            self.error = None;
         }
     }
 
@@ -78,6 +80,13 @@ impl ReferencesPanelState {
         let model = ResultModel::from_rows(columns, rows);
         let grid = DataGridState::for_model(&model);
         self.related = Some((relation, Related { key, model, grid }));
+        self.error = None;
+    }
+
+    /// Record a failed related-rows fetch so the panel shows the error and a Retry button
+    /// instead of spinning forever.
+    pub fn set_related_error(&mut self, relation: usize, key: Vec<Value>, message: String) {
+        self.error = Some((relation, key, message));
     }
 
     /// Build relations from the result's foreign keys (outgoing only).
@@ -198,9 +207,18 @@ impl<'a> ReferencesPanel<'a> {
             return actions;
         }
         let have = state.related.as_ref().is_some_and(|(r, d)| *r == sel && d.key == key);
-        if !have && state.requested.as_ref() != Some(&(sel, key.clone())) {
+        let failed = state.error.as_ref().filter(|(r, k, _)| *r == sel && *k == key).map(|(_, _, e)| e.clone());
+        if !have && failed.is_none() && state.requested.as_ref() != Some(&(sel, key.clone())) {
             state.requested = Some((sel, key.clone()));
             actions.push(GridAction::RequestReferences { relation: sel, values: key.clone() });
+        }
+        if let Some(err) = failed {
+            ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Error, &err);
+            if ternarygrid_ui::kit::button_full(ui, ternarygrid_ui::kit::Kind::Secondary, Some(egui_phosphor::regular::ARROW_CLOCKWISE), tr("Retry"), true, false).clicked() {
+                state.error = None;
+                state.requested = None;
+            }
+            return actions;
         }
         match state.related.as_mut() {
             Some((r, d)) if *r == sel && d.key == key => {

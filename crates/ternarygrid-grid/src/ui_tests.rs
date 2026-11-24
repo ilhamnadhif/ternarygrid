@@ -307,7 +307,7 @@ fn grouping_panel_groups_in_background() {
     let mut model = editable_model(300);
     let mut state = GroupingPanelState::default();
     state.spec.columns = vec![3];
-    state.spec.measure = Some(0);
+    state.spec.measures = vec![0];
     let mut action = None;
     for _ in 0..400 {
         ui.run(vec![], Modifiers::NONE, |ui| {
@@ -322,7 +322,7 @@ fn grouping_panel_groups_in_background() {
     let result = state.result().expect("grouping finished");
     assert_eq!(result.groups.len(), 3);
     assert!(result.groups.iter().all(|g| g.count == 100));
-    assert!(result.groups.iter().all(|g| g.sum.is_some()));
+    assert!(result.groups.iter().all(|g| g.measures.first().and_then(|m| m.sum).is_some()));
 }
 
 #[test]
@@ -992,4 +992,157 @@ fn row_footer_actions_work_in_record_view_and_keyboard_nav_preserves_copy() {
         _ => None,
     });
     assert_eq!(copied.as_deref(), Some("name 2"), "Cmd+C copies active field after ArrowRight navigation");
+}
+
+#[test]
+fn typed_defaults_and_bool_checkbox_on_new_row() {
+    use ternarygrid_core::ddl::{ColumnDef, TableDef};
+    let mut model = editable_model(2);
+    let mut def = TableDef::new(Some("app".into()), "t");
+    def.columns = vec![
+        ColumnDef::new("id", "int8").not_null().auto_increment().default_value("nextval('items_id_seq'::regclass)"),
+        ColumnDef::new("name", "varchar(50)"),
+        ColumnDef::new("flag", "bool").not_null().default_value("true"),
+        {
+            let mut c = ColumnDef::new("category", "int8").not_null().default_value("0");
+            c.generated = Some("id * 2".into());
+            c
+        },
+    ];
+    model.apply_table_def(&def);
+    assert_eq!(model.default_display(0), crate::model::DefaultDisplay::Expr("nextval('items_id_seq'::regclass)"));
+    assert_eq!(model.default_display(1), crate::model::DefaultDisplay::Null);
+    assert_eq!(model.default_bool(2), Some(true));
+    assert!(model.can_edit_cell(0, 3).is_err(), "generated column must not be editable");
+
+    // Insert a new row and inspect it in Record View.
+    let new_row = model.add_row(Some(1)).unwrap();
+    assert_eq!(model.effective_bool(new_row, 2), Some(true));
+
+    let mut v = Viewer::new(model);
+    v.state.grid.select_cell(new_row, 0);
+    v.state.toolbar.view = ResultViewKind::Record;
+    v.frame(vec![]);
+    v.frame(vec![]);
+
+    // Record view renders an interactive checkbox for the new row's boolean column (even while DEFAULT).
+    let cb = v
+        .output
+        .accesskit_update
+        .as_ref()
+        .and_then(|u| {
+            u.nodes.iter().find_map(|(_, n)| {
+                if n.role() == egui::accesskit::Role::CheckBox && n.label().is_some_and(|l| l.contains("true")) {
+                    let b = n.bounds()?;
+                    Some(Pos2::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("checkbox for default-true bool column on new row");
+    // Single click on default-true checkbox flips it directly to false (not requiring 2 clicks).
+    v.click(cb);
+    v.frame(vec![]);
+    assert_eq!(v.model.cell(new_row, 2), Some(Value::Bool(false)));
+}
+
+#[test]
+fn grouping_panel_multi_measure_and_header_sort() {
+    use crate::grouping::{GroupSort, GroupSortCol};
+    let mut ui = Ui::new();
+    ui.ctx.enable_accesskit();
+    let mut model = editable_model(60);
+    let mut state = GroupingPanelState::default();
+    state.spec.columns = vec![3];
+    state.spec.measures = vec![0, 3];
+    for _ in 0..400 {
+        ui.run(vec![], Modifiers::NONE, |ui| {
+            let _ = GroupingPanel::new(&mut model, &mut state).show(ui);
+        });
+        if !state.is_running() && state.result().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let res = state.result().expect("multi-measure result");
+    assert_eq!(res.groups.len(), 3);
+    assert_eq!(res.groups[0].measures.len(), 2);
+
+    // Click the "category" header to sort ascending, then click again to sort descending.
+    let out = ui.run(vec![], Modifiers::NONE, |ui| {
+        let _ = GroupingPanel::new(&mut model, &mut state).show(ui);
+    });
+    let cat_hdr = out
+        .accesskit_update
+        .as_ref()
+        .and_then(|u| {
+            u.nodes.iter().find_map(|(_, n)| {
+                if n.role() == egui::accesskit::Role::Button && n.label() == Some("category") {
+                    let b = n.bounds()?;
+                    Some(Pos2::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("sortable category header button");
+    for ev in [Event::PointerMoved(cat_hdr), press(cat_hdr, PointerButton::Primary, Modifiers::NONE), release(cat_hdr, PointerButton::Primary, Modifiers::NONE)] {
+        ui.run(vec![ev], Modifiers::NONE, |ui| {
+            let _ = GroupingPanel::new(&mut model, &mut state).show(ui);
+        });
+    }
+    assert_eq!(state.sort, GroupSort { col: GroupSortCol::Key(0), descending: false });
+    let keys_asc: Vec<_> = state.result().unwrap().groups.iter().map(|g| g.keys[0].clone()).collect();
+    assert_eq!(keys_asc, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    for ev in [Event::PointerMoved(cat_hdr), press(cat_hdr, PointerButton::Primary, Modifiers::NONE), release(cat_hdr, PointerButton::Primary, Modifiers::NONE)] {
+        ui.run(vec![ev], Modifiers::NONE, |ui| {
+            let _ = GroupingPanel::new(&mut model, &mut state).show(ui);
+        });
+    }
+    assert_eq!(state.sort, GroupSort { col: GroupSortCol::Key(0), descending: true });
+    let keys_desc: Vec<_> = state.result().unwrap().groups.iter().map(|g| g.keys[0].clone()).collect();
+    assert_eq!(keys_desc, vec![Value::Int(3), Value::Int(2), Value::Int(1)]);
+}
+
+#[test]
+fn references_panel_shows_error_and_retries() {
+    let mut ui = Ui::new();
+    ui.ctx.enable_accesskit();
+    let model = editable_model(5);
+    let mut grid = crate::grid::DataGridState::for_model(&model);
+    grid.select_cell(1, 0);
+    let mut state = ReferencesPanelState::default();
+    state.set_relations(vec![Relation {
+        name: Some("fk".into()),
+        direction: RelationDirection::References,
+        table: ObjectRef::table(Some("app".into()), "categories"),
+        columns: vec!["id".into()],
+        key_columns: vec![3],
+    }]);
+    let mut actions = Vec::new();
+    ui.run(vec![], Modifiers::NONE, |ui| actions = ReferencesPanel::new(&model, &grid, &mut state).show(ui));
+    assert_eq!(actions.len(), 1);
+    state.set_related_error(0, vec![Value::Int(2)], "permission denied".into());
+    let out = ui.run(vec![], Modifiers::NONE, |ui| actions = ReferencesPanel::new(&model, &grid, &mut state).show(ui));
+    assert!(actions.is_empty());
+    let retry = out
+        .accesskit_update
+        .as_ref()
+        .and_then(|u| {
+            u.nodes.iter().find_map(|(_, n)| {
+                if n.role() == egui::accesskit::Role::Button && n.label() == Some("Retry") {
+                    let b = n.bounds()?;
+                    Some(Pos2::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("Retry button shown on error");
+    for ev in [Event::PointerMoved(retry), press(retry, PointerButton::Primary, Modifiers::NONE), release(retry, PointerButton::Primary, Modifiers::NONE)] {
+        ui.run(vec![ev], Modifiers::NONE, |ui| actions = ReferencesPanel::new(&model, &grid, &mut state).show(ui));
+    }
+    ui.run(vec![], Modifiers::NONE, |ui| actions = ReferencesPanel::new(&model, &grid, &mut state).show(ui));
+    assert!(matches!(&actions[..], [GridAction::RequestReferences { relation: 0, .. }]), "Retry re-requests related rows");
 }

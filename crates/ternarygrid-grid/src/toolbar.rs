@@ -100,7 +100,28 @@ impl ToolbarState {
     }
 }
 
-/// Parse an ORDER BY list (`name DESC, [order date]`) against model column names.
+/// Strip a trailing SQL keyword sequence (`NULLS FIRST`, `DESC`, …) preceded by whitespace.
+fn strip_trailing_words<'a>(s: &'a str, words: &[&str]) -> Option<&'a str> {
+    let mut rest = s.trim_end();
+    for &w in words.iter().rev() {
+        let len = w.len();
+        if rest.len() <= len || !rest.is_char_boundary(rest.len() - len) {
+            return None;
+        }
+        let split = rest.len() - len;
+        if !rest[split..].eq_ignore_ascii_case(w) {
+            return None;
+        }
+        let before = &rest[..split];
+        if !before.chars().next_back().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        rest = before.trim_end();
+    }
+    Some(rest)
+}
+
+/// Parse an ORDER BY list (`name DESC NULLS LAST, [order date]`) against model column names.
 pub fn parse_order_by(text: &str, columns: &[String]) -> Result<Vec<SortKey>, String> {
     let mut keys = Vec::new();
     for part in text.split(',') {
@@ -108,15 +129,21 @@ pub fn parse_order_by(text: &str, columns: &[String]) -> Result<Vec<SortKey>, St
         if p.is_empty() {
             continue;
         }
-        let lower = p.to_ascii_lowercase();
-        let (name, desc) = if lower.ends_with(" desc") {
-            (p[..p.len() - 5].trim(), true)
-        } else if lower.ends_with(" asc") {
-            (p[..p.len() - 4].trim(), false)
+        // Strip optional NULLS FIRST / NULLS LAST suffix before checking ASC / DESC.
+        let p = strip_trailing_words(p, &["NULLS", "FIRST"]).or_else(|| strip_trailing_words(p, &["NULLS", "LAST"])).unwrap_or(p);
+        let (name, desc) = if let Some(n) = strip_trailing_words(p, &["DESC"]) {
+            (n, true)
+        } else if let Some(n) = strip_trailing_words(p, &["ASC"]) {
+            (n, false)
         } else {
             (p, false)
         };
-        let unquoted = name.strip_prefix('[').and_then(|n| n.strip_suffix(']')).or_else(|| name.strip_prefix('"').and_then(|n| n.strip_suffix('"'))).unwrap_or(name);
+        let unquoted = name
+            .strip_prefix('[')
+            .and_then(|n| n.strip_suffix(']'))
+            .or_else(|| name.strip_prefix('"').and_then(|n| n.strip_suffix('"')))
+            .or_else(|| name.strip_prefix('`').and_then(|n| n.strip_suffix('`')))
+            .unwrap_or(name);
         let col = columns
             .iter()
             .position(|c| c == unquoted)
@@ -1585,6 +1612,8 @@ mod tests {
         assert_eq!(parse_order_by("name desc, id", &cols).unwrap(), vec![SortKey::desc(1), SortKey::asc(0)]);
         assert_eq!(parse_order_by("[order date] ASC", &cols).unwrap(), vec![SortKey::asc(2)]);
         assert_eq!(parse_order_by("\"order date\" DESC", &cols).unwrap(), vec![SortKey::desc(2)]);
+        assert_eq!(parse_order_by("`order date`   DESC   NULLS   LAST, id ASC NULLS FIRST", &cols).unwrap(), vec![SortKey::desc(2), SortKey::asc(0)]);
+        assert_eq!(parse_order_by("name NULLS LAST", &cols).unwrap(), vec![SortKey::asc(1)]);
         assert_eq!(parse_order_by("3 desc", &cols).unwrap(), vec![SortKey::desc(2)]);
         assert!(parse_order_by("nope", &cols).unwrap_err().contains("nope"));
         assert!(parse_order_by("", &cols).unwrap().is_empty());

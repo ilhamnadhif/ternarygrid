@@ -3,6 +3,21 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.6 — 2026-11-24
+
+### Added
+- **Type-aware schema defaults and interactive boolean checkboxes on new rows.** `ResultPanel` now enriches result columns with real table metadata (`default`, `nullable`, `auto_increment`, `generated`) from `TableDef`, displaying actual SQL default expressions (such as `nextval(...)`, `0`, `now()`) or `NULL` for nullable columns on newly inserted rows instead of generic `[DEFAULT]`, while preserving safe `INSERT` semantics.
+- **Interactive checkboxes everywhere for boolean columns.** Boolean columns now render interactive checkboxes by default in **Record view**, **Grid view**, and the **Value panel** — including untouched `DEFAULT` cells (pre-checked for `DEFAULT true`, unchecked for `DEFAULT false`, indeterminate for nullable/NULL) and `NULL` cells — toggling in a single click on the checkbox (and respecting `DEFAULT true` → `false` on the first click).
+- **Multi-column Measures and sortable columns (ASC / DESC) in the Grouping panel.** Replaced the single-measure dropdown with removable multi-measure chips + `Add measure…` selector (and `Clear measures`), added clickable **ASC / DESC** sorting with direction arrows on every column header (`Group by` keys, `Count`, and each measure's `Sum` / `Avg`, with NULLs sorted last), and added minimum column widths with horizontal scrolling so headers and values never clip or overlap.
+- **Database Navigator multi-select ("block selection") and bulk actions.** Select multiple rows/objects via click-and-drag block selection, `Shift+Click`, `⌘/Ctrl+Click`, `Shift+↑/↓`, `⌘/Ctrl+A` (select siblings), and `Esc` (collapse to primary). Right-clicking preserves the selection and opens bulk context actions (`View data`, `ER diagram`, `Generate SELECT script`, `Export data…`, `Migrate…`, `Maintenance…`, `Copy names`, `Copy bare names`, `Hide in navigator`, `Refresh`, `Truncate…`, `Drop…`, plus bulk connection/database actions), and the **Properties** panel displays a multi-selection summary with combined size and estimated row count.
+
+### Fixed
+- **Generated table columns are now automatically marked read-only in editable results** instead of failing on `Save`.
+- **References panel no longer spins forever when loading related rows fails**; it now displays the error message with a `Retry` button.
+- **`ORDER BY` parsing now handles `NULLS FIRST` / `NULLS LAST`, extra whitespace, and backtick-quoted identifiers**, keeping grid header sort arrows in sync with server-side sort clauses.
+- **Object Editor sub-page tab strip now scrolls horizontally at narrow widths** with `Edit table` pinned right instead of clipping.
+- **Calc panel "Copied" indicator now uses theme-aware `pal.ok`** for legibility in both light and dark modes.
+
 ## 0.7.5 — 2026-11-24
 
 ### Changed

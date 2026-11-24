@@ -1,7 +1,7 @@
 //! Painting of the grid: body cells, row numbers, header, scrollbars, overlays.
 
 use super::GridAction;
-use super::frame::{Geo, GridFrame, PAD, fk_button_rect};
+use super::frame::{Geo, GridFrame, PAD, bool_checkbox_rect, fk_button_rect};
 
 /// A fetch running this long offers Cancel.
 pub(crate) const CANCEL_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
@@ -10,7 +10,7 @@ use super::state::BodyCache;
 use super::state::Drag;
 use super::text::{GlyphCache, Placed, TextBatch, layout_slow, place_slow};
 use crate::format::PreparedFormat;
-use crate::model::{CellRef, RowState};
+use crate::model::{CellRef, DefaultDisplay, RowState};
 use crate::theme::mix;
 use crate::valueview::{byte_size_text, detect_image};
 use egui::text::{LayoutJob, TextWrapping};
@@ -25,6 +25,7 @@ struct ColInfo<'o> {
     x0: f32,
     x1: f32,
     is_virtual: bool,
+    is_bool: bool,
     fk: bool,
     dict: bool,
     /// Values in the monospace font (UUIDs, JSON, XML, addresses, arrays).
@@ -73,6 +74,14 @@ impl Sink<'_> {
     }
 }
 
+/// Visual state of a boolean cell drawn as a checkbox.
+#[derive(Clone, Copy)]
+enum CheckboxLook {
+    Checked { muted: bool },
+    Unchecked,
+    Indeterminate,
+}
+
 /// How a cell is drawn.
 struct CellLook<'v> {
     text: std::borrow::Cow<'v, str>,
@@ -80,7 +89,7 @@ struct CellLook<'v> {
     align: Align,
     badge: Option<&'static str>,
     suffix: Option<&'v str>,
-    checkbox: Option<bool>,
+    checkbox: Option<CheckboxLook>,
 }
 
 fn is_number(v: &Value) -> bool {
@@ -139,6 +148,7 @@ impl GridFrame<'_> {
                     x0: geo.col_left(pos, sx),
                     x1: geo.col_left(pos + 1, sx),
                     is_virtual: model.is_virtual_column(col),
+                    is_bool: model.column_kind(col) == DataKind::Bool,
                     fk: model.foreign_key_for_column(col).is_some(),
                     dict: options.show_descriptions && model.dictionary(col).is_some(),
                     mono: matches!(model.column_kind(col), DataKind::Uuid | DataKind::Json | DataKind::Xml | DataKind::Network | DataKind::Array | DataKind::Range),
@@ -155,6 +165,7 @@ impl GridFrame<'_> {
             painter.layout_job(LayoutJob::single_section(null_text.to_string(), format))
         });
         let default_text = tr("[DEFAULT]");
+        let auto_text = tr("[AUTO]");
         let checkbox_style = fmt.bool_style == BoolStyle::Checkbox;
         let selection = &self.state.rt.selection;
         let ranges = selection.ranges();
@@ -272,15 +283,45 @@ impl GridFrame<'_> {
                         Some(_) => CellLook { text: "#ERR".into(), color: theme.error, align: Align::Min, badge: None, suffix: None, checkbox: None },
                         None => continue,
                     },
-                    CellRef::Default => CellLook { text: default_text.into(), color: theme.weak, align: Align::Min, badge: None, suffix: None, checkbox: None },
+                    CellRef::Default => {
+                        if info.is_bool && checkbox_style {
+                            let cb = match model.default_bool(info.col) {
+                                Some(true) => CheckboxLook::Checked { muted: true },
+                                Some(false) => CheckboxLook::Unchecked,
+                                None => CheckboxLook::Indeterminate,
+                            };
+                            CellLook { text: "".into(), color: theme.weak, align: Align::Center, badge: None, suffix: None, checkbox: Some(cb) }
+                        } else {
+                            let text = match model.default_display(info.col) {
+                                DefaultDisplay::Expr(e) => std::borrow::Cow::Borrowed(e),
+                                DefaultDisplay::Null => std::borrow::Cow::Borrowed(null_text),
+                                DefaultDisplay::Auto => std::borrow::Cow::Borrowed(auto_text),
+                                DefaultDisplay::Generic => std::borrow::Cow::Borrowed(default_text),
+                            };
+                            CellLook { text, color: theme.weak, align: Align::Min, badge: None, suffix: None, checkbox: None }
+                        }
+                    }
                     // Evaluated by the database when saved: as typed, marked as SQL.
                     CellRef::Expr(e) => CellLook { text: e.into(), color: theme.text, align: Align::Min, badge: Some("SQL"), suffix: None, checkbox: None },
-                    CellRef::Value(v) if v.is_null() => CellLook { text: null_text.into(), color: theme.weak, align: Align::Min, badge: None, suffix: None, checkbox: None },
+                    CellRef::Value(v) if v.is_null() => {
+                        if info.is_bool && checkbox_style {
+                            CellLook { text: "".into(), color: theme.weak, align: Align::Center, badge: None, suffix: None, checkbox: Some(CheckboxLook::Indeterminate) }
+                        } else {
+                            CellLook { text: null_text.into(), color: theme.weak, align: Align::Min, badge: None, suffix: None, checkbox: None }
+                        }
+                    }
                     CellRef::Value(v) => {
                         // Foreign key values look like others: their button (below) leads on.
                         let color = if deleted { theme.weak } else { theme.text };
                         match v {
-                            Value::Bool(b) if checkbox_style => CellLook { text: "".into(), color, align: Align::Center, badge: None, suffix: None, checkbox: Some(*b) },
+                            Value::Bool(b) if checkbox_style => CellLook {
+                                text: "".into(),
+                                color,
+                                align: Align::Center,
+                                badge: None,
+                                suffix: None,
+                                checkbox: Some(if *b { CheckboxLook::Checked { muted: deleted } } else { CheckboxLook::Unchecked }),
+                            },
                             // Images and other bytes read as a quiet summary; the header's icon tells the type.
                             Value::Bytes(b) if detect_image(b).is_some() => {
                                 let kind = detect_image(b).map_or("", |k| k.label());
@@ -312,17 +353,39 @@ impl GridFrame<'_> {
                         text_rect.min.x = br.right() + 4.0;
                     }
                 }
-                if let Some(checked) = look.checkbox {
-                    let side = (row_h - 8.0).clamp(8.0, 14.0);
-                    let r = Rect::from_center_size(inner.center(), vec2(side, side));
+                if let Some(cb) = look.checkbox {
+                    let r = bool_checkbox_rect(inner, row_h);
+                    let side = r.width();
                     sink.rect_stroke(r, CornerRadius::same(2), Stroke::new(1.0, theme.weak), StrokeKind::Inside);
-                    if checked {
-                        let s = Stroke::new(1.6, theme.bool_true);
-                        let a = pos2(r.left() + side * 0.22, r.center().y);
-                        let m = pos2(r.left() + side * 0.42, r.bottom() - side * 0.25);
-                        let z = pos2(r.right() - side * 0.18, r.top() + side * 0.22);
-                        sink.line_segment([a, m], s);
-                        sink.line_segment([m, z], s);
+                    match cb {
+                        CheckboxLook::Checked { muted } => {
+                            let c = if muted { theme.bool_true.gamma_multiply(0.75) } else { theme.bool_true };
+                            let s = Stroke::new(1.6, c);
+                            let a = pos2(r.left() + side * 0.22, r.center().y);
+                            let m = pos2(r.left() + side * 0.42, r.bottom() - side * 0.25);
+                            let z = pos2(r.right() - side * 0.18, r.top() + side * 0.22);
+                            sink.line_segment([a, m], s);
+                            sink.line_segment([m, z], s);
+                        }
+                        CheckboxLook::Unchecked => {}
+                        CheckboxLook::Indeterminate => {
+                            let s = Stroke::new(1.4, theme.weak);
+                            sink.line_segment([pos2(r.left() + side * 0.24, r.center().y), pos2(r.right() - side * 0.24, r.center().y)], s);
+                        }
+                    }
+                    if hover.is_some_and(|h| h.row == row && h.col == info.pos) {
+                        let tip = match cell {
+                            CellRef::Default => match model.default_display(info.col) {
+                                DefaultDisplay::Expr(e) => trf("Default: {}", &[&e]),
+                                DefaultDisplay::Null => format!("{} ({})", null_text, tr("default")),
+                                _ => tr("[DEFAULT]").to_string(),
+                            },
+                            CellRef::Value(v) if v.is_null() => null_text.to_string(),
+                            _ => String::new(),
+                        };
+                        if !tip.is_empty() {
+                            tooltip = Some((cell_rect, tip));
+                        }
                     }
                     continue;
                 }
@@ -346,7 +409,8 @@ impl GridFrame<'_> {
                         sink.galley(b.center() - g.rect.size() / 2.0, g, color);
                     }
                 }
-                let null = matches!(cell, CellRef::Value(v) if v.is_null());
+                let null =
+                    matches!(cell, CellRef::Value(v) if v.is_null()) || (matches!(cell, CellRef::Default) && matches!(model.default_display(info.col), DefaultDisplay::Null));
                 let binary = matches!(cell, CellRef::Value(Value::Bytes(_)));
                 let placed = match &null_galley {
                     Some(g) if null && g.size().x <= text_rect.width() => {
@@ -383,6 +447,16 @@ impl GridFrame<'_> {
                 if hovered {
                     if let Some(e) = &error_text {
                         tooltip = Some((cell_rect, e.clone()));
+                    } else if matches!(cell, CellRef::Default) {
+                        let tip = match model.default_display(info.col) {
+                            DefaultDisplay::Expr(e) => trf("Default: {}", &[&e]),
+                            DefaultDisplay::Auto => tr("Generated automatically on save").to_string(),
+                            DefaultDisplay::Null => String::new(),
+                            DefaultDisplay::Generic => String::new(),
+                        };
+                        if !tip.is_empty() {
+                            tooltip = Some((cell_rect, tip));
+                        }
                     } else if elided || look.badge.is_some() || temporal {
                         let full = match cell {
                             CellRef::Value(v) => {

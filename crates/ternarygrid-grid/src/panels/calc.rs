@@ -224,16 +224,14 @@ fn stats_table(ui: &mut Ui, rows: &[StatRow], state: &mut CalcPanelState) {
         let just_copied = state.copied.as_ref().is_some_and(|(n, t)| n == row.name && now - t < 1.2);
         // The copy button at the end of the hovered and the selected rows.
         let show_button = hovered || selected;
-        let value_right = if show_button || just_copied { button.left() - 4.0 } else { r.right() - 4.0 };
-        let value_right = if show_button || just_copied { value_right } else { r.right() - 10.0 };
+        let value_right = if show_button || just_copied { button.left() - 4.0 } else { r.right() - 10.0 };
         let value_rect = egui::Rect::from_min_max(pos2(r.left() + name_w + 10.0, r.top()), pos2(value_right, r.bottom()));
         let galley = painter.layout(row.shown.clone(), mono.clone(), theme.text, f32::INFINITY);
         // Right-aligned; a value wider than its cell starts at the cell's left (cut at the right).
         let x = (value_rect.right() - galley.size().x).max(value_rect.left());
         painter.with_clip_rect(value_rect).galley(pos2(x, r.center().y - galley.size().y / 2.0), galley, theme.text);
         if just_copied {
-            let ok = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
-            painter.text(pos2(r.right() - 6.0, r.center().y), Align2::RIGHT_CENTER, format!("{} {}", icon::CHECK, tr("Copied")), font.clone(), ok);
+            painter.text(pos2(r.right() - 6.0, r.center().y), Align2::RIGHT_CENTER, format!("{} {}", icon::CHECK, tr("Copied")), font.clone(), pal.ok);
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         } else if show_button {
             let color = if button_resp.hovered() { theme.text } else { pal.text_muted };

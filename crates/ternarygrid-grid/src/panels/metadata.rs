@@ -193,6 +193,9 @@ impl<'a> MetadataPanel<'a> {
                 if !r[4].is_empty() {
                     tip.push(format!("{}: {}", if self.model.is_virtual_column(c) { tr("Expression") } else { tr("Source") }, r[4]));
                 }
+                if let Some(def) = self.model.column_meta(c).and_then(|m| m.default_value.as_deref()).filter(|s| !s.trim().is_empty()) {
+                    tip.push(format!("{}: {def}", tr("Default")));
+                }
                 if !r[6].is_empty() {
                     tip.push(r[6].clone());
                 }

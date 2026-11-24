@@ -264,7 +264,69 @@ impl<'a> ValuePanel<'a> {
             }
         });
         let mode = shown_mode(state.mode);
-        if value.is_null() {
+        let is_default = model.cell_is_default(row, col);
+        let is_bool_auto = (kind == DataKind::Bool || matches!(value, Value::Bool(_))) && state.mode == ValueMode::Auto;
+        if is_bool_auto {
+            let current = if is_default { model.default_bool(col) } else { value.as_bool() };
+            let mut checked = current.unwrap_or(false);
+            let state_label = if is_default {
+                match current {
+                    Some(true) => format!("true ({})", tr("default")),
+                    Some(false) => format!("false ({})", tr("default")),
+                    None => match model.default_display(col) {
+                        crate::model::DefaultDisplay::Expr(e) => format!("{} ({})", tr("default"), e),
+                        crate::model::DefaultDisplay::Null => format!("{} ({})", options.format.null_text, tr("default")),
+                        _ => tr("[DEFAULT]").to_string(),
+                    },
+                }
+            } else if value.is_null() {
+                options.format.null_text.clone()
+            } else if checked {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            };
+            ternarygrid_ui::parts::bordered(ui).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let changed = ui.add_enabled_ui(cell_editable, |ui| ternarygrid_ui::kit::checkbox(ui, &mut checked, &state_label).changed()).inner;
+                    if changed {
+                        match model.set_value(row, col, Value::Bool(checked)) {
+                            Ok(()) => state.error = None,
+                            Err(e) => state.error = Some(e),
+                        }
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                use ternarygrid_ui::kit;
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if cell_editable {
+                    if kit::button_full(ui, kit::Kind::Ghost, None, tr("Set NULL"), true, false).clicked() {
+                        state.error = model.set_null(row, col).err();
+                    }
+                    if kit::button_full(ui, kit::Kind::Ghost, None, tr("Set DEFAULT"), true, false).clicked() {
+                        state.error = model.set_default(row, col).err();
+                    }
+                } else if let Some(r) = model.read_only_reason() {
+                    ui.label(RichText::new(format!("{} {}", egui_phosphor::regular::LOCK_SIMPLE, r.short_label())).color(pal.warn));
+                }
+            });
+            if let Some(e) = &state.error {
+                ternarygrid_ui::parts::status(ui, ternarygrid_ui::parts::Tone::Error, e);
+            }
+            return actions;
+        }
+        if is_default {
+            let label = match model.default_display(col) {
+                crate::model::DefaultDisplay::Expr(e) => trf("Default: {}", &[&e]),
+                crate::model::DefaultDisplay::Null => format!("{} ({})", options.format.null_text, tr("default")),
+                crate::model::DefaultDisplay::Auto => tr("Generated automatically on save").to_string(),
+                crate::model::DefaultDisplay::Generic => tr("[DEFAULT]").to_string(),
+            };
+            ui.weak(label);
+        } else if value.is_null() {
             ui.weak(&options.format.null_text);
         }
         match mode {

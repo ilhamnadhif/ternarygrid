@@ -71,6 +71,7 @@ pub struct ResultPanel {
     where_clause: Option<String>,
     order_by: Option<String>,
     editability: Option<Result<EditTarget, ReadOnlyReason>>,
+    table_def: Option<Arc<TableDef>>,
     foreign_keys: Vec<ForeignKeyLink>,
     relations: Vec<Relation>,
     save_preview: Option<String>,
@@ -206,6 +207,7 @@ impl ResultPanel {
             where_clause: None,
             order_by: None,
             editability: None,
+            table_def: None,
             foreign_keys: Vec::new(),
             relations: Vec::new(),
             save_preview: None,
@@ -287,6 +289,7 @@ impl ResultPanel {
             }
             self.columns_seen = self.src.columns_version;
             self.editability = None;
+            self.table_def = None;
             self.foreign_keys.clear();
             table_sources(&mut self.src.columns, self.table.as_ref());
             self.model.reset(self.src.columns.clone(), self.src.store.clone());
@@ -308,6 +311,9 @@ impl ResultPanel {
             self.model.set_foreign_keys(self.foreign_keys.clone());
             if let Some(e) = &self.editability {
                 self.model.set_editability(e.clone());
+            }
+            if let Some(def) = &self.table_def {
+                self.model.apply_table_def(def);
             }
             self.chart = None;
             self.spatial = None;
@@ -415,7 +421,11 @@ impl ResultPanel {
             self.refs_job = None;
             match r {
                 Ok((cols, rows)) => self.view.references.set_related_rows(rel, key, cols, rows),
-                Err(e) => self.status = Some((e.full_text(), true)),
+                Err(e) => {
+                    let msg = e.full_text();
+                    self.view.references.set_related_error(rel, key, msg.clone());
+                    self.status = Some((msg, true));
+                }
             }
         }
     }
@@ -526,7 +536,9 @@ impl ResultPanel {
             o.database = base_db.clone();
             o
         };
+        let mut base_def = None;
         if let Some(def) = base.as_ref().and_then(find) {
+            base_def = Some(def.clone());
             for fk in &def.foreign_keys {
                 let cols: Option<Vec<usize>> = fk.columns.iter().map(|c| col_index(c)).collect();
                 if let Some(cols) = cols {
@@ -588,12 +600,16 @@ impl ResultPanel {
                 ));
             }
         }
-        self.model.set_editability(e.clone());
+        self.model.set_editability(e);
+        if let Some(def) = &base_def {
+            self.model.apply_table_def(def);
+        }
         self.model.set_foreign_keys(links.clone());
         self.view.references.set_relations(relations.clone());
+        self.table_def = base_def;
         self.foreign_keys = links;
         self.relations = relations;
-        self.editability = Some(e);
+        self.editability = Some(self.model.editability().clone());
     }
 
     fn where_for(dialect: &dyn Dialect, columns: &[String], values: &[Value]) -> String {

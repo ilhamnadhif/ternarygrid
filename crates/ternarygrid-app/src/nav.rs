@@ -155,10 +155,24 @@ impl FailedBlock {
     }
 }
 
+#[derive(Clone, Debug)]
+struct DragSelect {
+    start_row: usize,
+    start_pos: egui::Pos2,
+    active: bool,
+    base_set: HashSet<NavNode>,
+}
+
 #[derive(Default)]
 pub struct Navigator {
     expanded: HashSet<NavNode>,
     pub selected: Option<NavNode>,
+    /// All selected nodes (contains `selected` whenever a node is selected).
+    selected_set: HashSet<NavNode>,
+    /// Anchor node for Shift+Click and Shift+Arrow range selection.
+    selection_anchor: Option<NavNode>,
+    /// Active click-and-drag block selection across rows.
+    drag_select: Option<DragSelect>,
     /// Object to select once its row exists (Link with editor), with a deadline.
     pending_reveal: Option<(String, ObjectRef, std::time::Instant)>,
     pub filter: String,
@@ -314,8 +328,118 @@ fn filter_ok(cfg: &ConnectionConfig, kind: ObjectKind, name: &str) -> bool {
 
 impl Navigator {
     pub fn select(&mut self, node: NavNode) {
-        self.selected = Some(node);
+        self.select_single(node);
         self.scroll_to_selected = true;
+    }
+
+    fn select_single(&mut self, node: NavNode) {
+        self.selected_set.clear();
+        self.selected_set.insert(node.clone());
+        self.selection_anchor = Some(node.clone());
+        self.selected = Some(node);
+    }
+
+    /// True if `node` is currently selected (primary or part of a multi-selection).
+    pub fn is_selected(&self, node: &NavNode) -> bool {
+        self.selected_set.contains(node) || self.selected.as_ref() == Some(node)
+    }
+
+    /// Visible selected nodes in `rows`, in top-to-bottom tree order.
+    fn visible_selected_in(&self, rows: &[Row]) -> Vec<NavNode> {
+        let mut out = Vec::new();
+        for r in rows {
+            if r.kind == RowKind::Node && self.is_selected(&r.node) && !out.contains(&r.node) {
+                out.push(r.node.clone());
+            }
+        }
+        out
+    }
+
+    /// Visible selected nodes in top-to-bottom tree order.
+    pub fn selected_nodes(&self) -> Vec<NavNode> {
+        self.visible_selected_in(&self.rows)
+    }
+
+    /// Toggle `node` in the multi-selection (Cmd/Ctrl+Click).
+    fn toggle_select(&mut self, node: NavNode, rows: &[Row]) {
+        // If `selected` was set externally without `selected_set`, sync it first.
+        if let Some(sel) = &self.selected
+            && !self.selected_set.contains(sel)
+        {
+            self.selected_set.insert(sel.clone());
+        }
+        if self.selected_set.remove(&node) {
+            if self.selected.as_ref() == Some(&node) {
+                self.selected = rows.iter().find(|r| r.kind == RowKind::Node && self.selected_set.contains(&r.node)).map(|r| r.node.clone());
+            }
+        } else {
+            self.selected_set.insert(node.clone());
+            self.selected = Some(node.clone());
+            self.selection_anchor = Some(node);
+        }
+    }
+
+    /// Select a contiguous range of visible nodes from the anchor to `target_idx`.
+    fn select_range(&mut self, rows: &[Row], target_idx: usize, additive: bool) {
+        if target_idx >= rows.len() || rows[target_idx].kind != RowKind::Node {
+            return;
+        }
+        if !additive {
+            self.selected_set.clear();
+        } else if let Some(sel) = &self.selected {
+            self.selected_set.insert(sel.clone());
+        }
+        let anchor_idx =
+            self.selection_anchor.as_ref().or(self.selected.as_ref()).and_then(|a| rows.iter().position(|r| r.kind == RowKind::Node && &r.node == a)).unwrap_or(target_idx);
+        let (lo, hi) = (anchor_idx.min(target_idx), anchor_idx.max(target_idx));
+        for r in &rows[lo..=hi] {
+            if r.kind == RowKind::Node {
+                self.selected_set.insert(r.node.clone());
+            }
+        }
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(rows[anchor_idx].node.clone());
+        }
+        self.selected = Some(rows[target_idx].node.clone());
+    }
+
+    /// Select all visible sibling nodes under the same parent as the primary selection (Cmd/Ctrl+A).
+    fn select_siblings(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let cur = self.selected.as_ref().and_then(|s| self.rows.iter().position(|r| r.kind == RowKind::Node && &r.node == s));
+        let (depth, start, end) = match cur {
+            Some(i) => {
+                let d = self.rows[i].depth;
+                let mut lo = i;
+                while lo > 0 && self.rows[lo - 1].depth >= d {
+                    lo -= 1;
+                }
+                let mut hi = i;
+                while hi + 1 < self.rows.len() && self.rows[hi + 1].depth >= d {
+                    hi += 1;
+                }
+                (d, lo, hi)
+            }
+            None => (0, 0, self.rows.len() - 1),
+        };
+        self.selected_set.clear();
+        let mut first = None;
+        for r in &self.rows[start..=end] {
+            if r.kind == RowKind::Node && r.depth == depth {
+                if first.is_none() {
+                    first = Some(r.node.clone());
+                }
+                self.selected_set.insert(r.node.clone());
+            }
+        }
+        if self.selected.as_ref().is_none_or(|s| !self.selected_set.contains(s)) {
+            self.selected = first.clone();
+        }
+        if self.selection_anchor.as_ref().is_none_or(|a| !self.selected_set.contains(a)) {
+            self.selection_anchor = first;
+        }
     }
 
     /// Expand the path to `obj` and select it (once loaded).
@@ -363,8 +487,7 @@ impl Navigator {
         // The same database first; a reference without one means the default database.
         let found = self.rows.iter().find(|r| same(r, true)).or_else(|| self.rows.iter().find(|r| same(r, false)));
         if let Some(r) = found {
-            self.selected = Some(r.node.clone());
-            self.scroll_to_selected = true;
+            self.select(r.node.clone());
             self.pending_reveal = None;
         } else if std::time::Instant::now() > until {
             self.pending_reveal = None;
@@ -998,8 +1121,73 @@ impl Navigator {
         }
     }
 
-    /// Properties of the selected node (Properties panel).
+    /// Properties of the selected node(s) (Properties panel).
     pub fn selected_properties(&self, cx: &AppContext) -> Vec<(String, String)> {
+        let visible = self.selected_nodes();
+        if visible.len() > 1 {
+            let mut out: Vec<(String, String)> = Vec::new();
+            let mut kind_counts: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+            let mut conns: Vec<String> = Vec::new();
+            let mut schemas: Vec<String> = Vec::new();
+            let mut total_size: i64 = 0;
+            let mut has_size = false;
+            let mut total_rows: i64 = 0;
+            let mut has_rows = false;
+            for n in &visible {
+                if let Some(c) = n.connection()
+                    && !conns.iter().any(|x| x == c)
+                {
+                    conns.push(c.to_string());
+                }
+                match n {
+                    NavNode::Object { conn, obj } | NavNode::Child { conn, obj } => {
+                        *kind_counts.entry(obj.kind.plural_label()).or_insert(0) += 1;
+                        if let Some(sc) = &obj.schema
+                            && !schemas.iter().any(|x| x == sc)
+                        {
+                            schemas.push(sc.clone());
+                        }
+                        if let Some(live) = cx.conns.live(conn)
+                            && let Some(info) = live.meta.objects.values().chain(live.meta.children.values()).filter_map(|l| l.get()).flatten().find(|i| i.obj == *obj)
+                        {
+                            if let Some(b) = info.size_bytes.filter(|b| *b >= 0) {
+                                total_size += b;
+                                has_size = true;
+                            }
+                            if let Some(r) = info.row_estimate.filter(|r| *r >= 0) {
+                                total_rows += r;
+                                has_rows = true;
+                            }
+                        }
+                    }
+                    NavNode::Connection(_) => *kind_counts.entry("Connections").or_insert(0) += 1,
+                    NavNode::Database { .. } => *kind_counts.entry("Databases").or_insert(0) += 1,
+                    NavNode::Schema { .. } => *kind_counts.entry("Schemas").or_insert(0) += 1,
+                    NavNode::Folder(_) => *kind_counts.entry("Folders").or_insert(0) += 1,
+                    _ => *kind_counts.entry("Items").or_insert(0) += 1,
+                }
+            }
+            out.push((tr("Selected").to_string(), ternarygrid_core::trf("{} items", &[&visible.len()])));
+            if !kind_counts.is_empty() {
+                let breakdown = kind_counts.into_iter().map(|(k, n)| format!("{n} {}", tr(k).to_lowercase())).collect::<Vec<_>>().join(", ");
+                out.push((tr("Types").to_string(), breakdown));
+            }
+            if conns.len() == 1
+                && let Some(cfg) = cx.conns.config(&conns[0])
+            {
+                out.push((tr("Connection").to_string(), cfg.name.clone()));
+            }
+            if schemas.len() == 1 {
+                out.push((tr("Schema").to_string(), schemas[0].clone()));
+            }
+            if has_size {
+                out.push((tr("Total size").to_string(), long_size(total_size)));
+            }
+            if has_rows {
+                out.push((tr("Estimated rows").to_string(), format!("~{total_rows}")));
+            }
+            return out;
+        }
         let Some(node) = &self.selected else { return Vec::new() };
         let mut out: Vec<(String, String)> = Vec::new();
         let mut add = |k: &str, v: Option<String>| {
@@ -1119,7 +1307,7 @@ impl Navigator {
             ternarygrid_ui::kit::semibold_label(ui, tr("Properties"), 12.5, p.text);
         });
         // only a node of the tree (not one removed since it was selected)
-        let in_tree = self.selected.as_ref().is_some_and(|sel| self.rows.iter().any(|r| &r.node == sel));
+        let in_tree = !self.selected_nodes().is_empty();
         let props = if in_tree { self.selected_properties(cx) } else { Vec::new() };
         if props.is_empty() {
             ui.horizontal(|ui| {
@@ -1344,7 +1532,11 @@ impl Navigator {
         }
         // Vertical only: a row is as wide as the panel (long names end in "…"); a
         // horizontal bar was always shown for a few pixels of overflow.
-        let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("nav_scroll");
+        // Disable drag-to-scroll so click-and-drag cleanly block-selects multiple rows.
+        let mut sa = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Never, ..Default::default() })
+            .id_salt("nav_scroll");
         if let Some(i) = scroll_target {
             sa = sa.vertical_scroll_offset((i as f32 * pitch - 80.0).max(0.0));
         }
@@ -1365,7 +1557,7 @@ impl Navigator {
                 let rect = egui::Rect::from_min_size(slot.min, egui::vec2(slot.width(), row_h));
                 let row_id = ui.id().with(("nav_row", i));
                 if r.kind == RowKind::Node {
-                    self.node_row(ui, cx, r, i, rect, row_id, &mut picked);
+                    self.node_row(ui, cx, &rows, i, rect, row_id, &mut picked);
                     continue;
                 }
                 let resp = ui.interact(rect, row_id, Sense::click());
@@ -1474,37 +1666,87 @@ impl Navigator {
             pinned.set_clip_rect(view);
             pinned.painter().rect_filled(band, 0.0, p.canvas);
             let rect = egui::Rect::from_min_size(band.min, egui::vec2(band.width().max(200.0), row_h));
-            self.node_row(&mut pinned, cx, &rows[pin.row], pin.row, rect, egui::Id::new("nav_pinned"), &mut picked);
+            self.node_row(&mut pinned, cx, &rows, pin.row, rect, egui::Id::new("nav_pinned"), &mut picked);
             pinned.painter().hline(band.x_range(), band.bottom() - 0.5, egui::Stroke::new(1.0, p.border));
             // Folded from here, the rows under it shift: back to the connection.
-            if picked.toggled == Some(pin.row) || picked.clicked == Some((pin.row, true)) {
+            if picked.toggled == Some(pin.row) || matches!(picked.clicked, Some((row, true, _)) if row == pin.row) {
                 self.scroll_to_selected = true;
             }
         }
         ui.spacing_mut().item_spacing.y = item_gap;
+        if let Some((start_row, start_pos, mods)) = picked.pressed
+            && !mods.shift
+        {
+            let base_set = if mods.command { self.visible_selected_in(&rows).into_iter().collect() } else { HashSet::new() };
+            self.drag_select = Some(DragSelect { start_row, start_pos, active: false, base_set });
+        }
+        let mut drag_consumed_click = false;
+        if let Some(mut drag) = self.drag_select.take() {
+            if ui.input(|inp| inp.pointer.primary_down()) {
+                if let Some(pos) = ui.input(|inp| inp.pointer.interact_pos()) {
+                    if !drag.active && pos.distance(drag.start_pos) >= 4.0 {
+                        drag.active = true;
+                    }
+                    if drag.active
+                        && let Some(top) = content_top
+                        && !rows.is_empty()
+                    {
+                        let target = ((pos.y - top) / pitch).floor().clamp(0.0, (rows.len() - 1) as f32) as usize;
+                        let (lo, hi) = (drag.start_row.min(target), drag.start_row.max(target));
+                        self.selected_set = drag.base_set.clone();
+                        let mut lead = None;
+                        for r in &rows[lo..=hi] {
+                            if r.kind == RowKind::Node {
+                                self.selected_set.insert(r.node.clone());
+                                lead = Some(r.node.clone());
+                            }
+                        }
+                        if rows[target].kind == RowKind::Node {
+                            self.selected = Some(rows[target].node.clone());
+                        } else if let Some(l) = lead {
+                            self.selected = Some(l);
+                        }
+                        if drag.start_row < rows.len() && rows[drag.start_row].kind == RowKind::Node {
+                            self.selection_anchor = Some(rows[drag.start_row].node.clone());
+                        }
+                    }
+                }
+                self.drag_select = Some(drag);
+            } else if drag.active {
+                drag_consumed_click = true;
+            }
+        }
         if let Some(i) = picked.toggled {
             self.toggle(&rows[i].node, cx);
-            self.selected = Some(rows[i].node.clone());
+            self.select_single(rows[i].node.clone());
         }
-        if let Some((i, double)) = picked.clicked {
+        if !drag_consumed_click && let Some((i, double, mods)) = picked.clicked {
             let node = rows[i].node.clone();
-            self.selected = Some(node.clone());
             if double {
+                self.select_single(node.clone());
                 self.activate(&node, cx);
+            } else if mods.shift {
+                self.select_range(&rows, i, mods.command);
+            } else if mods.command {
+                self.toggle_select(node, &rows);
+            } else {
+                self.select_single(node);
             }
         }
         self.rows = rows;
         self.keyboard(ui, cx);
     }
 
-    /// A node's row (`i` in the rows), in the list or pinned at the top: its fill, the type's
+    /// A node's row (`i` in `rows`), in the list or pinned at the top: its fill, the type's
     /// stripe, the caret, the logo or icon, the name, the state and the details, its clicks and
     /// its menu.
     #[allow(clippy::too_many_arguments)]
-    fn node_row(&mut self, ui: &mut Ui, cx: &mut AppContext, r: &Row, i: usize, rect: egui::Rect, id: egui::Id, picked: &mut RowPick) {
+    fn node_row(&mut self, ui: &mut Ui, cx: &mut AppContext, rows: &[Row], i: usize, rect: egui::Rect, id: egui::Id, picked: &mut RowPick) {
+        let r = &rows[i];
         let p = ternarygrid_ui::pal(ui);
         let resp = ui.interact(rect, id, Sense::click());
-        let selected = Some(&r.node) == self.selected.as_ref();
+        let selected = self.is_selected(&r.node);
+        let is_primary = self.selected.as_ref() == Some(&r.node);
         resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &r.label));
         let inner = rect.shrink2(egui::vec2(6.0, 0.0));
         let fill = if selected {
@@ -1518,7 +1760,13 @@ impl Navigator {
             ui.painter().rect_filled(inner, ternarygrid_ui::style::RADIUS, fill);
         }
         if selected {
-            let outline = ternarygrid_ui::soft(p.accent, if ui.visuals().dark_mode { 0.45 } else { 0.30 });
+            let alpha = match (is_primary, ui.visuals().dark_mode) {
+                (true, true) => 0.48,
+                (true, false) => 0.34,
+                (false, true) => 0.22,
+                (false, false) => 0.16,
+            };
+            let outline = ternarygrid_ui::soft(p.accent, alpha);
             ui.painter().rect_stroke(inner, ternarygrid_ui::style::RADIUS, egui::Stroke::new(1.0, outline), egui::StrokeKind::Inside);
         }
         let row_bg = fill.unwrap_or(p.canvas);
@@ -1526,11 +1774,12 @@ impl Navigator {
         let y = inner.center().y;
         let text_color = if selected { p.accent_text } else { p.text };
         let size = ternarygrid_ui::style::body_size(ui.ctx());
+        let mut caret_rect = egui::Rect::NOTHING;
         if r.expandable {
             let arrow = if r.expanded { icon::CARET_DOWN } else { icon::CARET_RIGHT };
-            let arrow_rect = egui::Rect::from_center_size(egui::pos2(x + 6.0, y), egui::vec2(16.0, rect.height()));
-            ui.painter().text(arrow_rect.center(), egui::Align2::CENTER_CENTER, arrow, ternarygrid_ui::style::icon_font(12.0), p.text_faint);
-            if resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| arrow_rect.contains(q)) {
+            caret_rect = egui::Rect::from_center_size(egui::pos2(x + 6.0, y), egui::vec2(16.0, rect.height()));
+            ui.painter().text(caret_rect.center(), egui::Align2::CENTER_CENTER, arrow, ternarygrid_ui::style::icon_font(12.0), p.text_faint);
+            if resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| caret_rect.contains(q)) {
                 picked.toggled = Some(i);
             }
         }
@@ -1595,16 +1844,28 @@ impl Navigator {
             let g = fit(ui, RichText::new(d).size(11.5).color(p.text_faint), right - (after + 8.0));
             ui.painter().galley(egui::pos2(after + 8.0, y - g.size().y / 2.0), g, p.text_faint);
         }
+        let mods = ui.input(|inp| inp.modifiers);
+        if ui.input(|inp| inp.pointer.primary_pressed())
+            && let Some(pos) = ui.input(|inp| inp.pointer.interact_pos())
+            && rect.contains(pos)
+            && !caret_rect.contains(pos)
+        {
+            picked.pressed = Some((i, pos, mods));
+        }
         if resp.double_clicked() {
-            picked.clicked = Some((i, true));
+            picked.clicked = Some((i, true, mods));
         } else if resp.clicked() && picked.toggled != Some(i) {
-            picked.clicked = Some((i, false));
+            picked.clicked = Some((i, false, mods));
         }
         if resp.secondary_clicked() {
-            self.selected = Some(r.node.clone());
+            if !self.is_selected(&r.node) {
+                self.select_single(r.node.clone());
+            } else {
+                self.selected = Some(r.node.clone());
+            }
         }
         let node = r.node.clone();
-        resp.context_menu(|ui| self.context_menu(ui, cx, &node));
+        resp.context_menu(|ui| self.context_menu(ui, cx, &node, rows));
     }
 
     /// Follow where the user clicks: the navigator, or somewhere else.
@@ -1692,8 +1953,18 @@ impl Navigator {
         let nodes: Vec<usize> = self.rows.iter().enumerate().filter(|(_, r)| r.kind == RowKind::Node).map(|(i, _)| i).collect();
         let cur = self.selected.as_ref().and_then(|s| self.rows.iter().position(|r| &r.node == s));
         // F5 (Refresh) comes through the keymap: `App::dispatch_action`.
-        let (down, up, left, right, enter) =
-            ui.input(|i| (i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowUp), i.key_pressed(Key::ArrowLeft), i.key_pressed(Key::ArrowRight), i.key_pressed(Key::Enter)));
+        let (down, up, left, right, enter, escape, select_all, shift) = ui.input(|i| {
+            (
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowLeft),
+                i.key_pressed(Key::ArrowRight),
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Escape),
+                i.modifiers.command && i.key_pressed(Key::A),
+                i.modifiers.shift,
+            )
+        });
         // Copy the name / drop: only with the pointer over the navigator.
         let pointer_here = ui.ui_contains_pointer();
         let (copy, delete, rename) = ui.input(|i| {
@@ -1706,6 +1977,16 @@ impl Navigator {
         if ui.memory(|m| m.focused().is_some()) {
             return; // a text field (filter) has focus
         }
+        if select_all && pointer_here {
+            self.select_siblings();
+            return;
+        }
+        if escape && self.selected_nodes().len() > 1 {
+            if let Some(primary) = self.selected.clone() {
+                self.select_single(primary);
+            }
+            return;
+        }
         if down || up {
             let pos = cur.and_then(|c| nodes.iter().position(|&n| n == c));
             let next = match (pos, down) {
@@ -1714,8 +1995,28 @@ impl Navigator {
                 (Some(p), false) => nodes.get(p.saturating_sub(1)).copied(),
             };
             if let Some(n) = next {
-                self.select(self.rows[n].node.clone());
+                if shift {
+                    let rows = std::mem::take(&mut self.rows);
+                    self.select_range(&rows, n, false);
+                    self.rows = rows;
+                    self.scroll_to_selected = true;
+                } else {
+                    self.select(self.rows[n].node.clone());
+                }
             }
+        }
+        let selected_list = self.selected_nodes();
+        if selected_list.len() > 1 {
+            if copy {
+                let text = self.format_selected_names(cx, &self.rows, &selected_list, true);
+                if !text.is_empty() {
+                    ui.ctx().copy_text(text);
+                }
+            }
+            if delete {
+                self.drop_selected_nodes(cx, &selected_list);
+            }
+            return;
         }
         if let Some(c) = cur {
             let node = self.rows[c].node.clone();
@@ -1751,7 +2052,272 @@ impl Navigator {
         }
     }
 
-    fn context_menu(&mut self, ui: &mut Ui, cx: &mut AppContext, node: &NavNode) {
+    /// Format names of `nodes` (qualified or bare) separated by newlines.
+    fn format_selected_names(&self, cx: &AppContext, rows: &[Row], nodes: &[NavNode], qualified: bool) -> String {
+        nodes
+            .iter()
+            .filter_map(|n| match n {
+                NavNode::Object { conn, obj } | NavNode::Child { conn, obj } => {
+                    if qualified {
+                        Some(cx.conns.live(conn).map(|l| l.dialect.qualified_ref(obj)).unwrap_or_else(|| obj.display_path()))
+                    } else {
+                        Some(obj.name.clone())
+                    }
+                }
+                NavNode::Database { db, .. } => Some(db.clone()),
+                NavNode::Schema { schema, .. } => schema.schema.clone(),
+                NavNode::CatalogItem { ctx, .. } => ctx.name.clone(),
+                other => rows.iter().find(|r| r.kind == RowKind::Node && &r.node == other).map(|r| r.label.clone()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Trigger the bulk drop dialog for droppable selected nodes on a single connection.
+    fn drop_selected_nodes(&self, cx: &mut AppContext, nodes: &[NavNode]) {
+        let mut conn: Option<String> = None;
+        let mut objects: Vec<ObjectRef> = Vec::new();
+        for n in nodes {
+            let (c, obj) = match n {
+                NavNode::Object { conn, obj } | NavNode::Child { conn, obj } => (conn.as_str(), obj.clone()),
+                NavNode::Database { conn, db } => (conn.as_str(), ObjectRef::new(ObjectKind::Database, None, db.clone()).with_database(Some(db.clone()))),
+                _ => continue,
+            };
+            match &conn {
+                None => conn = Some(c.to_string()),
+                Some(prev) if prev != c => {
+                    cx.toasts.warning(tr("Cannot drop across multiple connections"), Some(tr("Select objects from a single connection to drop them together.").to_string()));
+                    return;
+                }
+                _ => {}
+            }
+            objects.push(obj);
+        }
+        if let Some(connection) = conn
+            && !objects.is_empty()
+        {
+            cx.push(AppCommand::DropObjects { connection, objects });
+        }
+    }
+
+    /// Context menu when multiple visible rows are selected.
+    fn context_menu_multi(&mut self, ui: &mut Ui, cx: &mut AppContext, rows: &[Row], nodes: &[NavNode]) {
+        use ternarygrid_ui::kit;
+        kit::menu_look(ui, 260.0);
+        kit::menu_caption(ui, &ternarygrid_core::trf("{} items selected", &[&nodes.len()]));
+
+        // Classify selection.
+        let mut obj_items: Vec<(String, ObjectRef)> = Vec::new();
+        let mut conn_ids: Vec<String> = Vec::new();
+        let mut db_items: Vec<(String, String)> = Vec::new();
+        for n in nodes {
+            match n {
+                NavNode::Object { conn, obj } | NavNode::Child { conn, obj } => obj_items.push((conn.clone(), obj.clone())),
+                NavNode::Connection(id) => conn_ids.push(id.clone()),
+                NavNode::Database { conn, db } => db_items.push((conn.clone(), db.clone())),
+                _ => {}
+            }
+        }
+
+        // Case 1: Multiple database objects / children selected.
+        if !obj_items.is_empty() && obj_items.len() == nodes.len() {
+            let first_conn = obj_items[0].0.clone();
+            let same_conn = obj_items.iter().all(|(c, _)| c == &first_conn);
+            let sql = same_conn && is_sql(cx, &first_conn);
+            let all_objs: Vec<ObjectRef> = obj_items.iter().map(|(_, o)| o.clone()).collect();
+            let data_objs: Vec<ObjectRef> = all_objs.iter().filter(|o| o.kind.has_data()).cloned().collect();
+            let table_like: Vec<ObjectRef> = all_objs.iter().filter(|o| o.kind.is_table_like()).cloned().collect();
+            let truncatable: Vec<ObjectRef> = all_objs.iter().filter(|o| matches!(o.kind, ObjectKind::Table | ObjectKind::Partition)).cloned().collect();
+            let hideable: Vec<(String, ObjectRef)> = obj_items.iter().filter(|(_, o)| o.table.is_none()).cloned().collect();
+
+            if !data_objs.is_empty() && data_objs.len() <= 20 && item(ui, icon::TABLE, &ternarygrid_core::trf("View data ({})", &[&data_objs.len()]), "").clicked() {
+                for (c, o) in obj_items.iter().filter(|(_, o)| o.kind.has_data()) {
+                    cx.push(AppCommand::OpenObject { connection: c.clone(), object: o.clone(), page: ObjectPage::Data });
+                }
+                ui.close();
+            }
+            if same_conn && sql && !table_like.is_empty() {
+                let first_schema = table_like[0].schema_ref();
+                let same_schema = table_like.iter().all(|o| o.schema_ref() == first_schema);
+                if same_schema && kit::menu_item(ui, Some(icon::GRAPH), tr("ER diagram"), "").clicked() {
+                    let tables = table_like.iter().map(|o| o.name.clone()).collect();
+                    cx.push(AppCommand::OpenErDiagram { connection: first_conn.clone(), schema: first_schema, tables });
+                    ui.close();
+                }
+                if kit::menu_item(ui, Some(icon::FILE_CODE), tr("Generate SELECT script"), "").clicked() {
+                    let text = if let Some(live) = cx.conns.live(&first_conn) {
+                        table_like.iter().map(|o| format!("{};", live.dialect.select_table(o, None, None, None, Some(100)))).collect::<Vec<_>>().join("\n\n")
+                    } else {
+                        table_like.iter().map(|o| format!("SELECT * FROM {};", o.display_path())).collect::<Vec<_>>().join("\n\n")
+                    };
+                    let schema = table_like.first().map(ObjectRef::schema_ref);
+                    cx.push(AppCommand::NewSqlEditor { connection: Some(first_conn.clone()), schema, text: Some(text) });
+                    ui.close();
+                }
+            }
+            if same_conn && (!data_objs.is_empty() || (sql && !table_like.is_empty())) {
+                kit::menu_separator(ui);
+                if !data_objs.is_empty() && kit::menu_item(ui, Some(icon::EXPORT), tr("Export data…"), "").clicked() {
+                    cx.push(AppCommand::OpenExport { connection: first_conn.clone(), objects: data_objs.clone(), sql: None });
+                    ui.close();
+                }
+                if sql && !table_like.is_empty() {
+                    if kit::menu_item(ui, Some(icon::ARROW_RIGHT), tr("Migrate to another database…"), "").clicked() {
+                        cx.push(AppCommand::OpenMigration { connection: first_conn.clone(), objects: table_like.clone() });
+                        ui.close();
+                    }
+                    if kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance…"), "").clicked() {
+                        cx.push(AppCommand::OpenMaintenance { connection: first_conn.clone(), objects: table_like.clone(), op: None });
+                        ui.close();
+                    }
+                }
+            }
+            kit::menu_separator(ui);
+            if item(ui, icon::COPY, tr("Copy names"), COPY_KEYS).clicked() {
+                ui.ctx().copy_text(self.format_selected_names(cx, rows, nodes, true));
+                ui.close();
+            }
+            if kit::menu_item(ui, Some(icon::COPY_SIMPLE), tr("Copy bare names"), "").clicked() {
+                ui.ctx().copy_text(self.format_selected_names(cx, rows, nodes, false));
+                ui.close();
+            }
+            if !hideable.is_empty()
+                && kit::menu_item(ui, Some(icon::EYE_SLASH), tr("Hide in navigator"), "").on_hover_text(tr("Adds the names to the connection's navigator filter")).clicked()
+            {
+                for (c, o) in hideable {
+                    cx.push(AppCommand::HideInNavigator { connection: c, object: o });
+                }
+                ui.close();
+            }
+            if item(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), &crate::keys::label(cx.keymap, crate::keys::Action::Refresh)).clicked() {
+                for (c, o) in &obj_items {
+                    cx.push(AppCommand::RefreshMetadata { connection: c.clone(), object: Some(o.clone()), schema: None });
+                }
+                ui.close();
+            }
+            if same_conn {
+                kit::menu_separator(ui);
+                if sql
+                    && !truncatable.is_empty()
+                    && kit::menu_item_danger(ui, Some(icon::ERASER), &ternarygrid_core::trf("Truncate {}…", &[&truncatable.len()]), "")
+                        .on_hover_text(tr("Delete every row of the selected tables"))
+                        .clicked()
+                {
+                    cx.push(AppCommand::OpenMaintenance {
+                        connection: first_conn.clone(),
+                        objects: truncatable,
+                        op: Some(ternarygrid_core::admin::MaintenanceOp::TRUNCATE.to_string()),
+                    });
+                    ui.close();
+                }
+                if kit::menu_item_danger(ui, Some(icon::TRASH), &ternarygrid_core::trf("Drop {}…", &[&all_objs.len()]), DROP_KEYS).clicked() {
+                    cx.push(AppCommand::DropObjects { connection: first_conn, objects: all_objs });
+                    ui.close();
+                }
+            }
+            return;
+        }
+
+        // Case 2: Multiple connections selected.
+        if !conn_ids.is_empty() && conn_ids.len() == nodes.len() {
+            let disconnected: Vec<String> = conn_ids.iter().filter(|id| !cx.conns.is_connected(id)).cloned().collect();
+            let connected: Vec<String> = conn_ids.iter().filter(|id| cx.conns.is_connected(id)).cloned().collect();
+            if !disconnected.is_empty() && kit::menu_item(ui, Some(icon::PLUGS_CONNECTED), tr("Connect selected"), "").clicked() {
+                for id in disconnected {
+                    cx.push(AppCommand::Connect(id));
+                }
+                ui.close();
+            }
+            if !connected.is_empty() && kit::menu_item(ui, Some(icon::PLUGS), tr("Disconnect selected"), "").clicked() {
+                for id in connected {
+                    cx.push(AppCommand::Disconnect(id));
+                }
+                ui.close();
+            }
+            kit::menu_separator(ui);
+            if kit::menu_item(ui, Some(icon::UPLOAD_SIMPLE), tr("Export connections…"), "").clicked() {
+                cx.push(AppCommand::ExportConnections(Some(conn_ids.clone())));
+                ui.close();
+            }
+            let folders = cx.conns.folders().to_vec();
+            kit::submenu(ui, Some(icon::FOLDER), tr("Move to folder"), 200.0, &mut |ui| {
+                if kit::menu_item(ui, None, tr("(top level)"), "").clicked() {
+                    for id in &conn_ids {
+                        cx.push(AppCommand::MoveToFolder { id: id.clone(), folder: None });
+                    }
+                    ui.close();
+                }
+                for f in &folders {
+                    let depth = f.matches('/').count();
+                    let name = f.rsplit('/').next().unwrap_or(f);
+                    let label = format!("{}{name}", "    ".repeat(depth));
+                    if kit::menu_item(ui, Some(icon::FOLDER), &label, "").clicked() {
+                        for id in &conn_ids {
+                            cx.push(AppCommand::MoveToFolder { id: id.clone(), folder: Some(f.clone()) });
+                        }
+                        ui.close();
+                    }
+                }
+            });
+            kit::menu_separator(ui);
+            if item(ui, icon::COPY, tr("Copy names"), COPY_KEYS).clicked() {
+                ui.ctx().copy_text(self.format_selected_names(cx, rows, nodes, true));
+                ui.close();
+            }
+            return;
+        }
+
+        // Case 3: Multiple databases on the same connection.
+        if !db_items.is_empty() && db_items.len() == nodes.len() {
+            let first_conn = db_items[0].0.clone();
+            let same_conn = db_items.iter().all(|(c, _)| c == &first_conn);
+            let dbs: Vec<ObjectRef> = db_items.iter().map(|(_, db)| ObjectRef::new(ObjectKind::Database, None, db.clone()).with_database(Some(db.clone()))).collect();
+            if same_conn
+                && cx.conns.live(&first_conn).is_some_and(|l| l.dialect.maintenance_ops().iter().any(|o| o.applies_to.contains(&ObjectKind::Database)))
+                && kit::menu_item(ui, Some(icon::WRENCH), tr("Maintenance…"), "").clicked()
+            {
+                cx.push(AppCommand::OpenMaintenance { connection: first_conn.clone(), objects: dbs.clone(), op: None });
+                ui.close();
+            }
+            if item(ui, icon::COPY, tr("Copy names"), COPY_KEYS).clicked() {
+                ui.ctx().copy_text(self.format_selected_names(cx, rows, nodes, true));
+                ui.close();
+            }
+            if item(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), &crate::keys::label(cx.keymap, crate::keys::Action::Refresh)).clicked() {
+                for (c, db) in &db_items {
+                    cx.push(AppCommand::RefreshMetadata { connection: c.clone(), object: None, schema: Some(SchemaRef { database: Some(db.clone()), schema: None }) });
+                }
+                ui.close();
+            }
+            if same_conn {
+                kit::menu_separator(ui);
+                if kit::menu_item_danger(ui, Some(icon::TRASH), &ternarygrid_core::trf("Drop {}…", &[&dbs.len()]), DROP_KEYS).clicked() {
+                    cx.push(AppCommand::DropObjects { connection: first_conn, objects: dbs });
+                    ui.close();
+                }
+            }
+            return;
+        }
+
+        // Fallback: mixed node kinds.
+        if item(ui, icon::COPY, tr("Copy names"), COPY_KEYS).clicked() {
+            ui.ctx().copy_text(self.format_selected_names(cx, rows, nodes, true));
+            ui.close();
+        }
+        if item(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), &crate::keys::label(cx.keymap, crate::keys::Action::Refresh)).clicked() {
+            for n in nodes {
+                self.refresh_node(n, cx.commands);
+            }
+            ui.close();
+        }
+    }
+
+    fn context_menu(&mut self, ui: &mut Ui, cx: &mut AppContext, node: &NavNode, rows: &[Row]) {
+        let visible_sel = self.visible_selected_in(rows);
+        if visible_sel.len() > 1 && visible_sel.contains(node) {
+            self.context_menu_multi(ui, cx, rows, &visible_sel);
+            return;
+        }
         ternarygrid_ui::kit::menu_look(ui, 240.0);
         let conn = node.connection().map(str::to_string);
         match node {
@@ -2035,8 +2601,10 @@ pub fn catalog_icon(i: CatalogIcon) -> &'static str {
 /// What the rows reported this frame.
 #[derive(Default)]
 struct RowPick {
-    /// (row, double click)
-    clicked: Option<(usize, bool)>,
+    /// (row, double click, modifiers)
+    clicked: Option<(usize, bool, egui::Modifiers)>,
+    /// Primary press on a row (not its caret): starts a potential drag-select.
+    pressed: Option<(usize, egui::Pos2, egui::Modifiers)>,
     /// Its caret was clicked.
     toggled: Option<usize>,
 }
@@ -2469,5 +3037,58 @@ mod tests {
         assert_eq!(toolbar_buttons(111.0), 4, "Refresh and Disconnect at the default width");
         assert_eq!(toolbar_buttons(138.0), 5);
         assert_eq!(toolbar_buttons(400.0), 6);
+    }
+
+    #[test]
+    fn multi_select_range_toggle_and_siblings() {
+        let tbl = |name: &str| {
+            let obj = ObjectRef::table(Some("public".into()), name);
+            let mut r = node(2, NavNode::Object { conn: "c".into(), obj }, false);
+            r.label = name.to_string();
+            r
+        };
+        let rows = vec![
+            conn(0, "c", true),
+            node(1, NavNode::KindFolder { conn: "c".into(), schema: SchemaRef::new(None, Some("public".into())), kind: ObjectKind::Table }, true),
+            tbl("admin_users"),
+            tbl("agent_runs"),
+            tbl("audit_logs"),
+            tbl("finance_budgets"),
+            tbl("messages"),
+            node(1, NavNode::KindFolder { conn: "c".into(), schema: SchemaRef::new(None, Some("public".into())), kind: ObjectKind::View }, true),
+            tbl("v_summary"),
+        ];
+        let mut nav = Navigator { rows: rows.clone(), ..Default::default() };
+
+        // Single select sets anchor.
+        nav.select_single(rows[2].node.clone());
+        assert_eq!(nav.selected_nodes().len(), 1);
+        assert!(nav.is_selected(&rows[2].node));
+
+        // Shift+Click range from index 2 to 5 selects 4 tables.
+        nav.select_range(&rows, 5, false);
+        assert_eq!(nav.selected_nodes().len(), 4);
+        assert!(nav.is_selected(&rows[2].node));
+        assert!(nav.is_selected(&rows[3].node));
+        assert!(nav.is_selected(&rows[4].node));
+        assert!(nav.is_selected(&rows[5].node));
+        assert!(!nav.is_selected(&rows[6].node));
+
+        // Cmd+Click toggles row 3 off and row 6 on.
+        nav.toggle_select(rows[3].node.clone(), &rows);
+        assert!(!nav.is_selected(&rows[3].node));
+        nav.toggle_select(rows[6].node.clone(), &rows);
+        assert!(nav.is_selected(&rows[6].node));
+        assert_eq!(nav.selected_nodes().len(), 4);
+
+        // Cmd+A selects all siblings under the same Tables folder (5 tables, not the view in the next folder).
+        nav.select_single(rows[4].node.clone());
+        nav.select_siblings();
+        assert_eq!(nav.selected_nodes().len(), 5);
+        assert!(!nav.is_selected(&rows[8].node));
+
+        // Filtering out rows excludes hidden nodes from selected_nodes().
+        nav.rows = vec![rows[0].clone(), rows[1].clone(), rows[2].clone(), rows[4].clone()];
+        assert_eq!(nav.selected_nodes().len(), 2);
     }
 }

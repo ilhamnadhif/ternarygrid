@@ -147,6 +147,8 @@ pub struct ColumnMeta {
     pub scale: Option<u32>,
     pub max_length: Option<u32>,
     pub auto_increment: Option<bool>,
+    #[serde(default)]
+    pub default_value: Option<String>,
     pub source: Option<ColumnSource>,
 }
 
@@ -804,6 +806,82 @@ pub fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+/// Strip balanced enclosing parentheses (`((0))` → `0`, `(false)` → `false`)
+/// without altering expressions like `(a) + (b)` or `nextval('seq'::regclass)`.
+pub fn display_default(expr: &str) -> &str {
+    let mut s = expr.trim();
+    loop {
+        if s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
+            let mut depth = 0i32;
+            let mut in_quote = false;
+            let mut encloses_all = true;
+            let bytes = s.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'\'' {
+                    in_quote = !in_quote;
+                } else if !in_quote {
+                    if b == b'(' {
+                        depth += 1;
+                    } else if b == b')' {
+                        depth -= 1;
+                        if depth == 0 && i + 1 < bytes.len() {
+                            encloses_all = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if encloses_all && depth == 0 {
+                s = s[1..s.len() - 1].trim();
+                continue;
+            }
+        }
+        break;
+    }
+    s
+}
+
+/// Interpret a SQL column default expression as a boolean literal, if it is one
+/// (`false`, `true`, `0`, `1`, `((0))`, `'false'::boolean`, `b'1'`, `'f'`, …).
+pub fn parse_default_bool(expr: &str) -> Option<bool> {
+    let mut s = display_default(expr);
+    // Strip a top-level PostgreSQL type cast suffix (`'false'::boolean`, `0::bit(1)`).
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    let mut cast_pos = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            in_quote = !in_quote;
+        } else if !in_quote {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth -= 1;
+            } else if depth == 0 && b == b':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                cast_pos = Some(i);
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if let Some(idx) = cast_pos {
+        let cast = s[idx + 2..].trim();
+        if !cast.is_empty() && cast.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '(' | ')')) {
+            s = display_default(s[..idx].trim());
+        }
+    }
+    if (s.starts_with("b'") || s.starts_with("B'")) && s.ends_with('\'') && s.len() >= 3 {
+        s = &s[2..s.len() - 1];
+    } else if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        s = &s[1..s.len() - 1];
+    }
+    parse_bool(s)
+}
+
 pub fn is_decimal_text(t: &str) -> bool {
     let t = t.strip_prefix(['-', '+']).unwrap_or(t);
     if t.is_empty() {
@@ -1151,6 +1229,26 @@ mod tests {
         assert_eq!(v.to_text(), "2024-01-02 03:04:05.5+07");
         assert_eq!(Value::parse_as("0xff00", DataKind::Binary).unwrap(), Value::bytes(vec![255u8, 0]));
         assert!(Value::parse_as("{bad", DataKind::Json).is_err());
+    }
+
+    #[test]
+    fn default_expr_display_and_bool() {
+        assert_eq!(display_default("nextval('ratios_id_seq'::regclass)"), "nextval('ratios_id_seq'::regclass)");
+        assert_eq!(display_default("((0))"), "0");
+        assert_eq!(display_default("(a) + (b)"), "(a) + (b)");
+        assert_eq!(display_default("  (false)  "), "false");
+
+        assert_eq!(parse_default_bool("false"), Some(false));
+        assert_eq!(parse_default_bool("TRUE"), Some(true));
+        assert_eq!(parse_default_bool("((0))"), Some(false));
+        assert_eq!(parse_default_bool("((1))"), Some(true));
+        assert_eq!(parse_default_bool("'false'::boolean"), Some(false));
+        assert_eq!(parse_default_bool("'t'::bool"), Some(true));
+        assert_eq!(parse_default_bool("b'1'"), Some(true));
+        assert_eq!(parse_default_bool("B'0'"), Some(false));
+        assert_eq!(parse_default_bool("0::bit(1)"), Some(false));
+        assert_eq!(parse_default_bool("nextval('ratios_id_seq'::regclass)"), None);
+        assert_eq!(parse_default_bool("now()"), None);
     }
 
     #[test]
