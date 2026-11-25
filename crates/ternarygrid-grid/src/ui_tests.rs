@@ -655,11 +655,17 @@ fn record_view_has_the_grids_menu_and_keys() {
 #[test]
 fn discard_drops_pending_changes_at_once() {
     let mut v = Viewer::new(editable_model(3));
+    v.frame(vec![]);
+    // Fixed-anchor Cancel/Save stay in place when clean (disabled).
+    let clean_save = v.find_all_exact("Save")[0];
     v.model.set_value(1, 1, ternarygrid_core::Value::text("changed")).unwrap();
     v.frame(vec![]);
     assert!(v.model.has_changes());
-    assert!(v.find("1 change").is_some(), "the footer counts the pending change");
-    let discard = v.find("Discard").expect("Discard button");
+    let dirty_save = v.find_all_exact("Save")[0];
+    assert!((clean_save.x - dirty_save.x).abs() < 1.0, "fixed-anchor Save does not jump when becoming dirty: {clean_save:?} vs {dirty_save:?}");
+    // No +1 / ~1 / -1 delta counter chips in the Cancel/Save cluster.
+    assert!(v.find("~1").is_none() && v.find("+1").is_none() && v.find("-1").is_none(), "no delta counter chips in Cancel/Save");
+    let discard = v.find("Discard").expect("Cancel/Discard button");
     v.click(discard);
     assert!(!v.model.has_changes(), "no Discard / Keep question first");
     assert!(v.actions.iter().any(|a| matches!(a, GridAction::ChangesDiscarded)));
@@ -795,42 +801,60 @@ fn the_footer_moves_what_does_not_fit_into_its_menu() {
     v.frame(vec![]);
     let all = vec!["Refresh", "Add row", "Duplicate", "Delete", "Undo", "Export"];
     assert_eq!(on_footer(&v), all, "wide");
-    // Wide: every functional group is directly on the footer bar (no overflow menu needed).
-    for item in [
-        "Auto refresh",
-        "Fetch all rows",
-        "Calculate total row count",
-        "Add row before",
-        "Copy from row above",
-        "Copy from row below",
-        "Grid",
-        "Text",
-        "Record",
-        "JSON",
-        "XML",
-        "Chart",
-        "Spatial view",
-        "Value",
-        "Metadata",
-        "Grouping",
-        "Calc",
-        "References",
-    ] {
+    // Wide (Full): every primary group and split-button menu trigger is directly on the footer bar.
+    for item in ["Auto refresh", "Fetch all rows", "Calculate total row count", "More row actions", "Discard", "Save", "Grid", "Record", "Text", "More views", "Panels"] {
         assert!(!v.find_all_exact(item).is_empty(), "{item} on the wide footer");
     }
-    assert!(v.find_all_exact("More result actions").is_empty(), "nothing overflowed");
-    // Medium: core groups stay on the bar, extra actions move into ⋯.
-    sized(&mut v, 700.0);
-    assert_eq!(on_footer(&v), all, "medium");
-    assert!(!v.find_all_exact("More result actions").is_empty(), "overflow menu appears");
-    // Narrow: Refresh and Add row stay; the others are one click away in ⋯.
-    sized(&mut v, 440.0);
-    assert_eq!(on_footer(&v), vec!["Refresh", "Add row"], "narrow");
+    assert!(v.find_all_exact("More result actions").is_empty(), "nothing overflowed at full width");
+
+    // Split-button menus expose secondary row actions, views/visuals, and panels cleanly.
+    let row_drop = v.find_all_exact("More row actions")[0];
+    v.click(row_drop);
+    v.frame(vec![]);
+    for item in ["Add row after", "Add row before", "Copy from row above", "Copy from row below"] {
+        assert!(v.find(item).is_some(), "{item} in + Add ▾ menu");
+    }
+    v.frame(vec![crate::test_support::key(egui::Key::Escape, Modifiers::NONE)]);
+    v.frame(vec![]);
+
+    let views_drop = v.find_all_exact("More views")[0];
+    v.click(views_drop);
+    v.frame(vec![]);
+    for item in ["JSON", "XML", "Chart", "Spatial view"] {
+        assert!(v.find(item).is_some(), "{item} in More views menu");
+    }
+    v.frame(vec![crate::test_support::key(egui::Key::Escape, Modifiers::NONE)]);
+    v.frame(vec![]);
+
+    let panels_drop = v.find_all_exact("Panels")[0];
+    v.click(panels_drop);
+    v.frame(vec![]);
+    for item in ["Value", "Metadata", "Grouping", "Calc", "References", "Show panels"] {
+        assert!(v.find(item).is_some(), "{item} in Panels menu");
+    }
+    v.frame(vec![crate::test_support::key(egui::Key::Escape, Modifiers::NONE)]);
+    v.frame(vec![]);
+
+    // Medium (Core): core row buttons, fixed Cancel/Save, Export icon and views stay; Fetch all/Count move into ⋯.
+    sized(&mut v, 840.0);
+    assert_eq!(on_footer(&v), all, "medium (Core)");
+    assert!(!v.find_all_exact("More result actions").is_empty(), "overflow menu appears at Core");
+
+    // Narrow (Essential): Dup/Del/Undo & Export move into ⋯ while Refresh, Add row, compact views and Panels stay.
+    sized(&mut v, 620.0);
+    assert_eq!(on_footer(&v), vec!["Refresh", "Add row"], "narrow (Essential)");
+    assert!(!v.find_all_exact("Grid").is_empty(), "compact views stay at Essential");
+    assert!(v.find_all_exact("Save").is_empty(), "idle Save hides at Essential when clean");
+
+    // Ultra-narrow (Minimal): views also move into ⋯; Refresh, Add row, Panels and ⋯ stay.
+    sized(&mut v, 350.0);
+    assert_eq!(on_footer(&v), vec!["Refresh", "Add row"], "minimal");
+    assert!(v.find_all_exact("Grid").is_empty(), "views moved into ⋯ at Minimal");
     let more = v.find_all_exact("More result actions")[0];
     v.click(more);
     v.frame(vec![]);
-    for item in ["Duplicate selected rows", "Delete selected rows", "Export…"] {
-        assert!(v.find(item).is_some(), "{item} in ⋯");
+    for item in ["Grid", "Text", "Record", "JSON", "XML", "Chart", "Spatial view", "Duplicate selected rows", "Delete selected rows", "Export…"] {
+        assert!(v.find(item).is_some(), "{item} in ⋯ at Minimal");
     }
     assert!(v.find("Fetch next").is_none(), "nothing to fetch here");
 }
@@ -838,17 +862,18 @@ fn the_footer_moves_what_does_not_fit_into_its_menu() {
 #[test]
 fn the_more_menu_has_only_what_the_bar_does_not() {
     let mut v = Viewer::new(editable_model(5));
-    // At medium width, Core groups stay on the bar while secondary groups move into ⋯.
-    sized(&mut v, 700.0);
+    // At Core width, Dup/Del/Undo and Export are on the bar; only Count (and Fetch all when has_more) move into ⋯.
+    sized(&mut v, 840.0);
     let more = v.find_all_exact("More result actions")[0];
     v.click(more);
     v.frame(vec![]);
-    for item in ["Add row before", "Copy from row above", "Auto refresh", "Calculate total row count", "Chart", "Spatial view", "Panels"] {
-        assert!(v.find(item).is_some(), "{item} in ⋯");
-    }
+    assert!(v.find("Calculate total row count").is_some(), "Count moved into ⋯ at Core");
     for item in ["Duplicate selected rows", "Delete selected rows", "Export…"] {
-        assert!(v.find(item).is_none(), "{item} is on the bar");
+        assert!(v.find(item).is_none(), "{item} is already on the bar");
     }
+    // Auto refresh and Panels remain exclusively on the bar (never duplicated in ⋯).
+    assert_eq!(v.find_all_exact("Auto refresh").len(), 1, "Auto refresh stays only on Refresh ▾");
+    assert_eq!(v.find_all_exact("Panels").len(), 1, "Panels stays only on Panels ▾");
 }
 
 #[test]
@@ -907,28 +932,79 @@ fn pending_changes_keep_their_place_in_a_full_footer() {
     v.model.set_cell(1, 1, "changed").unwrap();
     v.frame(vec![]);
     v.frame(vec![]);
-    let save = v.find_all_exact("Save")[0];
-    let refresh = v.find_all_exact("Refresh")[0];
-    assert!(save.x < refresh.x, "the pill ends before the buttons start: {save:?} {refresh:?}");
-    // In a narrow footer the buttons give way, not the pill.
-    sized(&mut v, 700.0);
-    let save = v.find_all_exact("Save")[0];
-    let refresh = v.find_all_exact("Refresh")[0];
-    assert!(save.x < refresh.x, "{save:?} {refresh:?}");
+    // Option A 3-zone order: Refresh (left) < Add row < Discard < Save (center) < Panels (right).
+    let (refresh, add, discard, save, panels) =
+        (v.find_all_exact("Refresh")[0], v.find_all_exact("Add row")[0], v.find_all_exact("Discard")[0], v.find_all_exact("Save")[0], v.find_all_exact("Panels")[0]);
+    assert!(
+        refresh.x < add.x && add.x < discard.x && discard.x < save.x && save.x < panels.x,
+        "3-zone order preserved at full width: {refresh:?} {add:?} {discard:?} {save:?} {panels:?}"
+    );
+    // At narrow (Essential) width, Cancel/Save stay visible while dirty and nothing overlaps.
+    sized(&mut v, 620.0);
+    let (refresh, add, discard, save, panels) =
+        (v.find_all_exact("Refresh")[0], v.find_all_exact("Add row")[0], v.find_all_exact("Discard")[0], v.find_all_exact("Save")[0], v.find_all_exact("Panels")[0]);
+    assert!(refresh.x < add.x && add.x < discard.x && discard.x < save.x && save.x < panels.x, "Essential order: {refresh:?} {add:?} {discard:?} {save:?} {panels:?}");
     assert_eq!(on_footer(&v), vec!["Refresh", "Add row"]);
-    // The narrowest: the pill gets shorter and the views move into ⋯, and nothing overlaps.
-    sized(&mut v, 460.0);
-    let (discard, save, refresh) = (v.find_all_exact("Discard")[0], v.find_all_exact("Save")[0], v.find_all_exact("Refresh")[0]);
-    assert!(discard.x > 80.0, "the status stays beside the pill: {discard:?}");
-    assert!(discard.x < save.x && save.x < refresh.x, "{discard:?} {save:?} {refresh:?}");
-    assert!(v.find_all_exact("Grid").is_empty(), "the views are not on the bar");
-    let more = v.find_all_exact("More result actions")[0];
+
+    // Ultra-narrow (Minimal): views move into ⋯, active Cancel/Save stay visible with zero overlap.
+    sized(&mut v, 440.0);
+    let (refresh, add, discard, save, more) =
+        (v.find_all_exact("Refresh")[0], v.find_all_exact("Add row")[0], v.find_all_exact("Discard")[0], v.find_all_exact("Save")[0], v.find_all_exact("More result actions")[0]);
+    assert!(refresh.x < add.x && add.x < discard.x && discard.x < save.x && save.x < more.x, "Minimal order: {refresh:?} {add:?} {discard:?} {save:?} {more:?}");
+    assert!(v.find_all_exact("Grid").is_empty(), "the views are in ⋯ at Minimal");
     v.click(more);
     v.frame(vec![]);
     let text = v.find_all_exact("Text").first().copied().expect("the views in ⋯");
     v.click(text);
     v.frame(vec![]);
     assert_eq!(v.state.toolbar.view, ResultViewKind::Text);
+}
+
+#[test]
+fn footer_handles_save_readonly_and_floating_notice_cleanly() {
+    // 1) Mixed edits (add + edit + delete): Save emits SaveChanges, no +1/~1/-1 delta chips.
+    let mut v = Viewer::new(editable_model(4));
+    v.model.add_row(Some(0)).unwrap();
+    v.model.set_cell(1, 1, "edited").unwrap();
+    v.model.delete_rows(&[3]).unwrap();
+    v.frame(vec![]);
+    assert!(v.find("+1").is_none() && v.find("~1").is_none() && v.find("-1").is_none(), "no delta chips");
+    let save = v.find_all_exact("Save")[0];
+    v.click(save);
+    assert!(v.actions.iter().any(|a| matches!(a, GridAction::SaveChanges)), "Save emits SaveChanges");
+
+    // 2) Saving state: shows Saving… and disables row edits.
+    v.model.set_saving(true);
+    v.frame(vec![]);
+    assert!(!v.find_all_exact("Saving…").is_empty(), "Saving… shown while save runs");
+    let rows_before = v.model.row_count();
+    let add = v.find_all_exact("Add row")[0];
+    v.click(add);
+    v.frame(vec![]);
+    assert_eq!(v.model.row_count(), rows_before, "Add row disabled during save");
+
+    // 3) Read-only table without unique key: shows clickable Virtual key… pill action.
+    let mut ro = editable_model(2);
+    ro.set_editability(Err(crate::model::ReadOnlyReason::NoKey));
+    let mut v = Viewer::new(ro);
+    v.frame(vec![]);
+    assert!(v.find_all_exact("Add row").is_empty(), "no row edit buttons when read-only");
+    let vkey = v.find_all_exact("Virtual key…").first().copied().expect("Virtual key… action on read-only pill");
+    v.click(vkey);
+    assert!(v.actions.iter().any(|a| matches!(a, GridAction::DefineVirtualKey { .. })), "clicking Virtual key… emits DefineVirtualKey");
+
+    // 4) Non-error notice floats cleanly above the footer and dismisses via its × button.
+    let mut v = Viewer::new(editable_model(4));
+    v.state.grid.select_cell(1, 1);
+    v.frame(vec![]);
+    let delete = v.find_all_exact("Delete")[0];
+    v.click(delete);
+    v.frame(vec![]);
+    assert!(v.find("1 row marked for deletion").is_some(), "floating notice visible");
+    let dismiss = v.find_all_exact("Dismiss").first().copied().expect("floating notice Dismiss button");
+    v.click(dismiss);
+    v.frame(vec![]);
+    assert!(v.state.toolbar.notice.is_none(), "Dismiss clears floating notice");
 }
 
 #[test]
@@ -969,15 +1045,21 @@ fn row_footer_actions_work_in_record_view_and_keyboard_nav_preserves_copy() {
     v.state.toolbar.view = ResultViewKind::Record;
     v.frame(vec![]);
     v.frame(vec![]);
-    // Add row before works immediately from Record view (no need to switch back to Grid).
-    let before = v.find_all_exact("Add row before")[0];
+    // Add row before works immediately from Record view via the + Add ▾ split menu.
+    let more_rows = v.find_all_exact("More row actions")[0];
+    v.click(more_rows);
+    v.frame(vec![]);
+    let before = v.find("Add row before").expect("Add row before in + Add ▾ menu");
     v.click(before);
     v.frame(vec![]);
     assert_eq!(v.model.row_count(), 6, "Add row before inserted immediately in Record view");
-    // Copy from row below works immediately from Record view.
+    // Copy from row below works immediately from Record view via the + Add ▾ split menu.
     v.state.grid.select_cell(2, 1);
     v.frame(vec![]);
-    let copy_below = v.find_all_exact("Copy from row below")[0];
+    let more_rows = v.find_all_exact("More row actions")[0];
+    v.click(more_rows);
+    v.frame(vec![]);
+    let copy_below = v.find("Copy from row below").expect("Copy from row below in + Add ▾ menu");
     v.click(copy_below);
     v.frame(vec![]);
     assert_eq!(v.model.cell(2, 1), v.model.cell(3, 1), "Copy from row below ran immediately in Record view");

@@ -2081,7 +2081,17 @@ fn boolean_check_boxes_in_the_record_view() {
     h.query_all_by_role(egui::accesskit::Role::CheckBox).find(|n| n.accesskit_node().label().as_deref() == Some("false")).unwrap().click();
     frames(&mut h, 3);
     assert!(boxes(&h).iter().any(|l| l == "true"), "toggled: {:?}", boxes(&h));
-    assert!(has(&h, "1 change"), "one pending change: {:?}", labels(&h));
+    let pending = h
+        .state_mut()
+        .dock
+        .find_active_focused()
+        .and_then(|(_, tab)| tab.view.as_any_mut().downcast_mut::<ternarygrid_app::tabs::object::ObjectEditorTab>())
+        .and_then(|o| o.data.as_mut())
+        .and_then(|d| d.panel.as_ref())
+        .map(|p| p.model.pending_counts().total());
+    assert_eq!(pending, Some(1), "one pending change recorded in model");
+    let save = h.query_all_by_label("Save").next().expect("Save button on footer");
+    assert!(!save.accesskit_node().is_disabled(), "Save becomes enabled after toggling checkbox");
     assert!(h.query_all_by_role(egui::accesskit::Role::TextInput).all(|n| n.accesskit_node().value().as_deref() != Some("false")), "no text field for a boolean");
 }
 

@@ -169,6 +169,53 @@ fn fetch_error_bar(ui: &mut Ui, message: &str) -> bool {
     close
 }
 
+/// Non-error notice pill floating centered just above the result footer so it never shifts
+/// or crowds toolbar actions. Returns `true` when dismissed.
+fn floating_notice_toast(ui: &Ui, id: Id, central: egui::Rect, message: &str) -> bool {
+    use egui::{CornerRadius, Margin, RichText, Shadow, Stroke};
+    use egui_phosphor::regular as icon;
+    if central.width() < 120.0 || central.height() < 48.0 {
+        return false;
+    }
+    let pal = ternarygrid_ui::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    let max_w = (central.width() - 32.0).clamp(120.0, 440.0);
+    let text_w = ui.painter().layout_no_wrap(message.to_string(), egui::FontId::proportional(12.0), egui::Color32::PLACEHOLDER).size().x;
+    let pill_w = (12.0 + 14.0 + 6.0 + text_w + 8.0 + 20.0 + 8.0).min(max_w);
+    let pill_h = 30.0;
+    let left = (central.center().x - pill_w / 2.0).max(central.left() + 8.0);
+    let top = (central.bottom() - pill_h - 10.0).max(central.top() + 8.0);
+    let mut dismissed = false;
+    let shadow = Shadow { offset: [0, 3], blur: 10, spread: 0, color: egui::Color32::from_black_alpha(if dark { 110 } else { 32 }) };
+    let inner_w = (pill_w - 17.0).max(80.0);
+    let label_w = (inner_w - 14.0 - 6.0 - 6.0 - 20.0).max(40.0);
+    egui::Area::new(id.with("result_notice_toast")).order(egui::Order::Foreground).movable(false).fixed_pos(egui::pos2(left, top)).default_size(egui::vec2(pill_w, pill_h)).show(
+        ui.ctx(),
+        |ui| {
+            Frame::new()
+                .fill(pal.surface)
+                .stroke(Stroke::new(1.0, pal.border_strong))
+                .corner_radius(CornerRadius::same(15))
+                .shadow(shadow)
+                .inner_margin(Margin { left: 11, right: 6, top: 4, bottom: 4 })
+                .show(ui, |ui| {
+                    ui.set_width(inner_w);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(icon::INFO).font(ternarygrid_ui::style::icon_font(14.0)).color(pal.accent_text));
+                        ui.allocate_ui_with_layout(egui::vec2(label_w, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(RichText::new(message).size(12.0).color(pal.text)).truncate()).on_hover_text(message);
+                        });
+                        if ternarygrid_ui::kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 20.0).clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+        },
+    );
+    dismissed
+}
+
 fn panel_icon(p: PanelKind) -> &'static str {
     crate::toolbar::PANELS.iter().find(|(k, ..)| *k == p).map_or("", |(_, icon, _, _)| icon)
 }
@@ -243,9 +290,9 @@ impl<'a> ResultViewer<'a> {
         let mut grid_response = None;
         let pal = ternarygrid_ui::pal(ui);
         // The filter bar: 46 high, 16 / 12 at the sides, a line under it; the footer a line
-        // and 48 under it (single-row icon + micro-label toolbar), 14 / 10 at the sides.
+        // and 36 under it (single-row Option A precision bar), 10 at the sides.
         let filter_frame = Frame::new().inner_margin(egui::Margin { left: 16, right: 12, top: 8, bottom: 9 }).fill(pal.canvas);
-        let footer_frame = Frame::new().inner_margin(egui::Margin { left: 14, right: 10, top: 5, bottom: 5 }).fill(pal.canvas);
+        let footer_frame = Frame::new().inner_margin(egui::Margin { left: 10, right: 10, top: 4, bottom: 4 }).fill(pal.canvas);
         let line = egui::Stroke::new(1.0, pal.border);
         let bar = Panel::top(id.with("filter_bar")).frame(filter_frame).show_separator_line(false).show(ui, |ui| {
             actions.extend(FilterBar::new(model, &mut state.grid, &mut state.toolbar).dialect(options.dialect.clone()).show(ui));
@@ -352,7 +399,7 @@ impl<'a> ResultViewer<'a> {
             // The line left of the panels.
             ui.painter().vline(side.response.rect.left() + 0.5, side.response.rect.y_range(), egui::Stroke::new(1.0, pal.border));
         }
-        egui::CentralPanel::no_frame().show(ui, |ui| {
+        let central = egui::CentralPanel::no_frame().show(ui, |ui| {
             if let Some(e) = model.fetch.error.clone().filter(|e| state.toolbar.dismissed_fetch_error.as_ref() != Some(e))
                 && fetch_error_bar(ui, &e)
             {
@@ -377,6 +424,12 @@ impl<'a> ResultViewer<'a> {
                 ResultViewKind::Xml => DocumentView::new(model, &state.grid, options, &mut state.documents, DocumentKind::Xml).show(ui),
             }
         });
+        // Non-error notices float cleanly above the footer so toolbar controls never shift or crush.
+        if let Some((message, false)) = state.toolbar.notice.clone()
+            && floating_notice_toast(ui, id, central.response.rect, &message)
+        {
+            state.toolbar.notice = None;
+        }
         // Filter box requests of the column menu.
         let some = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
         let mut defaults = Vec::new();

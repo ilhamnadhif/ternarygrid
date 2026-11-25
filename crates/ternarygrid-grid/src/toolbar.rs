@@ -3,7 +3,7 @@
 use crate::grid::{self, DataGridState, DataMode, GridAction, PanelKind, ResultViewKind};
 use crate::model::ResultModel;
 use crate::view::{ClientFilter, SortKey};
-use egui::{Button, Key, Popup, PopupCloseBehavior, RichText, Ui};
+use egui::{Key, Popup, PopupCloseBehavior, RichText, Ui};
 use egui_phosphor::regular as icon;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -622,16 +622,16 @@ fn prefixed_field(
     resp
 }
 
-/// The footer of a result, the same under a table's data and the SQL editor: on the left the
-/// status ("400 rows · more available · 286 ms", the time the rows were read in its tooltip)
-/// and Fetch next; on the right the pending changes with Discard and Save (only while there
-/// are some), then every result action grouped by function:
-/// Data/Fetch (Refresh, Auto refresh, Fetch all, Total count) |
-/// Row editing (Add, Add before, Duplicate, Copy above, Copy below, Delete, Undo) |
-/// Views & Visuals (Grid, Text, Record, JSON, XML, Chart, Spatial) |
-/// Export |
-/// Panels (Value, Metadata, Grouping, Calc, References, Hide/show).
-/// What does not fit in a narrow pane moves cleanly into ⋯ ([`FooterFit`]).
+/// The footer of a result, shared by table data tabs and the SQL editor (Option A · Pola A1):
+/// - **Left**: Refresh split-button (`↻ ▾` with Auto refresh menu & active amber badge),
+///   Fetch next pill (`↓ +200`) or red `Stop` button, Fetch all & Total count (at full width),
+///   single-line tabular status (`400 rows · 162 ms`, read time in tooltip), and error chip.
+/// - **Center**: Row editing (`+ Add ▾` split-button, Duplicate, Delete, Undo) and fixed-anchor
+///   `Cancel` / `Save` commit cluster (warm-amber pill when dirty, spinner when saving, no delta
+///   counter clutter), or a warm-amber read-only pill with optional `Virtual key…` shortcut.
+/// - **Right**: Compact segmented view switcher (`Grid | Rec | Text | JSON ▾` with Chart & Spatial
+///   inside the menu), `Export`, `Panels ▾` dropdown with active count badge, and `⋯` overflow
+///   containing strictly the actions that did not fit on the bar ([`FooterFit`]).
 pub struct ResultToolbar<'a> {
     model: &'a mut ResultModel,
     grid: &'a mut DataGridState,
@@ -670,298 +670,180 @@ impl<'a> ResultToolbar<'a> {
     /// Show it. Returns actions for the application.
     pub fn show(self, ui: &mut Ui) -> Vec<GridAction> {
         let ResultToolbar { model, grid, state, fetch_size, can_edit, editing } = self;
-        let can_edit = can_edit && model.is_editable();
+        let editable = model.is_editable();
+        let saving = model.is_saving();
+        let can_edit = can_edit && editable && !saving;
         let mut actions = Vec::new();
         auto_refresh_tick(ui, model, grid.is_editing() || editing, state, &mut actions);
         let p = ternarygrid_ui::pal(ui);
         let ic = ternarygrid_ui::style::icons(ui);
+        let fetching = model.fetch.fetching;
+        let has_more = model.fetch.has_more;
+        let pending = model.pending_counts().total();
+        let show_stop = model.fetch.fetching_for().is_some_and(|r| r >= crate::grid::CANCEL_AFTER);
+        if let Some(running) = model.fetch.fetching_for()
+            && running < crate::grid::CANCEL_AFTER
+        {
+            ui.ctx().request_repaint_after(crate::grid::CANCEL_AFTER - running);
+        }
+        let auto_text = state.auto_refresh_secs.map(auto_label);
+        let fetch_label = if fetch_size > 0 { trf("Fetch next {}", &[&fetch_size]) } else { tr("Fetch more").to_string() };
+        let fetch_short = if fetch_size > 0 { format!("+{fetch_size}") } else { tr("More").to_string() };
+        let read_only = if editable { None } else { model.read_only_reason().cloned() };
+        let dismissed_err = model.fetch.error.as_ref().filter(|e| state.dismissed_fetch_error.as_ref() == Some(*e)).cloned();
+        let read_at = model.fetch.fetched_at.map(|at| fetched_at_text(at, chrono::Local::now()));
+        let panels_visible = !state.open_panels.is_empty() && !state.panels_hidden;
+        let panel_badge = panels_visible.then_some(state.open_panels.len()).filter(|n| *n > 0);
+        let metrics = FooterMetrics {
+            editable,
+            saving,
+            pending,
+            show_stop,
+            has_more,
+            auto_text: auto_text.as_deref(),
+            fetch_short: &fetch_short,
+            read_only_label: read_only.as_ref().map(|r| r.short_label()),
+            read_only_vkey: read_only.as_ref().is_some_and(|r| r.virtual_key_helps()),
+            has_err_chip: dismissed_err.is_some(),
+            view: state.view,
+            panel_badge,
+        };
         ui.horizontal(|ui| {
             ui.set_min_height(FOOTER_H);
-            ui.spacing_mut().item_spacing.x = 8.0;
-            // --- left: stacked two-line status (row count · elapsed on top; Fetch next / active
-            // auto-refresh / stop / error link below) so all five action groups stay comfortable
-            // on a single pro-toolbar row.
-            let fetching = model.fetch.fetching;
-            let fetch_label = if fetch_size > 0 { trf("Fetch next {}", &[&fetch_size]) } else { tr("Fetch more").to_string() };
-            let fetch_link_w = ui.painter().layout_no_wrap(fetch_label.clone(), ternarygrid_ui::style::medium(ui.ctx(), 11.0), egui::Color32::PLACEHOLDER).size().x + 6.0;
-            // What the right side needs at minimum: the read-only note, the pending changes
-            // (shorter when the status would not fit beside them), and the fewest buttons.
-            let auto_short = state.auto_refresh_secs.map(auto_label).unwrap_or_else(|| tr("Auto").to_string());
-            let min_widths = footer_widths(ui, model.is_editable(), false, &auto_short);
-            let locked_w = if model.is_editable() { 0.0 } else { model.read_only_reason().map_or(0.0, |r| read_only_width(ui, r.short_label()) + FOOTER_GAP) };
-            let full = ui.available_width();
-            let needed = min_widths.minimal + locked_w + FOOTER_SIDE_GAP;
-            let pending = model.pending_counts().total();
-            let pending_label = if pending == 1 { tr("1 change").to_string() } else { trf("{} changes", &[&pending]) };
-            // First check status width to decide whether pending pill should be compact.
-            let preview_status = status_job(ui, model, state, &p, false);
-            let preview_status_w = ui.painter().layout_job(preview_status).size().x;
-            let pill_short = full - needed - preview_status_w < pending_width(ui, &pending_label, false) + FOOTER_GAP;
-            let pending_label = if pill_short { pending.to_string() } else { pending_label };
-            let pending_w = if pending > 0 { pending_width(ui, &pending_label, pill_short) + FOOTER_GAP } else { 0.0 };
-            let free = (full - needed - pending_w).max(60.0);
-            let fetch_shown = model.fetch.has_more && free >= fetch_link_w;
-            let fetch_overflow = model.fetch.has_more && !fetch_shown;
-            let widths = footer_widths(ui, model.is_editable(), fetch_overflow, &auto_short);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let full_avail = ui.available_width();
+            let (fit, fetch_shown) = choose_footer_plan(ui, full_avail, &metrics);
+            let fetch_overflow = has_more && !show_stop && !fetch_shown;
+            let has_more_menu = fit < FooterFit::Full || fetch_overflow;
             let job = status_job(ui, model, state, &p, fetch_shown);
-            let read_at = model.fetch.fetched_at.map(|at| fetched_at_text(at, chrono::Local::now()));
-            let dismissed_err = model.fetch.error.as_ref().filter(|e| state.dismissed_fetch_error.as_ref() == Some(*e)).cloned();
-            let show_stop = model.fetch.fetching_for().is_some_and(|r| r >= crate::grid::CANCEL_AFTER);
-            if let Some(running) = model.fetch.fetching_for()
-                && running < crate::grid::CANCEL_AFTER
-            {
-                ui.ctx().request_repaint_after(crate::grid::CANCEL_AFTER - running);
+            let status_desired_w = ui.painter().layout_job(job.clone()).size().x.ceil() + 2.0;
+            let layout = measure_plan(ui, fit, fetch_shown, &metrics);
+            let fixed_non_status = layout.left_ctrl_w + layout.err_chip_w + layout.center_w + layout.right_w + layout.zone_gaps;
+            let status_avail = (full_avail - fixed_non_status).max(20.0);
+            let status_w = status_desired_w.min(status_avail);
+            let extra = (full_avail - fixed_non_status - status_w).max(0.0);
+            let (left_spring, right_spring) = if layout.center_w > 0.0 {
+                let l = (extra * 0.45).floor();
+                (l, extra - l)
+            } else {
+                (0.0, extra)
+            };
+
+            // -----------------------------------------------------------------
+            // Zone 1 (Left): Refresh ▾ | Stop / ↓ +200 | ⤓ # | Status | Error
+            // -----------------------------------------------------------------
+            let (refresh_resp, auto_resp) = refresh_split_button(ui, auto_text.as_deref(), model.has_changes() || fetching);
+            if refresh_resp.clicked() {
+                actions.push(GridAction::Refresh);
             }
-            // Only show the compact left auto-refresh chip when the right-side Auto button
-            // overflowed into More (avoids duplicating the control at full width).
-            let line1_w = ui.painter().layout_job(job.clone()).size().x;
-            let base_line2_w = (if fetch_shown { fetch_link_w } else { 0.0 }) + if show_stop { 26.0 } else { 0.0 } + if dismissed_err.is_some() { 116.0 } else { 0.0 };
-            let base_left_w = line1_w.max(base_line2_w).min(free);
-            let pre_fit = FooterFit::choose(full - base_left_w - pending_w - locked_w - FOOTER_SIDE_GAP, &widths);
-            let show_left_auto = state.auto_refresh_secs.is_some() && pre_fit < FooterFit::All;
-            let has_line2 = fetch_shown || show_left_auto || show_stop || dismissed_err.is_some();
-            // Compute the tight width of the left status stack so `room` on the right is accurate.
-            let mut line2_w = 0.0_f32;
-            if fetch_shown {
-                line2_w += fetch_link_w;
-            }
-            if show_left_auto && let Some(s) = state.auto_refresh_secs {
-                let chip_w = ui.painter().layout_no_wrap(auto_label(s), ternarygrid_ui::style::medium(ui.ctx(), 10.5), egui::Color32::PLACEHOLDER).size().x + 24.0;
-                line2_w += if line2_w > 0.0 { 6.0 + chip_w } else { chip_w };
-            }
+            Popup::menu(&auto_resp).id(ui.id().with("auto_refresh_btn")).align(egui::RectAlign::TOP_START).show(|ui| auto_refresh_menu(ui, state, &mut actions));
+
             if show_stop {
-                line2_w += if line2_w > 0.0 { 6.0 + 20.0 } else { 20.0 };
-            }
-            if dismissed_err.is_some() {
-                line2_w += if line2_w > 0.0 { 6.0 + 110.0 } else { 110.0 };
-            }
-            let status_col_w = line1_w.max(line2_w).min(free);
-            ui.allocate_ui_with_layout(egui::vec2(status_col_w, FOOTER_H), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                if !has_line2 {
-                    ui.add_space(((FOOTER_H - 16.0) / 2.0).max(0.0));
-                } else {
-                    ui.add_space(2.0);
+                ui.add_space(CTRL_GAP);
+                if stop_button(ui).clicked() {
+                    actions.push(GridAction::CancelFetch);
                 }
+            } else if fetch_shown {
+                ui.add_space(CTRL_GAP);
+                let resp = ui.add_enabled_ui(!fetching, |ui| fetch_pill(ui, &fetch_short, &fetch_label, tr("Fetch next page"))).inner;
+                if resp.clicked() {
+                    actions.push(GridAction::FetchMore);
+                }
+            }
+
+            if fit >= FooterFit::Full {
+                ui.add_space(CTRL_GAP);
+                let fetch_all_tip = if has_more { tr("Fetch all rows") } else { tr("All rows fetched") };
+                let fetch_all =
+                    ui.add_enabled_ui(has_more && !fetching, |ui| toolbar_icon_btn(ui, icon::DOWNLOAD_SIMPLE, tr("Fetch all rows"), fetch_all_tip, false, None, false)).inner;
+                if fetch_all.clicked() {
+                    actions.push(GridAction::FetchAll);
+                }
+                ui.add_space(INNER_GAP);
+                let count = ui
+                    .add_enabled_ui(!model.fetch.counting, |ui| {
+                        toolbar_icon_btn(ui, icon::HASH, tr("Calculate total row count"), tr("Calculate total row count"), false, None, false)
+                    })
+                    .inner;
+                if count.clicked() {
+                    actions.push(GridAction::CountTotal);
+                }
+            }
+
+            ui.add_space(STATUS_GAP);
+            ui.allocate_ui_with_layout(egui::vec2(status_w, FOOTER_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let status = ui.add(egui::Label::new(job).selectable(false).truncate());
                 if let Some(at) = read_at {
                     status.on_hover_text(trf("Read at {}", &[&at]));
                 }
-                if has_line2 {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        if fetch_shown {
-                            let r = ui.add_enabled_ui(!fetching, |ui| compact_link(ui, &fetch_label)).inner.on_hover_text(tr("Fetch next page"));
-                            if r.clicked() {
-                                actions.push(GridAction::FetchMore);
-                            }
-                        }
-                        if show_left_auto && let Some(s) = state.auto_refresh_secs {
-                            let r = compact_auto_chip(ui, &auto_label(s)).on_hover_text(tr("Auto refresh"));
-                            Popup::menu(&r).id(ui.id().with("auto_refresh_chip")).show(|ui| auto_refresh_menu(ui, state, &mut actions));
-                        }
-                        if show_stop {
-                            let stop = Button::new(RichText::new(icon::STOP_CIRCLE).size(12.5).color(ic.red)).frame_when_inactive(false);
-                            if ui.add(stop).on_hover_text(tr("Stop the query")).clicked() {
-                                actions.push(GridAction::CancelFetch);
-                            }
-                        }
-                        if let Some(e) = &dismissed_err {
-                            let label = egui::Label::new(RichText::new(format!("{} {}", icon::WARNING_CIRCLE, tr("The fetch failed"))).size(11.0).color(ic.red))
-                                .sense(egui::Sense::click())
-                                .truncate();
-                            if ui.add(label).on_hover_text(e.as_str()).clicked() {
-                                state.dismissed_fetch_error = None;
-                            }
-                        }
-                    });
-                }
             });
-            // --- right, right to left: grouped by function — Panels, Export, Views & Visuals,
-            // Row edits, Refresh & Fetch, and Pending changes. Every button displays its semantic
-            // coloured icon on top with a concise label underneath (Opsi 1).
-            let room = ui.max_rect().right() - ui.min_rect().right() - pending_w - locked_w - FOOTER_SIDE_GAP;
-            let fit = FooterFit::choose(room, &widths);
-            let has_more_menu = fit < FooterFit::All || fetch_overflow;
-            let footer = MoreContext { fit, can_edit, fetch: fetch_overflow.then_some(fetch_label) };
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = FOOTER_GAP;
-                let divide = |ui: &mut Ui| {
-                    if fit >= FooterFit::Core {
-                        footer_divider(ui);
+
+            if let Some(e) = &dismissed_err {
+                ui.add_space(CTRL_GAP);
+                if fetch_error_chip(ui, e).clicked() {
+                    state.dismissed_fetch_error = None;
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // Zone 2 (Center): Row editing + Fixed Cancel/Save, or Read-only
+            // -----------------------------------------------------------------
+            if layout.center_w > 0.0 {
+                ui.add_space(ZONE_GAP + left_spring);
+                if editable {
+                    row_edit_and_commit_zone(ui, fit, can_edit, saving, pending, model, grid, &mut actions);
+                } else if let Some(r) = &read_only {
+                    let show_vkey = r.virtual_key_helps() && fit >= FooterFit::Essential;
+                    if read_only_pill(ui, r.short_label(), &r.message(), show_vkey) {
+                        actions.push(GridAction::DefineVirtualKey { table: crate::model::source_table(model.columns()).ok() });
                     }
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // Zone 3 (Right): View switcher | Export | Panels ▾ | ⋯
+            // -----------------------------------------------------------------
+            ui.add_space(ZONE_GAP + right_spring);
+            let mut right_started = false;
+            if fit >= FooterFit::Essential {
+                right_started = true;
+                view_switcher(ui, fit, state, &mut actions);
+            }
+            if fit >= FooterFit::Core {
+                if right_started {
+                    ui.add_space(GROUP_GAP);
+                }
+                right_started = true;
+                let clicked = if fit >= FooterFit::Full {
+                    toolbar_text_btn(ui, Some(icon::EXPORT), tr("Export"), tr("Export"), tr("Export…"), false, None).clicked()
+                } else {
+                    toolbar_icon_btn(ui, icon::EXPORT, tr("Export"), tr("Export…"), false, None, false).clicked()
                 };
-                // Group 5: Side panels (Value, Meta, Group, Calc, Refs) + Panel toggle (and More if overflow).
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = FOOTER_INNER_GAP;
-                    let visible = !state.open_panels.is_empty() && !state.panels_hidden;
-                    if panel_toggle(ui, visible).clicked() {
-                        if visible {
-                            state.panels_hidden = true;
-                        } else {
-                            if state.open_panels.is_empty() {
-                                state.set_panel_open(PanelKind::Value, true);
-                            }
-                            state.panels_hidden = false;
-                        }
-                    }
-                    if has_more_menu {
-                        let w = kit::labeled_icon_width(ui, tr("More"));
-                        let more =
-                            kit::labeled_icon_button(ui, icon::DOTS_THREE, tr("More"), tr("More result actions"), tr("More result actions"), false, w, FOOTER_H, None, false);
-                        Popup::menu(&more).id(ui.id().with("result_more")).align(egui::RectAlign::TOP_END).show(|ui| more_menu(ui, model, grid, state, &footer, &mut actions));
-                    }
-                    if fit >= FooterFit::All {
-                        for (kind, glyph, name, short) in PANELS.iter().rev() {
-                            let on = state.is_panel_open(*kind) && !state.panels_hidden;
-                            let tip = trf("{} panel", &[&tr(name)]);
-                            let w = kit::labeled_icon_width(ui, tr(short));
-                            if kit::labeled_icon_button(ui, glyph, tr(short), tr(name), &tip, on, w, FOOTER_H, Some(panel_color(ui, *kind)), false).clicked() {
-                                actions.push(GridAction::TogglePanel(*kind));
-                            }
-                        }
-                    }
-                });
-                divide(ui);
-                // Group 4: Export.
-                if fit >= FooterFit::Core {
-                    let w = kit::labeled_icon_width(ui, tr("Export"));
-                    if kit::labeled_icon_button(ui, icon::EXPORT, tr("Export"), tr("Export"), tr("Export…"), false, w, FOOTER_H, Some(ic.teal), false).clicked() {
-                        actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
-                    }
-                    divide(ui);
+                if clicked {
+                    actions.push(GridAction::Export { rows: None, columns: grid.visible_columns() });
                 }
-                // Group 3: Views (Grid, Text, Rec, JSON, XML) + Visualizations (Chart, Map).
-                if fit >= FooterFit::Essential {
-                    ui.scope(|ui| {
-                        ui.spacing_mut().item_spacing.x = FOOTER_INNER_GAP;
-                        if fit >= FooterFit::All {
-                            let map_w = kit::labeled_icon_width(ui, tr("Map"));
-                            if kit::labeled_icon_button(ui, icon::MAP_TRIFOLD, tr("Map"), tr("Spatial view"), tr("Spatial view"), false, map_w, FOOTER_H, Some(ic.purple), false)
-                                .clicked()
-                            {
-                                actions.push(GridAction::ShowSpatial);
-                            }
-                            let chart_w = kit::labeled_icon_width(ui, tr("Chart"));
-                            if kit::labeled_icon_button(ui, icon::CHART_BAR, tr("Chart"), tr("Chart"), tr("Chart"), false, chart_w, FOOTER_H, Some(ic.green), false).clicked() {
-                                actions.push(GridAction::ShowChart);
-                            }
-                            ui.add_space(2.0);
-                        }
-                        if let Some(kind) = view_switch(ui, state.view)
-                            && state.view != kind
-                        {
-                            state.view = kind;
-                            actions.push(GridAction::SwitchView(kind));
-                        }
-                    });
-                }
-                // Group 2: Row editing (or read-only indicator).
-                if model.is_editable() {
-                    divide(ui);
-                    ui.scope(|ui| {
-                        ui.spacing_mut().item_spacing.x = FOOTER_INNER_GAP;
-                        row_buttons(ui, fit, can_edit, model, grid, &mut actions);
-                    });
-                } else if let Some(r) = model.read_only_reason() {
-                    // 🔒 No unique key, 5 apart, the reason in the tooltip.
-                    ui.scope(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        ui.label(RichText::new(r.short_label()).size(12.0).color(p.warn)).on_hover_text(r.message());
-                        ui.label(RichText::new(icon::LOCK_SIMPLE).font(ternarygrid_ui::style::icon_font(13.0)).color(p.warn));
-                    });
-                }
-                divide(ui);
-                // Group 1: Data & Fetch (Refresh, Auto, All, Count).
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = FOOTER_INNER_GAP;
-                    if fit >= FooterFit::All {
-                        let count_w = kit::labeled_icon_width(ui, tr("Count"));
-                        let count_resp = ui
-                            .add_enabled_ui(!model.fetch.counting, |ui| {
-                                kit::labeled_icon_button(
-                                    ui,
-                                    icon::HASH,
-                                    tr("Count"),
-                                    tr("Calculate total row count"),
-                                    tr("Calculate total row count"),
-                                    false,
-                                    count_w,
-                                    FOOTER_H,
-                                    Some(ic.purple),
-                                    false,
-                                )
-                            })
-                            .inner;
-                        if count_resp.clicked() {
-                            actions.push(GridAction::CountTotal);
-                        }
-                        let fetch_all_tip = if model.fetch.has_more { tr("Fetch all rows") } else { tr("All rows fetched") };
-                        let all_w = kit::labeled_icon_width(ui, tr("All"));
-                        let fetch_all_resp = ui
-                            .add_enabled_ui(model.fetch.has_more && !fetching, |ui| {
-                                kit::labeled_icon_button(ui, icon::DOWNLOAD_SIMPLE, tr("All"), tr("Fetch all rows"), fetch_all_tip, false, all_w, FOOTER_H, Some(ic.teal), false)
-                            })
-                            .inner;
-                        if fetch_all_resp.clicked() {
-                            actions.push(GridAction::FetchAll);
-                        }
-                        let auto_tip = match state.auto_refresh_secs {
-                            Some(s) => format!("{} ({})", tr("Auto refresh"), auto_label(s)),
-                            None => tr("Auto refresh").to_string(),
-                        };
-                        let auto_w = kit::labeled_icon_width(ui, &auto_short);
-                        let auto_resp = kit::labeled_icon_button(
-                            ui,
-                            icon::TIMER,
-                            &auto_short,
-                            tr("Auto refresh"),
-                            &auto_tip,
-                            state.auto_refresh_secs.is_some(),
-                            auto_w,
-                            FOOTER_H,
-                            Some(ic.amber),
-                            false,
-                        );
-                        Popup::menu(&auto_resp).id(ui.id().with("auto_refresh_btn")).align(egui::RectAlign::TOP_START).show(|ui| auto_refresh_menu(ui, state, &mut actions));
-                    }
-                    let refresh_tip = format!("{} ({})", tr("Refresh"), keys("⌘R", "Ctrl+R"));
-                    let ref_w = kit::labeled_icon_width(ui, tr("Refresh"));
-                    if kit::labeled_icon_button(ui, icon::ARROW_CLOCKWISE, tr("Refresh"), tr("Refresh"), &refresh_tip, false, ref_w, FOOTER_H, Some(ic.blue), false).clicked() {
-                        actions.push(GridAction::Refresh);
-                    }
-                });
-                // --- pending changes: only while there are some (Cmd+S saves, as always)
-                if pending > 0 {
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(pending_w - FOOTER_GAP, 32.0), egui::Sense::hover());
-                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
-                    let saving = model.is_saving();
-                    match child.add_enabled_ui(!saving, |ui| pending_pill(ui, &pending_label, pending, pill_short)).inner {
-                        Some(true) => actions.push(grid::save_action(model)),
-                        Some(false) => {
-                            // Discard drops them at once: they are only pending.
-                            model.discard_changes();
-                            actions.push(GridAction::ChangesDiscarded);
-                        }
-                        None => {}
-                    }
-                }
-                // Errors open a pop-up (the result viewer); other messages show here.
-                if let Some((message, _)) = state.notice.clone().filter(|(_, error)| !error) {
-                    if kit::icon_button_ex(ui, icon::X, tr("Dismiss"), false, 20.0).clicked() {
-                        state.notice = None;
-                    }
-                    ui.add(egui::Label::new(RichText::new(format!("{} {message}", icon::INFO)).size(12.0).color(p.text)).truncate()).on_hover_text(message);
-                }
-            });
+            }
+            if right_started {
+                ui.add_space(GROUP_GAP);
+            }
+            let panels_resp = panels_dropdown_button(ui, fit >= FooterFit::Core, panels_visible, panel_badge);
+            Popup::menu(&panels_resp).id(ui.id().with("panels_menu")).align(egui::RectAlign::TOP_END).show(|ui| panels_dropdown_menu(ui, state, panels_visible, &mut actions));
+
+            if has_more_menu {
+                ui.add_space(CTRL_GAP);
+                let footer = MoreContext { fit, can_edit, fetch: fetch_overflow.then_some(fetch_label) };
+                let more = toolbar_icon_btn(ui, icon::DOTS_THREE, tr("More result actions"), tr("More result actions"), false, None, false);
+                Popup::menu(&more).id(ui.id().with("result_more")).align(egui::RectAlign::TOP_END).show(|ui| more_menu(ui, model, grid, state, &footer, &mut actions));
+            }
+            let _ = ic;
         });
         actions
     }
 }
 
-/// Build the first-line status job (`400 rows · 171 ms` — omitting the redundant "more available"
-/// when the clickable "Fetch next …" link is rendered directly underneath on line 2).
-fn status_job(ui: &Ui, model: &ResultModel, state: &ToolbarState, p: &ternarygrid_ui::Palette, fetch_below: bool) -> egui::text::LayoutJob {
+/// Build the single-line status job (`400 rows · 162 ms` — omitting the redundant "more available"
+/// when the clickable `↓ +200` fetch pill is shown directly beside it).
+fn status_job(ui: &Ui, model: &ResultModel, state: &ToolbarState, p: &ternarygrid_ui::Palette, fetch_shown: bool) -> egui::text::LayoutJob {
     let rows = crate::format::group_thousands(&model.row_count().to_string());
     let rows = trf("{} rows", &[&rows]);
     let mut rest = String::new();
@@ -971,7 +853,7 @@ fn status_job(ui: &Ui, model: &ResultModel, state: &ToolbarState, p: &ternarygri
     if model.fetch.fetching {
         rest.push_str(" · ");
         rest.push_str(tr("fetching…"));
-    } else if model.fetch.has_more && !fetch_below {
+    } else if model.fetch.has_more && !fetch_shown {
         rest.push_str(" · ");
         rest.push_str(tr("more available"));
     }
@@ -987,7 +869,7 @@ fn status_job(ui: &Ui, model: &ResultModel, state: &ToolbarState, p: &ternarygri
     }
     if state.auto_refresh_secs.is_some() && (model.has_changes() || model.fetch.fetching) {
         rest.push_str(" · ");
-        rest.push_str(tr("auto refresh paused"));
+        rest.push_str(tr("auto paused"));
     }
     let mut job = egui::text::LayoutJob::default();
     let size = 12.0;
@@ -996,78 +878,33 @@ fn status_job(ui: &Ui, model: &ResultModel, state: &ToolbarState, p: &ternarygri
     job
 }
 
-/// Compact clickable link shown on line 2 under the status (`Fetch next 200`).
-fn compact_link(ui: &mut Ui, text: &str) -> egui::Response {
-    let p = ternarygrid_ui::pal(ui);
-    let font = ternarygrid_ui::style::medium(ui.ctx(), 11.0);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::PLACEHOLDER);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 4.0, 16.0), egui::Sense::click());
-    let enabled = ui.is_enabled();
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
-    if ui.is_rect_visible(rect) {
-        let hovered = enabled && resp.hovered();
-        let color = if enabled { p.accent_text } else { p.accent_text.gamma_multiply(0.45) };
-        if hovered {
-            ui.painter().rect_filled(rect.expand2(egui::vec2(2.0, 0.0)), 4, p.accent_soft);
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        ui.painter().galley(egui::pos2(rect.left() + 1.0, rect.center().y - galley.size().y / 2.0), galley, color);
-    }
-    resp
-}
-
-/// Compact auto-refresh interval pill on line 2 (`⏱ 10 s`).
-fn compact_auto_chip(ui: &mut Ui, text: &str) -> egui::Response {
-    let ic = ternarygrid_ui::style::icons(ui);
-    let dark = ui.visuals().dark_mode;
-    let font = ternarygrid_ui::style::medium(ui.ctx(), 10.5);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::PLACEHOLDER);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 22.0, 16.0), egui::Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
-    if ui.is_rect_visible(rect) {
-        let fill = ternarygrid_ui::style::soft(
-            ic.amber,
-            if resp.hovered() {
-                0.24
-            } else if dark {
-                0.16
-            } else {
-                0.12
-            },
-        );
-        ui.painter().rect_filled(rect, 4, fill);
-        ui.painter().text(egui::pos2(rect.left() + 9.0, rect.center().y), egui::Align2::CENTER_CENTER, icon::TIMER, ternarygrid_ui::style::icon_font(11.0), ic.amber);
-        ui.painter().galley(egui::pos2(rect.left() + 17.0, rect.center().y - galley.size().y / 2.0), galley, ic.amber);
-    }
-    resp
-}
-
-/// How much of the footer's buttons fit beside the status and the pending changes, fewest first.
+/// Responsive tiers of the single-row Option A footer, narrowest to widest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum FooterFit {
-    /// Refresh, Add row, More and Panel toggle; views and the rest in More.
+    /// Ultra-narrow: Refresh split, status, compact `+ ▾` (+ active Cancel/Save if dirty), compact Panels, `⋯`.
     Minimal,
-    /// Refresh, Add row, all 5 views, More and Panel toggle; the rest in More.
+    /// Narrow: adds compact 3-segment view switcher (`Grid | Rec | ▾`) and `+ Add ▾` label.
     Essential,
-    /// Core groups (Refresh, core row edits, 5 views, Export, More and Panel toggle).
+    /// Medium: adds Dup/Del/Undo, fixed Cancel/Save anchor, Export icon, full `Panels ▾` label, Text segment.
     Core,
-    /// Every functional group surfaced directly on the single-row footer bar.
-    All,
+    /// Wide: adds Fetch all, Total count, Export label, `JSON ▾` label, Save shortcut hint; no `⋯` unless fetch overflows.
+    Full,
 }
 
-/// What the footer's right side needs at each [`FooterFit`].
+/// What the footer needs at each [`FooterFit`] (used for testing monotonic tier selection).
+#[cfg(test)]
 struct FooterWidths {
-    minimal: f32,
     essential: f32,
     core: f32,
-    all: f32,
+    full: f32,
 }
 
 impl FooterFit {
-    /// The widest that fits in `room`.
+    /// The widest tier that fits in `room`.
+    #[cfg(test)]
     fn choose(room: f32, widths: &FooterWidths) -> Self {
-        if room >= widths.all {
-            FooterFit::All
+        if room >= widths.full {
+            FooterFit::Full
         } else if room >= widths.core {
             FooterFit::Core
         } else if room >= widths.essential {
@@ -1078,132 +915,814 @@ impl FooterFit {
     }
 }
 
-/// What More adds to its own actions, depending on what the bar shows.
+/// Inputs that determine exact widths across all tiers.
+struct FooterMetrics<'a> {
+    editable: bool,
+    saving: bool,
+    pending: usize,
+    show_stop: bool,
+    has_more: bool,
+    auto_text: Option<&'a str>,
+    fetch_short: &'a str,
+    read_only_label: Option<&'a str>,
+    read_only_vkey: bool,
+    has_err_chip: bool,
+    view: ResultViewKind,
+    panel_badge: Option<usize>,
+}
+
+/// Exact pixel budget of a concrete `(FooterFit, fetch_shown)` plan.
+struct FooterPlanLayout {
+    left_ctrl_w: f32,
+    err_chip_w: f32,
+    center_w: f32,
+    right_w: f32,
+    zone_gaps: f32,
+}
+
+/// What `⋯` overflow adds, strictly limited to what is not currently on the bar.
 struct MoreContext {
     fit: FooterFit,
     can_edit: bool,
-    /// "Fetch next 200", when it is not on the bar.
+    /// `"Fetch next 200"` / `"Fetch more"` when it did not fit on the bar.
     fetch: Option<String>,
 }
 
-/// Gap between the footer's functional groups.
-const FOOTER_GAP: f32 = 3.0;
-/// Gap between the status and what follows it.
-const FOOTER_SIDE_GAP: f32 = 10.0;
-/// Gap between buttons within the same functional group.
-const FOOTER_INNER_GAP: f32 = 1.0;
+/// Height of the single-row Option A footer content area (`28 + 4 + 4 = 36 px` total bar height).
+const FOOTER_H: f32 = 28.0;
+/// Standard control height inside the footer.
+const CTRL_H: f32 = 26.0;
+/// Width of square icon controls inside the footer.
+const ICON_BTN_W: f32 = 26.0;
+/// Gap between adjacent icons inside one tight group.
+const INNER_GAP: f32 = 2.0;
+/// Gap between related controls inside a zone.
+const CTRL_GAP: f32 = 4.0;
+/// Gap between the left controls and the status label.
+const STATUS_GAP: f32 = 8.0;
+/// Gap between separate groups inside the right zone.
+const GROUP_GAP: f32 = 6.0;
+/// Minimum horizontal separation between Left, Center and Right zones.
+const ZONE_GAP: f32 = 10.0;
 /// Width of [`footer_divider`].
-const DIVIDER_W: f32 = 5.0;
-/// Width of each view segment inside [`view_switch`].
-const VIEW_SEG_W: f32 = 29.0;
-/// Width of the 5-view segmented pill: five segments 1 apart, 2 padding around them.
-const VIEW_SWITCH_W: f32 = 5.0 * VIEW_SEG_W + 4.0 * 1.0 + 2.0 * 2.0;
+const DIVIDER_W: f32 = 9.0;
+/// Minimum width reserved for the status text when picking a [`FooterFit`] tier.
+const STATUS_MIN_W: f32 = 76.0;
 
-/// Tall subtle vertical hairline separating functional groups on the Opsi 1 footer.
+fn measure_text(ui: &Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::PLACEHOLDER).size().x
+}
+
+fn measure_plan(ui: &Ui, fit: FooterFit, fetch_shown: bool, m: &FooterMetrics<'_>) -> FooterPlanLayout {
+    let mut left_ctrl_w = refresh_split_width(ui, m.auto_text);
+    if m.show_stop {
+        left_ctrl_w += CTRL_GAP + stop_button_width(ui);
+    } else if fetch_shown {
+        left_ctrl_w += CTRL_GAP + fetch_pill_width(ui, m.fetch_short);
+    }
+    if fit >= FooterFit::Full {
+        left_ctrl_w += CTRL_GAP + ICON_BTN_W + INNER_GAP + ICON_BTN_W;
+    }
+    left_ctrl_w += STATUS_GAP;
+
+    let err_chip_w = if m.has_err_chip { CTRL_GAP + fetch_error_chip_width(ui) } else { 0.0 };
+
+    let center_w = if m.editable {
+        let mut w = add_split_width(ui, fit >= FooterFit::Essential);
+        if fit >= FooterFit::Core {
+            w += CTRL_GAP + ICON_BTN_W + INNER_GAP + ICON_BTN_W + INNER_GAP + ICON_BTN_W;
+        }
+        let show_commit = fit >= FooterFit::Core || m.pending > 0 || m.saving;
+        if show_commit {
+            let show_keys = fit >= FooterFit::Full;
+            w += CTRL_GAP + DIVIDER_W + CTRL_GAP + commit_cluster_width(ui, m.saving, show_keys);
+        }
+        w
+    } else if let Some(lbl) = m.read_only_label {
+        read_only_pill_width(ui, lbl, m.read_only_vkey && fit >= FooterFit::Essential)
+    } else {
+        0.0
+    };
+
+    let fetch_overflow = m.has_more && !m.show_stop && !fetch_shown;
+    let has_more_menu = fit < FooterFit::Full || fetch_overflow;
+    let mut right_w = 0.0;
+    let mut right_groups = 0usize;
+    if fit >= FooterFit::Essential {
+        right_w += view_switcher_width(ui, fit, m.view);
+        right_groups += 1;
+    }
+    if fit >= FooterFit::Core {
+        if right_groups > 0 {
+            right_w += GROUP_GAP;
+        }
+        right_w += if fit >= FooterFit::Full { export_label_btn_width(ui) } else { ICON_BTN_W };
+        right_groups += 1;
+    }
+    if right_groups > 0 {
+        right_w += GROUP_GAP;
+    }
+    right_w += panels_dropdown_width(ui, fit >= FooterFit::Core, m.panel_badge);
+    if has_more_menu {
+        right_w += CTRL_GAP + ICON_BTN_W;
+    }
+
+    let zone_gaps = if center_w > 0.0 { 2.0 * ZONE_GAP } else { ZONE_GAP };
+    FooterPlanLayout { left_ctrl_w, err_chip_w, center_w, right_w, zone_gaps }
+}
+
+fn choose_footer_plan(ui: &Ui, avail: f32, m: &FooterMetrics<'_>) -> (FooterFit, bool) {
+    let want_fetch = m.has_more && !m.show_stop;
+    let fits = |fit: FooterFit, fetch_shown: bool| {
+        let l = measure_plan(ui, fit, fetch_shown, m);
+        l.left_ctrl_w + STATUS_MIN_W + l.err_chip_w + l.center_w + l.right_w + l.zone_gaps <= avail
+    };
+    if fits(FooterFit::Full, want_fetch) {
+        return (FooterFit::Full, want_fetch);
+    }
+    if fits(FooterFit::Core, want_fetch) {
+        return (FooterFit::Core, want_fetch);
+    }
+    if fits(FooterFit::Essential, want_fetch) {
+        return (FooterFit::Essential, want_fetch);
+    }
+    if want_fetch && fits(FooterFit::Essential, false) {
+        return (FooterFit::Essential, false);
+    }
+    (FooterFit::Minimal, false)
+}
+
+/// Subtle vertical divider inside the footer.
 fn footer_divider(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(DIVIDER_W, 24.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(DIVIDER_W, 18.0), egui::Sense::hover());
     ui.painter().vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, ternarygrid_ui::pal(ui).border_strong));
 }
 
-/// Total width of a list of labeled buttons inside a single group.
-fn labeled_group_width(ui: &Ui, labels: &[&str]) -> f32 {
-    if labels.is_empty() {
-        return 0.0;
+/// Return a painter that undoes egui's disabled opacity fade so custom disabled states stay legible.
+fn crisp_painter(ui: &Ui, enabled: bool) -> egui::Painter {
+    let mut painter = ui.painter().clone();
+    if !enabled {
+        painter.set_opacity((painter.opacity() / ui.visuals().disabled_alpha()).min(1.0));
     }
-    let sum: f32 = labels.iter().map(|l| kit::labeled_icon_width(ui, tr(l))).sum();
-    sum + (labels.len() - 1) as f32 * FOOTER_INNER_GAP
+    painter
 }
 
-/// The read-only note's width: 🔒 and the short reason, 5 apart.
-fn read_only_width(ui: &Ui, text: &str) -> f32 {
-    ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(12.0), egui::Color32::PLACEHOLDER).size().x + 5.0 + 13.0
-}
-
-/// The width of a row of `items`, each followed by the gap.
-fn row_width(items: &[f32]) -> f32 {
-    items.iter().map(|w| w + FOOTER_GAP).sum()
-}
-
-/// What the right side of the footer needs at each [`FooterFit`].
-fn footer_widths(ui: &Ui, editable: bool, fetch_overflow: bool, auto_short: &str) -> FooterWidths {
-    let d = DIVIDER_W;
-    let w_refresh = kit::labeled_icon_width(ui, tr("Refresh"));
-    let w_add = kit::labeled_icon_width(ui, tr("Add"));
-    let w_export = kit::labeled_icon_width(ui, tr("Export"));
-    let right_collapsed = labeled_group_width(ui, &["More", "Panel"]);
-    let minimal = if editable { row_width(&[right_collapsed, w_add, w_refresh]) } else { row_width(&[right_collapsed, w_refresh]) };
-    let essential = minimal + row_width(&[VIEW_SWITCH_W]);
-    let rows_core = labeled_group_width(ui, &["Add", "Dup", "Del", "Undo"]);
-    let core_common = row_width(&[right_collapsed, d, w_export, d, VIEW_SWITCH_W, d, w_refresh]);
-    let core = if editable { core_common + row_width(&[rows_core, d]) } else { core_common };
-    let mut panel_labels: Vec<&str> = PANELS.iter().map(|(_, _, _, short)| *short).collect();
-    if fetch_overflow {
-        panel_labels.push("More");
-    }
-    panel_labels.push("Panel");
-    let panels_all = labeled_group_width(ui, &panel_labels);
-    let visuals_w = labeled_group_width(ui, &["Chart", "Map"]);
-    let views_all = VIEW_SWITCH_W + 2.0 + FOOTER_INNER_GAP + visuals_w;
-    let data_all = w_refresh + kit::labeled_icon_width(ui, auto_short) + kit::labeled_icon_width(ui, tr("All")) + kit::labeled_icon_width(ui, tr("Count")) + 3.0 * FOOTER_INNER_GAP;
-    let rows_all = labeled_group_width(ui, &["Add", "Before", "Dup", "Above", "Below", "Del", "Undo"]);
-    let all_common = row_width(&[panels_all, d, w_export, d, views_all, d, data_all]);
-    let all = if editable { all_common + row_width(&[rows_all, d]) } else { all_common };
-    FooterWidths { minimal, essential, core, all }
-}
-
-/// A labeled icon button on the footer with enabled/disabled state and semantic icon colour.
-#[allow(clippy::too_many_arguments)]
-fn footer_btn(ui: &mut Ui, glyph: &str, short: &str, name: &str, tip: &str, color: egui::Color32, danger_hover: bool, enabled: bool) -> egui::Response {
-    let w = kit::labeled_icon_width(ui, short);
-    ui.add_enabled_ui(enabled, |ui| kit::labeled_icon_button(ui, glyph, short, name, tip, false, w, FOOTER_H, Some(color), danger_hover)).inner
-}
-
-/// The rows' buttons, right to left (rendered Left → Right as:
-/// Add, Before, Dup, Above, Below, Del, Undo).
-fn row_buttons(ui: &mut Ui, fit: FooterFit, can_edit: bool, model: &mut ResultModel, grid: &mut DataGridState, actions: &mut Vec<GridAction>) {
+/// Quiet neutral 26×26 icon button for the footer (with optional semantic icon color & danger hover).
+fn toolbar_icon_btn(ui: &mut Ui, glyph: &str, name: &str, tip: &str, on: bool, color: Option<egui::Color32>, danger_hover: bool) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
     let ic = ternarygrid_ui::style::icons(ui);
+    let dark = ui.visuals().dark_mode;
+    let enabled = ui.is_enabled();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON_BTN_W, CTRL_H), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, name));
+    let resp = if tip.is_empty() { resp } else { resp.on_hover_text(tip) };
+    if ui.is_rect_visible(rect) {
+        let hovered = enabled && resp.hovered();
+        let pressed = enabled && resp.is_pointer_button_down_on();
+        let painter = crisp_painter(ui, enabled);
+        let radius = egui::CornerRadius::same(ternarygrid_ui::style::RADIUS);
+        if on {
+            painter.rect_filled(rect, radius, p.accent_soft);
+            painter.rect_stroke(rect, radius, egui::Stroke::new(1.0, ternarygrid_ui::style::soft(p.accent_text, if dark { 0.35 } else { 0.25 })), egui::StrokeKind::Inside);
+        } else if pressed {
+            painter.rect_filled(rect, radius, p.subtle);
+        } else if hovered {
+            let hover_fill = if danger_hover { ternarygrid_ui::style::soft(ic.red, if dark { 0.16 } else { 0.11 }) } else { p.hover };
+            painter.rect_filled(rect, radius, hover_fill);
+        }
+        if resp.has_focus() {
+            painter.rect_stroke(rect, radius, egui::Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
+        }
+        let icon_color = if !enabled {
+            p.text_faint.gamma_multiply(if dark { 0.55 } else { 0.65 })
+        } else if on {
+            p.accent_text
+        } else if hovered && danger_hover {
+            ic.red
+        } else if let Some(c) = color {
+            c
+        } else if hovered {
+            p.text
+        } else {
+            p.text_muted
+        };
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, glyph, ternarygrid_ui::style::icon_font(14.0), icon_color);
+    }
+    resp
+}
+
+fn export_label_btn_width(ui: &Ui) -> f32 {
+    (8.0 + 14.0 + 5.0 + measure_text(ui, tr("Export"), ternarygrid_ui::style::medium(ui.ctx(), 12.0)) + 8.0).ceil()
+}
+
+/// Quiet icon+text button for the footer (e.g. `Export`).
+fn toolbar_text_btn(ui: &mut Ui, glyph: Option<&str>, text: &str, name: &str, tip: &str, on: bool, icon_tint: Option<egui::Color32>) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    let enabled = ui.is_enabled();
+    let galley = ui.painter().layout_no_wrap(text.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.0), egui::Color32::PLACEHOLDER);
+    let icon_w = if glyph.is_some() { 14.0 + 5.0 } else { 0.0 };
+    let width = (8.0 + icon_w + galley.size().x + 8.0).ceil();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, CTRL_H), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, name));
+    let resp = if tip.is_empty() { resp } else { resp.on_hover_text(tip) };
+    if ui.is_rect_visible(rect) {
+        let hovered = enabled && resp.hovered();
+        let pressed = enabled && resp.is_pointer_button_down_on();
+        let painter = crisp_painter(ui, enabled);
+        let radius = egui::CornerRadius::same(ternarygrid_ui::style::RADIUS);
+        if on {
+            painter.rect_filled(rect, radius, p.accent_soft);
+            painter.rect_stroke(rect, radius, egui::Stroke::new(1.0, ternarygrid_ui::style::soft(p.accent_text, if dark { 0.35 } else { 0.25 })), egui::StrokeKind::Inside);
+        } else if pressed {
+            painter.rect_filled(rect, radius, p.subtle);
+        } else if hovered {
+            painter.rect_filled(rect, radius, p.hover);
+        }
+        let fg = if !enabled {
+            p.text_faint
+        } else if on {
+            p.accent_text
+        } else if hovered {
+            p.text
+        } else {
+            p.text_muted
+        };
+        let mut x = rect.left() + 8.0;
+        if let Some(g) = glyph {
+            let ic_col = if !enabled { p.text_faint } else { icon_tint.unwrap_or(fg) };
+            painter.text(egui::pos2(x + 7.0, rect.center().y), egui::Align2::CENTER_CENTER, g, ternarygrid_ui::style::icon_font(14.0), ic_col);
+            x += 14.0 + 5.0;
+        }
+        painter.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, fg);
+    }
+    resp
+}
+
+// -----------------------------------------------------------------------------
+// Left Zone Widgets: Refresh ▾, Stop, ↓ +200, Error chip
+// -----------------------------------------------------------------------------
+
+fn refresh_split_width(ui: &Ui, auto_text: Option<&str>) -> f32 {
+    let main_w = match auto_text {
+        Some(t) => (8.0 + 13.0 + 4.0 + measure_text(ui, t, ternarygrid_ui::style::medium(ui.ctx(), 11.0)) + 6.0).ceil(),
+        None => ICON_BTN_W,
+    };
+    main_w + 16.0
+}
+
+/// Split button for Refresh (`↻`) + Auto refresh menu (`▾`). Turns amber when auto-refresh is active.
+fn refresh_split_button(ui: &mut Ui, auto_text: Option<&str>, paused: bool) -> (egui::Response, egui::Response) {
+    let p = ternarygrid_ui::pal(ui);
+    let ic = ternarygrid_ui::style::icons(ui);
+    let dark = ui.visuals().dark_mode;
+    let active = auto_text.is_some();
+    let total_w = refresh_split_width(ui, auto_text);
+    let main_w = total_w - 16.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, CTRL_H), egui::Sense::hover());
+    let main_rect = egui::Rect::from_min_size(rect.min, egui::vec2(main_w, CTRL_H));
+    let drop_rect = egui::Rect::from_min_size(egui::pos2(main_rect.right(), rect.top()), egui::vec2(16.0, CTRL_H));
+    let main_resp = ui.interact(main_rect, ui.id().with("refresh_main"), egui::Sense::click());
+    main_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("Refresh")));
+    let refresh_tip = format!("{} ({})", tr("Refresh"), keys("⌘R", "Ctrl+R"));
+    let main_resp = main_resp.on_hover_text(refresh_tip);
+
+    let drop_resp = ui.interact(drop_rect, ui.id().with("refresh_auto_drop"), egui::Sense::click());
+    drop_resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, tr("Auto refresh")));
+    let auto_tip = match auto_text {
+        Some(t) if paused => format!("{} ({t} — {})", tr("Auto refresh"), tr("paused while editing or fetching")),
+        Some(t) => format!("{} ({t})", tr("Auto refresh")),
+        None => tr("Auto refresh").to_string(),
+    };
+    let drop_resp = drop_resp.on_hover_text(auto_tip);
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let r = ternarygrid_ui::style::RADIUS;
+        let radius = egui::CornerRadius::same(r);
+        let any_hover = main_resp.hovered() || drop_resp.hovered();
+        if active {
+            let fill = ternarygrid_ui::style::soft(ic.amber, if dark { 0.16 } else { 0.12 });
+            let stroke = ternarygrid_ui::style::soft(ic.amber, if dark { 0.36 } else { 0.28 });
+            painter.rect(rect, radius, fill, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+            let hover_fill = ternarygrid_ui::style::soft(ic.amber, if dark { 0.26 } else { 0.20 });
+            if main_resp.hovered() {
+                painter.rect_filled(main_rect, egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 }, hover_fill);
+            } else if drop_resp.hovered() {
+                painter.rect_filled(drop_rect, egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }, hover_fill);
+            }
+            painter.vline(main_rect.right(), (rect.top() + 4.0)..=(rect.bottom() - 4.0), egui::Stroke::new(1.0, stroke));
+        } else {
+            if main_resp.is_pointer_button_down_on() {
+                painter.rect_filled(main_rect, egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 }, p.subtle);
+            } else if main_resp.hovered() {
+                painter.rect_filled(main_rect, egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 }, p.hover);
+            }
+            if drop_resp.is_pointer_button_down_on() {
+                painter.rect_filled(drop_rect, egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }, p.subtle);
+            } else if drop_resp.hovered() {
+                painter.rect_filled(drop_rect, egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }, p.hover);
+            }
+            if any_hover {
+                painter.rect_stroke(rect, radius, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+                painter.vline(main_rect.right(), (rect.top() + 4.0)..=(rect.bottom() - 4.0), egui::Stroke::new(1.0, p.border));
+            }
+        }
+        let main_color = if active {
+            ic.amber
+        } else if main_resp.hovered() {
+            p.text
+        } else {
+            p.text_muted
+        };
+        if let Some(t) = auto_text {
+            let mut x = main_rect.left() + 8.0;
+            painter.text(egui::pos2(x + 6.5, main_rect.center().y), egui::Align2::CENTER_CENTER, icon::ARROW_CLOCKWISE, ternarygrid_ui::style::icon_font(13.5), main_color);
+            x += 13.0 + 4.0;
+            let g = painter.layout_no_wrap(t.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.0), main_color);
+            painter.galley(egui::pos2(x, main_rect.center().y - g.size().y / 2.0), g, main_color);
+        } else {
+            painter.text(main_rect.center(), egui::Align2::CENTER_CENTER, icon::ARROW_CLOCKWISE, ternarygrid_ui::style::icon_font(14.0), main_color);
+        }
+        let drop_color = if active {
+            ic.amber
+        } else if drop_resp.hovered() {
+            p.text
+        } else {
+            p.text_faint
+        };
+        painter.text(drop_rect.center(), egui::Align2::CENTER_CENTER, icon::CARET_DOWN, ternarygrid_ui::style::icon_font(9.5), drop_color);
+    }
+    (main_resp, drop_resp)
+}
+
+fn stop_button_width(ui: &Ui) -> f32 {
+    (8.0 + 13.0 + 5.0 + measure_text(ui, tr("Stop"), ternarygrid_ui::style::medium(ui.ctx(), 11.5)) + 8.0).ceil()
+}
+
+/// Red Stop pill shown when a fetch has been running longer than `CANCEL_AFTER`.
+fn stop_button(ui: &mut Ui) -> egui::Response {
+    let ic = ternarygrid_ui::style::icons(ui);
+    let dark = ui.visuals().dark_mode;
+    let w = stop_button_width(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, CTRL_H), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("Stop the query")));
+    let resp = resp.on_hover_text(tr("Stop the query"));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let fill = ternarygrid_ui::style::soft(
+            ic.red,
+            if resp.hovered() {
+                if dark { 0.28 } else { 0.20 }
+            } else if dark {
+                0.17
+            } else {
+                0.11
+            },
+        );
+        let stroke = ternarygrid_ui::style::soft(ic.red, if dark { 0.42 } else { 0.30 });
+        painter.rect(rect, ternarygrid_ui::style::RADIUS, fill, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        let mut x = rect.left() + 8.0;
+        painter.text(egui::pos2(x + 6.5, rect.center().y), egui::Align2::CENTER_CENTER, icon::STOP_CIRCLE, ternarygrid_ui::style::icon_font(13.0), ic.red);
+        x += 13.0 + 5.0;
+        let g = painter.layout_no_wrap(tr("Stop").to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.5), ic.red);
+        painter.galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, ic.red);
+    }
+    resp
+}
+
+fn fetch_pill_width(ui: &Ui, short_text: &str) -> f32 {
+    (7.0 + 12.0 + 4.0 + measure_text(ui, short_text, ternarygrid_ui::style::medium(ui.ctx(), 11.5)) + 8.0).ceil()
+}
+
+/// Teal accent-soft fetch pill (`↓ +200` / `↓ More`). Accessible label stays `"Fetch next 200"` / `"Fetch more"`.
+fn fetch_pill(ui: &mut Ui, short_text: &str, accessible_name: &str, tip: &str) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    let enabled = ui.is_enabled();
+    let w = fetch_pill_width(ui, short_text);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, accessible_name));
+    let resp = resp.on_hover_text(tip);
+    if ui.is_rect_visible(rect) {
+        let hovered = enabled && resp.hovered();
+        let painter = crisp_painter(ui, enabled);
+        let fill = if !enabled {
+            p.subtle
+        } else if hovered {
+            ternarygrid_ui::style::soft(p.accent, if dark { 0.30 } else { 0.20 })
+        } else {
+            ternarygrid_ui::style::soft(p.accent, if dark { 0.18 } else { 0.11 })
+        };
+        let stroke = if enabled { egui::Stroke::new(1.0, ternarygrid_ui::style::soft(p.accent_text, if dark { 0.34 } else { 0.24 })) } else { egui::Stroke::NONE };
+        painter.rect(rect, ternarygrid_ui::style::RADIUS, fill, stroke, egui::StrokeKind::Inside);
+        let fg = if enabled { p.accent_text } else { p.text_faint };
+        let mut x = rect.left() + 7.0;
+        painter.text(egui::pos2(x + 6.0, rect.center().y), egui::Align2::CENTER_CENTER, icon::ARROW_DOWN, ternarygrid_ui::style::icon_font(12.0), fg);
+        x += 12.0 + 4.0;
+        let g = painter.layout_no_wrap(short_text.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.5), fg);
+        painter.galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, fg);
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    resp
+}
+
+fn fetch_error_chip_width(ui: &Ui) -> f32 {
+    (7.0 + 12.0 + 4.0 + measure_text(ui, tr("Fetch failed"), ternarygrid_ui::style::medium(ui.ctx(), 11.0)) + 7.0).ceil()
+}
+
+/// Compact red clickable chip to restore a dismissed fetch error banner.
+fn fetch_error_chip(ui: &mut Ui, full_error: &str) -> egui::Response {
+    let ic = ternarygrid_ui::style::icons(ui);
+    let dark = ui.visuals().dark_mode;
+    let w = fetch_error_chip_width(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("The fetch failed")));
+    let resp = resp.on_hover_text(full_error);
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let fill = ternarygrid_ui::style::soft(
+            ic.red,
+            if resp.hovered() {
+                if dark { 0.26 } else { 0.18 }
+            } else if dark {
+                0.15
+            } else {
+                0.10
+            },
+        );
+        let stroke = ternarygrid_ui::style::soft(ic.red, if dark { 0.35 } else { 0.25 });
+        painter.rect(rect, ternarygrid_ui::style::RADIUS, fill, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        let mut x = rect.left() + 7.0;
+        painter.text(egui::pos2(x + 6.0, rect.center().y), egui::Align2::CENTER_CENTER, icon::WARNING_CIRCLE, ternarygrid_ui::style::icon_font(12.0), ic.red);
+        x += 12.0 + 4.0;
+        let g = painter.layout_no_wrap(tr("Fetch failed").to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.0), ic.red);
+        painter.galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, ic.red);
+    }
+    resp
+}
+
+// -----------------------------------------------------------------------------
+// Center Zone Widgets: + Add ▾, Dup/Del/Undo, Fixed Cancel/Save, Read-only Pill
+// -----------------------------------------------------------------------------
+
+fn add_split_width(ui: &Ui, show_label: bool) -> f32 {
+    let main_w = if show_label { (8.0 + 13.0 + 5.0 + measure_text(ui, tr("Add"), ternarygrid_ui::style::medium(ui.ctx(), 12.0)) + 8.0).ceil() } else { ICON_BTN_W };
+    main_w + 16.0
+}
+
+/// `+ Add ▾` split button: main click inserts row after selection; chevron opens all row actions.
+fn add_split_button(ui: &mut Ui, show_label: bool, enabled: bool) -> (egui::Response, egui::Response) {
+    let p = ternarygrid_ui::pal(ui);
+    let ic = ternarygrid_ui::style::icons(ui);
+    let dark = ui.visuals().dark_mode;
+    let total_w = add_split_width(ui, show_label);
+    let main_w = total_w - 16.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, CTRL_H), egui::Sense::hover());
+    let main_rect = egui::Rect::from_min_size(rect.min, egui::vec2(main_w, CTRL_H));
+    let drop_rect = egui::Rect::from_min_size(egui::pos2(main_rect.right(), rect.top()), egui::vec2(16.0, CTRL_H));
+
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let main_resp = ui.interact(main_rect, ui.id().with("add_row_main"), sense);
+    main_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tr("Add row")));
+    let add_tip = if cfg!(target_os = "macos") { tr("Add a row after the selected one") } else { tr("Add a row after the selected one (Insert)") };
+    let main_resp = main_resp.on_hover_text(add_tip);
+
+    let drop_resp = ui.interact(drop_rect, ui.id().with("add_row_drop"), sense);
+    drop_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tr("More row actions")));
+    let drop_resp = drop_resp.on_hover_text(tr("More row actions"));
+
+    if ui.is_rect_visible(rect) {
+        let painter = crisp_painter(ui, enabled);
+        let r = ternarygrid_ui::style::RADIUS;
+        let radius = egui::CornerRadius::same(r);
+        let main_hover = enabled && main_resp.hovered();
+        let drop_hover = enabled && drop_resp.hovered();
+        let any_hover = main_hover || drop_hover;
+        if main_hover && main_resp.is_pointer_button_down_on() {
+            painter.rect_filled(main_rect, egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 }, p.subtle);
+        } else if main_hover {
+            painter.rect_filled(main_rect, egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 }, p.hover);
+        }
+        if drop_hover && drop_resp.is_pointer_button_down_on() {
+            painter.rect_filled(drop_rect, egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }, p.subtle);
+        } else if drop_hover {
+            painter.rect_filled(drop_rect, egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }, p.hover);
+        }
+        if any_hover {
+            painter.rect_stroke(rect, radius, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            painter.vline(main_rect.right(), (rect.top() + 4.0)..=(rect.bottom() - 4.0), egui::Stroke::new(1.0, p.border));
+        }
+        let plus_color = if !enabled { p.text_faint.gamma_multiply(if dark { 0.55 } else { 0.65 }) } else { ic.green };
+        let text_color = if !enabled {
+            p.text_faint.gamma_multiply(if dark { 0.55 } else { 0.65 })
+        } else if main_hover {
+            p.text
+        } else {
+            p.text_muted
+        };
+        if show_label {
+            let mut x = main_rect.left() + 8.0;
+            painter.text(egui::pos2(x + 6.5, main_rect.center().y), egui::Align2::CENTER_CENTER, icon::PLUS, ternarygrid_ui::style::icon_font(13.5), plus_color);
+            x += 13.0 + 5.0;
+            let g = painter.layout_no_wrap(tr("Add").to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.0), text_color);
+            painter.galley(egui::pos2(x, main_rect.center().y - g.size().y / 2.0), g, text_color);
+        } else {
+            painter.text(main_rect.center(), egui::Align2::CENTER_CENTER, icon::PLUS, ternarygrid_ui::style::icon_font(14.0), plus_color);
+        }
+        let caret_color = if !enabled {
+            p.text_faint.gamma_multiply(if dark { 0.55 } else { 0.65 })
+        } else if drop_hover {
+            p.text
+        } else {
+            p.text_faint
+        };
+        painter.text(drop_rect.center(), egui::Align2::CENTER_CENTER, icon::CARET_DOWN, ternarygrid_ui::style::icon_font(9.5), caret_color);
+    }
+    (main_resp, drop_resp)
+}
+
+/// Center zone for editable models: `+ Add ▾`, core row icons (`Dup`, `Del`, `Undo`), and fixed-anchor `Cancel` / `Save`.
+#[allow(clippy::too_many_arguments)]
+fn row_edit_and_commit_zone(
+    ui: &mut Ui,
+    fit: FooterFit,
+    can_edit: bool,
+    saving: bool,
+    pending: usize,
+    model: &mut ResultModel,
+    grid: &mut DataGridState,
+    actions: &mut Vec<GridAction>,
+) {
     let notify_error = |r: Result<usize, String>, actions: &mut Vec<GridAction>| {
         if let Err(message) = r {
             actions.push(GridAction::Notify { message, error: true });
         }
     };
     let selected = !grid.selection().is_empty();
-    if fit >= FooterFit::Core {
-        let undo_tip = format!("{} ({})", tr("Undo"), keys("⌘Z", "Ctrl+Z"));
-        if footer_btn(ui, icon::ARROW_U_UP_LEFT, tr("Undo"), tr("Undo"), &undo_tip, ic.amber, false, can_edit && model.can_undo()).clicked() {
-            model.undo();
-        }
-        let delete_tip = format!("{} ({})", tr("Delete selected rows"), keys("fn⌫", "Delete"));
-        if footer_btn(ui, icon::TRASH, tr("Del"), tr("Delete"), &delete_tip, ic.red, true, can_edit && selected).clicked() {
-            delete_rows(model, grid, actions);
-        }
-    }
-    if fit >= FooterFit::All {
-        let below_tip = format!("{} ({})", tr("Copy from row below"), keys("⌘⌥↓", "Ctrl+Alt+Down"));
-        if footer_btn(ui, icon::ARROW_FAT_LINE_UP, tr("Below"), tr("Copy from row below"), &below_tip, ic.amber, false, can_edit && selected).clicked() {
-            notify_error(grid::copy_from_adjacent(model, grid, false), actions);
-        }
-        let above_tip = format!("{} ({})", tr("Copy from row above"), keys("⌘⌥↑", "Ctrl+Alt+Up"));
-        if footer_btn(ui, icon::ARROW_FAT_LINE_DOWN, tr("Above"), tr("Copy from row above"), &above_tip, ic.amber, false, can_edit && selected).clicked() {
-            notify_error(grid::copy_from_adjacent(model, grid, true), actions);
-        }
-    }
-    if fit >= FooterFit::Core {
-        let duplicate_tip = format!("{} ({})", tr("Duplicate selected rows"), keys("⌘D", "Ctrl+D"));
-        if footer_btn(ui, icon::COPY, tr("Dup"), tr("Duplicate"), &duplicate_tip, ic.cyan, false, can_edit && selected).clicked() {
-            notify_error(grid::duplicate_selected(model, grid), actions);
-        }
-    }
-    if fit >= FooterFit::All {
-        let before_tip = if cfg!(target_os = "macos") { tr("Add row before").to_string() } else { format!("{} (Shift+Insert)", tr("Add row before")) };
-        if footer_btn(ui, icon::ROWS_PLUS_TOP, tr("Before"), tr("Add row before"), &before_tip, ic.teal, false, can_edit).clicked() {
-            notify_error(grid::add_row_before(model, grid), actions);
-        }
-    }
-    let add_tip = if cfg!(target_os = "macos") { tr("Add a row after the selected one") } else { tr("Add a row after the selected one (Insert)") };
-    if footer_btn(ui, icon::PLUS, tr("Add"), tr("Add row"), add_tip, ic.green, false, can_edit).clicked() {
+    let (add_resp, drop_resp) = add_split_button(ui, fit >= FooterFit::Essential, can_edit);
+    if can_edit && add_resp.clicked() {
         notify_error(grid::add_row(model, grid).map(|_| 0), actions);
     }
+    Popup::menu(&drop_resp).id(ui.id().with("row_actions_menu")).align(egui::RectAlign::TOP_START).show(|ui| {
+        kit::menu_look(ui, 240.0);
+        ui.add_enabled_ui(can_edit, |ui| {
+            if kit::menu_item(ui, Some(icon::PLUS), tr("Add row after"), keys("", "Insert")).clicked() {
+                notify_error(grid::add_row(model, grid).map(|_| 0), actions);
+                ui.close();
+            }
+            if kit::menu_item(ui, Some(icon::ROWS_PLUS_TOP), tr("Add row before"), keys("", "Shift+Insert")).clicked() {
+                notify_error(grid::add_row_before(model, grid), actions);
+                ui.close();
+            }
+            kit::menu_separator(ui);
+            if ui.add_enabled_ui(selected, |ui| kit::menu_item(ui, Some(icon::COPY), tr("Duplicate selected rows"), keys("⌘D", "Ctrl+D"))).inner.clicked() {
+                notify_error(grid::duplicate_selected(model, grid), actions);
+                ui.close();
+            }
+            if ui.add_enabled_ui(selected, |ui| kit::menu_item(ui, Some(icon::ARROW_FAT_LINE_DOWN), tr("Copy from row above"), keys("⌘⌥↑", "Ctrl+Alt+Up"))).inner.clicked() {
+                notify_error(grid::copy_from_adjacent(model, grid, true), actions);
+                ui.close();
+            }
+            if ui.add_enabled_ui(selected, |ui| kit::menu_item(ui, Some(icon::ARROW_FAT_LINE_UP), tr("Copy from row below"), keys("⌘⌥↓", "Ctrl+Alt+Down"))).inner.clicked() {
+                notify_error(grid::copy_from_adjacent(model, grid, false), actions);
+                ui.close();
+            }
+            if fit < FooterFit::Core {
+                kit::menu_separator(ui);
+                if ui.add_enabled_ui(model.can_undo(), |ui| kit::menu_item(ui, Some(icon::ARROW_U_UP_LEFT), tr("Undo"), keys("⌘Z", "Ctrl+Z"))).inner.clicked() {
+                    model.undo();
+                    ui.close();
+                }
+                if ui.add_enabled_ui(selected, |ui| kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete selected rows"), keys("fn⌫", "Delete"))).inner.clicked() {
+                    delete_rows(model, grid, actions);
+                    ui.close();
+                }
+            }
+        });
+    });
+
+    if fit >= FooterFit::Core {
+        ui.add_space(CTRL_GAP);
+        let dup_tip = format!("{} ({})", tr("Duplicate selected rows"), keys("⌘D", "Ctrl+D"));
+        if ui.add_enabled_ui(can_edit && selected, |ui| toolbar_icon_btn(ui, icon::COPY, tr("Duplicate"), &dup_tip, false, None, false)).inner.clicked() {
+            notify_error(grid::duplicate_selected(model, grid), actions);
+        }
+        ui.add_space(INNER_GAP);
+        let del_tip = format!("{} ({})", tr("Delete selected rows"), keys("fn⌫", "Delete"));
+        if ui.add_enabled_ui(can_edit && selected, |ui| toolbar_icon_btn(ui, icon::TRASH, tr("Delete"), &del_tip, false, None, true)).inner.clicked() {
+            delete_rows(model, grid, actions);
+        }
+        ui.add_space(INNER_GAP);
+        let undo_tip = format!("{} ({})", tr("Undo"), keys("⌘Z", "Ctrl+Z"));
+        if ui.add_enabled_ui(can_edit && model.can_undo(), |ui| toolbar_icon_btn(ui, icon::ARROW_U_UP_LEFT, tr("Undo"), &undo_tip, false, None, false)).inner.clicked() {
+            model.undo();
+        }
+    }
+
+    let show_commit = fit >= FooterFit::Core || pending > 0 || saving;
+    if show_commit {
+        ui.add_space(CTRL_GAP);
+        footer_divider(ui);
+        ui.add_space(CTRL_GAP);
+        let show_keys = fit >= FooterFit::Full;
+        match commit_cluster(ui, pending, saving, show_keys) {
+            Some(true) => actions.push(grid::save_action(model)),
+            Some(false) => {
+                model.discard_changes();
+                actions.push(GridAction::ChangesDiscarded);
+            }
+            None => {}
+        }
+    }
+}
+
+/// Width of the fixed-anchor Cancel / Save cluster (no `+1 ~2 -1` counters).
+fn commit_cluster_width(ui: &Ui, saving: bool, show_keys: bool) -> f32 {
+    let cancel_w = commit_cancel_width(ui);
+    let save_w = commit_save_width(ui, saving, show_keys);
+    3.0 + cancel_w + 4.0 + save_w + 3.0
+}
+
+fn commit_cancel_width(ui: &Ui) -> f32 {
+    (9.0 + measure_text(ui, tr("Cancel"), egui::FontId::proportional(12.0)) + 9.0).ceil()
+}
+
+fn commit_save_width(ui: &Ui, saving: bool, show_keys: bool) -> f32 {
+    let medium = ternarygrid_ui::style::medium(ui.ctx(), 12.0);
+    if saving {
+        (9.0 + 12.0 + 6.0 + measure_text(ui, tr("Saving…"), medium) + 10.0).ceil()
+    } else {
+        let keys_w = if show_keys { 6.0 + measure_text(ui, SAVE_KEYS, egui::FontId::proportional(10.5)) } else { 0.0 };
+        (9.0 + 13.0 + 5.0 + measure_text(ui, tr("Save"), medium) + keys_w + 10.0).ceil()
+    }
+}
+
+/// Fixed-anchor DBeaver-style Cancel / Save commit cluster (Pola A1, without `+1 ~2 -1` badges).
+/// Returns `Some(true)` on Save, `Some(false)` on Cancel/Discard.
+fn commit_cluster(ui: &mut Ui, pending: usize, saving: bool, show_keys: bool) -> Option<bool> {
+    let p = ternarygrid_ui::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    let dirty = pending > 0 && !saving;
+    let total_w = commit_cluster_width(ui, saving, show_keys);
+    let cancel_w = commit_cancel_width(ui);
+    let save_w = commit_save_width(ui, saving, show_keys);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, FOOTER_H), egui::Sense::hover());
+
+    if ui.is_rect_visible(rect) {
+        if dirty {
+            let modified = crate::theme::GridTheme::from_visuals(ui.visuals()).modified;
+            let border = ternarygrid_ui::style::soft(p.warn, if dark { 0.42 } else { 0.35 });
+            ui.painter().rect(rect, 7, modified, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+        } else if saving {
+            ui.painter().rect(rect, 7, p.subtle, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+        }
+    }
+
+    let btn_h = 22.0;
+    let top = rect.center().y - btn_h / 2.0;
+    let cancel_rect = egui::Rect::from_min_size(egui::pos2(rect.left() + 3.0, top), egui::vec2(cancel_w, btn_h));
+    let save_rect = egui::Rect::from_min_size(egui::pos2(cancel_rect.right() + 4.0, top), egui::vec2(save_w, btn_h));
+
+    let mut out = None;
+
+    // Cancel button (visual text "Cancel", accessible name "Discard" to avoid colliding with modal "Cancel").
+    let cancel_sense = if dirty { egui::Sense::click() } else { egui::Sense::hover() };
+    let cancel_resp = ui.interact(cancel_rect, ui.id().with("commit_cancel"), cancel_sense);
+    cancel_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, dirty, tr("Discard")));
+    let cancel_tip =
+        if dirty { ternarygrid_core::trn(pending, tr("Discard 1 pending change"), tr("Discard {} pending changes")) } else { tr("No pending changes to discard").to_string() };
+    let cancel_resp = cancel_resp.on_hover_text(cancel_tip);
+    if ui.is_rect_visible(cancel_rect) {
+        let hovered = dirty && cancel_resp.hovered();
+        let pressed = dirty && cancel_resp.is_pointer_button_down_on();
+        let fill = if pressed {
+            p.subtle
+        } else if hovered {
+            p.hover
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        if fill != egui::Color32::TRANSPARENT {
+            ui.painter().rect_filled(cancel_rect, 5, fill);
+        }
+        let fg = if dirty { p.text } else { p.text_faint.gamma_multiply(if dark { 0.58 } else { 0.68 }) };
+        let g = ui.painter().layout_no_wrap(tr("Cancel").to_string(), egui::FontId::proportional(12.0), fg);
+        ui.painter().galley(egui::pos2(cancel_rect.center().x - g.size().x / 2.0, cancel_rect.center().y - g.size().y / 2.0), g, fg);
+    }
+    if dirty && cancel_resp.clicked() {
+        out = Some(false);
+    }
+
+    // Save / Saving… button.
+    let save_sense = if dirty { egui::Sense::click() } else { egui::Sense::hover() };
+    let save_resp = ui.interact(save_rect, ui.id().with("commit_save"), save_sense);
+    let save_a11y = if saving { tr("Saving…") } else { tr("Save") };
+    save_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, dirty, save_a11y));
+    let save_tip = if saving {
+        tr("Saving pending changes…").to_string()
+    } else if dirty {
+        format!("{} ({SAVE_KEYS})", ternarygrid_core::trn(pending, tr("Save 1 pending change"), tr("Save {} pending changes")))
+    } else {
+        format!("{} ({SAVE_KEYS})", tr("No pending changes to save"))
+    };
+    let save_resp = save_resp.on_hover_text(save_tip);
+    if ui.is_rect_visible(save_rect) {
+        let hovered = dirty && save_resp.hovered();
+        let (fill, stroke, fg) = if saving {
+            (p.accent_soft, egui::Stroke::new(1.0, ternarygrid_ui::style::soft(p.accent_text, 0.30)), p.accent_text)
+        } else if dirty {
+            (if hovered { p.accent_hover } else { p.accent }, egui::Stroke::NONE, p.on_accent)
+        } else {
+            (p.subtle, egui::Stroke::new(1.0, p.border), p.text_faint.gamma_multiply(if dark { 0.65 } else { 0.72 }))
+        };
+        ui.painter().rect(save_rect, 5, fill, stroke, egui::StrokeKind::Inside);
+        if save_resp.has_focus() {
+            ui.painter().rect_stroke(save_rect.expand(1.5), 6, egui::Stroke::new(1.5, p.accent), egui::StrokeKind::Outside);
+        }
+        let mut x = save_rect.left() + 9.0;
+        if saving {
+            paint_mini_spinner(ui, egui::pos2(x + 6.0, save_rect.center().y), 5.0, fg);
+            x += 12.0 + 6.0;
+            let g = ui.painter().layout_no_wrap(tr("Saving…").to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.0), fg);
+            ui.painter().galley(egui::pos2(x, save_rect.center().y - g.size().y / 2.0), g, fg);
+        } else {
+            ui.painter().text(egui::pos2(x + 6.5, save_rect.center().y), egui::Align2::CENTER_CENTER, icon::FLOPPY_DISK, ternarygrid_ui::style::icon_font(13.0), fg);
+            x += 13.0 + 5.0;
+            let g = ui.painter().layout_no_wrap(tr("Save").to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.0), fg);
+            let gw = g.size().x;
+            ui.painter().galley(egui::pos2(x, save_rect.center().y - g.size().y / 2.0), g, fg);
+            if show_keys {
+                let kc = if dirty { fg.gamma_multiply(0.80) } else { fg.gamma_multiply(0.75) };
+                let kg = ui.painter().layout_no_wrap(SAVE_KEYS.to_string(), egui::FontId::proportional(10.5), kc);
+                ui.painter().galley(egui::pos2(x + gw + 6.0, save_rect.center().y - kg.size().y / 2.0), kg, kc);
+            }
+        }
+    }
+    if dirty && save_resp.clicked() {
+        out = Some(true);
+    }
+    out
+}
+
+/// Tiny rotating arc spinner painted only while a save is running (zero idle repaints).
+fn paint_mini_spinner(ui: &Ui, center: egui::Pos2, radius: f32, color: egui::Color32) {
+    let t = ui.input(|i| i.time) as f32;
+    let start = t * std::f32::consts::TAU * 1.15;
+    let sweep = std::f32::consts::TAU * 0.68;
+    let steps = 14usize;
+    let pts: Vec<egui::Pos2> = (0..=steps)
+        .map(|i| {
+            let a = start + sweep * (i as f32 / steps as f32);
+            egui::pos2(center.x + a.cos() * radius, center.y + a.sin() * radius)
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.6, color)));
+    ui.ctx().request_repaint();
+}
+
+fn read_only_pill_width(ui: &Ui, short_label: &str, show_vkey: bool) -> f32 {
+    let base = (8.0 + 13.0 + 5.0 + measure_text(ui, short_label, ternarygrid_ui::style::medium(ui.ctx(), 11.5)) + 8.0).ceil();
+    if show_vkey { base + 4.0 + 6.0 + 4.0 + measure_text(ui, tr("Virtual key…"), ternarygrid_ui::style::medium(ui.ctx(), 11.5)).ceil() + 2.0 } else { base }
+}
+
+/// Warm-amber read-only pill with optional clickable `Virtual key…` action. Returns true if clicked.
+fn read_only_pill(ui: &mut Ui, short_label: &str, reason_msg: &str, show_vkey: bool) -> bool {
+    let p = ternarygrid_ui::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    let total_w = read_only_pill_width(ui, short_label, show_vkey);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(total_w, 24.0), egui::Sense::hover());
+    let _ = resp.on_hover_text(reason_msg);
+    let painter = ui.painter();
+    let fill = ternarygrid_ui::style::soft(p.warn, if dark { 0.14 } else { 0.10 });
+    let stroke = ternarygrid_ui::style::soft(p.warn, if dark { 0.30 } else { 0.24 });
+    painter.rect(rect, ternarygrid_ui::style::RADIUS, fill, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    let mut x = rect.left() + 8.0;
+    painter.text(egui::pos2(x + 6.5, rect.center().y), egui::Align2::CENTER_CENTER, icon::LOCK_SIMPLE, ternarygrid_ui::style::icon_font(12.5), p.warn);
+    x += 13.0 + 5.0;
+    let lbl = painter.layout_no_wrap(short_label.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.5), p.warn);
+    let lbl_w = lbl.size().x;
+    painter.galley(egui::pos2(x, rect.center().y - lbl.size().y / 2.0), lbl, p.warn);
+    if !show_vkey {
+        return false;
+    }
+    x += lbl_w + 5.0;
+    painter.text(egui::pos2(x + 2.0, rect.center().y), egui::Align2::CENTER_CENTER, "·", egui::FontId::proportional(12.0), p.warn.gamma_multiply(0.7));
+    x += 8.0;
+    let vkey_text = tr("Virtual key…");
+    let vkey_g = painter.layout_no_wrap(vkey_text.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.5), p.accent_text);
+    let vkey_rect = egui::Rect::from_min_size(egui::pos2(x - 2.0, rect.top() + 2.0), egui::vec2(vkey_g.size().x + 4.0, rect.height() - 4.0));
+    let vkey_resp = ui.interact(vkey_rect, ui.id().with("ro_virtual_key"), egui::Sense::click());
+    vkey_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, vkey_text));
+    let vkey_resp = vkey_resp.on_hover_text(tr("Define a virtual key to edit this table"));
+    if vkey_resp.hovered() {
+        painter.rect_filled(vkey_rect, 4, p.accent_soft);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    painter.galley(egui::pos2(x, rect.center().y - vkey_g.size().y / 2.0), vkey_g, p.accent_text);
+    vkey_resp.clicked()
 }
 
 /// Mark the selected rows deleted and say how many (as the keys and the context menu do).
@@ -1214,50 +1733,9 @@ fn delete_rows(model: &mut ResultModel, grid: &mut DataGridState, actions: &mut 
     }
 }
 
-/// Height of the single-row Opsi 1 footer (icon + micro-label).
-const FOOTER_H: f32 = 38.0;
-
-/// The panels' toggle: a crisp right-sidebar glyph over the "Panel" micro-label.
-fn panel_toggle(ui: &mut Ui, on: bool) -> egui::Response {
-    let p = ternarygrid_ui::pal(ui);
-    let dark = ui.visuals().dark_mode;
-    let tip = if on { tr("Hide panels") } else { tr("Show panels") };
-    let short = tr("Panel");
-    let width = kit::labeled_icon_width(ui, short);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, FOOTER_H), egui::Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, tip));
-    let resp = resp.on_hover_text(tr("Value, metadata and statistics panels"));
-    let painter = ui.painter();
-    let radius = egui::CornerRadius::same(ternarygrid_ui::style::RADIUS);
-    if on {
-        painter.rect_filled(rect, radius, p.accent_soft);
-        painter.rect_stroke(rect, radius, egui::Stroke::new(1.0, ternarygrid_ui::style::soft(p.accent_text, if dark { 0.36 } else { 0.25 })), egui::StrokeKind::Inside);
-    } else if resp.hovered() {
-        painter.rect_filled(rect, radius, p.hover);
-    }
-    let icon_color = if on {
-        p.accent_text
-    } else if resp.hovered() {
-        p.text
-    } else {
-        p.text_muted
-    };
-    let label_color = if on {
-        p.accent_text
-    } else if resp.hovered() {
-        p.text
-    } else {
-        p.text_muted
-    };
-    let icon_center = egui::pos2(rect.center().x, rect.top() + (FOOTER_H * 0.34).round());
-    let s = 14.5 / 24.0;
-    let box_rect = egui::Rect::from_center_size(icon_center, egui::vec2(18.0 * s, 15.0 * s));
-    let stroke = egui::Stroke::new(1.2, icon_color);
-    painter.rect_stroke(box_rect, 2.0 * s, stroke, egui::StrokeKind::Middle);
-    painter.vline(box_rect.left() + 11.5 * s, box_rect.y_range(), stroke);
-    painter.text(egui::pos2(rect.center().x, rect.bottom() - 8.0), egui::Align2::CENTER_CENTER, short, ternarygrid_ui::style::medium(ui.ctx(), 9.5), label_color);
-    resp
-}
+// -----------------------------------------------------------------------------
+// Right Zone Widgets: Segmented View Switcher & Panels Dropdown
+// -----------------------------------------------------------------------------
 
 /// The views of the rows: kind, icon, full accessible name, concise label.
 const VIEWS: [(ResultViewKind, &str, &str, &str); 5] = [
@@ -1268,85 +1746,289 @@ const VIEWS: [(ResultViewKind, &str, &str, &str); 5] = [
     (ResultViewKind::Xml, icon::FILE_CODE, "XML", "XML"),
 ];
 
-fn view_color(ui: &Ui, kind: ResultViewKind) -> egui::Color32 {
-    let ic = ternarygrid_ui::style::icons(ui);
-    match kind {
-        ResultViewKind::Grid => ic.blue,
-        ResultViewKind::Text => ic.slate,
-        ResultViewKind::Record => ic.teal,
-        ResultViewKind::Json => ic.amber,
-        ResultViewKind::Xml => ic.orange,
+fn view_seg_labeled_w(ui: &Ui, label: &str) -> f32 {
+    (7.0 + 13.0 + 4.0 + measure_text(ui, label, ternarygrid_ui::style::medium(ui.ctx(), 11.5)) + 7.0).ceil()
+}
+
+fn view_extra_seg_w(ui: &Ui, fit: FooterFit) -> f32 {
+    if fit >= FooterFit::Full {
+        let max_lbl = measure_text(ui, "JSON", ternarygrid_ui::style::medium(ui.ctx(), 11.5)).max(measure_text(ui, "XML", ternarygrid_ui::style::medium(ui.ctx(), 11.5)));
+        (7.0 + 13.0 + 4.0 + max_lbl + 4.0 + 9.0 + 6.0).ceil()
+    } else if fit >= FooterFit::Core {
+        34.0
+    } else {
+        24.0
     }
 }
 
-/// The view switcher, one pill: all five views (Grid, Text, Rec, JSON, XML) with coloured icons
-/// on top and concise micro-labels below, the active view raised. Returns the view clicked.
-fn view_switch(ui: &mut Ui, current: ResultViewKind) -> Option<ResultViewKind> {
+fn view_switcher_width(ui: &Ui, fit: FooterFit, _current: ResultViewKind) -> f32 {
+    if fit < FooterFit::Essential {
+        return 0.0;
+    }
+    if fit == FooterFit::Essential {
+        // [▦ | ☰ | ▾]
+        return 2.0 + 26.0 + 1.0 + 26.0 + 1.0 + view_extra_seg_w(ui, fit) + 2.0;
+    }
+    let grid_w = view_seg_labeled_w(ui, tr("Grid"));
+    let rec_w = view_seg_labeled_w(ui, tr("Rec"));
+    let text_w = 26.0;
+    let extra_w = view_extra_seg_w(ui, fit);
+    2.0 + grid_w + 1.0 + rec_w + 1.0 + text_w + 1.0 + extra_w + 2.0
+}
+
+/// Compact segmented view switcher:
+/// - `Full`: `[▦ Grid | ☰ Rec | Aa | {} JSON ▾]`
+/// - `Core`: `[▦ Grid | ☰ Rec | Aa | {} ▾]`
+/// - `Essential`: `[▦ | ☰ | ▾]`
+///
+/// Clicking the last segment opens a popover with JSON, XML, Chart, Spatial view (plus Text at Essential).
+fn view_switcher(ui: &mut Ui, fit: FooterFit, state: &mut ToolbarState, actions: &mut Vec<GridAction>) {
     let p = ternarygrid_ui::pal(ui);
-    let views = &VIEWS;
-    let (bw, bh, pad, gap) = (VIEW_SEG_W, FOOTER_H - 4.0, 2.0, 1.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(VIEW_SWITCH_W, FOOTER_H), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 8, p.subtle);
-    let mut clicked = None;
-    for (i, (kind, glyph, name, short)) in views.iter().enumerate() {
-        let r = egui::Rect::from_min_size(egui::pos2(rect.left() + pad + i as f32 * (bw + gap), rect.top() + pad), egui::vec2(bw, bh));
-        let resp = ui.interact(r, ui.id().with(("view", i)), egui::Sense::click());
-        let tip = trf("{} view", &[&tr(name)]);
-        let on = current == *kind;
-        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, tr(name)));
+    let total_w = view_switcher_width(ui, fit, state.view);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, CTRL_H), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 7, p.subtle);
+
+    let bh = CTRL_H - 4.0;
+    let top = rect.top() + 2.0;
+    let mut x = rect.left() + 2.0;
+
+    let draw_seg = |ui: &mut Ui, x: &mut f32, w: f32, id_salt: &str, glyph: &str, label: Option<&str>, name: &str, tip: &str, on: bool| -> egui::Response {
+        let r = egui::Rect::from_min_size(egui::pos2(*x, top), egui::vec2(w, bh));
+        *x += w + 1.0;
+        let resp = ui.interact(r, ui.id().with(("view_seg", id_salt)), egui::Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, name));
         let resp = resp.on_hover_text(tip);
-        if on {
-            ternarygrid_ui::kit::raised(ui.painter(), r, egui::CornerRadius::same(6), p.thumb);
-        } else if resp.hovered() {
-            ui.painter().rect_filled(r, 6, p.hover);
+        if ui.is_rect_visible(r) {
+            if on {
+                kit::raised(ui.painter(), r, egui::CornerRadius::same(5), p.thumb);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(r, 5, p.hover);
+            }
+            let icon_color = if on {
+                p.accent_text
+            } else if resp.hovered() {
+                p.text
+            } else {
+                p.text_muted
+            };
+            let text_color = if on || resp.hovered() { p.text } else { p.text_muted };
+            if let Some(lbl) = label {
+                let lx = r.left() + 7.0;
+                ui.painter().text(egui::pos2(lx + 6.5, r.center().y), egui::Align2::CENTER_CENTER, glyph, ternarygrid_ui::style::icon_font(13.0), icon_color);
+                let g = ui.painter().layout_no_wrap(lbl.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.5), text_color);
+                ui.painter().galley(egui::pos2(lx + 13.0 + 4.0, r.center().y - g.size().y / 2.0), g, text_color);
+            } else {
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, ternarygrid_ui::style::icon_font(13.5), icon_color);
+            }
         }
-        let vc = view_color(ui, *kind);
-        let icon_color = if on || resp.hovered() { vc } else { vc.gamma_multiply(0.82) };
-        let label_color = if on || resp.hovered() { p.text } else { p.text_muted };
-        ui.painter().text(egui::pos2(r.center().x, r.top() + 11.5), egui::Align2::CENTER_CENTER, *glyph, ternarygrid_ui::style::icon_font(14.0), icon_color);
-        ui.painter().text(egui::pos2(r.center().x, r.bottom() - 6.5), egui::Align2::CENTER_CENTER, tr(short), ternarygrid_ui::style::medium(ui.ctx(), 9.0), label_color);
-        if resp.clicked() {
-            clicked = Some(*kind);
+        resp
+    };
+
+    let labeled = fit >= FooterFit::Core;
+    let grid_w = if labeled { view_seg_labeled_w(ui, tr("Grid")) } else { 26.0 };
+    if draw_seg(ui, &mut x, grid_w, "grid", icon::TABLE, labeled.then_some(tr("Grid")), tr("Grid"), &trf("{} view", &[&tr("Grid")]), state.view == ResultViewKind::Grid).clicked()
+        && state.view != ResultViewKind::Grid
+    {
+        state.view = ResultViewKind::Grid;
+        actions.push(GridAction::SwitchView(ResultViewKind::Grid));
+    }
+
+    let rec_w = if labeled { view_seg_labeled_w(ui, tr("Rec")) } else { 26.0 };
+    if draw_seg(ui, &mut x, rec_w, "record", icon::LIST_DASHES, labeled.then_some(tr("Rec")), tr("Record"), &trf("{} view", &[&tr("Record")]), state.view == ResultViewKind::Record)
+        .clicked()
+        && state.view != ResultViewKind::Record
+    {
+        state.view = ResultViewKind::Record;
+        actions.push(GridAction::SwitchView(ResultViewKind::Record));
+    }
+
+    if labeled
+        && draw_seg(ui, &mut x, 26.0, "text", icon::TEXT_AA, None, tr("Text"), &trf("{} view", &[&tr("Text")]), state.view == ResultViewKind::Text).clicked()
+        && state.view != ResultViewKind::Text
+    {
+        state.view = ResultViewKind::Text;
+        actions.push(GridAction::SwitchView(ResultViewKind::Text));
+    }
+
+    // Extra views & visualizations dropdown segment.
+    let extra_w = view_extra_seg_w(ui, fit);
+    let extra_rect = egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(extra_w, bh));
+    let extra_active = matches!(state.view, ResultViewKind::Json | ResultViewKind::Xml) || (!labeled && state.view == ResultViewKind::Text);
+    let extra_resp = ui.interact(extra_rect, ui.id().with("view_extra_drop"), egui::Sense::click());
+    extra_resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, extra_active, tr("More views")));
+    let extra_resp = extra_resp.on_hover_text(tr("JSON, XML, Chart and Spatial views"));
+    if ui.is_rect_visible(extra_rect) {
+        if extra_active {
+            kit::raised(ui.painter(), extra_rect, egui::CornerRadius::same(5), p.thumb);
+        } else if extra_resp.hovered() {
+            ui.painter().rect_filled(extra_rect, 5, p.hover);
+        }
+        let icon_color = if extra_active {
+            p.accent_text
+        } else if extra_resp.hovered() {
+            p.text
+        } else {
+            p.text_muted
+        };
+        let text_color = if extra_active || extra_resp.hovered() { p.text } else { p.text_muted };
+        let (glyph, lbl) = match state.view {
+            ResultViewKind::Xml => (icon::FILE_CODE, "XML"),
+            ResultViewKind::Text if !labeled => (icon::TEXT_AA, "Text"),
+            _ => (icon::BRACKETS_CURLY, "JSON"),
+        };
+        if fit >= FooterFit::Full {
+            let lx = extra_rect.left() + 7.0;
+            ui.painter().text(egui::pos2(lx + 6.5, extra_rect.center().y), egui::Align2::CENTER_CENTER, glyph, ternarygrid_ui::style::icon_font(13.0), icon_color);
+            let g = ui.painter().layout_no_wrap(lbl.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.5), text_color);
+            ui.painter().galley(egui::pos2(lx + 13.0 + 4.0, extra_rect.center().y - g.size().y / 2.0), g, text_color);
+            ui.painter().text(
+                egui::pos2(extra_rect.right() - 10.5, extra_rect.center().y),
+                egui::Align2::CENTER_CENTER,
+                icon::CARET_DOWN,
+                ternarygrid_ui::style::icon_font(9.0),
+                if extra_active || extra_resp.hovered() { p.text_muted } else { p.text_faint },
+            );
+        } else if fit >= FooterFit::Core {
+            ui.painter().text(egui::pos2(extra_rect.left() + 11.0, extra_rect.center().y), egui::Align2::CENTER_CENTER, glyph, ternarygrid_ui::style::icon_font(13.0), icon_color);
+            ui.painter().text(
+                egui::pos2(extra_rect.right() - 8.0, extra_rect.center().y),
+                egui::Align2::CENTER_CENTER,
+                icon::CARET_DOWN,
+                ternarygrid_ui::style::icon_font(9.0),
+                if extra_active || extra_resp.hovered() { p.text_muted } else { p.text_faint },
+            );
+        } else {
+            ui.painter().text(extra_rect.center(), egui::Align2::CENTER_CENTER, icon::CARET_DOWN, ternarygrid_ui::style::icon_font(10.0), icon_color);
         }
     }
-    clicked
+    Popup::menu(&extra_resp).id(ui.id().with("view_extra_menu")).align(egui::RectAlign::TOP_END).show(|ui| {
+        kit::menu_look(ui, 190.0);
+        kit::menu_caption(ui, tr("View"));
+        if !labeled {
+            let mut on = state.view == ResultViewKind::Text;
+            if kit::menu_check(ui, &mut on, tr("Text")).clicked() {
+                state.view = ResultViewKind::Text;
+                actions.push(GridAction::SwitchView(ResultViewKind::Text));
+                ui.close();
+            }
+        }
+        for (kind, name) in [(ResultViewKind::Json, "JSON"), (ResultViewKind::Xml, "XML")] {
+            let mut on = state.view == kind;
+            if kit::menu_check(ui, &mut on, tr(name)).clicked() {
+                state.view = kind;
+                actions.push(GridAction::SwitchView(kind));
+                ui.close();
+            }
+        }
+        kit::menu_separator(ui);
+        kit::menu_caption(ui, tr("Visualizations"));
+        if kit::menu_item(ui, Some(icon::CHART_BAR), tr("Chart"), "").clicked() {
+            actions.push(GridAction::ShowChart);
+            ui.close();
+        }
+        if kit::menu_item(ui, Some(icon::MAP_TRIFOLD), tr("Spatial view"), "").clicked() {
+            actions.push(GridAction::ShowSpatial);
+            ui.close();
+        }
+    });
 }
 
-/// Width of the pending changes pill: 12 | ● 8 n changes 8 Discard 8 Save ⌘S | 4 (`short`:
-/// without the keys).
-fn pending_width(ui: &Ui, count: &str, short: bool) -> f32 {
-    let w = |t: &str, f: egui::FontId| ui.painter().layout_no_wrap(t.to_string(), f, egui::Color32::PLACEHOLDER).size().x;
-    let medium = ternarygrid_ui::style::medium(ui.ctx(), 12.5);
-    let label = w(count, medium.clone());
-    let discard = w(tr("Discard"), egui::FontId::proportional(12.5)) + 20.0;
-    let keys = if short { 0.0 } else { 8.0 + w(SAVE_KEYS, egui::FontId::proportional(11.0)) };
-    let save = w(tr("Save"), medium) + keys + 20.0;
-    (12.0 + 7.0 + 8.0 + label + 8.0 + discard + 8.0 + save + 4.0).ceil()
+fn panels_dropdown_width(ui: &Ui, show_label: bool, badge: Option<usize>) -> f32 {
+    let badge_w = if badge.is_some() { 5.0 + 16.0 } else { 0.0 };
+    if show_label {
+        (8.0 + 14.0 + 5.0 + measure_text(ui, tr("Panels"), ternarygrid_ui::style::medium(ui.ctx(), 12.0)) + badge_w + 4.0 + 9.0 + 7.0).ceil()
+    } else {
+        (7.0 + 14.0 + badge_w + 3.0 + 9.0 + 6.0).ceil()
+    }
+}
+
+/// Consolidated `Panels ▾` dropdown button with geometric sidebar glyph & active-panel count pill.
+fn panels_dropdown_button(ui: &mut Ui, show_label: bool, visible: bool, badge: Option<usize>) -> egui::Response {
+    let p = ternarygrid_ui::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    let w = panels_dropdown_width(ui, show_label, badge);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, CTRL_H), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, visible, tr("Panels")));
+    let resp = resp.on_hover_text(tr("Value, metadata and statistics panels"));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let radius = egui::CornerRadius::same(ternarygrid_ui::style::RADIUS);
+        if visible {
+            painter.rect_filled(rect, radius, p.accent_soft);
+            painter.rect_stroke(rect, radius, egui::Stroke::new(1.0, ternarygrid_ui::style::soft(p.accent_text, if dark { 0.36 } else { 0.25 })), egui::StrokeKind::Inside);
+        } else if resp.is_pointer_button_down_on() {
+            painter.rect_filled(rect, radius, p.subtle);
+        } else if resp.hovered() {
+            painter.rect_filled(rect, radius, p.hover);
+        }
+        let fg = if visible {
+            p.accent_text
+        } else if resp.hovered() {
+            p.text
+        } else {
+            p.text_muted
+        };
+        let mut x = rect.left() + if show_label { 8.0 } else { 7.0 };
+        // Crisp geometric right-sidebar glyph.
+        let s = 14.0 / 24.0;
+        let box_rect = egui::Rect::from_center_size(egui::pos2(x + 7.0, rect.center().y), egui::vec2(18.0 * s, 15.0 * s));
+        let stroke = egui::Stroke::new(1.2, fg);
+        painter.rect_stroke(box_rect, 2.0 * s, stroke, egui::StrokeKind::Middle);
+        painter.vline(box_rect.left() + 11.5 * s, box_rect.y_range(), stroke);
+        x += 14.0;
+        if show_label {
+            x += 5.0;
+            let g = painter.layout_no_wrap(tr("Panels").to_string(), ternarygrid_ui::style::medium(ui.ctx(), 12.0), fg);
+            let gw = g.size().x;
+            painter.galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, fg);
+            x += gw;
+        }
+        if let Some(n) = badge {
+            x += 5.0;
+            let pill = egui::Rect::from_center_size(egui::pos2(x + 8.0, rect.center().y), egui::vec2(16.0, 15.0));
+            painter.rect_filled(pill, 7, ternarygrid_ui::style::soft(p.accent, if dark { 0.35 } else { 0.18 }));
+            painter.text(pill.center(), egui::Align2::CENTER_CENTER, n.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 10.0), p.accent_text);
+            x += 16.0;
+        }
+        let caret_x = x + if show_label { 4.0 + 4.5 } else { 3.0 + 4.5 };
+        painter.text(
+            egui::pos2(caret_x, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            icon::CARET_DOWN,
+            ternarygrid_ui::style::icon_font(9.0),
+            if visible {
+                p.accent_text
+            } else if resp.hovered() {
+                p.text
+            } else {
+                p.text_faint
+            },
+        );
+    }
+    resp
+}
+
+fn panels_dropdown_menu(ui: &mut Ui, state: &mut ToolbarState, visible: bool, actions: &mut Vec<GridAction>) {
+    kit::menu_look(ui, 195.0);
+    kit::menu_caption(ui, tr("Side panels"));
+    panel_items(ui, state, actions);
+    kit::menu_separator(ui);
+    if visible {
+        if kit::menu_item(ui, Some(icon::SIDEBAR_SIMPLE), tr("Hide panels"), "").clicked() {
+            state.panels_hidden = true;
+            ui.close();
+        }
+    } else if kit::menu_item(ui, Some(icon::SIDEBAR_SIMPLE), tr("Show panels"), "").clicked() {
+        if state.open_panels.is_empty() {
+            state.set_panel_open(PanelKind::Value, true);
+        }
+        state.panels_hidden = false;
+        ui.close();
+    }
 }
 
 /// The keys of Save, shown in its button.
 const SAVE_KEYS: &str = if cfg!(target_os = "macos") { "⌘S" } else { "Ctrl+S" };
-
-/// "● 2 changes  Discard  Save ⌘S" on the changed cells' tint. `Some(true)`: Save, `Some(false)`: Discard.
-fn pending_pill(ui: &mut Ui, count: &str, pending: usize, short: bool) -> Option<bool> {
-    let p = ternarygrid_ui::pal(ui);
-    let rect = ui.max_rect();
-    let modified = crate::theme::GridTheme::from_visuals(ui.visuals()).modified;
-    ui.painter().rect_filled(rect, 8, modified);
-    ui.spacing_mut().item_spacing.x = 8.0;
-    ui.add_space(12.0);
-    kit::dot(ui, p.warn, 3.5);
-    ui.label(RichText::new(count).font(ternarygrid_ui::style::medium(ui.ctx(), 12.5)).color(p.text));
-    let mut out = None;
-    if key_button(ui, None, tr("Discard"), None, false, 26.0).on_hover_text(tr("Discard pending changes")).clicked() {
-        out = Some(false);
-    }
-    let save_tip = format!("{} ({SAVE_KEYS})", ternarygrid_core::trn(pending, tr("Save 1 pending change"), tr("Save {} pending changes")));
-    if key_button(ui, None, tr("Save"), (!short).then_some(SAVE_KEYS), true, 26.0).on_hover_text(save_tip).clicked() {
-        out = Some(true);
-    }
-    out
-}
 
 /// A button with its keys after the text (Save ⌘S, Copy ⌘↩): primary (accent) or quiet,
 /// `height` high, 10 (12 when 28 or more) at the sides, an optional icon before the text.
@@ -1390,9 +2072,10 @@ pub(crate) fn keys(mac: &'static str, other: &'static str) -> &'static str {
     if cfg!(target_os = "macos") { mac } else { other }
 }
 
-/// The auto refresh choices (the ⋯ menu's submenu, the interval chip and the clock button).
+/// The auto refresh choices (the Refresh split-button dropdown).
 fn auto_refresh_menu(ui: &mut Ui, state: &mut ToolbarState, actions: &mut Vec<GridAction>) {
     kit::menu_look(ui, 200.0);
+    kit::menu_caption(ui, tr("Auto refresh"));
     for choice in AUTO_REFRESH_CHOICES {
         let text = match choice {
             None => tr("Off").to_string(),
@@ -1420,7 +2103,7 @@ fn auto_refresh_menu(ui: &mut Ui, state: &mut ToolbarState, actions: &mut Vec<Gr
     });
 }
 
-/// The panels as check items (the ⋯ menu, the panel strip's +).
+/// The panels as check items (the Panels dropdown).
 fn panel_items(ui: &mut Ui, state: &ToolbarState, actions: &mut Vec<GridAction>) {
     for (kind, _, name, _) in PANELS {
         let mut open = state.is_panel_open(kind) && !state.panels_hidden;
@@ -1431,11 +2114,11 @@ fn panel_items(ui: &mut Ui, state: &ToolbarState, actions: &mut Vec<GridAction>)
     }
 }
 
-/// The footer's ⋯ overflow menu: contains only actions that did not fit on the bar.
+/// The footer's `⋯` overflow menu: strictly contains ONLY actions that did not fit on the bar.
 fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, state: &mut ToolbarState, footer: &MoreContext, actions: &mut Vec<GridAction>) {
-    kit::menu_look(ui, 260.0);
+    kit::menu_look(ui, 250.0);
     let narrow = footer.fit < FooterFit::Core;
-    let compact = footer.fit < FooterFit::All;
+    let compact = footer.fit < FooterFit::Full;
     let mut has_section = false;
     let sep = |ui: &mut Ui, has_section: &mut bool| {
         if *has_section {
@@ -1454,6 +2137,15 @@ fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, sta
                 ui.close();
             }
         }
+        kit::menu_separator(ui);
+        if kit::menu_item(ui, Some(icon::CHART_BAR), tr("Chart"), "").clicked() {
+            actions.push(GridAction::ShowChart);
+            ui.close();
+        }
+        if kit::menu_item(ui, Some(icon::MAP_TRIFOLD), tr("Spatial view"), "").clicked() {
+            actions.push(GridAction::ShowSpatial);
+            ui.close();
+        }
     }
     if narrow {
         sep(ui, &mut has_section);
@@ -1465,9 +2157,6 @@ fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, sta
     let fetching = model.fetch.fetching;
     if compact || footer.fetch.is_some() {
         sep(ui, &mut has_section);
-        if compact {
-            kit::submenu(ui, Some(icon::TIMER), tr("Auto refresh"), 200.0, &mut |ui| auto_refresh_menu(ui, state, actions));
-        }
         if let Some(label) = &footer.fetch
             && ui.add_enabled_ui(!fetching, |ui| kit::menu_item(ui, Some(icon::ARROW_LINE_DOWN), label, "")).inner.clicked()
         {
@@ -1483,7 +2172,7 @@ fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, sta
             ui.close();
         }
     }
-    if compact && model.is_editable() {
+    if narrow && model.is_editable() {
         sep(ui, &mut has_section);
         let notify = |r: Result<usize, String>, actions: &mut Vec<GridAction>| {
             if let Err(e) = r {
@@ -1492,52 +2181,23 @@ fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, sta
         };
         let selected = !grid.selection().is_empty();
         ui.add_enabled_ui(footer.can_edit, |ui| {
-            // Macs have no Insert key: no keys to show.
-            if kit::menu_item(ui, Some(icon::ROWS_PLUS_TOP), tr("Add row before"), keys("", "Shift+Insert")).clicked() {
-                notify(grid::add_row_before(model, grid), actions);
-                ui.close();
-            }
-            if narrow && ui.add_enabled_ui(selected, |ui| kit::menu_item(ui, Some(icon::COPY), tr("Duplicate selected rows"), keys("⌘D", "Ctrl+D"))).inner.clicked() {
+            if ui.add_enabled_ui(selected, |ui| kit::menu_item(ui, Some(icon::COPY), tr("Duplicate selected rows"), keys("⌘D", "Ctrl+D"))).inner.clicked() {
                 notify(grid::duplicate_selected(model, grid), actions);
                 ui.close();
             }
-            if ui.add_enabled_ui(selected, |ui| kit::menu_item(ui, Some(icon::ARROW_FAT_LINE_DOWN), tr("Copy from row above"), keys("⌘⌥↑", "Ctrl+Alt+Up"))).inner.clicked() {
-                notify(grid::copy_from_adjacent(model, grid, true), actions);
-                ui.close();
-            }
-            if ui.add_enabled_ui(selected, |ui| kit::menu_item(ui, Some(icon::ARROW_FAT_LINE_UP), tr("Copy from row below"), keys("⌘⌥↓", "Ctrl+Alt+Down"))).inner.clicked() {
-                notify(grid::copy_from_adjacent(model, grid, false), actions);
-                ui.close();
-            }
-            if narrow && model.can_undo() && kit::menu_item(ui, Some(icon::ARROW_U_UP_LEFT), tr("Undo"), keys("⌘Z", "Ctrl+Z")).clicked() {
+            if ui.add_enabled_ui(model.can_undo(), |ui| kit::menu_item(ui, Some(icon::ARROW_U_UP_LEFT), tr("Undo"), keys("⌘Z", "Ctrl+Z"))).inner.clicked() {
                 model.undo();
                 ui.close();
             }
-            if narrow && ui.add_enabled_ui(selected, |ui| kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete selected rows"), keys("fn⌫", "Delete"))).inner.clicked() {
+            if ui.add_enabled_ui(selected, |ui| kit::menu_item_danger(ui, Some(icon::TRASH), tr("Delete selected rows"), keys("fn⌫", "Delete"))).inner.clicked() {
                 delete_rows(model, grid, actions);
                 ui.close();
             }
         });
     }
-    if compact {
-        sep(ui, &mut has_section);
-        if kit::menu_item(ui, Some(icon::CHART_BAR), tr("Chart"), "").clicked() {
-            actions.push(GridAction::ShowChart);
-            ui.close();
-        }
-        if kit::menu_item(ui, Some(icon::MAP_TRIFOLD), tr("Spatial view"), "").clicked() {
-            actions.push(GridAction::ShowSpatial);
-            ui.close();
-        }
-        sep(ui, &mut has_section);
-        kit::submenu(ui, Some(icon::SIDEBAR_SIMPLE), tr("Panels"), 180.0, &mut |ui| {
-            kit::menu_look(ui, 180.0);
-            panel_items(ui, state, actions);
-        });
-    }
 }
 
-/// The side panels: kind, icon, full accessible name, and concise footer label.
+/// The side panels: kind, icon, full accessible name, and concise label.
 pub(crate) const PANELS: [(PanelKind, &str, &str, &str); 5] = [
     (PanelKind::Value, icon::EYE, "Value", "Value"),
     (PanelKind::Metadata, icon::INFO, "Metadata", "Meta"),
@@ -1546,7 +2206,7 @@ pub(crate) const PANELS: [(PanelKind, &str, &str, &str); 5] = [
     (PanelKind::References, icon::TREE_STRUCTURE, "References", "Refs"),
 ];
 
-/// Semantic colour for each side panel icon (used on both the footer and the panel tab strip).
+/// Semantic colour for each side panel icon (used on the panel tab strip).
 pub(crate) fn panel_color(ui: &Ui, kind: PanelKind) -> egui::Color32 {
     let ic = ternarygrid_ui::style::icons(ui);
     match kind {
@@ -1598,9 +2258,9 @@ mod tests {
 
     #[test]
     fn the_footer_shows_the_widest_that_fits() {
-        let widths = FooterWidths { minimal: 150.0, essential: 300.0, core: 500.0, all: 800.0 };
-        assert_eq!(FooterFit::choose(900.0, &widths), FooterFit::All);
-        assert_eq!(FooterFit::choose(800.0, &widths), FooterFit::All);
+        let widths = FooterWidths { essential: 300.0, core: 500.0, full: 800.0 };
+        assert_eq!(FooterFit::choose(900.0, &widths), FooterFit::Full);
+        assert_eq!(FooterFit::choose(800.0, &widths), FooterFit::Full);
         assert_eq!(FooterFit::choose(799.0, &widths), FooterFit::Core);
         assert_eq!(FooterFit::choose(499.0, &widths), FooterFit::Essential);
         assert_eq!(FooterFit::choose(299.0, &widths), FooterFit::Minimal);

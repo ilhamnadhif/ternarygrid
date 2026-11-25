@@ -800,7 +800,8 @@ fn result_screens(s: &mut Shots, conn: &str) {
     s.escape();
     s.frames(20);
 
-    // Chart and spatial view.
+    // Chart and spatial view (inside the footer's More views menu).
+    s.click("More views");
     s.click_contains("Chart");
     s.frames(20);
     s.park();
@@ -974,6 +975,7 @@ fn more_result_screens(s: &mut Shots, conn: &str) {
     s.close_tabs();
     // The chart as a donut.
     orders(s, conn);
+    s.click("More views");
     s.click_contains("Chart");
     s.frames(10);
     s.click_contains("Pie");
@@ -984,6 +986,7 @@ fn more_result_screens(s: &mut Shots, conn: &str) {
     // The spatial view.
     s.open(conn, "delivery_area", ObjectPage::Data);
     s.frames(10);
+    s.click("More views");
     s.click_contains("Spatial view");
     s.frames(20);
     s.park();
