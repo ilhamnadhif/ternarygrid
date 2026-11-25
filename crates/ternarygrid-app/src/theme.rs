@@ -6,14 +6,12 @@ use std::sync::{Arc, LazyLock};
 /// User theme choice (stored in `settings.json`).
 pub use ternarygrid_config::settings::Theme as ThemeChoice;
 
-/// Inter 4.1 Regular and Medium (SIL Open Font License, `assets/fonts/Inter-LICENSE.txt`):
-/// a typeface designed for screens, crisp at UI sizes; egui's default UI font
-/// is a light weight that looks faint and blurry. Subset without the private
-/// use area, where the Phosphor icons live (`pyftsubset --unicodes=
-/// U+0000-DFFF,U+F900-FFFF,U+10000-10FFFF --layout-features='*'`), and
-/// zlib-compressed (half the size in the binary; inflated once, in a few ms).
+/// Inter 4.1 (Regular, Medium, SemiBold) and JetBrains Mono Regular, zlib-compressed
+/// in the binary and inflated once on startup.
 static INTER: LazyLock<Vec<u8>> = LazyLock::new(|| inflate(include_bytes!("../assets/fonts/Inter-Regular.ttf.zz")));
 static INTER_MEDIUM: LazyLock<Vec<u8>> = LazyLock::new(|| inflate(include_bytes!("../assets/fonts/Inter-Medium.ttf.zz")));
+static INTER_SEMIBOLD: LazyLock<Vec<u8>> = LazyLock::new(|| inflate(include_bytes!("../assets/fonts/Inter-SemiBold.ttf.zz")));
+static JETBRAINS_MONO: LazyLock<Vec<u8>> = LazyLock::new(|| inflate(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf.zz")));
 
 fn inflate(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -21,36 +19,33 @@ fn inflate(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Fonts: Inter for the UI, Hack for code, then egui's emoji fonts and the
-/// Phosphor icon font as fallbacks, so icons can be mixed into any label.
-/// Inter is the Medium weight in the light theme: dark text on a light
-/// background reads thinner than light text on a dark one. (egui's other
-/// bundled font, Ubuntu-Light, is not used and not linked.)
-pub fn font_definitions(theme: Theme) -> FontDefinitions {
+/// Fonts: Inter (Regular, Medium, SemiBold) for the UI, JetBrains Mono (with Hack
+/// fallback) for SQL and tabular code, then egui's emoji fonts and the Phosphor
+/// icon font as fallbacks so icons can be mixed into any label.
+pub fn font_definitions(_theme: Theme) -> FontDefinitions {
     use egui::FontTweak;
-    let inter: &'static [u8] = if theme == Theme::Light { &INTER_MEDIUM } else { &INTER };
     let mut fonts = FontDefinitions::empty();
     let mut add = |name: &str, data: FontData| {
         fonts.font_data.insert(name.into(), Arc::new(data));
     };
-    add("Inter", FontData::from_static(inter));
-    // The medium weight for labels that need it (tabs, buttons, titles), in both themes.
+    add("Inter", FontData::from_static(&INTER));
     add("Inter-Medium", FontData::from_static(&INTER_MEDIUM));
+    add("Inter-SemiBold", FontData::from_static(&INTER_SEMIBOLD));
+    add("JetBrainsMono", FontData::from_static(&JETBRAINS_MONO));
     add("Hack", FontData::from_static(epaint_default_fonts::HACK_REGULAR));
     // egui's sizes for its emoji fonts.
     add("NotoEmoji-Regular", FontData::from_static(epaint_default_fonts::NOTO_EMOJI_REGULAR).tweak(FontTweak { scale: 0.81, ..Default::default() }));
     add("emoji-icon-font", FontData::from_static(epaint_default_fonts::EMOJI_ICON).tweak(FontTweak { scale: 0.90, ..Default::default() }));
     let emoji = ["NotoEmoji-Regular".to_string(), "emoji-icon-font".to_string()];
     fonts.families.insert(FontFamily::Proportional, ["Inter".to_string()].into_iter().chain(emoji.clone()).collect());
-    // Labels in monospace still find letters and symbols Hack lacks.
-    fonts.families.insert(FontFamily::Monospace, ["Hack".to_string(), "Inter".to_string()].into_iter().chain(emoji).collect());
+    // Labels in monospace fall back to Hack and Inter for glyphs JetBrains Mono leaves out.
+    fonts.families.insert(FontFamily::Monospace, ["JetBrainsMono".to_string(), "Hack".to_string(), "Inter".to_string()].into_iter().chain(emoji).collect());
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     // The icons sit a little high next to Inter: level with the text.
     if let Some(phosphor) = fonts.font_data.get_mut("phosphor") {
         Arc::make_mut(phosphor).tweak.y_offset_factor = 0.08;
     }
-    // Inter SemiBold is not bundled (binary size): titles use the medium weight.
-    ternarygrid_ui::style::add_weight_families(&mut fonts, "Inter-Medium", "Inter-Medium");
+    ternarygrid_ui::style::add_weight_families(&mut fonts, "Inter-Medium", "Inter-SemiBold");
     fonts
 }
 
@@ -73,8 +68,9 @@ pub fn sync_fonts(ctx: &Context) {
 
 /// Apply the appearance preferences: theme, contrast, zoom and UI font size.
 pub fn apply_settings(ctx: &Context, settings: &ternarygrid_config::AppSettings) {
-    // Semantic coloured icons across toolbars, menus, palette and object trees.
-    ternarygrid_icons::set_colored(true);
+    // Calm monochrome icons across toolbars and menus (shared with TernaryCode,
+    // TernaryShell and TernaryWire); database logos and object trees keep their hues.
+    ternarygrid_icons::set_colored(false);
     apply_theme(ctx, settings.general.theme, settings.accessibility.high_contrast);
     let scale = settings.general.ui_scale.clamp(0.5, 3.0);
     if (ctx.zoom_factor() - scale).abs() > f32::EPSILON {
@@ -86,9 +82,9 @@ pub fn apply_settings(ctx: &Context, settings: &ternarygrid_config::AppSettings)
             use egui::{FontFamily, FontId, TextStyle};
             style.text_styles.insert(TextStyle::Body, FontId::new(size, FontFamily::Proportional));
             style.text_styles.insert(TextStyle::Button, FontId::new(size, FontFamily::Proportional));
-            style.text_styles.insert(TextStyle::Small, FontId::new((size - 3.0).max(7.0), FontFamily::Proportional));
-            style.text_styles.insert(TextStyle::Heading, FontId::new(size + 5.0, FontFamily::Proportional));
-            style.text_styles.insert(TextStyle::Monospace, FontId::new(size, FontFamily::Monospace));
+            style.text_styles.insert(TextStyle::Small, FontId::new((size - 1.0).max(8.0), FontFamily::Proportional));
+            style.text_styles.insert(TextStyle::Heading, FontId::new(size + 3.0, FontFamily::Name(ternarygrid_ui::style::SEMIBOLD.into())));
+            style.text_styles.insert(TextStyle::Monospace, FontId::new((size - 1.0).max(8.0), FontFamily::Monospace));
             // Back to egui's default when switched off again.
             style.animation_time = if settings.accessibility.reduce_motion { 0.0 } else { egui::Style::default().animation_time };
         });
@@ -466,31 +462,32 @@ mod tests {
                 }
             }
         }
-        // The dark theme's MySQL logo on a test connection's green row was too faint.
-        let v = visuals(Theme::Dark);
-        let green = over(connection_marker(ternarygrid_core::config::ConnectionType::test().color).unwrap().gamma_multiply(0.22), v.panel_fill);
-        assert!(contrast(logo_color(DbKind::MySql, true), green) < 4.5);
+        // `legible_on` lifts a low-contrast logo on a lighter tinted row to WCAG AA (4.5:1).
+        let bright_green = Color32::from_rgb(0x4a, 0x5c, 0x4c);
+        assert!(contrast(logo_color(DbKind::MySql, true), bright_green) < 4.5);
+        assert!(contrast(legible_on(logo_color(DbKind::MySql, true), bright_green), bright_green) >= 4.5);
         assert_eq!(legible_on(Color32::WHITE, Color32::BLACK), Color32::WHITE);
     }
 
-    /// The weights of the design kit are registered (with the icons as their
-    /// fallback), and the icons sit level with the text.
+    /// The weights of the design kit and JetBrains Mono are registered (with the
+    /// icons as their fallback), and the icons sit level with the text.
     #[test]
     fn weight_families_and_icon_offset() {
         for theme in [Theme::Light, Theme::Dark] {
             let fonts = font_definitions(theme);
-            for family in [ternarygrid_ui::style::MEDIUM, ternarygrid_ui::style::SEMIBOLD] {
+            for (family, expected) in [(ternarygrid_ui::style::MEDIUM, "Inter-Medium"), (ternarygrid_ui::style::SEMIBOLD, "Inter-SemiBold")] {
                 let keys = &fonts.families[&FontFamily::Name(family.into())];
-                assert_eq!(keys.first().map(String::as_str), Some("Inter-Medium"), "{family}");
+                assert_eq!(keys.first().map(String::as_str), Some(expected), "{family}");
                 assert!(keys.iter().any(|k| k == "phosphor"), "{family} falls back to the icons");
             }
+            assert_eq!(fonts.families[&FontFamily::Monospace].first().map(String::as_str), Some("JetBrainsMono"));
             assert_eq!(fonts.font_data["phosphor"].tweak.y_offset_factor, 0.08);
         }
     }
 
     #[test]
-    fn light_theme_uses_a_heavier_inter() {
-        assert_eq!(font_definitions(Theme::Light).font_data["Inter"].font.len(), INTER_MEDIUM.len());
+    fn inter_regular_is_consistent_across_themes() {
+        assert_eq!(font_definitions(Theme::Light).font_data["Inter"].font.len(), INTER.len());
         assert_eq!(font_definitions(Theme::Dark).font_data["Inter"].font.len(), INTER.len());
         let ctx = Context::default();
         ctx.set_theme(Theme::Dark);
@@ -498,6 +495,6 @@ mod tests {
         assert_eq!(inter(&ctx), INTER.len());
         ctx.set_theme(Theme::Light);
         sync_fonts(&ctx);
-        assert_eq!(inter(&ctx), INTER_MEDIUM.len());
+        assert_eq!(inter(&ctx), INTER.len());
     }
 }

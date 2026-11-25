@@ -3,6 +3,13 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.9 — 2026-11-25
+
+### Changed
+- **Unified Obsidian Dark and Paper Light themes across the Ternary family.** Updated chrome (`#0d0d0f` / `#ececef`), navigator canvas (`#111114` / `#f5f5f7`), editor/grid surface (`#151517` / `#ffffff`), zebra stripes, text hierarchy, SQL syntax highlighting, and semantic status colours to match TernaryCode, TernaryShell, and TernaryWire while preserving TernaryGrid's Deep Teal signature accent (`#0f8572` dark / `#0f7a68` light) and WCAG AA contrast ratios.
+- **Calm monochrome toolbar & menu icons and neutral row selection.** Disabled multi-coloured toolbar/menu icons by default (`set_colored(false)`) and switched selected list rows to a neutral surface tint; database brand logos and navigator object icons continue to display their semantic hues.
+- **Bundled Inter SemiBold and JetBrains Mono.** Added `Inter-SemiBold` and `JetBrainsMono-Regular` to the bundled font set, standardized Inter Regular across light and dark themes, and aligned default text scale (`13.0` body/editor, `12.0` small/UI mono).
+
 ## 0.7.8 — 2026-11-25
 
 ### Security
