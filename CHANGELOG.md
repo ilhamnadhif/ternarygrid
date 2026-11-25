@@ -3,6 +3,16 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.10 — 2026-11-26
+
+### Changed
+- **Redesigned result grid footer toolbar (single-row 3-zone precision bar).** Replaced the crowded 21-button multi-colour footer with a compact 36 px bar organized into three calm, balanced zones:
+  - **Left (Refresh, Fetch & Status)**: unified `Refresh ▾` split-button with integrated Auto Refresh menu and active amber interval badge, compact teal `↓ +200` fetch pill (or red `Stop` button during long queries), `Fetch all` and `Total count` icons, single-line tabular row count & elapsed time (`400 rows · 162 ms`), and clickable `Fetch failed` restore chip.
+  - **Center (Row Editing & Fixed Commit Anchor)**: `+ Add ▾` split-button (grouping `Add row after`, `Add row before`, `Duplicate`, `Copy from row above`, and `Copy from row below`), quick `Duplicate` / `Delete` (danger red on hover) / `Undo` icons, and a fixed-position DBeaver-style `Cancel` / `Save` cluster that highlights cleanly in warm amber when changes are pending and shows an inline `Saving…` spinner while committing without layout shift. Read-only tables display a clean warm-amber status pill with an inline `Virtual key…` shortcut when applicable.
+  - **Right (Views, Export, Panels & Overflow)**: compact segmented view switcher (`Grid | Rec | Text | JSON ▾` with `XML`, `Chart`, and `Spatial view` inside the dropdown), `Export`, a consolidated `Panels ▾` dropdown with active-panel count badge, and a smart `⋯` overflow menu that appears only at narrower widths and contains strictly the controls that moved off the bar.
+- **Floating non-error result notices.** Transient messages (such as copy or mark-for-deletion confirmations) now float cleanly in a dismissible pill centered just above the footer so toolbar buttons never shift or compress.
+- **Responsive precision across all pane widths.** Exact measured layout tiers (`Full`, `Core`, `Essential`, `Minimal`) ensure zero overlap and zero clipped controls from wide desktop windows down to narrow split panes.
+
 ## 0.7.9 — 2026-11-25
 
 ### Changed
