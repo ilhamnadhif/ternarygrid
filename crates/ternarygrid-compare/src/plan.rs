@@ -1015,7 +1015,9 @@ impl<'a> Planner<'a> {
     }
 
     fn plan(&mut self) {
-        let granular = self.opts.alter_mode == AlterMode::Granular;
+        // SQLite does not support granular ALTER TABLE DROP/ADD CONSTRAINT without full
+        // 12-step table rebuilds, so fold table alterations into WholeTable mode.
+        let granular = self.opts.alter_mode == AlterMode::Granular && self.dialect.kind() != DbKind::Sqlite;
         let drop = self.opts.drop_removed;
         let source = self.a.ctx.source;
         let target = self.a.ctx.target;

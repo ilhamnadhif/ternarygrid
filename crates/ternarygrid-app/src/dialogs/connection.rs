@@ -1016,20 +1016,30 @@ impl ConnectionDialog {
                         ui.horizontal_top(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             let w = ((ui.available_width() - 8.0) / 2.0).floor();
-                            let mut inc = filter.include.join(", ");
-                            let mut exc = filter.exclude.join(", ");
+                            let inc_id = Id::new(("conn_filter_draft", &id, label, "inc"));
+                            let exc_id = Id::new(("conn_filter_draft", &id, label, "exc"));
+                            let mut inc = ui.data(|d| d.get_temp::<String>(inc_id)).unwrap_or_else(|| filter.include.join(", "));
+                            let mut exc = ui.data(|d| d.get_temp::<String>(exc_id)).unwrap_or_else(|| filter.exclude.join(", "));
                             ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
                                 ui.spacing_mut().item_spacing.y = 4.0;
                                 caption(ui, tr("Include"));
-                                if add_field(ui, text_field(&mut inc, w).font(egui::FontId::monospace(12.5)).hint_text(mono_hint(ui, tr("e.g. app_*")))).changed() {
+                                let r = add_field(ui, text_field(&mut inc, w).font(egui::FontId::monospace(12.5)).hint_text(mono_hint(ui, tr("e.g. app_*"))));
+                                if r.changed() {
                                     filter.include = split_patterns(&inc);
+                                    ui.data_mut(|d| d.insert_temp(inc_id, inc));
+                                } else if !r.has_focus() {
+                                    ui.data_mut(|d| d.insert_temp(inc_id, filter.include.join(", ")));
                                 }
                             });
                             ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
                                 ui.spacing_mut().item_spacing.y = 4.0;
                                 caption(ui, tr("Exclude"));
-                                if add_field(ui, text_field(&mut exc, w).font(egui::FontId::monospace(12.5)).hint_text(mono_hint(ui, tr("e.g. *_old, tmp_*")))).changed() {
+                                let r = add_field(ui, text_field(&mut exc, w).font(egui::FontId::monospace(12.5)).hint_text(mono_hint(ui, tr("e.g. *_old, tmp_*"))));
+                                if r.changed() {
                                     filter.exclude = split_patterns(&exc);
+                                    ui.data_mut(|d| d.insert_temp(exc_id, exc));
+                                } else if !r.has_focus() {
+                                    ui.data_mut(|d| d.insert_temp(exc_id, filter.exclude.join(", ")));
                                 }
                             });
                         });

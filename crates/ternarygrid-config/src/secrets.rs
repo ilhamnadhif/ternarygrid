@@ -643,6 +643,12 @@ struct Opened {
     params: KdfParams,
     salt: Vec<u8>,
     entries: BTreeMap<String, Secret>,
+    stamp: Option<(u64, std::time::SystemTime)>,
+}
+
+fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 /// Decrypts the entries of a vault file whose header was decoded; `None`
@@ -684,6 +690,7 @@ fn open_vault(bytes: &[u8], master: &Secret) -> DbResult<Opened> {
         params: header.params,
         salt: header.salt,
         entries,
+        stamp: None,
     })
 }
 
@@ -868,6 +875,7 @@ impl VaultStore {
             params,
             salt,
             entries,
+            stamp: file_stamp(&self.path),
         });
         drop(_file_lock);
         drop(guard);
@@ -878,7 +886,8 @@ impl VaultStore {
     /// Decrypts the vault. A wrong password is an [`ErrorKind::Auth`] error.
     pub fn unlock(&self, master: &Secret) -> DbResult<()> {
         let bytes = self.read_file()?;
-        let opened = open_vault(&bytes, master)?;
+        let mut opened = open_vault(&bytes, master)?;
+        opened.stamp = file_stamp(&self.path);
         *self.state.lock() = Some(opened);
         self.touch();
         Ok(())
@@ -933,6 +942,7 @@ impl VaultStore {
             params,
             salt,
             entries: opened.entries,
+            stamp: file_stamp(&self.path),
         });
         drop(_file_lock);
         drop(guard);
@@ -964,6 +974,24 @@ impl VaultStore {
         let opened = guard
             .as_mut()
             .ok_or_else(|| DbError::auth("The secret vault is locked"))?;
+        // Reload when another process (second window, `--run-task`) updated the vault file.
+        let disk_stamp = file_stamp(&self.path);
+        if disk_stamp.is_some() && disk_stamp != opened.stamp {
+            let _file_lock = VaultFileLock::acquire(&self.path)?;
+            let bytes = self.read_file()?;
+            match reopen_with_key(&bytes, opened) {
+                Ok(entries) => {
+                    opened.entries = entries;
+                    opened.stamp = file_stamp(&self.path);
+                }
+                Err(e) => {
+                    if e.kind == ErrorKind::Auth {
+                        *guard = None;
+                    }
+                    return Err(e);
+                }
+            }
+        }
         let r = f(opened);
         drop(guard);
         self.touch();
@@ -1000,6 +1028,7 @@ impl VaultStore {
             write_secure(&self.path, &sealed)?;
         }
         opened.entries = entries;
+        opened.stamp = file_stamp(&self.path);
         drop(_file_lock);
         drop(guard);
         self.touch();

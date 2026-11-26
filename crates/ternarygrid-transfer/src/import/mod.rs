@@ -329,17 +329,20 @@ async fn import_rows(source: &mut dyn RowSource, session: &mut dyn Session, mapp
         key_index,
     };
     let handle = session.cancel_handle();
-    // MySQL's upsert follows the table's unique keys, not the chosen columns: unless those
-    // are one of them, rows are replaced by DELETE + INSERT on the chosen columns.
-    let upsert_follows_keys =
-        if mapping.mode == ImportMode::Replace && matches!(dialect.kind(), DbKind::MySql | DbKind::MariaDb) && !mapping.key_columns.is_empty() && !mapping.create_table {
-            match session.table_definition(&mapping.target).await {
-                Ok(def) => keys_are_unique(&def, &mapping.key_columns),
-                Err(_) => false,
-            }
-        } else {
-            true
-        };
+    // Upsert (`ON CONFLICT` / `ON DUPLICATE KEY UPDATE`) requires the chosen match columns to
+    // back a primary or unique key on the target table; otherwise fall back to DELETE + INSERT.
+    let upsert_follows_keys = if mapping.mode == ImportMode::Replace
+        && matches!(dialect.kind(), DbKind::MySql | DbKind::MariaDb | DbKind::Sqlite | DbKind::Postgres | DbKind::CockroachDb)
+        && !mapping.key_columns.is_empty()
+        && !mapping.create_table
+    {
+        match session.table_definition(&mapping.target).await {
+            Ok(def) => keys_are_unique(&def, &mapping.key_columns),
+            Err(_) => false,
+        }
+    } else {
+        true
+    };
     let mut writer = BatchWriter::new(&mut *session, target, mapping.transaction, mapping.on_error, mapping.rows_per_statement, item.clone());
     if !upsert_follows_keys {
         writer.without_upsert("The key columns are no unique key of the table: rows are replaced by deleting and inserting them by those columns");

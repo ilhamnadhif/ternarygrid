@@ -1228,3 +1228,226 @@ fn references_panel_shows_error_and_retries() {
     ui.run(vec![], Modifiers::NONE, |ui| actions = ReferencesPanel::new(&model, &grid, &mut state).show(ui));
     assert!(matches!(&actions[..], [GridAction::RequestReferences { relation: 0, .. }]), "Retry re-requests related rows");
 }
+
+#[test]
+fn inline_editor_discard_save_and_view_switch_races() {
+    use crate::test_support::key;
+    use egui::Key;
+
+    // 1) Grid view: start editing a cell, type draft text, click footer Discard -> editor cancels and pending == 0.
+    let mut v = Viewer::new(editable_model(4));
+    v.state.grid.request_focus();
+    v.state.grid.select_cell(1, 1);
+    v.frame(vec![]);
+    // Mark a pending change first so Discard is active even before the inline edit commits.
+    v.model.set_cell(0, 1, "dirty_row0").unwrap();
+    v.frame(vec![]);
+    v.frame(vec![Event::Text("ghost_draft".into())]);
+    v.frame(vec![]);
+    assert!(v.state.grid.is_editing(), "grid inline editor opened");
+    let discard = v.find_all_exact("Discard")[0];
+    v.click(discard);
+    v.frame(vec![]);
+    assert!(!v.state.grid.is_editing(), "Discard cancels active grid editor");
+    assert_eq!(v.model.pending_counts().total(), 0, "Discard leaves zero pending changes (no ghost re-commit)");
+    assert_eq!(v.model.cell(1, 1), Some(Value::text("name 1")));
+
+    // 2) Grid view: start editing, type draft text, click footer Save -> commits active edit then emits SaveChanges.
+    v.model.set_cell(0, 1, "dirty_row0").unwrap();
+    v.state.grid.request_focus();
+    v.state.grid.select_cell(1, 1);
+    v.frame(vec![]);
+    v.frame(vec![Event::Text("flushed_on_save".into())]);
+    v.frame(vec![]);
+    assert!(v.state.grid.is_editing());
+    let save = v.find_all_exact("Save")[0];
+    v.click(save);
+    assert!(!v.state.grid.is_editing(), "Save commits active grid editor");
+    assert_eq!(v.model.cell(1, 1), Some(Value::text("flushed_on_save")), "in-flight draft saved before SaveChanges");
+    assert!(v.actions.iter().any(|a| matches!(a, GridAction::SaveChanges)), "Save emits SaveChanges");
+
+    // 3) Grid view -> Record view switch while editing: flushes active edit and closes grid editor.
+    v.state.grid.request_focus();
+    v.state.grid.select_cell(2, 1);
+    v.frame(vec![]);
+    v.frame(vec![Event::Text("switched_to_rec".into())]);
+    v.frame(vec![]);
+    assert!(v.state.grid.is_editing());
+    let rec = v.find_all_exact("Record")[0];
+    v.click(rec);
+    v.frame(vec![]);
+    assert!(!v.state.grid.is_editing(), "grid editor closed on view switch");
+    assert_eq!(v.state.toolbar.view, ResultViewKind::Record);
+    assert_eq!(v.model.cell(2, 1), Some(Value::text("switched_to_rec")));
+
+    // 4) Record view: start editing, type draft, click Discard -> cancels record editor and clears pending.
+    v.state.record.request_focus();
+    v.frame(vec![]);
+    v.frame(vec![key(Key::Enter, Modifiers::NONE)]);
+    v.frame(vec![]);
+    v.frame(vec![Event::Text("rec_ghost".into())]);
+    v.frame(vec![]);
+    assert!(v.state.record.is_editing(), "record editor active");
+    let discard = v.find_all_exact("Discard")[0];
+    v.click(discard);
+    v.frame(vec![]);
+    assert!(!v.state.record.is_editing(), "Discard cancels active record editor");
+    assert_eq!(v.model.pending_counts().total(), 0, "no ghost edit after Record Discard");
+
+    // 5) Record view: edit cell, click Save while editor still open -> commits record edit & emits SaveChanges.
+    v.model.set_cell(0, 1, "dirty_row0").unwrap();
+    v.state.grid.select_cell(1, 1);
+    v.state.record.request_focus();
+    v.frame(vec![]);
+    v.frame(vec![key(Key::Enter, Modifiers::NONE)]);
+    v.frame(vec![]);
+    v.frame(vec![Event::Text("rec_saved".into())]);
+    v.frame(vec![]);
+    assert!(v.state.record.is_editing());
+    let save = v.find_all_exact("Save")[0];
+    v.click(save);
+    assert!(!v.state.record.is_editing(), "Save commits active record editor");
+    assert_eq!(v.model.cell(1, 1), Some(Value::text("rec_saved")));
+    assert!(v.actions.iter().any(|a| matches!(a, GridAction::SaveChanges)));
+}
+
+#[test]
+fn option_a_toolbar_narrow_widths_readonly_and_clamps() {
+    // 1) Sweep narrow-to-wide widths with dirty edits + active auto-refresh + dismissed fetch error chip.
+    let mut v = Viewer::new(editable_model(5));
+    v.model.set_cell(1, 1, "dirty").unwrap();
+    v.state.toolbar.auto_refresh_secs = Some(10);
+    v.model.fetch.error = Some("fetch error".into());
+    v.state.toolbar.dismissed_fetch_error = Some("fetch error".into());
+    for width in [300.0, 350.0, 440.0, 620.0, 840.0, 1200.0] {
+        sized(&mut v, width);
+        let refresh = v.find_all_exact("Refresh")[0];
+        let panels = v.find_all_exact("Panels")[0];
+        assert!(refresh.x < panels.x, "Refresh stays left of Panels at width {width}");
+        assert!(panels.x <= width + 2.0, "Panels stays inside pane at width {width}: {panels:?}");
+    }
+
+    // 2) Read-only NoKey at Minimal width: Virtual key moves into ⋯ overflow menu and works.
+    let mut ro = editable_model(2);
+    ro.set_editability(Err(crate::model::ReadOnlyReason::NoKey));
+    let mut v = Viewer::new(ro);
+    sized(&mut v, 350.0);
+    assert!(v.find_all_exact("Virtual key…").is_empty(), "inline Virtual key hides at Minimal");
+    let more = v.find_all_exact("More result actions")[0];
+    v.click(more);
+    v.frame(vec![]);
+    let vkey = v.find("Define virtual key").expect("Define virtual key in ⋯ at Minimal");
+    v.click(vkey);
+    assert!(v.actions.iter().any(|a| matches!(a, GridAction::DefineVirtualKey { .. })));
+
+    // 3) can_edit = false disables Save and Discard even when model has pending edits.
+    let mut v = Viewer::new(editable_model(3));
+    v.model.set_cell(0, 1, "edited").unwrap();
+    v.options.allow_editing = false;
+    v.frame(vec![]);
+    v.frame(vec![]);
+    let save = v.find_all_exact("Save")[0];
+    v.click(save);
+    assert!(!v.actions.iter().any(|a| matches!(a, GridAction::SaveChanges)), "Save disabled when allow_editing = false");
+    let discard = v.find_all_exact("Discard")[0];
+    v.click(discard);
+    assert!(v.model.has_changes(), "Discard disabled when allow_editing = false");
+
+    // 4) auto_refresh_secs = Some(0) clamps to >= 1s (does not emit Refresh immediately every frame).
+    let mut v = Viewer::new(editable_model(2));
+    v.state.toolbar.auto_refresh_secs = Some(0);
+    v.frame(vec![]);
+    assert!(!v.actions.iter().any(|a| matches!(a, GridAction::Refresh)), "first tick initializes timer");
+    v.frame(vec![]);
+    assert!(!v.actions.iter().any(|a| matches!(a, GridAction::Refresh)), "0s interval clamped to 1s");
+
+    // 5) Floating notice toast on ultra-narrow pane (140 px) renders safely without panicking.
+    let mut v = Viewer::new(editable_model(3));
+    v.state.toolbar.notice = Some(("Very long notification message that must clamp cleanly".into(), false));
+    sized(&mut v, 140.0);
+    assert!(v.find("Dismiss").is_some(), "floating notice stays dismissible at 140px");
+}
+
+#[test]
+fn filter_bar_client_order_clear_mode_switch_and_null_to_empty() {
+    use crate::test_support::key;
+    use egui::Key;
+
+    // 1) Client mode ORDER BY clear + Client -> Server switch clearing client view.
+    let mut v = Viewer::new(editable_model(5));
+    v.state.toolbar.order_text = "id DESC".into();
+    let apply = v.filter_apply().expect("apply");
+    v.click(apply);
+    v.wait_jobs();
+    assert_eq!(v.model.cell(0, 0), Some(Value::Int(4)), "sorted descending");
+    // Open Sort / ORDER BY popup and clear it.
+    let order_btn = v.find("Sort").expect("Sort chip");
+    v.click(order_btn);
+    v.frame(vec![]);
+    v.state.toolbar.order_text.clear();
+    let apply_pop = v.find_all_exact("Apply").last().copied().expect("popup Apply");
+    v.click(apply_pop);
+    v.wait_jobs();
+    assert_eq!(v.model.cell(0, 0), Some(Value::Int(0)), "clearing ORDER BY restores original order");
+
+    // Apply a client filter, then switch Client -> Server mode: client view must be cleared.
+    v.state.toolbar.filter_text = "id > 2".into();
+    let apply = v.filter_apply().expect("apply");
+    v.click(apply);
+    v.wait_jobs();
+    assert_eq!(v.model.row_count(), 2);
+    assert!(v.model.has_client_view());
+    let mode_btn = v.find("Filter options").expect("Filter options menu");
+    v.click(mode_btn);
+    v.frame(vec![]);
+    let server = v.find("Server: in the database").expect("Server option in mode menu");
+    v.click(server);
+    v.frame(vec![]);
+    assert_eq!(v.state.grid.mode, crate::grid::DataMode::Server);
+    assert!(!v.model.has_client_view(), "Client->Server clears stale client filter view");
+    assert_eq!(v.model.row_count(), 5);
+
+    // 2) NULL text cell -> commit empty string "" in Grid view and Record view.
+    let mut v = Viewer::new(editable_model(3));
+    v.model.set_value(0, 1, Value::Null).unwrap();
+    v.model.set_value(1, 1, Value::Null).unwrap();
+    v.state.grid.request_focus();
+    v.state.grid.select_cell(0, 1);
+    v.frame(vec![]);
+    v.frame(vec![key(Key::Enter, Modifiers::NONE)]);
+    v.frame(vec![]);
+    assert!(v.state.grid.is_editing());
+    v.frame(vec![key(Key::Enter, Modifiers::NONE)]);
+    v.frame(vec![]);
+    assert_eq!(v.model.cell(0, 1), Some(Value::text("")), "NULL text cell committed as empty string in Grid view");
+
+    v.state.grid.select_cell(1, 1);
+    v.state.toolbar.view = ResultViewKind::Record;
+    v.state.record.request_focus();
+    v.frame(vec![]);
+    v.frame(vec![]);
+    v.frame(vec![key(Key::Enter, Modifiers::NONE)]);
+    v.frame(vec![]);
+    assert!(v.state.record.is_editing());
+    v.frame(vec![key(Key::Enter, Modifiers::NONE)]);
+    v.frame(vec![]);
+    assert_eq!(v.model.cell(1, 1), Some(Value::text("")), "NULL text cell committed as empty string in Record view");
+
+    // 3) set_cells duplicate (row, col) in one batch preserves true original value; duplicate_rows leaves generated Default.
+    use ternarygrid_core::ddl::{ColumnDef, TableDef};
+    let mut model = editable_model(2);
+    let mut def = TableDef::new(Some("app".into()), "t");
+    def.columns = vec![ColumnDef::new("id", "int8").not_null().auto_increment(), ColumnDef::new("name", "varchar(50)"), ColumnDef::new("flag", "bool"), {
+        let mut c = ColumnDef::new("category", "int8");
+        c.generated = Some("id * 2".into());
+        c
+    }];
+    model.apply_table_def(&def);
+    model.set_cells(vec![(0, 1, crate::model::CellValue::Value(Value::text("first"))), (0, 1, crate::model::CellValue::Value(Value::text("second")))]).unwrap();
+    assert_eq!(model.cell(0, 1), Some(Value::text("second")));
+    model.undo();
+    assert_eq!(model.cell(0, 1), Some(Value::text("name 0")), "undo restores true pre-batch original");
+    let dup = model.duplicate_rows(&[0]).unwrap();
+    assert_eq!(dup.len(), 1);
+    assert!(model.cell_is_default(dup[0], 3), "duplicate_rows leaves generated column as Default");
+}

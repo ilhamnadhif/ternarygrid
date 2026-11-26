@@ -167,6 +167,7 @@ impl MigrationTab {
         let mut job = self.options.clone();
         let enabled: Vec<&TableEntry> = self.tables.iter().filter(|t| t.enabled).collect();
         job.tables = enabled.iter().map(|t| t.source.clone()).collect();
+        job.target_database = self.target_schema.as_ref().and_then(|s| s.database.clone());
         job.target_schema = self.target_schema.as_ref().and_then(|s| s.schema.clone());
         // Keyed by the schema-qualified source name: tables of the same name in two
         // schemas keep their own names. A name only one table has is also given

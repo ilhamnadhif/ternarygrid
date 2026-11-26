@@ -466,7 +466,12 @@ impl ObjectEditorTab {
                         vm.set(key.clone(), vt.clone());
                     }
                     match p.save_virtual_model(&self.conn, &vm) {
-                        Ok(()) => cx.toasts.success(tr("Virtual model saved")),
+                        Ok(()) => {
+                            if let Some(panel) = self.data.as_mut().and_then(|d| d.panel.as_mut()) {
+                                panel.invalidate_virtual_model();
+                            }
+                            cx.toasts.success(tr("Virtual model saved"));
+                        }
                         Err(e) => cx.toasts.error(tr("Cannot save the virtual model"), Some(e.to_string())),
                     }
                 }

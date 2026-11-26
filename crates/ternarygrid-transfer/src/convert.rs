@@ -125,7 +125,7 @@ fn convert_text(s: &str, kind: DataKind, opts: &ConvertOptions) -> Result<Value,
             // A code typed as a number (a ZIP code `02134`, `+44…` after the sampled rows)
             // would lose its zeros or its sign: the row fails instead of changing silently.
             let digits = normalized.strip_prefix('-').unwrap_or(&normalized);
-            if normalized.starts_with('+') || (digits.len() > 1 && digits.starts_with('0') && !digits.starts_with("0.")) {
+            if normalized.starts_with('+') || (digits.len() > 1 && digits.starts_with('0') && !digits.starts_with("0.") && !digits.starts_with("0e") && !digits.starts_with("0E")) {
                 return Err(format!("'{t}' keeps its leading zeros or sign only as text"));
             }
             Value::parse_as(&normalized, kind)
@@ -303,6 +303,13 @@ fn convert_typed(v: &Value, kind: DataKind, opts: &ConvertOptions) -> Result<Val
             V::Float(f) if f.fract() == 0.0 && *f >= -9.2e18 && *f <= 9.2e18 => Ok(V::Int(*f as i64)),
             V::Float(f) => Err(format!("{f} is not an integer")),
             V::Decimal(s) => {
+                if s.contains(['e', 'E']) {
+                    let f: f64 = s.parse().map_err(|_| format!("{s} is not an integer"))?;
+                    if f.is_finite() && f.fract() == 0.0 && (-9.2e18..=9.2e18).contains(&f) {
+                        return Ok(V::Int(f as i64));
+                    }
+                    return Err(format!("{s} is not an integer"));
+                }
                 let int_part = match s.split_once('.') {
                     Some((i, frac)) if frac.chars().all(|c| c == '0') => i,
                     Some(_) => return Err(format!("{s} is not an integer")),

@@ -234,6 +234,8 @@ pub(crate) struct EditSession {
     pub just_started: bool,
     /// Started by typing (cursor at the end) instead of Enter/F2 (select all).
     pub typed: bool,
+    /// Cell was NULL or untouched DEFAULT when editing started, so committing `""` is a real change.
+    pub was_null_or_default: bool,
 }
 
 /// State of the dictionary / enum dropdown editor.
@@ -494,6 +496,33 @@ impl DataGridState {
     /// True while a cell editor or dropdown list is open.
     pub fn is_editing(&self) -> bool {
         self.rt.editing.is_some() || self.rt.dropdown.is_some()
+    }
+
+    /// Discard any open inline cell editor or dropdown without committing.
+    pub fn cancel_edit(&mut self) {
+        self.rt.editing = None;
+        self.rt.dropdown = None;
+    }
+
+    /// Commit any open inline cell editor into `model` (used before toolbar Save or view switch).
+    pub fn commit_pending_edit(&mut self, model: &mut ResultModel) -> Result<(), String> {
+        self.rt.dropdown = None;
+        let Some(mut session) = self.rt.editing.take() else {
+            return Ok(());
+        };
+        let Some(row) = session.anchor.and_then(|a| model.anchored_row(a, session.row)) else {
+            return Ok(());
+        };
+        session.row = row;
+        let null_to_empty = session.was_null_or_default && session.text.is_empty() && model.column_kind(session.col) == DataKind::Text;
+        if (session.text != session.original || null_to_empty)
+            && let Err(e) = model.set_cell(session.row, session.col, &session.text)
+        {
+            session.error = Some(e.clone());
+            self.rt.editing = Some(session);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Show a transient status message inside the grid.

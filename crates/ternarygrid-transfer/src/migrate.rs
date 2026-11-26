@@ -66,6 +66,8 @@ impl NameCase {
 pub struct MigrationJob {
     /// Source tables, migrated in this order.
     pub tables: Vec<ObjectRef>,
+    /// Database of the target tables (for multi-database servers); `None` uses the target connection's default database.
+    pub target_database: Option<String>,
     /// Schema of the target tables; `None` uses the target session's current schema.
     pub target_schema: Option<String>,
     /// Target table name by source table name: `schema.table` (tables of the
@@ -99,6 +101,7 @@ impl Default for MigrationJob {
     fn default() -> Self {
         MigrationJob {
             tables: Vec::new(),
+            target_database: None,
             target_schema: None,
             table_names: BTreeMap::new(),
             column_names: BTreeMap::new(),
@@ -403,6 +406,11 @@ async fn migrate(
     }
 
     // 3. Tables.
+    // On SQLite, adding foreign keys requires rebuilding the table (which drops and
+    // recreates it without external secondary indexes unless deferred), so when both
+    // `copy_indexes` and `copy_foreign_keys` are enabled we create secondary indexes
+    // after Phase 4 rebuilds the tables with all foreign keys in a single pass.
+    let defer_sqlite_indexes = dst_dialect.kind() == DbKind::Sqlite && job.copy_foreign_keys;
     for plan in &plans {
         let name = plan.source.display_path();
         progress.item_started(&name);
@@ -414,7 +422,7 @@ async fn migrate(
         summary.rows += ts.rows_written;
         match outcome {
             Ok(()) => {
-                if job.copy_indexes {
+                if job.copy_indexes && !defer_sqlite_indexes {
                     for idx in &plan.indexes {
                         let sql = dst_dialect.ddl().create_index(&plan.target, idx);
                         match cancellable(execute_update(dst, &sql, &[]), cancel, dst_handle.clone()).await {
@@ -449,6 +457,7 @@ async fn migrate(
             if !done {
                 continue;
             }
+            let mut mapped_fks = Vec::new();
             for fk in &plan.source_def.foreign_keys {
                 // Catalogs may spell the referenced table differently from the table itself.
                 let refers = |p: &&Plan, exact: bool| {
@@ -464,7 +473,7 @@ async fn migrate(
                     summary.warnings.push(format!("{}: foreign key to {} not copied (table not migrated)", plan.target_ref.display_path(), fk.ref_table));
                     continue;
                 };
-                let mapped = ForeignKeyDef {
+                mapped_fks.push(ForeignKeyDef {
                     name: fk.name.clone(),
                     schema: plan.target_ref.schema.clone(),
                     table: plan.target_ref.name.clone(),
@@ -475,12 +484,65 @@ async fn migrate(
                     on_update: fk.on_update,
                     on_delete: fk.on_delete,
                     deferrable: fk.deferrable,
-                };
-                let sql = dst_dialect.ddl().add_foreign_key(&plan.target, &mapped);
+                });
+            }
+            if mapped_fks.is_empty() {
+                continue;
+            }
+            if dst_dialect.kind() == DbKind::Sqlite {
+                // Apply all foreign keys for this SQLite table in a single table rebuild so
+                // multiple FKs never wipe each other out.
+                let mut desired = plan.target.clone();
+                desired.foreign_keys = mapped_fks.clone();
+                let stmts = dst_dialect.ddl().alter_table(&plan.target, &desired, &[]);
+                let mut ok = true;
+                let what = if mapped_fks.len() == 1 { "foreign key" } else { "foreign keys" };
+                for sql in stmts {
+                    match cancellable(execute_update(dst, &sql, &[]), cancel, dst_handle.clone()).await {
+                        Ok(_) => {}
+                        Err(e) if e.kind == ErrorKind::Cancelled => {
+                            if dst.in_transaction() {
+                                let _ = dst.rollback().await;
+                            }
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            if dst.in_transaction() {
+                                let _ = dst.rollback().await;
+                            }
+                            summary.warnings.push(format!("{}: {what} not created: {e}", plan.target_ref.display_path()));
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    summary.foreign_keys_created += mapped_fks.len() as u32;
+                }
+            } else {
+                for mapped in mapped_fks {
+                    let sql = dst_dialect.ddl().add_foreign_key(&plan.target, &mapped);
+                    match cancellable(execute_update(dst, &sql, &[]), cancel, dst_handle.clone()).await {
+                        Ok(_) => summary.foreign_keys_created += 1,
+                        Err(e) if e.kind == ErrorKind::Cancelled => return Err(e),
+                        Err(e) => summary.warnings.push(format!("{}: foreign key not created: {e}", plan.target_ref.display_path())),
+                    }
+                }
+            }
+        }
+    }
+    // 4b. Deferred SQLite secondary indexes (created once after FK table rebuilds finish).
+    if job.copy_indexes && defer_sqlite_indexes {
+        for plan in &plans {
+            let Some(ts) = summary.tables.iter_mut().find(|t| t.source.as_ref() == Some(&plan.source) && t.error.is_none()) else {
+                continue;
+            };
+            for idx in &plan.indexes {
+                let sql = dst_dialect.ddl().create_index(&plan.target, idx);
                 match cancellable(execute_update(dst, &sql, &[]), cancel, dst_handle.clone()).await {
-                    Ok(_) => summary.foreign_keys_created += 1,
+                    Ok(_) => ts.indexes_created += 1,
                     Err(e) if e.kind == ErrorKind::Cancelled => return Err(e),
-                    Err(e) => summary.warnings.push(format!("{}: foreign key not created: {e}", plan.target_ref.display_path())),
+                    Err(e) => summary.warnings.push(format!("{}: index {} not created: {e}", plan.target_ref.display_path(), idx.name)),
                 }
             }
         }

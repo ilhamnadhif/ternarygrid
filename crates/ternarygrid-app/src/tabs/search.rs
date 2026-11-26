@@ -593,8 +593,11 @@ impl SearchTab {
         let (Some(conn), Some(schema)) = (self.conn.clone(), self.data_schema.clone()) else { return (None, None) };
         let backend = cx.backend;
         let Some(live) = cx.conns.live_mut(&conn) else { return (None, None) };
-        let main = live.main.clone();
-        live.meta.request_snapshot(backend, &main, &schema);
+        if let Some(session) = live.ensure_session(backend, schema.database.as_deref()) {
+            live.meta.request_snapshot(backend, &session, &schema);
+        } else if let Some(err) = live.session_error(schema.database.as_deref()) {
+            return (None, Some(err));
+        }
         let err = live.meta.snapshots.get(&schema).and_then(|l| l.error()).map(|e| e.full_text());
         (live.meta.snapshot(&schema), err)
     }
@@ -1056,9 +1059,12 @@ impl TabView for SearchTab {
         TabActivity::Idle
     }
 
-    fn poll_background(&mut self, _ctx: &egui::Context, _cx: &mut AppContext) {
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
         if self.meta_job.is_some() {
             self.poll_metadata();
+        }
+        if self.data_requested && self.data_run.is_none() {
+            self.start_data(cx);
         }
         if self.data_run.is_some() {
             self.poll_data();

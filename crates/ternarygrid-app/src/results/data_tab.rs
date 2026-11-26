@@ -336,7 +336,9 @@ impl EmbeddedView for TableDataView {
                 true
             }
             A::Export => {
-                cx.push(crate::command::AppCommand::OpenExport { connection: self.conn.clone(), objects: vec![self.table.clone()], sql: None });
+                let table = p.table.clone().unwrap_or_else(|| self.table.clone());
+                let sql = if p.where_clause.is_some() || p.order_by.is_some() { Some(p.src.sql.clone()) } else { None };
+                cx.push(crate::command::AppCommand::OpenExport { connection: self.conn.clone(), objects: vec![table], sql });
                 true
             }
             _ => false,

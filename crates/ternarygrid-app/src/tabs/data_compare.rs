@@ -425,6 +425,7 @@ struct Outcome {
     elapsed: Duration,
     target_conn: String,
     target_schema: Option<SchemaRef>,
+    target_table: Option<ObjectRef>,
     target_name: String,
     script: String,
     lang: SqlLanguage,
@@ -574,8 +575,9 @@ impl DataCompareTab {
             .desired_width(ui.available_width().max(160.0))
             .id_salt(("dc_filter", uid, tag));
         ui.add(filter);
-        if *side != before && before.table != side.table {
+        if *side != before {
             self.result = None;
+            self.confirm_apply = false;
             self.error = None;
         }
     }
@@ -827,6 +829,7 @@ impl DataCompareTab {
                         elapsed: r.started.elapsed(),
                         target_conn: self.target.conn.clone().unwrap_or_default(),
                         target_schema: self.target.schema.clone(),
+                        target_table: self.target.table.clone(),
                         target_name: self.target.table.as_ref().map(|t| t.display_path()).unwrap_or_default(),
                         script,
                         lang: SqlLanguage::new(dialect),
@@ -1075,7 +1078,8 @@ impl DataCompareTab {
         let production = cx.conns.type_of(&o.target_conn).is_production();
         // Keys that are no primary or unique key of the target: a statement of the script
         // (`DELETE … WHERE email = 'A@x.com'`) may change every row sharing them.
-        let (keys, target_table) = (self.keys.clone(), self.target.table.clone());
+        // Validate against the frozen comparison outcome rather than live UI selections.
+        let (keys, target_table) = (o.layout.target_keys.clone(), o.target_table.clone());
         let o_target_conn = o.target_conn.clone();
         let not_unique = target_table.and_then(|t| cached_table_def(cx, &o_target_conn, &t).ok().flatten()).is_some_and(|def| !keys_identify_rows(&def, &keys));
         let Some(o) = &self.result else { return };
@@ -1242,6 +1246,11 @@ impl TabView for DataCompareTab {
     fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
         if self.run.is_some() || self.apply_job.is_some() {
             self.poll(cx);
+        }
+        if self.start_requested {
+            let src = Self::def_of(cx, &self.source.clone()).ok().flatten();
+            let dst = Self::def_of(cx, &self.target.clone()).ok().flatten();
+            self.try_start(cx, src.as_ref(), dst.as_ref());
         }
     }
 

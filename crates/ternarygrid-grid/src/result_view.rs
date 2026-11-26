@@ -179,11 +179,11 @@ fn floating_notice_toast(ui: &Ui, id: Id, central: egui::Rect, message: &str) ->
     }
     let pal = ternarygrid_ui::pal(ui);
     let dark = ui.visuals().dark_mode;
-    let max_w = (central.width() - 32.0).clamp(120.0, 440.0);
+    let max_w = (central.width() - 16.0).clamp(80.0, 440.0);
     let text_w = ui.painter().layout_no_wrap(message.to_string(), egui::FontId::proportional(12.0), egui::Color32::PLACEHOLDER).size().x;
     let pill_w = (12.0 + 14.0 + 6.0 + text_w + 8.0 + 20.0 + 8.0).min(max_w);
     let pill_h = 30.0;
-    let left = (central.center().x - pill_w / 2.0).max(central.left() + 8.0);
+    let left = (central.center().x - pill_w / 2.0).clamp(central.left() + 8.0, (central.right() - pill_w - 8.0).max(central.left() + 8.0));
     let top = (central.bottom() - pill_h - 10.0).max(central.top() + 8.0);
     let mut dismissed = false;
     let shadow = Shadow { offset: [0, 3], blur: 10, spread: 0, color: egui::Color32::from_black_alpha(if dark { 110 } else { 32 }) };
@@ -300,13 +300,12 @@ impl<'a> ResultViewer<'a> {
         ui.painter().hline(bar.response.rect.x_range(), bar.response.rect.bottom() - 0.5, line);
         // "Filter by value" in server mode adds to the WHERE the filter box shows.
         state.grid.set_server_filter(&state.toolbar.filter_text);
-        let record_editing = state.record.is_editing();
         let footer = Panel::bottom(id.with("toolbar")).frame(footer_frame).show_separator_line(false).show(ui, |ui| {
             actions.extend(
                 ResultToolbar::new(model, &mut state.grid, &mut state.toolbar)
                     .fetch_size(options.fetch_more_threshold)
                     .can_edit(options.allow_editing)
-                    .editing(record_editing)
+                    .record(&mut state.record)
                     .show(ui),
             );
         });

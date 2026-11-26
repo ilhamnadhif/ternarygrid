@@ -159,10 +159,13 @@ impl TabView for QueryBuilderTab {
         // Tables whose definition arrived.
         let mut still = Vec::new();
         for obj in std::mem::take(&mut self.pending) {
-            if !live.meta.table_defs.contains_key(&obj)
-                && let Some(main) = live.ensure_session(backend, obj.database.as_deref())
-            {
-                live.meta.request_table_def(backend, &main, &obj);
+            if !live.meta.table_defs.contains_key(&obj) {
+                if let Some(main) = live.ensure_session(backend, obj.database.as_deref()) {
+                    live.meta.request_table_def(backend, &main, &obj);
+                } else if let Some(err) = live.session_error(obj.database.as_deref()) {
+                    cx.toasts.error(tr("Cannot read the table"), Some(err));
+                    continue;
+                }
             }
             match live.meta.table_defs.get(&obj) {
                 Some(Loadable::Loaded(def)) => {

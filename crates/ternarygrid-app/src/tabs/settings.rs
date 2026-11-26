@@ -1586,7 +1586,7 @@ impl SettingsTab {
         }
     }
 
-    fn security(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
+    fn poll_secrets_job(&mut self, cx: &mut AppContext) -> bool {
         let mut moved = false;
         if let Some(r) = self.secrets_job.as_mut().and_then(|j| j.poll()) {
             self.secrets_job = None;
@@ -1601,6 +1601,11 @@ impl SettingsTab {
             }
             self.message = Some(r.map(|(m, _)| m));
         }
+        moved
+    }
+
+    fn security(&mut self, ui: &mut Ui, cx: &mut AppContext) -> bool {
+        let moved = self.poll_secrets_job(cx);
         let busy = self.secrets_job.is_some();
         let current = cx.services.secrets.read().backend();
         let pal = ternarygrid_ui::pal(ui);
@@ -1659,8 +1664,15 @@ impl SettingsTab {
                         opened.map_err(|e| e.to_string())?;
                         secrets.write().switch_to_vault(vault, &keys, true)
                     } else {
+                        let prev_vault = secrets.read().vault().cloned();
                         let keychain = ternarygrid_config::SecretsManager::platform_keychain_store();
-                        secrets.write().switch_backend(SecretBackend::Keychain, keychain, &keys, true)
+                        let switched = secrets.write().switch_backend(SecretBackend::Keychain, keychain, &keys, true);
+                        if switched.is_ok() && prev_vault.as_ref().is_some_and(|v| ternarygrid_config::SecretStore::list_keys(v.as_ref()).is_ok_and(|k| k.is_empty())) {
+                            // Remove the now-empty vault file so switching back to EncryptedFile
+                            // with a new master password creates a fresh vault cleanly.
+                            let _ = std::fs::remove_file(&vault_file);
+                        }
+                        switched
                     };
                     let r = r.map_err(|e| e.to_string())?;
                     Ok((trn(r.migrated.len(), tr("1 secret moved"), tr("{} secrets moved")), Some(target)))
@@ -1946,8 +1958,18 @@ impl TabView for SettingsTab {
         Some("settings".into())
     }
 
+    fn captures_keyboard(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    fn poll_background(&mut self, _ctx: &egui::Context, cx: &mut AppContext) {
+        if self.poll_secrets_job(cx) {
+            cx.push(AppCommand::SettingsChanged);
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, cx: &mut AppContext) {
-        let mut changed = false;
+        let mut changed = self.poll_secrets_job(cx);
         let p = ternarygrid_ui::pal(ui);
         let nav_frame = egui::Frame::new().fill(p.canvas).inner_margin(egui::Margin::symmetric(10, 14)).stroke(egui::Stroke::NONE);
         let nav = egui::Panel::left("settings_sections").resizable(false).exact_size(230.0).frame(nav_frame).show(ui, |ui| {

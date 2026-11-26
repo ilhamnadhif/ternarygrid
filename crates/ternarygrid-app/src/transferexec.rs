@@ -285,6 +285,9 @@ pub async fn import(exec: &AppTaskExecutor, ctx: &RunContext, connection_id: &st
         ctx.warn(w.clone());
     }
     let message = trf("{} imported, {} failed", &[&rows_text(summary.rows_written), &summary.rows_failed]);
+    if summary.rows_written == 0 && summary.rows_failed > 0 {
+        return Err(DbError::query(message));
+    }
     Ok(RunOutcome { rows: Some(summary.rows_written), output_files: Vec::new(), message: Some(message) })
 }
 
@@ -309,7 +312,16 @@ pub async fn migrate(exec: &AppTaskExecutor, ctx: &RunContext, source: &str, tar
         let _ = src_session.close().await;
         src
     };
-    let dst = AppSessionFactory::new(b.driver.clone(), b.params.clone(), b.config.clone(), None).with_session(b.session);
+    let dst_database = job.target_database.clone();
+    let dst_same_db = dst_database.is_none() || dst_database == b.params.database;
+    let dst = AppSessionFactory::new(b.driver.clone(), b.params.clone(), b.config.clone(), dst_database.as_deref());
+    let mut dst_session = b.session;
+    let dst = if dst_same_db {
+        dst.with_session(dst_session)
+    } else {
+        let _ = dst_session.close().await;
+        dst
+    };
     let (src, dst): (Arc<dyn SessionFactory>, Arc<dyn SessionFactory>) = (Arc::new(src), Arc::new(dst));
     let progress = Progress::new();
     let tables = job.tables.len();

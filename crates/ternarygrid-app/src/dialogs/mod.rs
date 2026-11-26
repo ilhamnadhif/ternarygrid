@@ -337,20 +337,22 @@ impl Dialogs {
                         (SecretSlot::SshPassphrase, &creds.ssh_passphrase),
                         (SecretSlot::ProxyPassword, &creds.proxy_password),
                     ];
+                    let mut saved_ok = true;
                     for (slot, v) in pairs {
                         if let Some(v) = v {
                             let key = match cx.conns.config(&p.conn_id) {
                                 Some(cfg) => cx.conns.store.network_secret_key(cfg, slot),
                                 None => secret_key(&p.conn_id, slot),
                             };
-                            if let Err(e) = cx.conns.secrets.set(&key, v)
-                                && !crate::dialogs::vault::unlock_after_failed_write(cx, &e)
-                            {
-                                cx.toasts.error(tr("Cannot store the password securely"), Some(e.to_string()));
+                            if let Err(e) = cx.conns.secrets.set(&key, v) {
+                                saved_ok = false;
+                                if !crate::dialogs::vault::unlock_after_failed_write(cx, &e) {
+                                    cx.toasts.error(tr("Cannot store the password securely"), Some(e.to_string()));
+                                }
                             }
                         }
                     }
-                    if let Some(cfg) = cx.conns.config_mut(&p.conn_id) {
+                    if saved_ok && let Some(cfg) = cx.conns.config_mut(&p.conn_id) {
                         // "Ask every time" with a saved password would keep asking: it is used from now on.
                         let ask = matches!(cfg.auth, ternarygrid_core::config::AuthMethod::Prompt) && creds.password.is_some();
                         if !cfg.save_password || ask {

@@ -1612,8 +1612,8 @@ impl TableDesignerTab {
         {
             live.meta.request_schemas(backend, &session, db.as_deref());
             schema_names = live.meta.schemas_of(db.as_deref()).get().map(|v| v.iter().filter(|s| !s.is_system).map(|s| s.name.clone()).collect()).unwrap_or_default();
-            for s in schemas.iter().filter(|s| !s.is_empty()) {
-                let sr = SchemaRef::new(db.clone(), Some(s.clone()));
+            for s in &schemas {
+                let sr = SchemaRef::new(db.clone(), (!s.is_empty()).then(|| s.clone()));
                 live.meta.request_snapshot(backend, &session, &sr);
                 if let Some(snap) = live.meta.snapshot(&sr) {
                     snaps.insert(s.clone(), snap);
@@ -1636,9 +1636,20 @@ impl TableDesignerTab {
                     field(ui, &mut f.name, ("td_fkn", uid, f.uid), 220.0, style::CONTROL_H, tr("name (optional)"), false);
                     let before = f.cols.clone();
                     if Self::columns_picker(ui, ("td_fkcols", uid, f.uid), &columns, &snapshot, &mut f.cols, 160.0, style::CONTROL_H) {
-                        // Keep each referenced column paired with its column.
+                        // Keep each referenced column paired with its column; if the target table
+                        // was picked first, carry its pre-populated PK columns into the new pairs.
                         let old = std::mem::take(&mut f.ref_columns);
-                        f.ref_columns = f.cols.iter().map(|r| before.iter().position(|b| b == r).and_then(|p| old.get(p).cloned()).unwrap_or_default()).collect();
+                        let fallback_pk: Vec<String> = if before.is_empty() && !old.is_empty() {
+                            old.clone()
+                        } else {
+                            snaps.get(f.ref_schema.trim()).and_then(|s| s.table(f.ref_table.trim())).and_then(|t| t.row_key()).map(|k| k.columns.clone()).unwrap_or_default()
+                        };
+                        f.ref_columns = f
+                            .cols
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, r)| before.iter().position(|b| b == r).and_then(|p| old.get(p).cloned()).or_else(|| fallback_pk.get(idx).cloned()).unwrap_or_default())
+                            .collect();
                     }
                     arrow(ui, 14.0);
                     let schema_text: egui::WidgetText = if f.ref_schema.is_empty() { unset(ui, tr("Choose schema…")) } else { f.ref_schema.clone().into() };
@@ -1675,9 +1686,9 @@ impl TableDesignerTab {
                         }
                     });
                 });
-                // One referenced column per column.
+                // One referenced column per column (preserve pre-populated target PK until local columns are picked).
                 let n = f.cols.len();
-                if f.ref_columns.len() != n {
+                if n > 0 && f.ref_columns.len() != n {
                     f.ref_columns.resize(n, String::new());
                 }
                 let ref_cols: Vec<String> = if f.ref_table.trim() == this_table && f.ref_schema.trim() == own_schema {
@@ -2445,7 +2456,15 @@ fn drops_data(stmts: &[String]) -> bool {
         let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
         s.starts_with("DROP TABLE")
             || s.contains(" DROP COLUMN ")
-            || (s.starts_with("ALTER TABLE") && s.contains(" DROP ") && !s.contains(" DROP CONSTRAINT ") && !s.contains(" DROP DEFAULT") && !s.contains(" DROP NOT NULL"))
+            || (s.starts_with("ALTER TABLE")
+                && s.contains(" DROP ")
+                && !s.contains(" DROP CONSTRAINT ")
+                && !s.contains(" DROP DEFAULT")
+                && !s.contains(" DROP NOT NULL")
+                && !s.contains(" DROP INDEX ")
+                && !s.contains(" DROP KEY ")
+                && !s.contains(" DROP FOREIGN KEY ")
+                && !s.contains(" DROP PRIMARY KEY"))
             || s.starts_with("TRUNCATE")
     })
 }
@@ -2627,6 +2646,23 @@ impl TabView for TableDesignerTab {
         if self.exec.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
+    }
+
+    fn action_enabled(&self, action: crate::keys::Action) -> Option<bool> {
+        match action {
+            crate::keys::Action::Save => Some(self.page_issues().is_empty() && self.is_dirty() && self.exec.is_none()),
+            _ => None,
+        }
+    }
+
+    fn on_action(&mut self, action: crate::keys::Action, _cx: &mut AppContext) -> bool {
+        if action == crate::keys::Action::Save {
+            if self.page_issues().is_empty() && !self.statements().is_empty() && self.exec.is_none() {
+                self.confirm = true;
+            }
+            return true;
+        }
+        false
     }
 
     fn prompts_on_close(&self) -> bool {

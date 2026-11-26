@@ -407,10 +407,15 @@ impl ImportTab {
     fn source_config(&self) -> ImportSourceConfig {
         let path = PathBuf::from(self.path.trim());
         match self.format {
-            ImportFileFormat::Csv => ImportSourceConfig::Csv { path, options: self.csv.clone() },
+            ImportFileFormat::Csv => {
+                let mut options = self.csv.clone();
+                options.null_values = self.options.convert.null_values.clone();
+                ImportSourceConfig::Csv { path, options }
+            }
             ImportFileFormat::Tsv => {
                 let mut options = self.csv.clone();
                 options.delimiter = "\t".into();
+                options.null_values = self.options.convert.null_values.clone();
                 ImportSourceConfig::Csv { path, options }
             }
             ImportFileFormat::Xlsx => ImportSourceConfig::Xlsx { path, options: self.xlsx.clone() },

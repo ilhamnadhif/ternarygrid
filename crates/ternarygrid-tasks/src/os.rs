@@ -166,8 +166,16 @@ pub fn default_launch_agents_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library").join("LaunchAgents"))
 }
 
+fn portable_home() -> Option<String> {
+    std::env::var("TERNARYGRID_HOME").ok().filter(|v| !v.is_empty())
+}
+
 /// launchd property list running `exe --run-task <id>` on the task's schedule.
 pub fn launchd_plist(task: &TaskDef, exe: &Path) -> DbResult<String> {
+    launchd_plist_with_home(task, exe, portable_home().as_deref())
+}
+
+fn launchd_plist_with_home(task: &TaskDef, exe: &Path, home: Option<&str>) -> DbResult<String> {
     let schedule = os_schedule(require_schedule(task)?)?;
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -179,6 +187,11 @@ pub fn launchd_plist(task: &TaskDef, exe: &Path) -> DbResult<String> {
         s.push_str(&format!("        <string>{}</string>\n", xml(&a)));
     }
     s.push_str("    </array>\n");
+    if let Some(home) = home.filter(|h| !h.is_empty()) {
+        s.push_str("    <key>EnvironmentVariables</key>\n    <dict>\n");
+        s.push_str(&format!("        <key>TERNARYGRID_HOME</key>\n        <string>{}</string>\n", xml(home)));
+        s.push_str("    </dict>\n");
+    }
     match schedule {
         OsSchedule::Interval(secs) => s.push_str(&format!("    <key>StartInterval</key>\n    <integer>{secs}</integer>\n")),
         OsSchedule::Calendar(entries) => {
@@ -297,13 +310,18 @@ fn crontab_schedule(schedule: &Schedule) -> DbResult<String> {
 /// crontab line running `exe --run-task <id>` on the task's schedule, ending
 /// with a `# ternarygrid-task:<id>` marker.
 pub fn crontab_line(task: &TaskDef, exe: &Path) -> DbResult<String> {
+    crontab_line_with_home(task, exe, portable_home().as_deref())
+}
+
+fn crontab_line_with_home(task: &TaskDef, exe: &Path, home: Option<&str>) -> DbResult<String> {
     // A line break in the id or the path would start another crontab entry.
     if task.id.chars().chain(exe.to_string_lossy().chars()).any(char::is_control) {
         return Err(DbError::config("The task id or the program path contains a control character"));
     }
     let when = crontab_schedule(require_schedule(task)?)?;
     // `%` is a newline in crontab commands
-    let command = format!("{} --run-task {}", shell_quote(&exe.to_string_lossy()), shell_quote(&task.id)).replace('%', "\\%");
+    let env_prefix = home.filter(|h| !h.is_empty() && !h.chars().any(char::is_control)).map(|h| format!("TERNARYGRID_HOME={} ", shell_quote(h))).unwrap_or_default();
+    let command = format!("{env_prefix}{} --run-task {}", shell_quote(&exe.to_string_lossy()), shell_quote(&task.id)).replace('%', "\\%");
     Ok(format!("{when} {command} {}", crontab_marker(&task.id)))
 }
 
@@ -526,9 +544,19 @@ fn schtasks_xml_trigger(schedule: &Schedule) -> DbResult<String> {
 /// Uses ISO-8601 `<StartBoundary>YYYY-MM-DDTHH:MM:SS</StartBoundary>` and
 /// separate XML-escaped `<Command>` / `<Arguments>` elements.
 pub fn schtasks_xml(task: &TaskDef, exe: &Path) -> DbResult<String> {
+    schtasks_xml_with_home(task, exe, portable_home().as_deref())
+}
+
+fn schtasks_xml_with_home(task: &TaskDef, exe: &Path, home: Option<&str>) -> DbResult<String> {
     let exe_str = validate_schtasks_inputs(&task.id, exe)?;
     let trigger = schtasks_xml_trigger(require_schedule(task)?)?;
-    let args = format!("--run-task {}", windows_quote_arg(&task.id));
+    let (cmd, args) = match home.filter(|h| !h.is_empty() && !h.chars().any(char::is_control)) {
+        Some(home) => {
+            let safe_home = home.replace('"', "\"\"");
+            ("cmd.exe".to_string(), format!("/C \"set \"TERNARYGRID_HOME={safe_home}\" && {} --run-task {}\"", windows_quote_arg(&exe_str), windows_quote_arg(&task.id)))
+        }
+        None => (exe_str, format!("--run-task {}", windows_quote_arg(&task.id))),
+    };
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
@@ -552,7 +580,7 @@ pub fn schtasks_xml(task: &TaskDef, exe: &Path) -> DbResult<String> {
          \x20 </Actions>\n\
          </Task>\n",
         xml(&task.name),
-        xml(&exe_str),
+        xml(&cmd),
         xml(&args),
     ))
 }
@@ -784,5 +812,23 @@ mod tests {
         assert_eq!(cmd.program, "schtasks");
         assert_eq!(cmd.args[..5], ["/Create", "/F", "/TN", "TernaryGrid\\task-a_b__c_", "/XML"]);
         assert_eq!(cmd.args[5], xml_path.to_string_lossy());
+    }
+
+    #[test]
+    fn portable_home_propagates_to_all_os_schedulers() {
+        let t = task(Schedule::Daily { at: "08:00".into(), weekdays: Vec::new() });
+        let home = "/Volumes/USB Drive/tg-home";
+        let plist = launchd_plist_with_home(&t, &exe(), Some(home)).unwrap();
+        assert!(plist.contains("<key>EnvironmentVariables</key>"), "{plist}");
+        assert!(plist.contains("<key>TERNARYGRID_HOME</key>"), "{plist}");
+        assert!(plist.contains(&format!("<string>{home}</string>")), "{plist}");
+
+        let cron = crontab_line_with_home(&t, &exe(), Some(home)).unwrap();
+        assert!(cron.contains("TERNARYGRID_HOME='/Volumes/USB Drive/tg-home' "), "{cron}");
+
+        let win_exe = Path::new("C:\\Portable\\ternarygrid.exe");
+        let xml_doc = schtasks_xml_with_home(&t, win_exe, Some("D:\\TG Home")).unwrap();
+        assert!(xml_doc.contains("<Command>cmd.exe</Command>"), "{xml_doc}");
+        assert!(xml_doc.contains("TERNARYGRID_HOME=D:\\TG Home"), "{xml_doc}");
     }
 }

@@ -119,15 +119,26 @@ impl ImportDialog {
 
     fn apply(&mut self, cx: &mut AppContext) -> bool {
         let Some(mut result) = self.result.take() else { return false };
-        let mut keep = self.selected.iter();
-        result.connections.retain(|_| *keep.next().unwrap_or(&false));
+        let mut filtered = result.clone();
+        filtered.retain_selected(&self.selected);
+        if !filtered.secrets.is_empty() && cx.services.secrets.read().is_locked() {
+            // Keep the dialog open with its parsed result so the user can unlock the vault
+            // without losing the imported passwords or half-mutating the connection store.
+            self.result = Some(result);
+            cx.push(crate::command::AppCommand::UnlockVault);
+            cx.toasts.error(tr("Unlock the password vault first"), Some(tr("The selected connections include passwords; unlock the vault, then import again.").to_string()));
+            return false;
+        }
+        result = filtered;
         result.neutralize(self.keep_shell_commands);
         if !self.folder_prefix.trim().is_empty() {
             result.prefix_folders(self.folder_prefix.trim());
         }
         let warnings = result.warnings.clone();
         let summary = merge_into_store(&mut cx.conns.store, result, self.policy);
-        if let Err(e) = cx.services.secrets.read().store_all(&summary.secrets) {
+        if let Err(e) = cx.services.secrets.read().store_all(&summary.secrets)
+            && !crate::dialogs::vault::unlock_after_failed_write(cx, &e)
+        {
             cx.toasts.error(tr("Cannot store the imported passwords"), Some(e.to_string()));
         }
         cx.conns.dirty = true;
@@ -213,10 +224,15 @@ impl ImportDialog {
                             self.tg_path = p.display().to_string();
                             picked = true;
                         }
+                        let mut just_detected_secrets = false;
                         if picked || r.lost_focus() {
+                            let had = self.tg_has_secrets;
                             self.tg_has_secrets = std::fs::read(self.tg_path.trim()).is_ok_and(|b| ternarygrid_config::import::ternarygrid::has_secrets(&b));
+                            just_detected_secrets = !had && self.tg_has_secrets && self.tg_password.is_empty();
                         }
-                        find |= find_button(ui);
+                        if find_button(ui) && !just_detected_secrets {
+                            find = true;
+                        }
                     });
                     if self.tg_has_secrets {
                         super::form_row_w(ui, tr("File password"), 110.0, |ui| {

@@ -1313,7 +1313,7 @@ impl ResultModel {
         for (src, col, value) in resolved {
             match src {
                 RowSource::Stored(s) => {
-                    let original = originals.remove(&(s, col)).unwrap_or(Value::Null);
+                    let original = originals.get(&(s, col)).cloned().unwrap_or(Value::Null);
                     let entry = self.updates.entry(s).or_default();
                     let pos = entry.iter().position(|(c, _)| *c == col);
                     let prev = pos.map(|p| entry[p].1.clone());
@@ -1406,7 +1406,9 @@ impl ResultModel {
         }
         let n = self.columns.len();
         let mut copies: Vec<Vec<CellValue>> = Vec::with_capacity(sorted.len());
-        let auto: Vec<bool> = self.columns.iter().map(|c| c.auto_increment == Some(true)).collect();
+        let auto: Vec<bool> = (0..n)
+            .map(|i| self.columns[i].auto_increment == Some(true) || self.editability.as_ref().ok().and_then(|t| t.column_names.get(i)).is_some_and(Option::is_none))
+            .collect();
         for &r in &sorted {
             let mut vals = Vec::with_capacity(n);
             self.visit_rows(r..r + 1, |_, cells| {

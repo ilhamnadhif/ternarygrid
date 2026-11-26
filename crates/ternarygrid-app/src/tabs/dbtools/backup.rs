@@ -856,6 +856,9 @@ impl BackupTab {
                 ToolOutcome::Cancelled => OpState::Cancelled,
             };
             cx.ops.finish(run.op.id, state);
+            if self.restore && matches!(outcome, ToolOutcome::Succeeded | ToolOutcome::Warnings { .. }) {
+                cx.push(AppCommand::RefreshMetadata { connection: self.conn.clone(), object: None, schema: None });
+            }
             if matches!(outcome, ToolOutcome::Succeeded) {
                 finished_ok = Some(run.output.clone());
             }

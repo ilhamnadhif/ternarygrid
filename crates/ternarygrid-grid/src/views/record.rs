@@ -127,6 +127,8 @@ pub struct RecordViewState {
     pub column_filter: String,
     /// Row, column, text being typed, the text it started with.
     editing: Option<(usize, usize, String, String)>,
+    /// True when the cell being edited started as NULL or untouched DEFAULT.
+    editing_was_null_or_default: bool,
     /// The record being edited: the editor closes when the row shows another one.
     editing_anchor: Option<RowAnchor>,
     /// The editor just opened: its text selected (Enter, F2, double-click) or
@@ -159,14 +161,17 @@ pub struct RecordViewState {
 impl RecordViewState {
     /// Edit row `r`'s field `c`: an enum / dictionary column opens its list
     /// of values (unless typed into), any other the editor, as in the grid.
-    fn start_edit(&mut self, model: &ResultModel, r: usize, c: usize, text: String, original: String, typed: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn start_edit(&mut self, model: &ResultModel, r: usize, c: usize, text: String, original: String, typed: bool, was_null_or_default: bool) {
         self.error = None;
         if !typed && (model.dictionary(c).is_some() || model.enum_values(c).is_some()) {
             self.editing = None;
+            self.editing_was_null_or_default = false;
             self.dropdown = Some(Dropdown { row: r, anchor: model.row_anchor(r), col: c, search: String::new(), just_opened: true, current: None });
         } else {
             self.dropdown = None;
             self.editing = Some((r, c, text, original));
+            self.editing_was_null_or_default = was_null_or_default;
             self.editing_anchor = model.row_anchor(r);
             self.select_text = Some(!typed);
         }
@@ -182,6 +187,40 @@ impl RecordViewState {
     /// True while a field editor or value dropdown is open in record view.
     pub fn is_editing(&self) -> bool {
         self.editing.is_some() || self.dropdown.is_some()
+    }
+
+    /// Discard any open field editor or dropdown without committing.
+    pub fn cancel_edit(&mut self) {
+        self.editing = None;
+        self.editing_was_null_or_default = false;
+        self.editing_anchor = None;
+        self.dropdown = None;
+        self.error = None;
+    }
+
+    /// Commit any open inline field editor to `model` (used before toolbar Save or view switch).
+    pub fn commit_pending_edit(&mut self, model: &mut ResultModel) -> Result<(), String> {
+        self.dropdown = None;
+        let Some((r, c, text, original)) = self.editing.take() else {
+            return Ok(());
+        };
+        let was_null = std::mem::take(&mut self.editing_was_null_or_default);
+        let anchor = self.editing_anchor.take();
+        let Some(row) = anchor.and_then(|a| model.anchored_row(a, r)) else {
+            return Ok(());
+        };
+        let null_to_empty = was_null && text.is_empty() && model.column_kind(c) == ternarygrid_core::DataKind::Text;
+        if (text != original || null_to_empty)
+            && let Err(e) = model.set_cell(row, c, &text)
+        {
+            self.error = Some(e.clone());
+            self.editing = Some((row, c, text, original));
+            self.editing_was_null_or_default = was_null;
+            self.editing_anchor = anchor;
+            return Err(e);
+        }
+        self.error = None;
+        Ok(())
     }
 
     /// Take the keyboard focus on the next frame: Tab goes back to the
@@ -604,9 +643,11 @@ fn rows_table(
                                             if escape || enter {
                                                 state.focus_request = true;
                                             }
-                                            // Unchanged text is no edit (a NULL would become '').
-                                            if escape || text == original {
+                                            // Unchanged text is no edit unless explicitly converting a NULL/DEFAULT text cell to "".
+                                            let null_to_empty = state.editing_was_null_or_default && text.is_empty() && model.column_kind(c) == ternarygrid_core::DataKind::Text;
+                                            if escape || (text == original && !null_to_empty) {
                                                 state.editing = None;
+                                                state.editing_was_null_or_default = false;
                                             } else {
                                                 commit = Some((r, c, text.clone()));
                                             }
@@ -732,7 +773,7 @@ fn rows_table(
                                     let multi = matches!(v, Value::Text(s) if s.contains('\n')) || matches!(v, Value::Bytes(_));
                                     if can_edit && !multi {
                                         let text = if v.is_null() { String::new() } else { v.to_text().into_owned() };
-                                        state.start_edit(model, r, c, text.clone(), text, false);
+                                        state.start_edit(model, r, c, text.clone(), text, false, v.is_null() || *is_default);
                                     } else {
                                         open_value = Some((r, c));
                                     }
@@ -857,7 +898,8 @@ fn rows_table(
     let (menu_actions, edit) = crate::grid::detached_menu(model, grid, options, ui.id().with("record_menu"), ui, menu_resp.as_ref(), keys, &cells, |ui| copy_menu(ui, &mut copy));
     actions.extend(menu_actions);
     if let Some(e) = edit {
-        state.start_edit(model, e.row, e.col, e.text, e.original, e.typed);
+        let was_null_or_default = model.cell(e.row, e.col).is_none_or(|v| v.is_null()) || model.cell_is_default(e.row, e.col);
+        state.start_edit(model, e.row, e.col, e.text, e.original, e.typed, was_null_or_default);
     }
     if let Some(names) = copy {
         let shown: Vec<(usize, usize)> = state.picked.iter().copied().filter(|(r, c)| rows.contains(r) && order.contains(c)).collect();

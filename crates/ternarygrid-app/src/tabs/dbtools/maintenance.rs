@@ -232,7 +232,7 @@ async fn run_all(
 
 impl MaintenanceTab {
     pub fn new(conn: String, objects: Vec<ObjectRef>) -> Self {
-        let database = objects.iter().find_map(|o| o.database.clone());
+        let database = objects.iter().find_map(|o| o.database.clone().or_else(|| (o.kind == ObjectKind::Database && !o.name.is_empty()).then(|| o.name.clone())));
         MaintenanceTab { done: false, conn, objects, op: None, options: BTreeMap::new(), session: ToolSession::new(database), run: None, pending: false, error: None, lang: None }
     }
 

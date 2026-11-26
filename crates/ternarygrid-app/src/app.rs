@@ -930,6 +930,13 @@ impl TernaryGridApp {
             return;
         }
         let in_popup = self.popup_focus.filter(|id| self.popups.iter().any(|t| t.id == *id));
+        let captures = match in_popup {
+            Some(id) => self.popups.iter().find(|t| t.id == id).is_some_and(|t| t.view.captures_keyboard()),
+            None => self.dock.find_active_focused().is_some_and(|(_, t)| t.view.captures_keyboard()),
+        };
+        if captures {
+            return;
+        }
         let context = match in_popup {
             Some(id) => self.popups.iter().find(|t| t.id == id).map(|t| t.view.focus_context()).unwrap_or(crate::keys::ActionContext::Global),
             None => self.dock.find_active_focused().map(|(_, t)| t.view.focus_context()).unwrap_or(crate::keys::ActionContext::Global),

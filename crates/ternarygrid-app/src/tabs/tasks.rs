@@ -488,7 +488,9 @@ impl TasksTab {
                 self.upsert_run(run);
             }
             TaskEvent::Message { run_id, message, .. } => {
-                if let Some(r) = self.find_run_mut(&run_id) {
+                if let Some(r) = self.find_run_mut(&run_id)
+                    && !r.messages.iter().any(|m| m.time == message.time && m.level == message.level && m.text == message.text)
+                {
                     r.push_message(message);
                 }
             }

@@ -30,6 +30,8 @@ pub struct VaultDialog {
     job: Option<Job<DbResult<()>>>,
     /// Why the password was refused, under the master password (`false`) or its repetition.
     error: Option<(bool, String)>,
+    /// Whether initial keyboard focus was already given to the master password field.
+    focused: bool,
     /// "Skip" (or closed): connections ask for their passwords instead of the vault.
     pub skipped: bool,
 }
@@ -51,6 +53,7 @@ impl VaultDialog {
                     self.password.clear();
                     self.confirm.clear();
                     self.error = None;
+                    self.focused = false;
                     cx.toasts.success(tr("Saved passwords unlocked"));
                     *open = false;
                     return;
@@ -75,8 +78,9 @@ impl VaultDialog {
                 let r = super::form_row(ui, tr("Master password"), |ui| {
                     ui.add_enabled_ui(!busy, |ui| add_field_ex(ui, text_field(&mut self.password, f32::INFINITY).password(true), error.is_some() && !on_repeat)).inner
                 });
-                if !busy && self.password.is_empty() {
+                if !busy && !self.focused {
                     r.request_focus();
+                    self.focused = true;
                 }
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !create {
                     submit.set(true);
@@ -128,6 +132,7 @@ impl VaultDialog {
             }
         }
         if skip.get() || (resp.close && !busy) {
+            self.focused = false;
             self.skipped = true;
             *open = false;
         }

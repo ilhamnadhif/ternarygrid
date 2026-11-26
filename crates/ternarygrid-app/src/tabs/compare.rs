@@ -77,11 +77,17 @@ pub(crate) async fn apply_script(s: SessionHandle, target_schema: Option<String>
         }
         None => None,
     };
-    // PostgreSQL changes its schema in transactions: the whole migration is one, so a
-    // statement that fails (a NOT NULL on a column with NULLs) undoes the ones before it
-    // instead of leaving the target half migrated.
+    // PostgreSQL and SQLite change schemas in transactions: wrap the whole migration in one
+    // unless the script itself carries explicit transaction/PRAGMA rebuild control (SQLite rebuilds).
+    let has_tx_control = stmts.iter().any(|sql| {
+        let u = sql.trim_start().to_ascii_uppercase();
+        u == "BEGIN" || u.starts_with("BEGIN ") || u.starts_with("PRAGMA FOREIGN_KEYS")
+    });
+    if s.kind() == ternarygrid_core::DbKind::Sqlite && has_tx_control && s.tx_state().in_transaction {
+        s.commit().await?;
+    }
     let mut result = Ok(());
-    if matches!(s.kind(), ternarygrid_core::DbKind::Postgres) && !s.tx_state().in_transaction {
+    if matches!(s.kind(), ternarygrid_core::DbKind::Postgres | ternarygrid_core::DbKind::Sqlite) && !has_tx_control && !s.tx_state().in_transaction {
         result = s.execute_update("BEGIN", &[]).await.map(|_| ());
     }
     let mut n = 0;
@@ -251,7 +257,11 @@ impl SchemaCompareTab {
     fn build_script(&mut self, cx: &AppContext) {
         let (Some(d), Some((a, b)), Some(tc)) = (self.selected_diff(), self.snapshots.clone(), self.target.conn.clone()) else { return };
         let Some(dialect) = cx.conns.live(&tc).map(|l| l.dialect.clone()) else { return };
-        self.script = Some(ternarygrid_compare::migration_script(&d, &a, &b, dialect.as_ref(), &self.script_options()));
+        let mut opts = self.script_options();
+        if dialect.kind() == ternarygrid_core::DbKind::Sqlite {
+            opts.alter_mode = ternarygrid_compare::AlterMode::WholeTable;
+        }
+        self.script = Some(ternarygrid_compare::migration_script(&d, &a, &b, dialect.as_ref(), &opts));
         self.script_lang = Some(SqlLanguage::new(dialect));
     }
 
@@ -541,7 +551,11 @@ impl SchemaCompareTab {
             self.job = None;
             match r {
                 Ok((a, b)) => {
-                    let diff = ternarygrid_compare::schema_diff(&a, &b, &CompareOptions::default());
+                    let cross_dialect = match (self.source.conn.as_deref().and_then(|c| cx.conns.live(c)), self.target.conn.as_deref().and_then(|c| cx.conns.live(c))) {
+                        (Some(sa), Some(sb)) => sa.dialect.kind() != sb.dialect.kind(),
+                        _ => false,
+                    };
+                    let diff = ternarygrid_compare::schema_diff(&a, &b, &CompareOptions { cross_dialect, ..Default::default() });
                     self.snapshots = Some((a, b));
                     self.diff = Some(diff);
                 }

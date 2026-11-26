@@ -26,13 +26,27 @@ pub struct DropDialog {
 }
 
 /// `DROP` statement for one object in the connection's dialect.
-pub fn drop_sql(d: &dyn Dialect, o: &ObjectRef, cascade: bool) -> String {
+pub fn supports_cascade(kind: ternarygrid_core::DbKind, obj: ObjectKind) -> bool {
+    use ternarygrid_core::DbKind::*;
+    match kind {
+        Postgres | CockroachDb => matches!(
+            obj,
+            ObjectKind::Table | ObjectKind::ForeignTable | ObjectKind::Partition | ObjectKind::View | ObjectKind::MaterializedView | ObjectKind::Sequence | ObjectKind::Schema
+        ),
+        Oracle => matches!(obj, ObjectKind::Table | ObjectKind::Schema),
+        MySql | MariaDb => matches!(obj, ObjectKind::Table | ObjectKind::View),
+        _ => false,
+    }
+}
+
+fn drop_sql(d: &dyn Dialect, o: &ObjectRef, cascade: bool) -> String {
     let ddl = d.ddl();
     let parent = || {
         let mut t = TableDef::new(o.schema.clone(), o.table.clone().unwrap_or_default());
         t.schema = o.schema.clone();
         t
     };
+    let cascade = cascade && supports_cascade(d.kind(), o.kind);
     let cascade_sfx = if cascade { " CASCADE" } else { "" };
     match o.kind {
         // A MySQL partition is no table: `DROP TABLE p0` would drop a table of that name.
@@ -134,6 +148,10 @@ impl DropDialog {
         if let Some(s) = self.objects.first().and_then(|o| o.schema.clone()).filter(|s| self.objects.iter().all(|o| o.schema.as_deref() == Some(s.as_str()))) {
             place = format!("{place} · {s}");
         }
+        let can_cascade = self.objects.iter().any(|o| supports_cascade(dialect.kind(), o.kind));
+        if !can_cascade {
+            self.cascade = false;
+        }
         let statements: Vec<String> = self.objects.iter().map(|o| drop_sql(dialect.as_ref(), o, self.cascade)).collect();
         let script = statements.iter().map(|s| format!("{s};\n")).collect::<String>();
         let busy = self.job.is_some();
@@ -154,7 +172,9 @@ impl DropDialog {
                 ui.spacing_mut().item_spacing.y = 12.0;
                 let question = trn(count, "Drop 1 object? This cannot be undone.", "Drop {} objects? This cannot be undone.");
                 ui.add(egui::Label::new(RichText::new(question).font(style::medium(ui.ctx(), 13.5))).wrap());
-                ternarygrid_ui::kit::checkbox(ui, cascade, tr("Cascade (also drop dependent objects)"));
+                if can_cascade {
+                    ternarygrid_ui::kit::checkbox(ui, cascade, tr("Cascade (also drop dependent objects)"));
+                }
                 super::sql_preview(ui, "drop_sql", Some(dialect.clone()), script.trim_end(), 240.0, true);
                 if read_only {
                     crate::dialogs::error_note(ui, tr("The connection is read-only."));
@@ -207,7 +227,20 @@ impl DropDialog {
                 }
                 let mut n = 0;
                 for (sql, s) in &work {
-                    s.execute_update(sql, &[]).await.map_err(|e| e.with_context(sql.clone()))?;
+                    if let Err(e) = s.execute_update(sql, &[]).await {
+                        // Roll back any open manual-commit transactions so a mid-batch failure
+                        // does not leave half-dropped objects and locks open.
+                        let mut rolled: Vec<&SessionHandle> = Vec::new();
+                        for (_, s) in &work {
+                            if !rolled.iter().any(|r| r.same(s)) {
+                                rolled.push(s);
+                                if s.tx_state().in_transaction {
+                                    let _ = s.rollback().await;
+                                }
+                            }
+                        }
+                        return Err(e.with_context(sql.clone()));
+                    }
                     n += 1;
                     // Counted once it is committed (auto-commit), which is when it is gone.
                     if !s.tx_state().in_transaction {

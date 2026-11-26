@@ -308,7 +308,7 @@ fn select_sql(spec: &TableSpec, d: &dyn Dialect, order: bool, limit: Option<u64>
         None
     } else {
         let mut c = spec.key_columns.clone();
-        c.extend(spec.columns.iter().filter(|x| !spec.key_columns.contains(x)).cloned());
+        c.extend(spec.columns.iter().filter(|x| !spec.key_columns.iter().any(|k| k.eq_ignore_ascii_case(x))).cloned());
         Some(c)
     };
     let order_by = if order { Some(spec.key_columns.iter().map(|k| d.quote_ident(k)).collect::<Vec<_>>().join(", ")) } else { None };

@@ -148,11 +148,13 @@ impl AppTaskExecutor {
         let mut b = self.open(&cfg.target_connection).await?;
         let sa = a.session.schema_snapshot(&SchemaRef::new(None, cfg.source_schema.clone()), &SnapshotOptions::full()).await?;
         let sb = b.session.schema_snapshot(&SchemaRef::new(None, cfg.target_schema.clone()), &SnapshotOptions::full()).await?;
-        let diff = ternarygrid_compare::schema_diff(&sa, &sb, &ternarygrid_compare::CompareOptions::default());
+        let dialect = b.session.dialect();
+        let cross_dialect = a.session.dialect().kind() != dialect.kind();
+        let diff = ternarygrid_compare::schema_diff(&sa, &sb, &ternarygrid_compare::CompareOptions { cross_dialect, ..Default::default() });
         let t = diff.summary.total;
         ctx.info(format!("{} added, {} removed, {} modified", t.added, t.removed, t.modified));
-        let opts = ternarygrid_compare::ScriptOptions { drop_removed: cfg.drop_removed, include_comments: true, ..Default::default() };
-        let dialect = b.session.dialect();
+        let alter_mode = if dialect.kind() == ternarygrid_core::DbKind::Sqlite { ternarygrid_compare::AlterMode::WholeTable } else { ternarygrid_compare::AlterMode::Granular };
+        let opts = ternarygrid_compare::ScriptOptions { drop_removed: cfg.drop_removed, include_comments: true, alter_mode, ..Default::default() };
         let script = ternarygrid_compare::migration_script(&diff, &sa, &sb, dialect.as_ref(), &opts);
         let mut out = RunOutcome::default();
         if let Some(p) = &cfg.script_path {

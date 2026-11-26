@@ -76,12 +76,13 @@ pub fn prepare(text: &str, scope: Scope, cfg: &PrepConfig, values: &BTreeMap<Str
     let mut out = Prepared { variables: values.clone(), ..Default::default() };
     let spans = spans_for(text, &scope, cfg.syntax, &cfg.split);
     let mut index = 0usize;
-    add_spans(text, &spans, cfg, &mut out, &mut index, 0, true);
+    let mut positional = 0usize;
+    add_spans(text, &spans, cfg, &mut out, &mut index, &mut positional, 0, true);
     out.missing.dedup();
     out
 }
 
-fn add_spans(text: &str, spans: &[StatementSpan], cfg: &PrepConfig, out: &mut Prepared, index: &mut usize, depth: usize, editor_ranges: bool) {
+fn add_spans(text: &str, spans: &[StatementSpan], cfg: &PrepConfig, out: &mut Prepared, index: &mut usize, positional: &mut usize, depth: usize, editor_ranges: bool) {
     for span in spans {
         let stmt = span.text(text);
         if stmt.trim().is_empty() {
@@ -92,12 +93,14 @@ fn add_spans(text: &str, spans: &[StatementSpan], cfg: &PrepConfig, out: &mut Pr
             match cmd {
                 Err(e) => out.errors.push(e),
                 Ok(ClientCommand::Set { name, value }) => {
-                    let value = substitute(&value, cfg, &out.variables, &mut Vec::new());
+                    let mut dummy = 0usize;
+                    let value = substitute(&value, cfg, &out.variables, &mut Vec::new(), &mut dummy);
                     out.variables.insert(name.clone(), value.clone());
                     push(out, index, stmt, String::new(), range, false, Some(ClientAction::Set { name, value }));
                 }
                 Ok(ClientCommand::Echo(t)) => {
-                    let t = substitute(&t, cfg, &out.variables, &mut Vec::new());
+                    let mut dummy = 0usize;
+                    let t = substitute(&t, cfg, &out.variables, &mut Vec::new(), &mut dummy);
                     push(out, index, stmt, String::new(), range, false, Some(ClientAction::Echo(t)));
                 }
                 Ok(ClientCommand::Export { options }) => push(out, index, stmt, String::new(), range, false, Some(ClientAction::Export(options))),
@@ -118,7 +121,7 @@ fn add_spans(text: &str, spans: &[StatementSpan], cfg: &PrepConfig, out: &mut Pr
                                 params: cfg.params,
                                 base_dir: full.parent().map(Path::to_path_buf),
                             };
-                            add_spans(&inner, &inner_spans, &sub, out, index, depth + 1, false);
+                            add_spans(&inner, &inner_spans, &sub, out, index, positional, depth + 1, false);
                         }
                         Err(e) => out.errors.push(format!("@include {}: {e}", full.display())),
                     }
@@ -128,7 +131,7 @@ fn add_spans(text: &str, spans: &[StatementSpan], cfg: &PrepConfig, out: &mut Pr
             continue;
         }
         let mut missing = Vec::new();
-        let sql = substitute(stmt, cfg, &out.variables, &mut missing);
+        let sql = substitute(stmt, cfg, &out.variables, &mut missing, positional);
         for m in missing {
             if !out.missing.contains(&m) {
                 out.missing.push(m);
@@ -178,18 +181,30 @@ fn push(out: &mut Prepared, index: &mut usize, original: &str, sql: String, rang
 }
 
 /// Replace parameters with their values; unknown ones are collected in `missing`
-/// and left in place.
-fn substitute(stmt: &str, cfg: &PrepConfig, vars: &BTreeMap<String, String>, missing: &mut Vec<(ParamKind, String)>) -> String {
+/// and left in place. Positional `?` parameters receive monotonically increasing
+/// ordinals across the whole script so `SELECT ?; SELECT ?;` prompts for `1` and `2`.
+fn substitute(stmt: &str, cfg: &PrepConfig, vars: &BTreeMap<String, String>, missing: &mut Vec<(ParamKind, String)>, positional_base: &mut usize) -> String {
     let Some(opts) = cfg.params else { return stmt.to_string() };
     let refs = ternarygrid_sql::find_parameters(stmt, cfg.syntax, &opts);
     if refs.is_empty() {
         return stmt.to_string();
     }
-    match ternarygrid_sql::substitute(stmt, cfg.syntax, &opts, &|r| vars.get(&r.name).cloned()) {
+    let base = *positional_base;
+    let pos_count = refs.iter().filter(|r| r.kind == ParamKind::Positional).count();
+    *positional_base += pos_count;
+    let key_for = |r: &ternarygrid_sql::ParamRef| -> String {
+        if r.kind == ParamKind::Positional {
+            let local: usize = r.name.parse().unwrap_or(1);
+            (base + local).to_string()
+        } else {
+            r.name.clone()
+        }
+    };
+    match ternarygrid_sql::substitute(stmt, cfg.syntax, &opts, &|r| vars.get(&key_for(r)).cloned()) {
         Ok(s) => s,
         Err(unresolved) => {
             for r in unresolved {
-                let k = (r.kind, r.name.clone());
+                let k = (r.kind, key_for(&r));
                 if !missing.contains(&k) {
                     missing.push(k);
                 }

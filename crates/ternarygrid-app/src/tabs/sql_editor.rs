@@ -105,11 +105,13 @@ struct Request {
     confirmed: bool,
     /// SQL to run instead of the editor text (row count, evaluate expression).
     sql: Option<String>,
+    /// One-shot values for anonymous `?` positional parameters (never persisted to `variables`).
+    positional_values: BTreeMap<String, String>,
 }
 
 struct ParamPrompt {
     request: Request,
-    names: Vec<String>,
+    names: Vec<(ternarygrid_sql::ParamKind, String)>,
     values: Vec<String>,
     /// The first field got the keyboard focus.
     focused: bool,
@@ -205,6 +207,8 @@ pub struct SqlEditorTab {
     run_warning: Option<String>,
     /// First statement error message seen during the current execution.
     run_error: Option<String>,
+    /// Diagnostics collected across statements during the current execution.
+    run_diagnostics: Vec<ternarygrid_editor::Diagnostic>,
 }
 
 #[allow(clippy::field_reassign_with_default)]
@@ -338,6 +342,7 @@ impl SqlEditorTab {
             last_outcome: None,
             run_warning: None,
             run_error: None,
+            run_diagnostics: Vec::new(),
         }
     }
 
@@ -599,13 +604,13 @@ impl SqlEditorTab {
             Action::SelectRowCount => {
                 if let Some(r) = self.current_statement(cx) {
                     let sql = crate::textops::row_count_sql(&self.editor.text()[r]);
-                    self.run(cx, Request { scope: Scope::Script, new_tab: true, explain: None, confirmed: false, sql: Some(sql) });
+                    self.run(cx, Request { scope: Scope::Script, new_tab: true, explain: None, confirmed: false, sql: Some(sql), positional_values: BTreeMap::new() });
                 }
             }
             Action::EvaluateExpression => {
                 if let Some(e) = self.selection_or_word() {
                     let sql = format!("SELECT {}", e.trim().trim_end_matches(';'));
-                    self.run(cx, Request { scope: Scope::Script, new_tab: true, explain: None, confirmed: false, sql: Some(sql) });
+                    self.run(cx, Request { scope: Scope::Script, new_tab: true, explain: None, confirmed: false, sql: Some(sql), positional_values: BTreeMap::new() });
                 }
             }
             Action::OpenDeclaration => {
@@ -684,7 +689,9 @@ impl SqlEditorTab {
         let text = req.sql.clone().unwrap_or_else(|| self.editor.text().to_string());
         let prepared = {
             let cfg = self.prep_config(cx);
-            crate::sqlprep::prepare(&text, req.scope.clone(), &cfg, &self.variables)
+            let mut vars = self.variables.clone();
+            vars.extend(req.positional_values.clone());
+            crate::sqlprep::prepare(&text, req.scope.clone(), &cfg, &vars)
         };
         for e in &prepared.errors {
             self.log("ERROR", e.clone());
@@ -699,24 +706,35 @@ impl SqlEditorTab {
             return;
         }
         if !prepared.missing.is_empty() {
-            let names: Vec<String> = prepared.missing.iter().map(|(_, n)| n.clone()).collect();
-            let values = names.iter().map(|n| self.variables.get(n).cloned().unwrap_or_default()).collect();
+            let names = prepared.missing.clone();
+            let values = names
+                .iter()
+                .map(|(k, n)| {
+                    if *k == ternarygrid_sql::ParamKind::Positional {
+                        req.positional_values.get(n).cloned().unwrap_or_default()
+                    } else {
+                        self.variables.get(n).cloned().unwrap_or_default()
+                    }
+                })
+                .collect();
             self.params = Some(ParamPrompt { request: req, names, values, focused: false });
             return;
         }
         let cfg = cx.conns.config(&conn).cloned();
         let ctype = cx.conns.type_of(&conn);
-        if cfg.as_ref().is_some_and(|c| c.read_only) && prepared.has_writes {
+        // Plain EXPLAIN (analyze = false) only plans the query without mutating data; EXPLAIN ANALYZE executes writes.
+        let mutates_db = prepared.has_writes && req.explain != Some(false);
+        if cfg.as_ref().is_some_and(|c| c.read_only) && mutates_db {
             self.last_outcome = Some(crate::tabs::TabActivity::Error { detail: tr("Read-only connection").to_string() });
             self.log("ERROR", tr("The connection is read-only; data and schema changes are blocked."));
             cx.toasts.error(tr("Read-only connection"), Some(tr("The script contains statements that change data or schema.").to_string()));
             return;
         }
-        if !req.confirmed {
+        if !req.confirmed && req.explain != Some(false) {
             let mut reasons: Vec<String> = Vec::new();
             // Only statements that change data or schema: reading (SELECT,
             // EXPLAIN, SHOW …) runs without a question.
-            if ctype.confirm_execute && prepared.has_writes {
+            if ctype.confirm_execute && mutates_db {
                 reasons.push(trf("Connection type \"{}\" asks before statements that change data or schema.", &[&ctype.name]));
             }
             if ctype.confirm_dangerous || cx.settings.execution.confirm_dangerous_statements {
@@ -802,7 +820,10 @@ impl SqlEditorTab {
         let name = cfg.as_ref().map(|c| c.name.clone());
         let history =
             cx.services.history_sink(Some(conn.clone()), name, self.schema.as_ref().and_then(|s| s.database.clone()), self.schema.as_ref().and_then(|s| s.schema.clone()));
-        self.variables = prepared.variables.clone();
+        // Variables from `@set` commands are persisted in `self.variables` only as each
+        // `ClientAction::Set` executes, so a failing earlier statement does not leak later `@set`s.
+        self.pending_export = None;
+        self.run_diagnostics.clear();
         self.log("INFO", ternarygrid_core::trn(prepared.plans.len(), "Executing 1 statement…", "Executing {} statements…"));
         self.exec = Some(Execution::start(cx.backend, session, prepared.plans, opts, history));
         // What runs shows its progress, results and messages under the editor.
@@ -896,7 +917,9 @@ impl SqlEditorTab {
                     }
                     self.bottom = Bottom::Result(pos);
                     self.show_results = true;
-                    self.replace_result = true;
+                    // Only the first result of a single-statement run replaces the active tab;
+                    // subsequent result sets and multi-statement script results each get their own tab.
+                    self.replace_result = false;
                 }
                 ExecEvent::Update { index, rows, tag, last_insert_id } => {
                     if let Some(st) = self.stats.iter_mut().find(|s| s.index == index) {
@@ -1027,6 +1050,7 @@ impl SqlEditorTab {
         }
         if finished {
             self.exec = None;
+            self.pending_export = None;
             self.editor.set_statement_highlight(None);
         } else {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -1070,13 +1094,18 @@ impl SqlEditorTab {
         let r = match position {
             Some(p) if p > 0 => {
                 let stmt = &text[range.clone()];
-                let off = range.start + ternarygrid_sql::char_pos_to_byte(stmt, p);
-                let end = text[off..].find(|c: char| c.is_whitespace() || c == ',' || c == ';').map(|e| off + e.max(1)).unwrap_or(text.len());
-                off..end.max(off + 1).min(text.len())
+                let mut off = (range.start + ternarygrid_sql::char_pos_to_byte(stmt, p)).min(text.len());
+                while off > 0 && !text.is_char_boundary(off) {
+                    off -= 1;
+                }
+                let next_char = text[off..].chars().next().map_or(off, |c| off + c.len_utf8());
+                let end = text[off..].find(|c: char| c.is_whitespace() || c == ',' || c == ';').map(|e| off + e).filter(|&e| e > off).unwrap_or(text.len());
+                off..end.max(next_char).min(text.len())
             }
             _ => range,
         };
-        self.editor.set_diagnostics(vec![ternarygrid_editor::Diagnostic::new(r.clone(), ternarygrid_editor::Severity::Error, message.to_string())]);
+        self.run_diagnostics.push(ternarygrid_editor::Diagnostic::new(r, ternarygrid_editor::Severity::Error, message.to_string()));
+        self.editor.set_diagnostics(self.run_diagnostics.clone());
     }
 
     /// SQL terminal mode: print rows as text in the output.
@@ -1584,10 +1613,18 @@ impl SqlEditorTab {
                     });
                 }
                 match chosen_run {
-                    Some(Action::ExecuteStatement) => self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None }),
-                    Some(Action::ExecuteInNewTab) => self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None }),
-                    Some(Action::ExecuteScript) => self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None }),
-                    Some(Action::ExplainPlan) => self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None }),
+                    Some(Action::ExecuteStatement) => {
+                        self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+                    }
+                    Some(Action::ExecuteInNewTab) => {
+                        self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+                    }
+                    Some(Action::ExecuteScript) => {
+                        self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+                    }
+                    Some(Action::ExplainPlan) => {
+                        self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None, positional_values: BTreeMap::new() })
+                    }
                     _ => {}
                 }
                 // Format SQL; in a narrow editor it moves into "⋯" first.
@@ -1824,7 +1861,17 @@ impl SqlEditorTab {
                 cx.toasts.info(tr("Save or discard the data changes first."));
             } else {
                 release_result(self.results.remove(i), cx);
-                self.bottom = if self.results.is_empty() { Bottom::Output } else { Bottom::Result(i.min(self.results.len() - 1)) };
+                self.bottom = match self.bottom {
+                    Bottom::Result(cur) if cur == i => {
+                        if self.results.is_empty() {
+                            Bottom::Output
+                        } else {
+                            Bottom::Result(i.min(self.results.len() - 1))
+                        }
+                    }
+                    Bottom::Result(cur) if cur > i => Bottom::Result(cur - 1),
+                    other => other,
+                };
             }
         }
         match self.bottom {
@@ -2048,8 +2095,9 @@ impl SqlEditorTab {
                 egui::Id::new(("params", self.editor.id())),
                 |ui| {
                     ui.label(RichText::new(tr("Values are inserted as SQL text: quote strings, e.g. 'abc'.")).color(ternarygrid_ui::pal(ui).text_muted));
-                    for (i, n) in p.names.iter().enumerate() {
-                        ternarygrid_ui::parts::form_row(ui, n, 120.0, |ui| {
+                    for (i, (kind, n)) in p.names.iter().enumerate() {
+                        let label = if *kind == ternarygrid_sql::ParamKind::Positional { format!("?{n}") } else { n.clone() };
+                        ternarygrid_ui::parts::form_row(ui, &label, 120.0, |ui| {
                             let r = ui.add(egui::TextEdit::singleline(&mut p.values[i]).desired_width(280.0).font(egui::TextStyle::Monospace));
                             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 enter = true;
@@ -2074,9 +2122,13 @@ impl SqlEditorTab {
             );
             run |= enter;
             if run {
-                let p = self.params.take().expect("present");
-                for (n, v) in p.names.iter().zip(p.values) {
-                    self.variables.insert(n.clone(), v);
+                let mut p = self.params.take().expect("present");
+                for ((kind, n), v) in p.names.into_iter().zip(p.values) {
+                    if kind == ternarygrid_sql::ParamKind::Positional {
+                        p.request.positional_values.insert(n, v);
+                    } else {
+                        self.variables.insert(n, v);
+                    }
                 }
                 self.run(cx, p.request);
             } else if close || modal.close {
@@ -2225,10 +2277,18 @@ impl SqlEditorTab {
                 }
                 EditorEvent::LinkClicked { range, .. } => self.open_declaration(cx, range.start),
                 EditorEvent::ContextMenu(a) => match a {
-                    ContextAction::Execute => self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None }),
-                    ContextAction::ExecuteScript => self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None }),
-                    ContextAction::ExecuteNewTab => self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None }),
-                    ContextAction::Explain => self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None }),
+                    ContextAction::Execute => {
+                        self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+                    }
+                    ContextAction::ExecuteScript => {
+                        self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+                    }
+                    ContextAction::ExecuteNewTab => {
+                        self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+                    }
+                    ContextAction::Explain => {
+                        self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None, positional_values: BTreeMap::new() })
+                    }
                     ContextAction::Format => self.format(cx),
                     ContextAction::AddSpellingWord(w) => {
                         self.user_words.insert(w.to_lowercase());
@@ -2424,12 +2484,24 @@ impl TabView for SqlEditorTab {
             | A::CollapseAllFolds
             | A::ExpandAllFolds
             | A::LoadExecutionPlan => self.editor_command(&ctx, cx, action),
-            A::ExecuteStatement => self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None }),
-            A::ExecuteSelection => self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None }),
-            A::ExecuteScript => self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None }),
-            A::ExecuteInNewTab => self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None }),
-            A::ExplainPlan | A::ShowPlanDiagram => self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None }),
-            A::ExplainAnalyze => self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(true), confirmed: false, sql: None }),
+            A::ExecuteStatement => {
+                self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+            }
+            A::ExecuteSelection => {
+                self.run(cx, Request { scope: self.scope_for(true), new_tab: false, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+            }
+            A::ExecuteScript => {
+                self.run(cx, Request { scope: self.scope_for(false), new_tab: false, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+            }
+            A::ExecuteInNewTab => {
+                self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: None, confirmed: false, sql: None, positional_values: BTreeMap::new() })
+            }
+            A::ExplainPlan | A::ShowPlanDiagram => {
+                self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(false), confirmed: false, sql: None, positional_values: BTreeMap::new() })
+            }
+            A::ExplainAnalyze => {
+                self.run(cx, Request { scope: self.scope_for(true), new_tab: true, explain: Some(true), confirmed: false, sql: None, positional_values: BTreeMap::new() })
+            }
             A::CancelQuery => self.cancel(cx),
             A::SelectConnection => self.select_conn_open = true,
             A::SelectSchema => self.select_schema_open = true,
@@ -2607,7 +2679,7 @@ impl TabView for SqlEditorTab {
             let confirmed = self.auto_run;
             self.auto_run = false;
             self.run_on_open = false;
-            self.run(cx, Request { scope: Scope::Script, new_tab: true, explain: None, confirmed, sql: None });
+            self.run(cx, Request { scope: Scope::Script, new_tab: true, explain: None, confirmed, sql: None, positional_values: BTreeMap::new() });
         }
         self.poll_exec(&ctx, cx);
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -2777,13 +2849,17 @@ impl SqlEditorTab {
         self.editor.diagnostics().len()
     }
     pub fn pending_params(&self) -> Option<Vec<String>> {
-        self.params.as_ref().map(|p| p.names.clone())
+        self.params.as_ref().map(|p| p.names.iter().map(|(_, n)| n.clone()).collect())
     }
     /// Fill the parameter prompt and run.
     pub fn answer_params(&mut self, cx: &mut AppContext, values: &[&str]) {
-        if let Some(p) = self.params.take() {
-            for (n, v) in p.names.iter().zip(values) {
-                self.variables.insert(n.clone(), v.to_string());
+        if let Some(mut p) = self.params.take() {
+            for ((kind, n), v) in p.names.into_iter().zip(values) {
+                if kind == ternarygrid_sql::ParamKind::Positional {
+                    p.request.positional_values.insert(n, v.to_string());
+                } else {
+                    self.variables.insert(n, v.to_string());
+                }
             }
             self.run(cx, p.request);
         }

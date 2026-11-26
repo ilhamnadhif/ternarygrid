@@ -68,8 +68,8 @@ pub struct ResultPanel {
     base_sql: String,
     /// Set for table data views (object editor data page, FK navigation).
     pub table: Option<ObjectRef>,
-    where_clause: Option<String>,
-    order_by: Option<String>,
+    pub(crate) where_clause: Option<String>,
+    pub(crate) order_by: Option<String>,
     editability: Option<Result<EditTarget, ReadOnlyReason>>,
     table_def: Option<Arc<TableDef>>,
     foreign_keys: Vec<ForeignKeyLink>,
@@ -390,6 +390,11 @@ impl ResultPanel {
             if let Some(def) = &self.table_def {
                 self.model.apply_table_def(def);
             }
+            let base = match self.editability.as_ref() {
+                Some(Ok(t)) => Some(t.table.clone()),
+                _ => self.table.clone(),
+            };
+            self.apply_virtual_model(cx, base.as_ref());
             self.chart = None;
             self.spatial = None;
         }
@@ -642,42 +647,6 @@ impl ResultPanel {
                 }
             }
         }
-        // Virtual model: virtual columns of the base table and dictionaries of referenced tables.
-        if let Some(vm) = &virtual_model {
-            if let Some(vt) = base.as_ref().and_then(|b| vm_lookup(vm, b)) {
-                for vc in &vt.virtual_columns {
-                    if let Err(err) = self.model.add_virtual_column(&vc.name, &vc.expression) {
-                        tracing::warn!("virtual column {}: {err:?}", vc.name);
-                    }
-                }
-            }
-            for link in links.iter().filter(|l| l.columns.len() == 1) {
-                let Some(dict) = vm_lookup(vm, &link.ref_table).and_then(|v| v.dictionary.clone()).filter(|d| !d.description_columns.is_empty()) else { continue };
-                let d = live.dialect.clone();
-                let key_col = link.ref_columns[0].clone();
-                let mut cols = vec![d.quote_ident(&key_col)];
-                cols.extend(dict.description_columns.iter().map(|c| d.quote_ident(c)));
-                let sql = d.limit_query(&format!("SELECT {} FROM {}", cols.join(", "), d.qualified_ref(&link.ref_table)), 20_000, 0);
-                // The shared session of the table's database (the result's own session would
-                // lose its open cursor); not open yet: no dictionary this time.
-                let Some(s) = live.ensure_session(backend, link.ref_table.database.as_deref()) else { continue };
-                let col = link.columns[0];
-                self.dict_jobs.push((
-                    col,
-                    backend.spawn(async move {
-                        let (_, rows) = s.query_all(&sql, &[]).await?;
-                        Ok(rows
-                            .into_iter()
-                            .filter_map(|r| {
-                                let k = r.first()?.to_text().into_owned();
-                                let v = r.iter().skip(1).map(|v| v.to_text().into_owned()).collect::<Vec<_>>().join(" ");
-                                Some((k, v))
-                            })
-                            .collect())
-                    }),
-                ));
-            }
-        }
         self.model.set_editability(e);
         if let Some(def) = &base_def {
             self.model.apply_table_def(def);
@@ -688,6 +657,57 @@ impl ResultPanel {
         self.foreign_keys = links;
         self.relations = relations;
         self.editability = Some(self.model.editability().clone());
+        self.apply_virtual_model(cx, base.as_ref());
+    }
+
+    /// Force editability, virtual columns, and FK dictionaries to reload on the next frame
+    /// (called after saving changes in the Object Editor's Virtual Model page).
+    pub fn invalidate_virtual_model(&mut self) {
+        self.editability = None;
+        self.dict_jobs.clear();
+        let kept = self.src.columns.clone();
+        self.model.reset(kept, self.src.store.clone());
+    }
+
+    /// Apply project virtual columns and spawn FK dictionary lookups for `base`.
+    fn apply_virtual_model(&mut self, cx: &mut AppContext, base: Option<&ObjectRef>) {
+        let Some(vm) = cx.services.projects.as_ref().and_then(|p| p.virtual_model(&self.conn).ok()) else {
+            return;
+        };
+        if let Some(vt) = base.and_then(|b| vm_lookup(&vm, b)) {
+            for vc in &vt.virtual_columns {
+                if let Err(err) = self.model.add_virtual_column(&vc.name, &vc.expression) {
+                    tracing::warn!("virtual column {}: {err:?}", vc.name);
+                }
+            }
+        }
+        let backend = cx.backend;
+        let Some(live) = cx.conns.live_mut(&self.conn) else { return };
+        self.dict_jobs.clear();
+        for link in self.foreign_keys.iter().filter(|l| l.columns.len() == 1) {
+            let Some(dict) = vm_lookup(&vm, &link.ref_table).and_then(|v| v.dictionary.clone()).filter(|d| !d.description_columns.is_empty()) else { continue };
+            let d = live.dialect.clone();
+            let key_col = link.ref_columns[0].clone();
+            let mut cols = vec![d.quote_ident(&key_col)];
+            cols.extend(dict.description_columns.iter().map(|c| d.quote_ident(c)));
+            let sql = d.limit_query(&format!("SELECT {} FROM {}", cols.join(", "), d.qualified_ref(&link.ref_table)), 20_000, 0);
+            let Some(s) = live.ensure_session(backend, link.ref_table.database.as_deref()) else { continue };
+            let col = link.columns[0];
+            self.dict_jobs.push((
+                col,
+                backend.spawn(async move {
+                    let (_, rows) = s.query_all(&sql, &[]).await?;
+                    Ok(rows
+                        .into_iter()
+                        .filter_map(|r| {
+                            let k = r.first()?.to_text().into_owned();
+                            let v = r.iter().skip(1).map(|v| v.to_text().into_owned()).collect::<Vec<_>>().join(" ");
+                            Some((k, v))
+                        })
+                        .collect())
+                }),
+            ));
+        }
     }
 
     fn where_for(dialect: &dyn Dialect, columns: &[String], values: &[Value]) -> String {
@@ -1433,7 +1453,21 @@ impl ResultPanel {
         if let Some((table, selected)) = self.virtual_key_dialog.as_mut() {
             let mut close = false;
             let mut apply = false;
-            let names: Vec<String> = self.model.columns().iter().map(|c| c.name.clone()).collect();
+            // Only base-table columns can participate in a virtual key, and we store the
+            // underlying source column name so aliased queries (`SELECT id AS uid`) match.
+            let candidates: Vec<(String, String)> = self
+                .model
+                .columns()
+                .iter()
+                .filter_map(|c| {
+                    let src = c.source.as_ref()?;
+                    let display = if src.column.eq_ignore_ascii_case(&c.name) { c.name.clone() } else { format!("{} ({})", src.column, c.name) };
+                    Some((src.column.clone(), display))
+                })
+                .collect();
+            if selected.len() != candidates.len() {
+                selected.resize(candidates.len(), false);
+            }
             let table_name = table.name.clone();
             // Enabled from the ticks of the last frame (the list below borrows them).
             let any = selected.iter().any(|s| *s);
@@ -1443,9 +1477,9 @@ impl ResultPanel {
                 |ui| {
                     ui.label(trf("Columns that identify a row of {}:", &[&table_name]));
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                        for (i, n) in names.iter().enumerate() {
+                        for (i, (_, display)) in candidates.iter().enumerate() {
                             if let Some(s) = selected.get_mut(i) {
-                                ternarygrid_ui::kit::checkbox(ui, s, n);
+                                ternarygrid_ui::kit::checkbox(ui, s, display);
                             }
                         }
                     });
@@ -1463,7 +1497,7 @@ impl ResultPanel {
                 },
             );
             if apply {
-                let cols: Vec<String> = names.iter().zip(selected.iter()).filter(|(_, s)| **s).map(|(n, _)| n.clone()).collect();
+                let cols: Vec<String> = candidates.iter().zip(selected.iter()).filter(|(_, s)| **s).map(|((base, _), _)| base.clone()).collect();
                 if let Some(p) = cx.services.projects.as_ref() {
                     let mut vm = p.virtual_model(&self.conn).unwrap_or_default();
                     let key = ternarygrid_config::project::VirtualTableKey::of(table);
@@ -1561,11 +1595,30 @@ impl ResultPanel {
     }
 }
 
-/// Clipboard text for the "Paste" menu item (⌘V is handled by egui).
+/// Clipboard text for the "Paste" menu item (⌘V / Ctrl+V is handled by egui).
 fn read_clipboard() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let out = std::process::Command::new("pbpaste").output().ok()?;
+        return out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for (prog, args) in [("wl-paste", &["--no-newline"][..]), ("xclip", &["-selection", "clipboard", "-o"][..]), ("xsel", &["--clipboard", "--output"][..])] {
+            if let Ok(out) = std::process::Command::new(prog).args(args).output()
+                && out.status.success()
+            {
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+        }
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out =
+            std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"]).creation_flags(CREATE_NO_WINDOW).output().ok()?;
         return out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned());
     }
     #[allow(unreachable_code)]

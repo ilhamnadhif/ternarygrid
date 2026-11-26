@@ -11,6 +11,40 @@ struct FromStep {
     joins: Vec<(usize, bool)>,
 }
 
+/// Whether a select expression without an explicit aggregate selector can legally appear in
+/// an auto-generated `GROUP BY` clause (excludes `*`, `t.*`, literals, and manual aggregates).
+fn is_groupable_expr(expr: &str) -> bool {
+    let t = expr.trim();
+    if t.is_empty() || t == "*" || t.ends_with(".*") {
+        return false;
+    }
+    // Plain numeric, quoted string, boolean, or NULL literals need not be grouped.
+    if (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
+        || t.eq_ignore_ascii_case("null")
+        || t.eq_ignore_ascii_case("true")
+        || t.eq_ignore_ascii_case("false")
+        || t.parse::<f64>().is_ok()
+    {
+        return false;
+    }
+    let up = t.to_ascii_uppercase();
+    for agg in [
+        "COUNT(",
+        "SUM(",
+        "AVG(",
+        "MIN(",
+        "MAX(",
+        "GROUP_CONCAT(",
+        "STRING_AGG(",
+        "ARRAY_AGG(",
+    ] {
+        if up.contains(agg) {
+            return false;
+        }
+    }
+    true
+}
+
 impl QueryModel {
     /// Renders an expression: `alias.column` references of tables in the
     /// model (and `alias.*`) are quoted with the dialect, anything else is
@@ -271,7 +305,7 @@ impl QueryModel {
             for s in self
                 .select
                 .iter()
-                .filter(|s| s.visible && s.aggregate.is_none())
+                .filter(|s| s.visible && s.aggregate.is_none() && is_groupable_expr(&s.expr))
             {
                 push(self.render_expr(&s.expr, dialect));
             }

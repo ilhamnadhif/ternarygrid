@@ -256,6 +256,7 @@ impl<'a> FilterBar<'a> {
         let mut apply = false;
         let mut clear = false;
         let mut clear_sort = false;
+        let mut order_edited = false;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             // The keyword says where the filter runs: the database (WHERE) or the fetched rows.
@@ -296,7 +297,7 @@ impl<'a> FilterBar<'a> {
             if !server {
                 filter_resp.clone().on_hover_text(crate::expr::help_text());
             }
-            let order_field = |ui: &mut Ui, width: f32, text: &mut String, suggest: &mut crate::suggest::Suggest, history: &[String], apply: &mut bool| {
+            let order_field = |ui: &mut Ui, width: f32, text: &mut String, suggest: &mut crate::suggest::Suggest, history: &[String], apply: &mut bool, edited: &mut bool| {
                 let field = Field {
                     salt: "filter_order",
                     prefix: "ORDER BY",
@@ -309,8 +310,12 @@ impl<'a> FilterBar<'a> {
                     history,
                 };
                 let order_resp = prefixed_field(ui, field, text, &columns, &quote, suggest, apply);
+                if order_resp.changed() {
+                    *edited = true;
+                }
                 if order_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     *apply = true;
+                    *edited = true;
                 }
             };
             let order_popup = ui.id().with("order_by_popup");
@@ -322,9 +327,10 @@ impl<'a> FilterBar<'a> {
                 ui.label(kit::section_title(ui, tr("Order rows by")));
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    order_field(ui, 300.0, &mut state.order_text, &mut state.rt.order_suggest, &state.order_history, &mut apply);
+                    order_field(ui, 300.0, &mut state.order_text, &mut state.rt.order_suggest, &state.order_history, &mut apply, &mut order_edited);
                     if kit::button_ex(ui, kit::Kind::Primary, None, tr("Apply"), false).clicked() {
                         apply = true;
+                        order_edited = true;
                     }
                 });
                 if apply {
@@ -350,10 +356,13 @@ impl<'a> FilterBar<'a> {
                     .on_disabled_hover_text(tr("Redis has no server side filter: its read commands take no condition."));
                 if on_server.clicked() {
                     grid.mode = DataMode::Server;
+                    model.clear_view();
+                    ui.close();
                 }
                 let mut on = !server;
                 if kit::menu_check(ui, &mut on, tr("Client: over the fetched rows")).on_hover_text(client_hint).clicked() {
                     grid.mode = DataMode::Client;
+                    ui.close();
                 }
                 // The chip's ORDER BY editor and ×.
                 kit::menu_separator(ui);
@@ -392,9 +401,9 @@ impl<'a> FilterBar<'a> {
             state.order_text.clear();
             state.rt.filter_error = None;
             grid.sort.clear();
-            match grid.mode {
-                DataMode::Client => model.clear_view(),
-                DataMode::Server => actions.push(GridAction::ServerQueryChanged { where_clause: Some(String::new()), order_by: Some(String::new()) }),
+            model.clear_view();
+            if grid.mode == DataMode::Server {
+                actions.push(GridAction::ServerQueryChanged { where_clause: Some(String::new()), order_by: Some(String::new()) });
             }
         }
         if apply {
@@ -417,10 +426,10 @@ impl<'a> FilterBar<'a> {
                     match (filter, sort) {
                         (Ok(filter), Ok(sort)) => {
                             state.rt.filter_error = None;
-                            if !state.order_text.trim().is_empty() || !sort.is_empty() {
+                            if order_edited || !state.order_text.trim().is_empty() || !sort.is_empty() {
                                 grid.sort = sort.clone();
                             }
-                            let spec = crate::view::ViewSpec { sort: if state.order_text.trim().is_empty() { grid.sort.clone() } else { sort }, filter };
+                            let spec = crate::view::ViewSpec { sort: if !order_edited && state.order_text.trim().is_empty() { grid.sort.clone() } else { sort }, filter };
                             let ctx = ui.ctx().clone();
                             model.start_client_view(spec, Box::new(move || ctx.request_repaint()));
                         }
@@ -462,19 +471,14 @@ fn sort_summary(model: &ResultModel, grid: &DataGridState, state: &ToolbarState)
     let text = state.order_text.trim();
     if !text.is_empty() {
         let parts: Vec<&str> = text.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
-        let mut first = parts.first()?.to_string();
-        for suffix in [" nulls first", " nulls last"] {
-            if first.to_ascii_lowercase().ends_with(suffix) {
-                first.truncate(first.len() - suffix.len());
-            }
-        }
-        let lower = first.to_ascii_lowercase();
-        let (name, descending) = if lower.ends_with(" desc") {
-            (first[..first.len() - 5].trim(), true)
-        } else if lower.ends_with(" asc") {
-            (first[..first.len() - 4].trim(), false)
+        let first = *parts.first()?;
+        let stripped = strip_trailing_words(first, &["NULLS", "FIRST"]).or_else(|| strip_trailing_words(first, &["NULLS", "LAST"])).unwrap_or(first);
+        let (name, descending) = if let Some(n) = strip_trailing_words(stripped, &["DESC"]) {
+            (n, true)
+        } else if let Some(n) = strip_trailing_words(stripped, &["ASC"]) {
+            (n, false)
         } else {
-            (first.trim(), false)
+            (stripped.trim(), false)
         };
         return Some(SortSummary { name: name.to_string(), descending, more: parts.len() - 1 });
     }
@@ -635,6 +639,7 @@ fn prefixed_field(
 pub struct ResultToolbar<'a> {
     model: &'a mut ResultModel,
     grid: &'a mut DataGridState,
+    record: Option<&'a mut crate::views::RecordViewState>,
     state: &'a mut ToolbarState,
     fetch_size: usize,
     can_edit: bool,
@@ -644,7 +649,13 @@ pub struct ResultToolbar<'a> {
 impl<'a> ResultToolbar<'a> {
     /// New toolbar.
     pub fn new(model: &'a mut ResultModel, grid: &'a mut DataGridState, state: &'a mut ToolbarState) -> Self {
-        ResultToolbar { model, grid, state, fetch_size: 0, can_edit: true, editing: false }
+        ResultToolbar { model, grid, record: None, state, fetch_size: 0, can_edit: true, editing: false }
+    }
+
+    /// Record view state, so Save / Cancel / SwitchView can flush or discard an open Record editor.
+    pub fn record(mut self, record: &'a mut crate::views::RecordViewState) -> Self {
+        self.record = Some(record);
+        self
     }
 
     /// The rows one "Fetch next" reads (its label says how many; 0: "Fetch more").
@@ -669,12 +680,13 @@ impl<'a> ResultToolbar<'a> {
 
     /// Show it. Returns actions for the application.
     pub fn show(self, ui: &mut Ui) -> Vec<GridAction> {
-        let ResultToolbar { model, grid, state, fetch_size, can_edit, editing } = self;
+        let ResultToolbar { model, grid, mut record, state, fetch_size, can_edit, editing } = self;
         let editable = model.is_editable();
         let saving = model.is_saving();
         let can_edit = can_edit && editable && !saving;
+        let is_editing = grid.is_editing() || editing || record.as_deref().is_some_and(|r| r.is_editing());
         let mut actions = Vec::new();
-        auto_refresh_tick(ui, model, grid.is_editing() || editing, state, &mut actions);
+        auto_refresh_tick(ui, model, is_editing, state, &mut actions);
         let p = ternarygrid_ui::pal(ui);
         let ic = ternarygrid_ui::style::icons(ui);
         let fetching = model.fetch.fetching;
@@ -694,7 +706,7 @@ impl<'a> ResultToolbar<'a> {
         let read_at = model.fetch.fetched_at.map(|at| fetched_at_text(at, chrono::Local::now()));
         let panels_visible = !state.open_panels.is_empty() && !state.panels_hidden;
         let panel_badge = panels_visible.then_some(state.open_panels.len()).filter(|n| *n > 0);
-        let metrics = FooterMetrics {
+        let mut metrics = FooterMetrics {
             editable,
             saving,
             pending,
@@ -714,12 +726,25 @@ impl<'a> ResultToolbar<'a> {
             let full_avail = ui.available_width();
             let (fit, fetch_shown) = choose_footer_plan(ui, full_avail, &metrics);
             let fetch_overflow = has_more && !show_stop && !fetch_shown;
-            let has_more_menu = fit < FooterFit::Full || fetch_overflow;
-            let job = status_job(ui, model, state, &p, fetch_shown);
+            let vkey_overflow = !editable && metrics.read_only_vkey && fit < FooterFit::Essential;
+            let has_more_menu = fit < FooterFit::Full || fetch_overflow || vkey_overflow;
+            let job = status_job(ui, model, state, &p, fetch_shown, is_editing);
             let status_desired_w = ui.painter().layout_job(job.clone()).size().x.ceil() + 2.0;
-            let layout = measure_plan(ui, fit, fetch_shown, &metrics);
+            let mut layout = measure_plan(ui, fit, fetch_shown, &metrics);
+            // On ultra-narrow Minimal widths, shed optional badges before clipping essential controls.
+            if fit == FooterFit::Minimal {
+                let needed = |l: &FooterPlanLayout| l.left_ctrl_w + l.err_chip_w + l.center_w + l.right_w + l.zone_gaps;
+                if needed(&layout) > full_avail && metrics.auto_text.is_some() {
+                    metrics.auto_text = None;
+                    layout = measure_plan(ui, fit, fetch_shown, &metrics);
+                }
+                if needed(&layout) > full_avail && metrics.has_err_chip {
+                    metrics.has_err_chip = false;
+                    layout = measure_plan(ui, fit, fetch_shown, &metrics);
+                }
+            }
             let fixed_non_status = layout.left_ctrl_w + layout.err_chip_w + layout.center_w + layout.right_w + layout.zone_gaps;
-            let status_avail = (full_avail - fixed_non_status).max(20.0);
+            let status_avail = (full_avail - fixed_non_status).max(0.0);
             let status_w = status_desired_w.min(status_avail);
             let extra = (full_avail - fixed_non_status - status_w).max(0.0);
             let (left_spring, right_spring) = if layout.center_w > 0.0 {
@@ -732,7 +757,7 @@ impl<'a> ResultToolbar<'a> {
             // -----------------------------------------------------------------
             // Zone 1 (Left): Refresh ▾ | Stop / ↓ +200 | ⤓ # | Status | Error
             // -----------------------------------------------------------------
-            let (refresh_resp, auto_resp) = refresh_split_button(ui, auto_text.as_deref(), model.has_changes() || fetching);
+            let (refresh_resp, auto_resp) = refresh_split_button(ui, state.auto_refresh_secs.is_some(), metrics.auto_text, model.has_changes() || fetching || is_editing);
             if refresh_resp.clicked() {
                 actions.push(GridAction::Refresh);
             }
@@ -771,14 +796,18 @@ impl<'a> ResultToolbar<'a> {
             }
 
             ui.add_space(STATUS_GAP);
-            ui.allocate_ui_with_layout(egui::vec2(status_w, FOOTER_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let status = ui.add(egui::Label::new(job).selectable(false).truncate());
-                if let Some(at) = read_at {
-                    status.on_hover_text(trf("Read at {}", &[&at]));
-                }
-            });
+            if status_w > 0.0 {
+                ui.allocate_ui_with_layout(egui::vec2(status_w, FOOTER_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let status = ui.add(egui::Label::new(job).selectable(false).truncate());
+                    if let Some(at) = read_at {
+                        status.on_hover_text(trf("Read at {}", &[&at]));
+                    }
+                });
+            }
 
-            if let Some(e) = &dismissed_err {
+            if metrics.has_err_chip
+                && let Some(e) = &dismissed_err
+            {
                 ui.add_space(CTRL_GAP);
                 if fetch_error_chip(ui, e).clicked() {
                     state.dismissed_fetch_error = None;
@@ -791,7 +820,7 @@ impl<'a> ResultToolbar<'a> {
             if layout.center_w > 0.0 {
                 ui.add_space(ZONE_GAP + left_spring);
                 if editable {
-                    row_edit_and_commit_zone(ui, fit, can_edit, saving, pending, model, grid, &mut actions);
+                    row_edit_and_commit_zone(ui, fit, can_edit, saving, pending, model, grid, record.as_deref_mut(), &mut actions);
                 } else if let Some(r) = &read_only {
                     let show_vkey = r.virtual_key_helps() && fit >= FooterFit::Essential;
                     if read_only_pill(ui, r.short_label(), &r.message(), show_vkey) {
@@ -807,7 +836,7 @@ impl<'a> ResultToolbar<'a> {
             let mut right_started = false;
             if fit >= FooterFit::Essential {
                 right_started = true;
-                view_switcher(ui, fit, state, &mut actions);
+                view_switcher(ui, fit, model, grid, record.as_deref_mut(), state, &mut actions);
             }
             if fit >= FooterFit::Core {
                 if right_started {
@@ -831,9 +860,9 @@ impl<'a> ResultToolbar<'a> {
 
             if has_more_menu {
                 ui.add_space(CTRL_GAP);
-                let footer = MoreContext { fit, can_edit, fetch: fetch_overflow.then_some(fetch_label) };
+                let footer = MoreContext { fit, can_edit, fetch: fetch_overflow.then_some(fetch_label), virtual_key: vkey_overflow };
                 let more = toolbar_icon_btn(ui, icon::DOTS_THREE, tr("More result actions"), tr("More result actions"), false, None, false);
-                Popup::menu(&more).id(ui.id().with("result_more")).align(egui::RectAlign::TOP_END).show(|ui| more_menu(ui, model, grid, state, &footer, &mut actions));
+                Popup::menu(&more).id(ui.id().with("result_more")).align(egui::RectAlign::TOP_END).show(|ui| more_menu(ui, model, grid, record, state, &footer, &mut actions));
             }
             let _ = ic;
         });
@@ -841,9 +870,32 @@ impl<'a> ResultToolbar<'a> {
     }
 }
 
+/// Commit any open inline cell editor (Grid or Record view) before Save or switching views.
+fn commit_open_editors(model: &mut ResultModel, grid: &mut DataGridState, record: Option<&mut crate::views::RecordViewState>, actions: &mut Vec<GridAction>) -> bool {
+    if let Err(message) = grid.commit_pending_edit(model) {
+        actions.push(GridAction::Notify { message, error: true });
+        return false;
+    }
+    if let Some(rec) = record
+        && let Err(message) = rec.commit_pending_edit(model)
+    {
+        actions.push(GridAction::Notify { message, error: true });
+        return false;
+    }
+    true
+}
+
+/// Discard any open inline cell editor (Grid or Record view) without applying its draft text.
+fn cancel_open_editors(grid: &mut DataGridState, record: Option<&mut crate::views::RecordViewState>) {
+    grid.cancel_edit();
+    if let Some(rec) = record {
+        rec.cancel_edit();
+    }
+}
+
 /// Build the single-line status job (`400 rows · 162 ms` — omitting the redundant "more available"
 /// when the clickable `↓ +200` fetch pill is shown directly beside it).
-fn status_job(ui: &Ui, model: &ResultModel, state: &ToolbarState, p: &ternarygrid_ui::Palette, fetch_shown: bool) -> egui::text::LayoutJob {
+fn status_job(ui: &Ui, model: &ResultModel, state: &ToolbarState, p: &ternarygrid_ui::Palette, fetch_shown: bool, is_editing: bool) -> egui::text::LayoutJob {
     let rows = crate::format::group_thousands(&model.row_count().to_string());
     let rows = trf("{} rows", &[&rows]);
     let mut rest = String::new();
@@ -867,7 +919,7 @@ fn status_job(ui: &Ui, model: &ResultModel, state: &ToolbarState, p: &ternarygri
         rest.push_str(" · ");
         rest.push_str(&duration_text(e));
     }
-    if state.auto_refresh_secs.is_some() && (model.has_changes() || model.fetch.fetching) {
+    if state.auto_refresh_secs.is_some() && (model.has_changes() || model.fetch.fetching || is_editing) {
         rest.push_str(" · ");
         rest.push_str(tr("auto paused"));
     }
@@ -946,6 +998,8 @@ struct MoreContext {
     can_edit: bool,
     /// `"Fetch next 200"` / `"Fetch more"` when it did not fit on the bar.
     fetch: Option<String>,
+    /// True when the table is read-only due to missing key and `Virtual key…` was hidden at Minimal width.
+    virtual_key: bool,
 }
 
 /// Height of the single-row Option A footer content area (`28 + 4 + 4 = 36 px` total bar height).
@@ -1005,7 +1059,8 @@ fn measure_plan(ui: &Ui, fit: FooterFit, fetch_shown: bool, m: &FooterMetrics<'_
     };
 
     let fetch_overflow = m.has_more && !m.show_stop && !fetch_shown;
-    let has_more_menu = fit < FooterFit::Full || fetch_overflow;
+    let vkey_overflow = !m.editable && m.read_only_vkey && fit < FooterFit::Essential;
+    let has_more_menu = fit < FooterFit::Full || fetch_overflow || vkey_overflow;
     let mut right_w = 0.0;
     let mut right_groups = 0usize;
     if fit >= FooterFit::Essential {
@@ -1172,11 +1227,10 @@ fn refresh_split_width(ui: &Ui, auto_text: Option<&str>) -> f32 {
 }
 
 /// Split button for Refresh (`↻`) + Auto refresh menu (`▾`). Turns amber when auto-refresh is active.
-fn refresh_split_button(ui: &mut Ui, auto_text: Option<&str>, paused: bool) -> (egui::Response, egui::Response) {
+fn refresh_split_button(ui: &mut Ui, active: bool, auto_text: Option<&str>, paused: bool) -> (egui::Response, egui::Response) {
     let p = ternarygrid_ui::pal(ui);
     let ic = ternarygrid_ui::style::icons(ui);
     let dark = ui.visuals().dark_mode;
-    let active = auto_text.is_some();
     let total_w = refresh_split_width(ui, auto_text);
     let main_w = total_w - 16.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, CTRL_H), egui::Sense::hover());
@@ -1454,6 +1508,7 @@ fn row_edit_and_commit_zone(
     pending: usize,
     model: &mut ResultModel,
     grid: &mut DataGridState,
+    record: Option<&mut crate::views::RecordViewState>,
     actions: &mut Vec<GridAction>,
 ) {
     let notify_error = |r: Result<usize, String>, actions: &mut Vec<GridAction>| {
@@ -1528,9 +1583,14 @@ fn row_edit_and_commit_zone(
         footer_divider(ui);
         ui.add_space(CTRL_GAP);
         let show_keys = fit >= FooterFit::Full;
-        match commit_cluster(ui, pending, saving, show_keys) {
-            Some(true) => actions.push(grid::save_action(model)),
+        match commit_cluster(ui, pending, saving, can_edit, show_keys) {
+            Some(true) => {
+                if commit_open_editors(model, grid, record, actions) {
+                    actions.push(grid::save_action(model));
+                }
+            }
             Some(false) => {
+                cancel_open_editors(grid, record);
                 model.discard_changes();
                 actions.push(GridAction::ChangesDiscarded);
             }
@@ -1562,10 +1622,10 @@ fn commit_save_width(ui: &Ui, saving: bool, show_keys: bool) -> f32 {
 
 /// Fixed-anchor DBeaver-style Cancel / Save commit cluster (Pola A1, without `+1 ~2 -1` badges).
 /// Returns `Some(true)` on Save, `Some(false)` on Cancel/Discard.
-fn commit_cluster(ui: &mut Ui, pending: usize, saving: bool, show_keys: bool) -> Option<bool> {
+fn commit_cluster(ui: &mut Ui, pending: usize, saving: bool, can_edit: bool, show_keys: bool) -> Option<bool> {
     let p = ternarygrid_ui::pal(ui);
     let dark = ui.visuals().dark_mode;
-    let dirty = pending > 0 && !saving;
+    let dirty = pending > 0 && !saving && can_edit;
     let total_w = commit_cluster_width(ui, saving, show_keys);
     let cancel_w = commit_cancel_width(ui);
     let save_w = commit_save_width(ui, saving, show_keys);
@@ -1694,35 +1754,51 @@ fn read_only_pill(ui: &mut Ui, short_label: &str, reason_msg: &str, show_vkey: b
     let dark = ui.visuals().dark_mode;
     let total_w = read_only_pill_width(ui, short_label, show_vkey);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(total_w, 24.0), egui::Sense::hover());
-    let _ = resp.on_hover_text(reason_msg);
+    let mut vkey_clicked = false;
+    let mut vkey_hovered = false;
+    let visible = ui.is_rect_visible(rect);
     let painter = ui.painter();
-    let fill = ternarygrid_ui::style::soft(p.warn, if dark { 0.14 } else { 0.10 });
-    let stroke = ternarygrid_ui::style::soft(p.warn, if dark { 0.30 } else { 0.24 });
-    painter.rect(rect, ternarygrid_ui::style::RADIUS, fill, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    if visible {
+        let fill = ternarygrid_ui::style::soft(p.warn, if dark { 0.14 } else { 0.10 });
+        let stroke = ternarygrid_ui::style::soft(p.warn, if dark { 0.30 } else { 0.24 });
+        painter.rect(rect, ternarygrid_ui::style::RADIUS, fill, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    }
     let mut x = rect.left() + 8.0;
-    painter.text(egui::pos2(x + 6.5, rect.center().y), egui::Align2::CENTER_CENTER, icon::LOCK_SIMPLE, ternarygrid_ui::style::icon_font(12.5), p.warn);
+    if visible {
+        painter.text(egui::pos2(x + 6.5, rect.center().y), egui::Align2::CENTER_CENTER, icon::LOCK_SIMPLE, ternarygrid_ui::style::icon_font(12.5), p.warn);
+    }
     x += 13.0 + 5.0;
     let lbl = painter.layout_no_wrap(short_label.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.5), p.warn);
     let lbl_w = lbl.size().x;
-    painter.galley(egui::pos2(x, rect.center().y - lbl.size().y / 2.0), lbl, p.warn);
-    if !show_vkey {
-        return false;
+    if visible {
+        painter.galley(egui::pos2(x, rect.center().y - lbl.size().y / 2.0), lbl, p.warn);
     }
-    x += lbl_w + 5.0;
-    painter.text(egui::pos2(x + 2.0, rect.center().y), egui::Align2::CENTER_CENTER, "·", egui::FontId::proportional(12.0), p.warn.gamma_multiply(0.7));
-    x += 8.0;
-    let vkey_text = tr("Virtual key…");
-    let vkey_g = painter.layout_no_wrap(vkey_text.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.5), p.accent_text);
-    let vkey_rect = egui::Rect::from_min_size(egui::pos2(x - 2.0, rect.top() + 2.0), egui::vec2(vkey_g.size().x + 4.0, rect.height() - 4.0));
-    let vkey_resp = ui.interact(vkey_rect, ui.id().with("ro_virtual_key"), egui::Sense::click());
-    vkey_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, vkey_text));
-    let vkey_resp = vkey_resp.on_hover_text(tr("Define a virtual key to edit this table"));
-    if vkey_resp.hovered() {
-        painter.rect_filled(vkey_rect, 4, p.accent_soft);
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    if show_vkey {
+        x += lbl_w + 5.0;
+        if visible {
+            painter.text(egui::pos2(x + 2.0, rect.center().y), egui::Align2::CENTER_CENTER, "·", egui::FontId::proportional(12.0), p.warn.gamma_multiply(0.7));
+        }
+        x += 8.0;
+        let vkey_text = tr("Virtual key…");
+        let vkey_g = painter.layout_no_wrap(vkey_text.to_string(), ternarygrid_ui::style::medium(ui.ctx(), 11.5), p.accent_text);
+        let vkey_rect = egui::Rect::from_min_size(egui::pos2(x - 2.0, rect.top() + 2.0), egui::vec2(vkey_g.size().x + 4.0, rect.height() - 4.0));
+        let vkey_resp = ui.interact(vkey_rect, ui.id().with("ro_virtual_key"), egui::Sense::click());
+        vkey_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, vkey_text));
+        let vkey_resp = vkey_resp.on_hover_text(tr("Define a virtual key to edit this table"));
+        vkey_hovered = vkey_resp.hovered();
+        if visible {
+            if vkey_hovered {
+                painter.rect_filled(vkey_rect, 4, p.accent_soft);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            painter.galley(egui::pos2(x, rect.center().y - vkey_g.size().y / 2.0), vkey_g, p.accent_text);
+        }
+        vkey_clicked = vkey_resp.clicked();
     }
-    painter.galley(egui::pos2(x, rect.center().y - vkey_g.size().y / 2.0), vkey_g, p.accent_text);
-    vkey_resp.clicked()
+    if !vkey_hovered {
+        let _ = resp.on_hover_text(reason_msg);
+    }
+    vkey_clicked
 }
 
 /// Mark the selected rows deleted and say how many (as the keys and the context menu do).
@@ -1782,7 +1858,15 @@ fn view_switcher_width(ui: &Ui, fit: FooterFit, _current: ResultViewKind) -> f32
 /// - `Essential`: `[▦ | ☰ | ▾]`
 ///
 /// Clicking the last segment opens a popover with JSON, XML, Chart, Spatial view (plus Text at Essential).
-fn view_switcher(ui: &mut Ui, fit: FooterFit, state: &mut ToolbarState, actions: &mut Vec<GridAction>) {
+fn view_switcher(
+    ui: &mut Ui,
+    fit: FooterFit,
+    model: &mut ResultModel,
+    grid: &mut DataGridState,
+    record: Option<&mut crate::views::RecordViewState>,
+    state: &mut ToolbarState,
+    actions: &mut Vec<GridAction>,
+) {
     let p = ternarygrid_ui::pal(ui);
     let total_w = view_switcher_width(ui, fit, state.view);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, CTRL_H), egui::Sense::hover());
@@ -1791,6 +1875,7 @@ fn view_switcher(ui: &mut Ui, fit: FooterFit, state: &mut ToolbarState, actions:
     let bh = CTRL_H - 4.0;
     let top = rect.top() + 2.0;
     let mut x = rect.left() + 2.0;
+    let mut switch_to: Option<ResultViewKind> = None;
 
     let draw_seg = |ui: &mut Ui, x: &mut f32, w: f32, id_salt: &str, glyph: &str, label: Option<&str>, name: &str, tip: &str, on: bool| -> egui::Response {
         let r = egui::Rect::from_min_size(egui::pos2(*x, top), egui::vec2(w, bh));
@@ -1829,8 +1914,7 @@ fn view_switcher(ui: &mut Ui, fit: FooterFit, state: &mut ToolbarState, actions:
     if draw_seg(ui, &mut x, grid_w, "grid", icon::TABLE, labeled.then_some(tr("Grid")), tr("Grid"), &trf("{} view", &[&tr("Grid")]), state.view == ResultViewKind::Grid).clicked()
         && state.view != ResultViewKind::Grid
     {
-        state.view = ResultViewKind::Grid;
-        actions.push(GridAction::SwitchView(ResultViewKind::Grid));
+        switch_to = Some(ResultViewKind::Grid);
     }
 
     let rec_w = if labeled { view_seg_labeled_w(ui, tr("Rec")) } else { 26.0 };
@@ -1838,16 +1922,14 @@ fn view_switcher(ui: &mut Ui, fit: FooterFit, state: &mut ToolbarState, actions:
         .clicked()
         && state.view != ResultViewKind::Record
     {
-        state.view = ResultViewKind::Record;
-        actions.push(GridAction::SwitchView(ResultViewKind::Record));
+        switch_to = Some(ResultViewKind::Record);
     }
 
     if labeled
         && draw_seg(ui, &mut x, 26.0, "text", icon::TEXT_AA, None, tr("Text"), &trf("{} view", &[&tr("Text")]), state.view == ResultViewKind::Text).clicked()
         && state.view != ResultViewKind::Text
     {
-        state.view = ResultViewKind::Text;
-        actions.push(GridAction::SwitchView(ResultViewKind::Text));
+        switch_to = Some(ResultViewKind::Text);
     }
 
     // Extra views & visualizations dropdown segment.
@@ -1907,16 +1989,18 @@ fn view_switcher(ui: &mut Ui, fit: FooterFit, state: &mut ToolbarState, actions:
         if !labeled {
             let mut on = state.view == ResultViewKind::Text;
             if kit::menu_check(ui, &mut on, tr("Text")).clicked() {
-                state.view = ResultViewKind::Text;
-                actions.push(GridAction::SwitchView(ResultViewKind::Text));
+                if state.view != ResultViewKind::Text {
+                    switch_to = Some(ResultViewKind::Text);
+                }
                 ui.close();
             }
         }
         for (kind, name) in [(ResultViewKind::Json, "JSON"), (ResultViewKind::Xml, "XML")] {
             let mut on = state.view == kind;
             if kit::menu_check(ui, &mut on, tr(name)).clicked() {
-                state.view = kind;
-                actions.push(GridAction::SwitchView(kind));
+                if state.view != kind {
+                    switch_to = Some(kind);
+                }
                 ui.close();
             }
         }
@@ -1931,6 +2015,13 @@ fn view_switcher(ui: &mut Ui, fit: FooterFit, state: &mut ToolbarState, actions:
             ui.close();
         }
     });
+
+    if let Some(kind) = switch_to
+        && commit_open_editors(model, grid, record, actions)
+    {
+        state.view = kind;
+        actions.push(GridAction::SwitchView(kind));
+    }
 }
 
 fn panels_dropdown_width(ui: &Ui, show_label: bool, badge: Option<usize>) -> f32 {
@@ -2115,7 +2206,15 @@ fn panel_items(ui: &mut Ui, state: &ToolbarState, actions: &mut Vec<GridAction>)
 }
 
 /// The footer's `⋯` overflow menu: strictly contains ONLY actions that did not fit on the bar.
-fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, state: &mut ToolbarState, footer: &MoreContext, actions: &mut Vec<GridAction>) {
+fn more_menu(
+    ui: &mut Ui,
+    model: &mut ResultModel,
+    grid: &mut DataGridState,
+    mut record: Option<&mut crate::views::RecordViewState>,
+    state: &mut ToolbarState,
+    footer: &MoreContext,
+    actions: &mut Vec<GridAction>,
+) {
     kit::menu_look(ui, 250.0);
     let narrow = footer.fit < FooterFit::Core;
     let compact = footer.fit < FooterFit::Full;
@@ -2126,14 +2225,23 @@ fn more_menu(ui: &mut Ui, model: &mut ResultModel, grid: &mut DataGridState, sta
         }
         *has_section = true;
     };
+    if footer.virtual_key {
+        sep(ui, &mut has_section);
+        if kit::menu_item(ui, Some(icon::KEY), tr("Define virtual key…"), "").clicked() {
+            actions.push(GridAction::DefineVirtualKey { table: crate::model::source_table(model.columns()).ok() });
+            ui.close();
+        }
+    }
     if footer.fit == FooterFit::Minimal {
         sep(ui, &mut has_section);
         kit::menu_caption(ui, tr("View"));
         for (kind, _, name, _) in &VIEWS {
             let mut on = state.view == *kind;
             if kit::menu_check(ui, &mut on, tr(name)).clicked() {
-                state.view = *kind;
-                actions.push(GridAction::SwitchView(*kind));
+                if state.view != *kind && commit_open_editors(model, grid, record.as_deref_mut(), actions) {
+                    state.view = *kind;
+                    actions.push(GridAction::SwitchView(*kind));
+                }
                 ui.close();
             }
         }
@@ -2239,6 +2347,7 @@ fn auto_refresh_tick(ui: &Ui, model: &ResultModel, editing: bool, state: &mut To
         state.rt.next_refresh = None;
         return;
     };
+    let secs = secs.max(1);
     let now = ui.input(|i| i.time);
     let next = *state.rt.next_refresh.get_or_insert(now + secs as f64);
     if now >= next {

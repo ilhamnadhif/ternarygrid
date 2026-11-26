@@ -843,6 +843,7 @@ impl GridFrame<'_> {
             self.state.rt.dropdown = Some(super::state::Dropdown { row, anchor: self.model.row_anchor(row), col, search: String::new(), just_opened: true, current: None });
             return;
         }
+        let was_null_or_default = value.is_null() || self.model.cell_is_default(row, col);
         let text = value.to_text().into_owned();
         if typed.is_none() && (text.contains('\n') || text.chars().count() > 2000 || matches!(value, Value::Bytes(_))) {
             self.actions.push(GridAction::OpenValuePanel { row, col });
@@ -858,6 +859,7 @@ impl GridFrame<'_> {
             error: None,
             just_started: true,
             typed: is_typed,
+            was_null_or_default,
         });
         self.state.rt.scroll_to_active = true;
     }
@@ -867,7 +869,8 @@ impl GridFrame<'_> {
         let Some(mut session) = self.state.rt.editing.take() else { return true };
         let Some(row) = session.anchor.and_then(|a| self.model.anchored_row(a, session.row)) else { return true };
         session.row = row;
-        if session.text != session.original
+        let null_to_empty = session.was_null_or_default && session.text.is_empty() && self.model.column_kind(session.col) == DataKind::Text;
+        if (session.text != session.original || null_to_empty)
             && let Err(e) = self.model.set_cell(session.row, session.col, &session.text)
         {
             if keep_on_error {

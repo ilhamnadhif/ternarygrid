@@ -266,6 +266,12 @@ pub trait TabView: Any {
         crate::keys::ActionContext::Global
     }
 
+    /// True while the tab itself is capturing raw keystrokes (e.g. shortcut
+    /// recorder in Settings), so global and tab shortcuts must not fire.
+    fn captures_keyboard(&self) -> bool {
+        false
+    }
+
     /// Opens in a pop-up window instead of a tab (wizards and one-off actions: export,
     /// import, backup …) of this size: the design's window inside its 1-point border (the
     /// modal's CSS width × height, header included); the window adds the border.

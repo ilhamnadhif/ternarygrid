@@ -127,6 +127,53 @@ impl ImportResult {
             });
         }
     }
+
+    /// Keeps only connections where `selected[i]` is true, and prunes folders,
+    /// connection types, network profiles, and secrets not referenced by any kept connection.
+    pub fn retain_selected(&mut self, selected: &[bool]) {
+        let mut keep = selected.iter();
+        self.connections.retain(|_| *keep.next().unwrap_or(&false));
+        let kept_ids: std::collections::HashSet<&str> =
+            self.connections.iter().map(|c| c.id.as_str()).collect();
+        let kept_types: std::collections::HashSet<&str> = self
+            .connections
+            .iter()
+            .map(|c| c.connection_type.as_str())
+            .collect();
+        let kept_profiles: std::collections::HashSet<&str> = self
+            .connections
+            .iter()
+            .filter_map(|c| c.network_profile.as_deref())
+            .collect();
+        let kept_folders: Vec<&str> = self
+            .connections
+            .iter()
+            .filter_map(|c| c.folder.as_deref())
+            .collect();
+        self.connection_types
+            .retain(|t| kept_types.contains(t.id.as_str()));
+        self.network_profiles
+            .retain(|p| kept_profiles.contains(p.id.as_str()));
+        self.folders.retain(|f| {
+            kept_folders.iter().any(|cf| {
+                *cf == f.as_str()
+                    || cf
+                        .strip_prefix(f.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        });
+        self.secrets.retain(|(k, _)| {
+            if let Some(rest) = k.strip_prefix("conn:") {
+                let id = rest.split(':').next().unwrap_or("");
+                kept_ids.contains(id)
+            } else if let Some(rest) = k.strip_prefix("profile:") {
+                let id = rest.split(':').next().unwrap_or("");
+                kept_profiles.contains(id)
+            } else {
+                true
+            }
+        });
+    }
 }
 
 /// What to do with an imported connection that already exists (same id or

@@ -60,18 +60,28 @@ impl ExportConnectionsDialog {
         let store = &cx.conns.store;
         let mut secrets = BTreeMap::new();
         if self.include_passwords {
-            let manager = cx.services.secrets.read();
-            for key in file::secret_keys(store, &ids) {
-                match manager.get(&key) {
-                    Ok(Some(v)) => {
-                        secrets.insert(key, v);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        self.error = Some(trf("The saved passwords cannot be read: {}", &[&e.full_text()]));
-                        return false;
+            let keys = file::secret_keys(store, &ids);
+            let err = {
+                let manager = cx.services.secrets.read();
+                let mut err = None;
+                for key in keys {
+                    match manager.get(&key) {
+                        Ok(Some(v)) => {
+                            secrets.insert(key, v);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
                     }
                 }
+                err
+            };
+            if let Some(e) = err {
+                crate::dialogs::vault::unlock_after_failed_write(cx, &e);
+                self.error = Some(trf("The saved passwords cannot be read: {}", &[&e.full_text()]));
+                return false;
             }
         }
         let password = self.include_passwords.then(|| Secret::new(self.password.clone()));
