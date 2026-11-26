@@ -332,7 +332,7 @@ impl MetadataCache {
         if entry.is_not_loaded() {
             let s = session.clone();
             let t = table.clone();
-            *entry = Loadable::Loading(backend.spawn(async move { s.lock().await.table_definition(&t).await.map(Arc::new) }));
+            *entry = Loadable::Loading(backend.spawn(load_relation_definition(s, t)));
         }
     }
 
@@ -348,6 +348,31 @@ impl MetadataCache {
     pub fn loaded_snapshots(&self) -> Vec<Arc<SchemaSnapshot>> {
         self.snapshots.values().filter_map(|l| l.get().cloned()).collect()
     }
+}
+
+/// Loads a table or view definition from a session.
+///
+/// Most SQL drivers (PostgreSQL, SQLite, Oracle, MSSQL, etc.) reject views in
+/// `table_definition` and serve them via `view_definition`; falling back to
+/// `table_definition` keeps drivers that handle both uniformly working too.
+pub(crate) async fn load_relation_definition(session: SessionHandle, obj: ObjectRef) -> DbResult<Arc<TableDef>> {
+    let mut s = session.lock().await;
+    if matches!(obj.kind, ObjectKind::View | ObjectKind::MaterializedView) {
+        return match s.view_definition(&obj).await {
+            Ok(v) => {
+                let mut t = TableDef::new(v.schema, v.name);
+                t.columns = v.columns;
+                t.comment = v.comment;
+                t.options = v.options;
+                Ok(Arc::new(t))
+            }
+            Err(view_err) => match s.table_definition(&obj).await {
+                Ok(t) => Ok(Arc::new(t)),
+                Err(_) => Err(view_err),
+            },
+        };
+    }
+    s.table_definition(&obj).await.map(Arc::new)
 }
 
 #[cfg(test)]

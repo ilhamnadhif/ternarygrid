@@ -3,6 +3,13 @@
 All notable changes to TernaryGrid. The newest version comes first; TernaryGrid shows the
 notes of a new version once after it was updated (Help → What's new).
 
+## 0.7.12 — 2026-11-26
+
+### Fixed
+- **Object Editor `Properties` page layout.** Fixed an unbounded horizontal layout on the table `Properties` sub-page bar (`Columns`, `Constraints`, `Foreign keys`, `References`, `Indexes`, `Triggers`, `Partitions`, `Virtual model`, and `Edit table`) that vertically centered the pill bar mid-window and collapsed the table beneath it to zero height. The sub-bar now sits cleanly below the header across desktop and narrow split panes while scrolling horizontally when needed.
+- **View and Materialized View `Properties` loading.** Opening `Properties` (or requesting cached relation metadata in Query Builder, Transfer, and Data Compare) for a `View` or `MaterializedView` now loads columns, comments, and options via `view_definition` instead of calling `table_definition`, eliminating false "not a table / does not exist" errors across PostgreSQL, SQLite, Oracle, and SQL Server.
+- **Properties empty states, scrolling, and table isolation.** Added clean empty-state messages for empty `Constraints`, `Foreign keys`, `References`, `Indexes`, `Triggers`, `Partitions`, `Dependencies`, and `Statistics` pages instead of rendering empty 0-column boxes; wrapped `Virtual model` in a vertical scroll area so tables with many columns never clip `Save virtual model`; and separated `Foreign keys` / `References` table IDs per object so scroll offsets and column widths stay isolated.
+
 ## 0.7.11 — 2026-11-26
 
 ### Fixed

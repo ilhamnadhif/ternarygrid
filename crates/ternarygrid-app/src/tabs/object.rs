@@ -108,7 +108,7 @@ impl ObjectEditorTab {
         let is_table = self.obj.kind.is_table_like() || matches!(self.obj.kind, ObjectKind::View | ObjectKind::MaterializedView);
         if is_table {
             let obj = self.obj.clone();
-            Self::load(&mut self.table, cx.backend, session, move |s| async move { s.lock().await.table_definition(&obj).await.map(Arc::new) });
+            Self::load(&mut self.table, cx.backend, session, move |s| crate::conn::meta::load_relation_definition(s, obj));
         }
         let mut retry = false;
         let gap = ui.spacing().item_spacing.y;
@@ -118,7 +118,7 @@ impl ObjectEditorTab {
             if widgets::load_state(ui, &self.props, &mut retry)
                 && let Some(p) = self.props.get()
             {
-                egui::ScrollArea::vertical().show(ui, |ui| widgets::property_grid(ui, 180.0, p));
+                egui::ScrollArea::vertical().id_salt(("obj_props", &self.obj)).auto_shrink([false, false]).show(ui, |ui| widgets::property_grid(ui, 180.0, p));
             }
             if retry {
                 self.props = Loadable::NotLoaded;
@@ -141,7 +141,9 @@ impl ObjectEditorTab {
             (TablePage::VirtualModel, tr("Virtual model"), None),
         ];
         ui.add_space(10.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let width = ui.available_width();
+        ui.allocate_ui_with_layout(egui::vec2(width, SUB_BAR_H), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.set_min_height(SUB_BAR_H);
             ui.spacing_mut().item_spacing.x = 8.0;
             if self.obj.kind.is_table_like() && kit::button_full(ui, kit::Kind::Secondary, Some(icon::PENCIL), tr("Edit table"), true, false).clicked() {
                 cx.push(AppCommand::EditTable { connection: self.conn.clone(), table: self.obj.clone() });
@@ -149,10 +151,11 @@ impl ObjectEditorTab {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 egui::ScrollArea::horizontal()
                     .id_salt(("object_sub_pages", &self.obj))
+                    .max_height(SUB_BAR_H)
                     .auto_shrink([false, true])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_centered(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             for (page, label, n) in sub_pages {
                                 if pill_tab(ui, label, n.as_deref(), self.table_page == page).clicked() {
@@ -163,7 +166,7 @@ impl ObjectEditorTab {
                     });
             });
         });
-        ui.add_space(10.0 - gap);
+        ui.add_space((10.0 - gap).max(0.0));
         if let Some(t) = self.table.get().cloned() {
             // Rows and size are in the title.
             let options: Vec<String> = t.options.iter().map(|(k, v)| format!("{k}: {v}")).collect();
@@ -229,7 +232,7 @@ impl ObjectEditorTab {
                     &[-40.0, 1.2, 1.0, 0.8, 1.4, 0.4, 0.6, 1.6],
                     3,
                 );
-                let r = widgets::styled_table_widths(ui, "obj_cols", &headers, &rows, self.selected_row, &styles, &widths);
+                let r = widgets::styled_table_widths(ui, ("obj_cols", &self.obj, headers.len()), &headers, &rows, self.selected_row, &styles, &widths);
                 if let Some(i) = r.clicked {
                     self.selected_row = Some(i);
                 }
@@ -248,62 +251,84 @@ impl ObjectEditorTab {
                 for c in &t.checks {
                     rows.push(vec![name_or_unset(&c.name), "CHECK".into(), c.expression.clone()]);
                 }
-                use widgets::CellStyle as S;
-                if named {
-                    widgets::styled_table_widths(ui, "obj_cons", &[tr("Name"), tr("Type"), tr("Definition")], &rows, None, &[S::Plain, S::Chip, S::Mono], &[1.0, 0.7, 3.0]);
+                if rows.is_empty() {
+                    ui.label(RichText::new(tr("No constraints.")).color(ternarygrid_ui::pal(ui).text_muted));
                 } else {
-                    // No constraint has a name (SQLite's): the kind and the definition only.
-                    let rows: Vec<Vec<String>> = rows.into_iter().map(|r| r[1..].to_vec()).collect();
-                    widgets::styled_table_widths(ui, "obj_cons", &[tr("Type"), tr("Definition")], &rows, None, &[S::Chip, S::Mono], &[-140.0, 1.0]);
+                    use widgets::CellStyle as S;
+                    if named {
+                        widgets::styled_table_widths(
+                            ui,
+                            ("obj_cons", &self.obj, 3usize),
+                            &[tr("Name"), tr("Type"), tr("Definition")],
+                            &rows,
+                            None,
+                            &[S::Plain, S::Chip, S::Mono],
+                            &[1.0, 0.7, 3.0],
+                        );
+                    } else {
+                        // No constraint has a name (SQLite's): the kind and the definition only.
+                        let rows: Vec<Vec<String>> = rows.into_iter().map(|r| r[1..].to_vec()).collect();
+                        widgets::styled_table_widths(ui, ("obj_cons", &self.obj, 2usize), &[tr("Type"), tr("Definition")], &rows, None, &[S::Chip, S::Mono], &[-140.0, 1.0]);
+                    }
                 }
             }
             TablePage::ForeignKeys | TablePage::References => {
                 let list = if self.table_page == TablePage::ForeignKeys { &t.foreign_keys } else { &t.referenced_by };
                 let incoming = self.table_page == TablePage::References;
-                let names: Vec<Option<String>> = list.iter().map(|fk| fk.name.clone()).collect();
-                let named = some_names(&names);
-                let rows: Vec<Vec<String>> = list
-                    .iter()
-                    .map(|fk| {
-                        vec![
-                            if named { name_or_unset(&fk.name) } else { String::new() },
-                            // The referencing table (References), the referenced one (Foreign keys):
-                            // the other one is this table, said once by the page.
-                            if incoming {
-                                format!("{}{}", fk.schema.as_ref().map(|s| format!("{s}.")).unwrap_or_default(), fk.table)
-                            } else {
-                                format!("{}{}", fk.ref_schema.as_ref().map(|s| format!("{s}.")).unwrap_or_default(), fk.ref_table)
-                            },
-                            fmt_cols(&fk.columns),
-                            fmt_cols(&fk.ref_columns),
-                            fk.on_update.sql().to_string(),
-                            fk.on_delete.sql().to_string(),
-                        ]
-                    })
-                    .collect();
-                use widgets::CellStyle as S;
-                let table_label = if incoming { tr("Table") } else { tr("References") };
-                let (headers, rows, styles, widths) = drop_empty_columns(
-                    &[tr("Name"), table_label, tr("Columns"), tr("Referenced columns"), tr("On update"), tr("On delete")],
-                    rows,
-                    &[S::Plain, S::Plain, S::Mono, S::Mono, S::Plain, S::Plain],
-                    &[1.6, 1.1, 1.0, 1.0, 0.8, 0.8],
-                    0,
-                );
-                let r = widgets::styled_table_widths(ui, "obj_fks", &headers, &rows, None, &styles, &widths);
-                if let Some(i) = r.double_clicked
-                    && let Some(fk) = list.get(i)
-                {
-                    let (schema, table) = if self.table_page == TablePage::References {
-                        (fk.schema.clone(), fk.table.clone())
-                    } else {
-                        (fk.ref_schema.clone().or(self.obj.schema.clone()), fk.ref_table.clone())
-                    };
-                    let target = ObjectRef::table(schema, table).with_database(self.obj.database.clone());
-                    cx.push(AppCommand::OpenObject { connection: self.conn.clone(), object: target, page: ObjectPage::Properties });
+                if list.is_empty() {
+                    let msg = if incoming { tr("No referencing tables.") } else { tr("No foreign keys.") };
+                    ui.label(RichText::new(msg).color(ternarygrid_ui::pal(ui).text_muted));
+                } else {
+                    let names: Vec<Option<String>> = list.iter().map(|fk| fk.name.clone()).collect();
+                    let named = some_names(&names);
+                    let rows: Vec<Vec<String>> = list
+                        .iter()
+                        .map(|fk| {
+                            vec![
+                                if named { name_or_unset(&fk.name) } else { String::new() },
+                                // The referencing table (References), the referenced one (Foreign keys):
+                                // the other one is this table, said once by the page.
+                                if incoming {
+                                    format!("{}{}", fk.schema.as_ref().map(|s| format!("{s}.")).unwrap_or_default(), fk.table)
+                                } else {
+                                    format!("{}{}", fk.ref_schema.as_ref().map(|s| format!("{s}.")).unwrap_or_default(), fk.ref_table)
+                                },
+                                fmt_cols(&fk.columns),
+                                fmt_cols(&fk.ref_columns),
+                                fk.on_update.sql().to_string(),
+                                fk.on_delete.sql().to_string(),
+                            ]
+                        })
+                        .collect();
+                    use widgets::CellStyle as S;
+                    let table_label = if incoming { tr("Table") } else { tr("References") };
+                    let (headers, rows, styles, widths) = drop_empty_columns(
+                        &[tr("Name"), table_label, tr("Columns"), tr("Referenced columns"), tr("On update"), tr("On delete")],
+                        rows,
+                        &[S::Plain, S::Plain, S::Mono, S::Mono, S::Plain, S::Plain],
+                        &[1.6, 1.1, 1.0, 1.0, 0.8, 0.8],
+                        0,
+                    );
+                    let table_id = if incoming { "obj_refs" } else { "obj_fks" };
+                    let r = widgets::styled_table_widths(ui, (table_id, &self.obj, headers.len()), &headers, &rows, None, &styles, &widths);
+                    if let Some(i) = r.double_clicked
+                        && let Some(fk) = list.get(i)
+                    {
+                        let (schema, table) = if self.table_page == TablePage::References {
+                            (fk.schema.clone(), fk.table.clone())
+                        } else {
+                            (fk.ref_schema.clone().or(self.obj.schema.clone()), fk.ref_table.clone())
+                        };
+                        let target = ObjectRef::table(schema, table).with_database(self.obj.database.clone());
+                        cx.push(AppCommand::OpenObject { connection: self.conn.clone(), object: target, page: ObjectPage::Properties });
+                    }
                 }
             }
             TablePage::Indexes => {
+                if t.indexes.is_empty() {
+                    ui.label(RichText::new(tr("No indexes.")).color(ternarygrid_ui::pal(ui).text_muted));
+                    return;
+                }
                 let rows: Vec<Vec<String>> = t
                     .indexes
                     .iter()
@@ -333,9 +358,13 @@ impl ObjectEditorTab {
                     &[1.2, 0.7, 0.5, 1.0, 1.0, 2.6],
                     1,
                 );
-                widgets::styled_table_widths(ui, "obj_idx", &headers, &rows, None, &styles, &widths);
+                widgets::styled_table_widths(ui, ("obj_idx", &self.obj, headers.len()), &headers, &rows, None, &styles, &widths);
             }
             TablePage::Triggers => {
+                if t.triggers.is_empty() {
+                    ui.label(RichText::new(tr("No triggers.")).color(ternarygrid_ui::pal(ui).text_muted));
+                    return;
+                }
                 let rows: Vec<Vec<String>> = t
                     .triggers
                     .iter()
@@ -358,7 +387,7 @@ impl ObjectEditorTab {
                     &[1.3, 0.6, 0.8, 0.6, 0.6, 2.4],
                     1,
                 );
-                widgets::styled_table_widths(ui, "obj_trg", &headers, &rows, None, &styles, &widths);
+                widgets::styled_table_widths(ui, ("obj_trg", &self.obj, headers.len()), &headers, &rows, None, &styles, &widths);
             }
             TablePage::VirtualModel => {
                 let key = ternarygrid_config::project::VirtualTableKey::of(&self.obj);
@@ -368,111 +397,121 @@ impl ObjectEditorTab {
                     self.vmodel = Some(vm.get(&key).cloned().unwrap_or_default());
                 }
                 let Some(vt) = self.vmodel.as_mut() else { return };
-                use ternarygrid_ui::parts::group;
-                ui.label(RichText::new(tr("Client-side additions used by the data editor; stored in the project, not in the database.")).color(ternarygrid_ui::pal(ui).text_muted));
-                ui.add_space(4.0);
-                group(ui, Some(tr("Virtual key")), Some(tr("Columns that identify a row when the table has no primary or unique key.")), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        // 20 between the check boxes: each one's box with its own name.
-                        ui.spacing_mut().item_spacing.x = 20.0;
-                        let mut keys = vt.virtual_key.clone().unwrap_or_default();
-                        for c in &t.columns {
-                            let mut on = keys.contains(&c.name);
-                            if ternarygrid_ui::kit::checkbox(ui, &mut on, &c.name).changed() {
-                                if on {
-                                    keys.push(c.name.clone());
-                                } else {
-                                    keys.retain(|k| k != &c.name);
-                                }
-                            }
-                        }
-                        vt.virtual_key = if keys.is_empty() { None } else { Some(keys) };
-                    })
-                });
-                ui.add_space(8.0);
-                group(ui, Some(tr("Dictionary")), Some(tr("When other tables reference this one, show these columns next to the key.")), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 20.0;
-                        let mut cols = vt.dictionary.clone().map(|d| d.description_columns).unwrap_or_default();
-                        for c in &t.columns {
-                            let mut on = cols.contains(&c.name);
-                            if ternarygrid_ui::kit::checkbox(ui, &mut on, &c.name).changed() {
-                                if on {
-                                    cols.push(c.name.clone());
-                                } else {
-                                    cols.retain(|k| k != &c.name);
-                                }
-                            }
-                        }
-                        vt.dictionary = if cols.is_empty() { None } else { Some(ternarygrid_config::project::DictionaryConfig { description_columns: cols }) };
-                    })
-                });
-                ui.add_space(8.0);
-                let mut remove = None;
+                let mut saved: Option<Result<(), String>> = None;
                 let new_vcol = &mut self.new_vcol;
-                // A numeric column of this table for the expression's example.
-                let measure = t.columns.iter().find(|c| is_amount_type(&c.data_type) && !ternarygrid_grid::format::is_identifier_name(&c.name)).map(|c| c.name.clone());
-                let hint = match &measure {
-                    Some(m) => ternarygrid_core::trf("Expression, e.g. {} * 1.1", &[m]),
-                    None => tr("Expression, e.g. upper(name)").to_string(),
-                };
-                group(ui, Some(tr("Virtual columns")), Some(tr("Computed on the client from each row's values.")), |ui| {
-                    // Fields of fixed widths (not egui's grid, whose cells keep the last frame's width).
-                    ui.spacing_mut().item_spacing.y = 6.0;
-                    let (name_w, expr_w, h) = (180.0, 380.0, ternarygrid_ui::style::SMALL_H);
-                    let faint = ternarygrid_ui::pal(ui).text_faint;
-                    fn field<'t>(text: &'t mut String, hint: &str, mono: bool, faint: egui::Color32) -> egui::TextEdit<'t> {
-                        let te =
-                            egui::TextEdit::singleline(text).vertical_align(egui::Align::Center).margin(egui::Margin::symmetric(8, 0)).hint_text(RichText::new(hint).color(faint));
-                        if mono { te.font(egui::TextStyle::Monospace) } else { te }
-                    }
-                    for (i, c) in vt.virtual_columns.iter_mut().enumerate() {
+                egui::ScrollArea::vertical().id_salt(("obj_vmodel", &self.obj)).auto_shrink([false, false]).show(ui, |ui| {
+                    use ternarygrid_ui::parts::group;
+                    ui.label(
+                        RichText::new(tr("Client-side additions used by the data editor; stored in the project, not in the database.")).color(ternarygrid_ui::pal(ui).text_muted),
+                    );
+                    ui.add_space(4.0);
+                    group(ui, Some(tr("Virtual key")), Some(tr("Columns that identify a row when the table has no primary or unique key.")), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            // 20 between the check boxes: each one's box with its own name.
+                            ui.spacing_mut().item_spacing.x = 20.0;
+                            let mut keys = vt.virtual_key.clone().unwrap_or_default();
+                            for c in &t.columns {
+                                let mut on = keys.contains(&c.name);
+                                if ternarygrid_ui::kit::checkbox(ui, &mut on, &c.name).changed() {
+                                    if on {
+                                        keys.push(c.name.clone());
+                                    } else {
+                                        keys.retain(|k| k != &c.name);
+                                    }
+                                }
+                            }
+                            vt.virtual_key = if keys.is_empty() { None } else { Some(keys) };
+                        })
+                    });
+                    ui.add_space(8.0);
+                    group(ui, Some(tr("Dictionary")), Some(tr("When other tables reference this one, show these columns next to the key.")), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 20.0;
+                            let mut cols = vt.dictionary.clone().map(|d| d.description_columns).unwrap_or_default();
+                            for c in &t.columns {
+                                let mut on = cols.contains(&c.name);
+                                if ternarygrid_ui::kit::checkbox(ui, &mut on, &c.name).changed() {
+                                    if on {
+                                        cols.push(c.name.clone());
+                                    } else {
+                                        cols.retain(|k| k != &c.name);
+                                    }
+                                }
+                            }
+                            vt.dictionary = if cols.is_empty() { None } else { Some(ternarygrid_config::project::DictionaryConfig { description_columns: cols }) };
+                        })
+                    });
+                    ui.add_space(8.0);
+                    let mut remove = None;
+                    // A numeric column of this table for the expression's example.
+                    let measure = t.columns.iter().find(|c| is_amount_type(&c.data_type) && !ternarygrid_grid::format::is_identifier_name(&c.name)).map(|c| c.name.clone());
+                    let hint = match &measure {
+                        Some(m) => ternarygrid_core::trf("Expression, e.g. {} * 1.1", &[m]),
+                        None => tr("Expression, e.g. upper(name)").to_string(),
+                    };
+                    group(ui, Some(tr("Virtual columns")), Some(tr("Computed on the client from each row's values.")), |ui| {
+                        // Fields of fixed widths (not egui's grid, whose cells keep the last frame's width).
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        let (name_w, expr_w, h) = (180.0, 380.0, ternarygrid_ui::style::SMALL_H);
+                        let faint = ternarygrid_ui::pal(ui).text_faint;
+                        fn field<'t>(text: &'t mut String, hint: &str, mono: bool, faint: egui::Color32) -> egui::TextEdit<'t> {
+                            let te = egui::TextEdit::singleline(text)
+                                .vertical_align(egui::Align::Center)
+                                .margin(egui::Margin::symmetric(8, 0))
+                                .hint_text(RichText::new(hint).color(faint));
+                            if mono { te.font(egui::TextStyle::Monospace) } else { te }
+                        }
+                        for (i, c) in vt.virtual_columns.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.add_sized([name_w, h], field(&mut c.name, "", false, faint));
+                                ui.add_sized([expr_w, h], field(&mut c.expression, "", true, faint));
+                                let ic = ternarygrid_ui::style::icons(ui);
+                                if kit::icon_button_colored(ui, icon::TRASH, tr("Remove"), false, h, (h * 0.54).round(), Some(ic.red)).clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                        }
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.add_sized([name_w, h], field(&mut c.name, "", false, faint));
-                            ui.add_sized([expr_w, h], field(&mut c.expression, "", true, faint));
-                            let ic = ternarygrid_ui::style::icons(ui);
-                            if kit::icon_button_colored(ui, icon::TRASH, tr("Remove"), false, h, (h * 0.54).round(), Some(ic.red)).clicked() {
-                                remove = Some(i);
+                            ui.add_sized([name_w, h], field(&mut new_vcol.0, tr("Name"), false, faint));
+                            ui.add_sized([expr_w, h], field(&mut new_vcol.1, &hint, true, faint));
+                            let ready = !new_vcol.0.trim().is_empty() && !new_vcol.1.trim().is_empty();
+                            if ui.add_enabled_ui(ready, |ui| kit::button_full(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add column"), true, false).clicked()).inner {
+                                vt.virtual_columns.push(ternarygrid_config::project::VirtualColumn {
+                                    name: new_vcol.0.trim().to_string(),
+                                    expression: new_vcol.1.trim().to_string(),
+                                    ..Default::default()
+                                });
+                                *new_vcol = (String::new(), String::new());
                             }
                         });
-                    }
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.add_sized([name_w, h], field(&mut new_vcol.0, tr("Name"), false, faint));
-                        ui.add_sized([expr_w, h], field(&mut new_vcol.1, &hint, true, faint));
-                        let ready = !new_vcol.0.trim().is_empty() && !new_vcol.1.trim().is_empty();
-                        if ui.add_enabled_ui(ready, |ui| kit::button_full(ui, kit::Kind::Secondary, Some(icon::PLUS), tr("Add column"), true, false).clicked()).inner {
-                            vt.virtual_columns.push(ternarygrid_config::project::VirtualColumn {
-                                name: new_vcol.0.trim().to_string(),
-                                expression: new_vcol.1.trim().to_string(),
-                                ..Default::default()
-                            });
-                            *new_vcol = (String::new(), String::new());
-                        }
                     });
-                });
-                if let Some(i) = remove {
-                    vt.virtual_columns.remove(i);
-                }
-                ui.add_space(10.0);
-                if kit::primary_icon(ui, icon::CHECK, tr("Save virtual model")).clicked()
-                    && let Some(p) = projects
-                {
-                    let mut vm = p.virtual_model(&self.conn).unwrap_or_default();
-                    if vt.is_empty() {
-                        vm.remove(&key);
-                    } else {
-                        vm.set(key.clone(), vt.clone());
+                    if let Some(i) = remove {
+                        vt.virtual_columns.remove(i);
                     }
-                    match p.save_virtual_model(&self.conn, &vm) {
+                    ui.add_space(10.0);
+                    if kit::primary_icon(ui, icon::CHECK, tr("Save virtual model")).clicked()
+                        && let Some(p) = projects
+                    {
+                        let mut vm = p.virtual_model(&self.conn).unwrap_or_default();
+                        if vt.is_empty() {
+                            vm.remove(&key);
+                        } else {
+                            vm.set(key.clone(), vt.clone());
+                        }
+                        saved = Some(p.save_virtual_model(&self.conn, &vm).map_err(|e| e.to_string()));
+                    }
+                });
+                if let Some(res) = saved {
+                    match res {
                         Ok(()) => {
                             if let Some(panel) = self.data.as_mut().and_then(|d| d.panel.as_mut()) {
                                 panel.invalidate_virtual_model();
                             }
                             cx.toasts.success(tr("Virtual model saved"));
                         }
-                        Err(e) => cx.toasts.error(tr("Cannot save the virtual model"), Some(e.to_string())),
+                        Err(e) => cx.toasts.error(tr("Cannot save the virtual model"), Some(e)),
                     }
                 }
             }
@@ -480,9 +519,13 @@ impl ObjectEditorTab {
                 if let Some(p) = &t.partitioning {
                     ui.label(format!("{} {} ({})", tr("Partitioned by"), p.strategy, p.key));
                 }
+                if t.partitions.is_empty() {
+                    ui.label(RichText::new(tr("No partitions.")).color(ternarygrid_ui::pal(ui).text_muted));
+                    return;
+                }
                 let rows: Vec<Vec<String>> =
                     t.partitions.iter().map(|p| vec![p.name.clone(), p.bound.clone(), p.row_estimate.map(|r| r.to_string()).unwrap_or_default()]).collect();
-                widgets::simple_table(ui, "obj_parts", &[tr("Name"), tr("Bound"), tr("Rows")], &rows, None);
+                widgets::simple_table(ui, ("obj_parts", &self.obj), &[tr("Name"), tr("Bound"), tr("Rows")], &rows, None);
             }
         }
         if retry {
@@ -562,34 +605,35 @@ impl ObjectEditorTab {
             let deps = self.deps.get().cloned().unwrap_or_default();
             if deps.is_empty() {
                 ui.label(RichText::new(tr("No dependencies.")).color(ternarygrid_ui::pal(ui).text_muted));
-            }
-            let rows: Vec<Vec<String>> = deps
-                .iter()
-                .map(|d| {
-                    vec![
-                        match d.direction {
-                            DependencyDirection::DependsOn => tr("depends on").to_string(),
-                            DependencyDirection::UsedBy => tr("used by").to_string(),
-                        },
-                        tr(d.target.kind.label()).to_string(),
-                        d.target.display_path(),
-                        d.kind.clone().unwrap_or_default(),
-                    ]
-                })
-                .collect();
-            let r = widgets::styled_table_widths(
-                ui,
-                "obj_deps",
-                &[tr("Direction"), tr("Kind"), tr("Object"), tr("Dependency")],
-                &rows,
-                None,
-                &[widgets::CellStyle::Chip],
-                &[-130.0, -120.0, 1.4, 1.0],
-            );
-            if let Some(i) = r.double_clicked
-                && let Some(d) = deps.get(i)
-            {
-                cx.push(AppCommand::OpenObject { connection: self.conn.clone(), object: d.target.clone(), page: ObjectPage::Properties });
+            } else {
+                let rows: Vec<Vec<String>> = deps
+                    .iter()
+                    .map(|d| {
+                        vec![
+                            match d.direction {
+                                DependencyDirection::DependsOn => tr("depends on").to_string(),
+                                DependencyDirection::UsedBy => tr("used by").to_string(),
+                            },
+                            tr(d.target.kind.label()).to_string(),
+                            d.target.display_path(),
+                            d.kind.clone().unwrap_or_default(),
+                        ]
+                    })
+                    .collect();
+                let r = widgets::styled_table_widths(
+                    ui,
+                    ("obj_deps", &self.obj),
+                    &[tr("Direction"), tr("Kind"), tr("Object"), tr("Dependency")],
+                    &rows,
+                    None,
+                    &[widgets::CellStyle::Chip],
+                    &[-130.0, -120.0, 1.4, 1.0],
+                );
+                if let Some(i) = r.double_clicked
+                    && let Some(d) = deps.get(i)
+                {
+                    cx.push(AppCommand::OpenObject { connection: self.conn.clone(), object: d.target.clone(), page: ObjectPage::Properties });
+                }
             }
         }
         if retry {
@@ -607,11 +651,12 @@ impl ObjectEditorTab {
             let stats = self.stats.get().cloned().unwrap_or_default();
             if stats.is_empty() {
                 ui.label(RichText::new(tr("No statistics available.")).color(ternarygrid_ui::pal(ui).text_muted));
+            } else {
+                egui::ScrollArea::vertical().id_salt(("obj_stats", &self.obj)).auto_shrink([false, false]).show(ui, |ui| {
+                    stat_tiles(ui, &stats);
+                    widgets::property_grid(ui, 220.0, &stats);
+                });
             }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                stat_tiles(ui, &stats);
-                widgets::property_grid(ui, 220.0, &stats);
-            });
         }
         if retry {
             self.stats = Loadable::NotLoaded;
@@ -621,6 +666,9 @@ impl ObjectEditorTab {
 
 /// Height of the object editor's header: its pages, underlined, and its buttons.
 const HEADER_H: f32 = 36.0;
+
+/// Height of the table Properties sub-page pill bar (`pill_tab` is 28 px; small buttons are 26 px).
+const SUB_BAR_H: f32 = 28.0;
 
 impl ObjectEditorTab {
     /// The header, one line: the pages, underlined, with the counts of columns and indexes;
@@ -655,9 +703,12 @@ impl ObjectEditorTab {
                 // The pages take the rest; in a narrow tab they scroll (wheel) under the buttons
                 // instead of running into them.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    egui::ScrollArea::horizontal().id_salt("object_pages").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
-                        ui.horizontal_centered(|ui| self.pages_ui(ui));
-                    });
+                    egui::ScrollArea::horizontal().id_salt(("object_pages", &self.obj)).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(
+                        ui,
+                        |ui| {
+                            ui.horizontal_centered(|ui| self.pages_ui(ui));
+                        },
+                    );
                 });
             });
         });
@@ -834,7 +885,7 @@ impl TabView for ObjectEditorTab {
         if self.obj.kind.is_table_like() || matches!(self.obj.kind, ObjectKind::View | ObjectKind::MaterializedView) {
             let session = self.session(cx);
             let obj = self.obj.clone();
-            Self::load(&mut self.table, cx.backend, session, move |s| async move { s.lock().await.table_definition(&obj).await.map(Arc::new) });
+            Self::load(&mut self.table, cx.backend, session, move |s| crate::conn::meta::load_relation_definition(s, obj));
         }
         self.header_ui(ui, cx);
         // The pages other than Data, DDL and Diagram sit 16 px off the edges, as the mockups'

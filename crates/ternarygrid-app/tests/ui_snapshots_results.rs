@@ -834,7 +834,22 @@ fn object_pages(s: &mut Shots, conn: &str) {
         return;
     }
     s.open(conn, "orders", ObjectPage::Properties);
-    s.wait("the columns", |h| has(h, "Constraints"));
+    s.wait("the columns", |h| has(h, "Constraints") && has(h, "customer_id"));
+    {
+        let nav_right = s.h.state().chrome.nav.map_or(0.0, |r| r.right());
+        let top_bottom = s.h.state().chrome.top_bottom();
+        let in_pane = |label: &str| {
+            s.h.query_all_by_label(label)
+                .map(|n| n.rect())
+                .find(|r| r.left() >= nav_right - 1.0 && r.top() >= top_bottom - 1.0 && r.height() > 0.0)
+                .unwrap_or_else(|| panic!("expected {label:?} in object properties pane"))
+        };
+        let props = in_pane("Properties");
+        let cols = in_pane("Columns");
+        let row = in_pane("customer_id");
+        assert!((0.0..=30.0).contains(&(cols.top() - props.bottom())), "Properties sub-bar drifted: props={props:?}, cols={cols:?}");
+        assert!(row.top() > cols.bottom() && row.bottom() <= s.h.ctx.content_rect().bottom(), "Properties columns table must be visible below sub-bar: cols={cols:?}, row={row:?}");
+    }
     s.park();
     s.shot("obj_columns");
     for (pill, name) in [("Constraints", "obj_constraints"), ("References", "obj_refs"), ("Triggers", "obj_triggers"), ("Virtual model", "obj_virtual")] {

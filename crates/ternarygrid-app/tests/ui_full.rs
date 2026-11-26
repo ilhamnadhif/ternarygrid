@@ -2885,3 +2885,234 @@ fn tab_process_status_background_completion_error_attention_and_stable_width() {
     frames(&mut h, 4);
     assert_eq!(badge_of(&h, tab_a), TabBadge::None, "foreground run must not leave unread Done badge");
 }
+
+#[test]
+fn object_editor_properties_layout_and_geometry() {
+    use ternarygrid_app::command::ObjectPage;
+    use ternarygrid_app::conn::Credentials;
+    use ternarygrid_core::config::{AuthMethod, ConnectionConfig};
+    use ternarygrid_core::meta::ObjectKind;
+    use ternarygrid_core::{ConnectParams, DbKind, ExecOptions, ObjectRef};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("obj_layout.db");
+    {
+        let backend = Backend::new().unwrap();
+        backend.block_on(async {
+            let mut cfg = ConnectionConfig::new(DbKind::Sqlite, "layout-db");
+            cfg.file_path = Some(db_path.display().to_string());
+            cfg.auth = AuthMethod::None;
+            let drv = ternarygrid_app::driver_registry().get(DbKind::Sqlite).unwrap();
+            let mut s = drv.connect(&ConnectParams::from_config(&cfg, None)).await.unwrap();
+            let opts = ExecOptions::default();
+            s.execute("CREATE TABLE orgs (id INTEGER PRIMARY KEY, name TEXT NOT NULL)", &[], &opts).await.unwrap();
+            s.execute("INSERT INTO orgs (id, name) VALUES (1, 'Acme')", &[], &opts).await.unwrap();
+            let mut cols = vec![
+                "id INTEGER PRIMARY KEY".to_string(),
+                "org_id INTEGER REFERENCES orgs(id)".to_string(),
+                "email TEXT NOT NULL UNIQUE".to_string(),
+                "status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled'))".to_string(),
+            ];
+            for i in 0..22 {
+                cols.push(format!("extra_col_{i:02} TEXT"));
+            }
+            let create_users = format!("CREATE TABLE users ({})", cols.join(", "));
+            s.execute(&create_users, &[], &opts).await.unwrap();
+            s.execute("CREATE INDEX idx_users_email ON users (email)", &[], &opts).await.unwrap();
+            s.execute("CREATE TRIGGER trg_users_audit AFTER INSERT ON users BEGIN SELECT 1; END", &[], &opts).await.unwrap();
+            for i in 0..25 {
+                let sql = format!("CREATE TABLE child_{i:02} (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))");
+                s.execute(&sql, &[], &opts).await.unwrap();
+            }
+            s.execute("CREATE VIEW v_users AS SELECT id, email, status FROM users", &[], &opts).await.unwrap();
+            s.execute("INSERT INTO users (id, org_id, email) VALUES (1, 1, 'alice@example.com')", &[], &opts).await.unwrap();
+            let _ = s.close().await;
+        });
+    }
+
+    let open_harness = |size: egui::Vec2| -> (H, String) {
+        let mut settings = Settings::default();
+        settings.updates.check_automatically = Some(false);
+        settings.general.restore_session = false;
+        settings.general.onboarding_done = true;
+        let conns = ConnectionManager::new(ternarygrid_app::driver_registry(), Arc::new(MemorySecrets::default()), Arc::new(DirectNet));
+        let backend = Arc::new(Backend::new().unwrap());
+        let services = Services::ephemeral(&dir.path().join(format!("home_{}x{}", size.x as u32, size.y as u32)));
+        let mut h = Harness::builder().with_size(size).with_max_steps(400).with_step_dt(1.0 / 60.0).build_eframe(move |cc| {
+            ternarygrid_app::theme::setup_fonts(&cc.egui_ctx);
+            backend.set_context(cc.egui_ctx.clone());
+            TernaryGridApp::new(backend, conns, services, settings)
+        });
+        ternarygrid_app::theme::apply_settings(&h.ctx, &h.state().settings);
+        let mut cfg = ConnectionConfig::new(DbKind::Sqlite, "layout-db");
+        cfg.file_path = Some(db_path.display().to_string());
+        cfg.auth = AuthMethod::None;
+        let conn_id = cfg.id.clone();
+        h.state_mut().conns.upsert(cfg);
+        let b = h.state().backend.clone();
+        h.state_mut().conns.connect(&b, &conn_id, Credentials::default()).unwrap();
+        wait(&mut h, "connected layout-db", |h| h.state().conns.is_connected(&conn_id));
+        (h, conn_id)
+    };
+
+    // Helper: find a widget inside the main editor area (right of navigator, below top chrome).
+    let pane_rect = |h: &H, label: &str| -> egui::Rect {
+        let nav_right = h.state().chrome.nav.map_or(0.0, |r| r.right());
+        let top_bottom = h.state().chrome.top_bottom();
+        h.query_all_by_label(label)
+            .map(|n| n.rect())
+            .find(|r| r.left() >= nav_right - 1.0 && r.top() >= top_bottom - 1.0 && r.width() > 0.0 && r.height() > 0.0)
+            .unwrap_or_else(|| panic!("expected visible widget {label:?} in editor pane; labels: {:?}", labels(h)))
+    };
+
+    let pane_rect_contains = |h: &H, needle: &str| -> egui::Rect {
+        let nav_right = h.state().chrome.nav.map_or(0.0, |r| r.right());
+        let top_bottom = h.state().chrome.top_bottom();
+        h.query_all_by_label_contains(needle)
+            .map(|n| n.rect())
+            .find(|r| r.left() >= nav_right - 1.0 && r.top() >= top_bottom - 1.0 && r.width() > 0.0 && r.height() > 0.0)
+            .unwrap_or_else(|| panic!("expected visible widget containing {needle:?} in editor pane; labels: {:?}", labels(h)))
+    };
+
+    let click_in_pane = |h: &mut H, label: &str| {
+        pause(h);
+        let nav_right = h.state().chrome.nav.map_or(0.0, |r| r.right());
+        let top_bottom = h.state().chrome.top_bottom();
+        {
+            let node = h
+                .query_all_by_label(label)
+                .find(|n| {
+                    let r = n.rect();
+                    r.left() >= nav_right - 1.0 && r.top() >= top_bottom - 1.0
+                })
+                .unwrap_or_else(|| panic!("clickable {label:?} in editor pane; labels: {:?}", labels(h)));
+            node.click();
+        }
+        frames(h, 4);
+    };
+
+    // 1. Standard desktop viewport (1400 x 900) on table `users` (25 columns, 25 incoming FKs).
+    let (mut h, conn) = open_harness(egui::vec2(1400.0, 900.0));
+    h.state_mut().push_command(AppCommand::OpenObject { connection: conn.clone(), object: ObjectRef::table(Some("main".into()), "users"), page: ObjectPage::Properties });
+    wait(&mut h, "users columns rendered", |h| has(h, "email") && has(h, "Edit table"));
+    frames(&mut h, 3);
+
+    let viewport = h.ctx.content_rect();
+    let props_tab = pane_rect(&h, "Properties");
+    let cols_pill = pane_rect(&h, "Columns");
+    let edit_btn = pane_rect(&h, "Edit table");
+
+    // Sub-page pill bar MUST sit immediately below header (never vertically centered mid-screen!).
+    let sub_gap = cols_pill.top() - props_tab.bottom();
+    assert!((0.0..=30.0).contains(&sub_gap), "Properties sub-bar drifted from header: props_tab={props_tab:?}, cols_pill={cols_pill:?}, gap={sub_gap}");
+    assert!(
+        (edit_btn.center().y - cols_pill.center().y).abs() <= 4.0 && edit_btn.left() > cols_pill.right(),
+        "Edit table must align on the same row to the right of pills: cols_pill={cols_pill:?}, edit_btn={edit_btn:?}"
+    );
+
+    // Columns table header & rows MUST render directly below the sub-bar and inside the viewport.
+    let col_hdr = pane_rect(&h, "Type");
+    let email_row = pane_rect(&h, "email");
+    assert!(
+        col_hdr.top() > cols_pill.bottom() && col_hdr.top() - cols_pill.bottom() <= 60.0,
+        "Columns header must start right under sub-bar: cols_pill={cols_pill:?}, col_hdr={col_hdr:?}"
+    );
+    assert!(
+        email_row.top() > col_hdr.bottom() && email_row.bottom() <= viewport.bottom() && email_row.height() >= 12.0,
+        "Columns row must be visible inside viewport: col_hdr={col_hdr:?}, email_row={email_row:?}, viewport={viewport:?}"
+    );
+
+    // Visit every Properties sub-page and verify pinned sub-bar + visible content below it.
+    let sub_checks: &[(&str, &str)] = &[
+        ("Constraints", "Definition"),
+        ("Foreign keys", "orgs"),
+        ("References", "child_00"),
+        ("Indexes", "idx_users_email"),
+        ("Triggers", "trg_users_audit"),
+        ("Partitions", "No partitions."),
+        ("Virtual model", "Virtual key"),
+    ];
+    for (pill, expected_content) in sub_checks {
+        click_in_pane(&mut h, pill);
+        let p_tab = pane_rect(&h, "Properties");
+        let c_pill = pane_rect(&h, "Columns");
+        let gap = c_pill.top() - p_tab.bottom();
+        assert!((0.0..=30.0).contains(&gap), "sub-bar drifted on {pill}: gap={gap}");
+        let content = pane_rect_contains(&h, expected_content);
+        assert!(
+            content.top() > c_pill.bottom() && content.bottom() <= viewport.bottom() && content.height() >= 10.0,
+            "content {expected_content:?} on {pill} must be visible below sub-bar: sub_bar={c_pill:?}, content={content:?}, viewport={viewport:?}"
+        );
+    }
+    // Virtual model has 25 columns; Save button exists inside the scrollable area (no clipping panic).
+    assert!(has(&h, "Save virtual model"), "Virtual model renders Save button");
+
+    // Top-level object pages: DDL, Dependencies, Statistics, Data.
+    click_in_pane(&mut h, "DDL");
+    wait(&mut h, "DDL loaded", |h| has(h, "Open in SQL editor"));
+    let ddl_bar = pane_rect(&h, "Open in SQL editor");
+    let ddl_box = h
+        .query_all_by_role(egui::accesskit::Role::MultilineTextInput)
+        .find(|n| n.accesskit_node().value().is_some_and(|v| v.contains("CREATE TABLE")))
+        .expect("DDL text editor contains CREATE TABLE")
+        .rect();
+    assert!(ddl_box.top() > ddl_bar.bottom() && ddl_box.height() >= 40.0, "DDL code area below toolbar: bar={ddl_bar:?}, box={ddl_box:?}");
+
+    for (page, expected) in [("Dependencies", "child_00"), ("Statistics", "Row count"), ("Data", "Data grid,")] {
+        click_in_pane(&mut h, page);
+        wait(&mut h, page, |h| has(h, expected));
+        let content = pane_rect_contains(&h, expected);
+        assert!(content.bottom() <= viewport.bottom(), "{page} content inside viewport: {content:?}");
+    }
+    no_errors(&mut h, "users object pages");
+
+    // 2. View object (`!is_table_like()`): no Edit table button, sub-bar still pinned at top, columns visible.
+    h.state_mut().push_command(AppCommand::OpenObject {
+        connection: conn.clone(),
+        object: ObjectRef::new(ObjectKind::View, Some("main".into()), "v_users"),
+        page: ObjectPage::Properties,
+    });
+    wait(&mut h, "view columns rendered", |h| has(h, "email") && !has(h, "Edit table"));
+    frames(&mut h, 3);
+    let v_props = pane_rect(&h, "Properties");
+    let v_cols = pane_rect(&h, "Columns");
+    let v_email = pane_rect(&h, "email");
+    assert!((0.0..=30.0).contains(&(v_cols.top() - v_props.bottom())), "view sub-bar gap: {}", v_cols.top() - v_props.bottom());
+    assert!(v_email.top() > v_cols.bottom() && v_email.bottom() <= viewport.bottom(), "view column visible: {v_email:?}");
+    click_in_pane(&mut h, "Foreign keys");
+    let empty_fk = pane_rect(&h, "No foreign keys.");
+    assert!(empty_fk.top() > v_cols.bottom() && empty_fk.bottom() <= viewport.bottom(), "empty FK message visible: {empty_fk:?}");
+    // Metadata cache (`request_table_def`, used by Query Builder / Transfer / Data Compare)
+    // loads view definitions cleanly via `view_definition` without failing.
+    let v_obj = ObjectRef::new(ObjectKind::View, Some("main".into()), "v_users");
+    {
+        let backend = h.state().backend.clone();
+        let live = h.state_mut().conns.live_mut(&conn).unwrap();
+        let session = live.ensure_session(&backend, v_obj.database.as_deref()).unwrap();
+        live.meta.request_table_def(&backend, &session, &v_obj);
+    }
+    wait(&mut h, "view table_def cached", |h| h.state().conns.live(&conn).and_then(|l| l.meta.table_def(&v_obj)).is_some());
+    let v_def = h.state().conns.live(&conn).and_then(|l| l.meta.table_def(&v_obj)).unwrap();
+    let v_col_names: Vec<&str> = v_def.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(v_col_names, vec!["id", "email", "status"], "view columns loaded into metadata cache");
+    no_errors(&mut h, "view properties and metadata cache");
+
+    // 3. Narrow viewport (760 x 700, navigator visible → ~480 px tab pane): sub-bar scrolls horizontally
+    //    without pushing Edit table off-screen or hiding the Columns table below.
+    let (mut nh, nconn) = open_harness(egui::vec2(760.0, 700.0));
+    nh.state_mut().push_command(AppCommand::OpenObject { connection: nconn, object: ObjectRef::table(Some("main".into()), "users"), page: ObjectPage::Properties });
+    wait(&mut nh, "narrow users columns rendered", |h| has(h, "email") && has(h, "Edit table"));
+    frames(&mut nh, 3);
+    let nview = nh.ctx.content_rect();
+    let nprops = pane_rect(&nh, "Properties");
+    let ncols = pane_rect(&nh, "Columns");
+    let nedit = pane_rect(&nh, "Edit table");
+    let nemail = pane_rect(&nh, "email");
+    assert!((0.0..=30.0).contains(&(ncols.top() - nprops.bottom())), "narrow sub-bar gap: {}", ncols.top() - nprops.bottom());
+    assert!((nedit.center().y - ncols.center().y).abs() <= 4.0 && nedit.right() <= nview.right(), "narrow Edit table rect={nedit:?}, view={nview:?}");
+    assert!(
+        nemail.top() > ncols.bottom() && nemail.top() - ncols.bottom() <= 140.0 && nemail.bottom() <= nview.bottom(),
+        "narrow Columns row must stay visible near top: ncols={ncols:?}, nemail={nemail:?}, nview={nview:?}"
+    );
+    no_errors(&mut nh, "narrow object properties");
+}
